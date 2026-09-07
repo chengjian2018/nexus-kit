@@ -1,0 +1,52 @@
+[project]
+name = "nexus-kit"
+version = "0.1.0"
+description = "Brick-style dialogue/agent orchestration: a small kernel (nexus) + code bricks (atoms) + composed apps on one repo"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "jieba>=0.42",
+]
+
+[project.optional-dependencies]
+cli = [
+    "fire>=0.7",
+    "prompt-toolkit>=3.0",
+]
+dev = [
+    "pytest>=8.0",
+    "import-linter>=2.0",
+]
+
+# 布局说明：本仓库刻意采用扁平顶层包（nexus/atoms/apps/host），与旧仓库
+# hermes-nexus 的运行方式一致（pytest 经根 conftest.py 注入 sys.path）。
+# 顶层包名暂不命名空间化；若未来向 PyPI 分发第三方原子包，再引入
+# src 布局与命名空间（迁移计划 S7 处理）。
+[tool.setuptools]
+packages = [
+    "nexus", "nexus.model", "nexus.engine", "nexus.registry", "nexus.llm", "nexus.channels",
+    "atoms", "atoms.stages", "atoms.stages.nlu", "atoms.stages.nlg", "atoms.stages.query",
+    "atoms.stages.recaller", "atoms.stages.clarify", "atoms.augmentation",
+    "atoms.tools", "atoms.providers", "atoms.knowledge", "atoms.channels",
+    "apps", "apps.xianyu_agent", "apps.customer_agent",
+    "host", "host.config",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+# ---------------------------------------------------------------------------
+# 边界契约：host → apps → atoms → nexus（与 tests/test_architecture.py 同源；
+# import-linter 为本地人工审计工具，CI 闸门以架构测试为准）
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_packages = ["nexus", "atoms", "apps", "host"]
+
+[[tool.importlinter.contracts]]
+name = "Layers: host -> apps -> atoms -> nexus"
+type = "layers"
+layers = ["host", "apps", "atoms", "nexus"]

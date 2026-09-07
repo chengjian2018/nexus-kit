@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# 运行时数据与本机配置（不入库）
+data/
+host/config/local_config.yaml
