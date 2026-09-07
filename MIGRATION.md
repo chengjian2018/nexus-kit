@@ -30,19 +30,63 @@
   conftest 预热 atoms.stages），pytest 全绿，含 xianyu / customer_agent 两个
   业务 pattern 的行为验收。
 
-## 后续阶段（本次不实施，按优先级）
+## 总路线图 v2（统一编号；早期讨论中的 S6-S10 / P 系列 / R 系列标号全部并入本表并作废）
 
-- [ ] **S6 IR 投影**：给 Pattern/Module/Node 加 pydantic schema +
+### 第 1 章 · 接缝（纯内核重构，四件互相独立，无新依赖）
+
+- [ ] **1.1 会话 gate**（原 P0.1）：`governor.acquire_turn/release_turn`，
+  会话内轮次串行、会话间并行；
+- [ ] **1.2 RCU 快照**（原 P0.2）：注册中心改不可变快照 + 原子发布，
+  换版不阻塞读者，在飞轮次持旧引用跑完；
+- [ ] **1.3 Runner 插件化**（原 S8 第一刀 = R1/R2）：`ModuleRunner` 协议 +
+  `ModuleRuntime` 受限门面 + runner 注册表；agent → route → fsm 依次搬到
+  `atoms/runners/`；架构测试禁止 nexus import atoms.runners；
+- [ ] **1.4 管线与工具策略**（原 S8 剩余 = R3）：四槽骨架声明化（默认
+  不变）、transfer 工具注册期预生成、`ToolGate` 从 loop 析出。
+
+### 第 2 章 · 数据化（模版即数据；2.1 依赖 1.3）
+
+- [ ] **2.1 IR 投影**（原 S6）：Pattern/Module/Node 加 pydantic schema +
   `to_spec()/from_spec()`，Python 声明式写法变成编译到 IR 的语法糖；
-- [ ] **S7 分发边界**：泛型 `Registry[T]` 统一四个注册中心、entry_points
-  第三方发现、可选 src 布局与命名空间包；
-- [ ] **S8 策略析出**：ModuleType 枚举 → ModuleRunner 策略注册表；四槽位
-  骨架声明化；transfer 工具生成移到注册期；`ToolGate` 独立；
-- [ ] **S9 配置注入深化**：`nexus.settings` 模块级访问 → 构造注入的
-  RuntimeConfig/LLMRouter 服务对象；
-- [ ] **S10 内核剩余清理**：`nexus/registry/tools.py` 中 hermes-agent 的
-  handler 所有权映射逻辑瘦身；`nexus/channels/webhooks.py` 对 fastapi 的
-  依赖下沉为可选；`atoms/knowledge` 的 `account_id` 可信注入（旧仓库已知债务）。
+  `type` 字段引用 runner 注册表（查无此 runner = 注册期 fail-fast）；
+- [ ] **2.2 Module 契约**：provides/consumes/slots 插销契约 +
+  `module_ref` 库引用（模版 pin 模块版本，模块库单独演进）；
+- [ ] **2.3 分发边界**（原 S7）：泛型 `Registry[T]` 统一各注册中心、
+  entry_points 第三方发现、可选 src 布局与命名空间包。
+
+### 第 3 章 · 控制面（cordis-py 进场；3.2 依赖 1.2 + 2.1 + 3.1）
+
+- [ ] **3.1 cordis-py 收编**（原 P0/P1 前半）：vendor 进 `nexus/_vendor/`、
+  禁用 `!!js` eval、补 shutdown 序列、`nexus/runtime.py` 单写者提交口
+  （mount/unmount/update/publish）；发现函数插件化，注册皆可逆 effect；
+- [ ] **3.2 模版版本编排**（原 P2 前半）：IR → entry 子树编译器、
+  会话钉版 / canary / 回滚（EntryGroup 事务）；
+- [ ] **3.3 机器工具面**（原 P2 后半）：`pattern_inspect/get/diff/
+  define/simulate/activate` 工具组，走提交口 + 审批闸门 + 历史回放仿真；
+- [ ] **3.4 会话 realm**（原 P3，可选实验）：isolate 按会话能力组合
+  （dsh agent-presets 式）。
+
+### 第 4 章 · 收尾（低优先 / 条件触发）
+
+- [ ] **4.1 配置注入深化**（原 S9）：`nexus.settings` 模块级访问 → 构造
+  注入的 RuntimeConfig/LLMRouter 服务对象；
+- [ ] **4.2 内核清理**（原 S10）：`nexus/registry/tools.py` hermes-agent
+  所有权映射瘦身、webhooks 对 fastapi 依赖下沉、`atoms/knowledge` 的
+  `account_id` 可信注入；
+- [ ] **4.3 全 async 统一**（原 P4）：触发条件 = 流式输出 / 海量长连接；
+  届时 1.1/1.2 的快照与会话 gate 原样保留，仅执行器换任务。
+
+### 依赖关系
+
+```
+1.1 ──┐
+1.2 ──┼──→ 3.1 ──→ 3.2 ──→ 3.3        3.4（可随时实验）
+1.3 ──┼──→ 2.1 ──→ 2.2 ──→ 2.3
+1.4 ──┘
+```
+
+当前下一步：**1.3 Runner 插件化**（挡 2.1 的路；纯内部重构，444 测试兜底）；
+1.1 / 1.2 体量小，可穿插。
 
 ## 已知行为差异（有意为之）
 
