@@ -1,3 +1,5 @@
+import threading
+
 from nexus.context import DialogueContext
 
 
@@ -18,5 +20,11 @@ class Session:
         # Dialogue pipeline context: flows through pattern.stages, carrying history, slots, recall results, etc.
         # cxt.user_query is updated before each turn; session state is written back from cxt at turn end
         self.cxt = DialogueContext(session_id=session_id, user_query="")
+
+        # Per-session turn lock: serializes concurrent chat turns on the SAME
+        # session (begin_turn/history writes are not otherwise synchronized);
+        # different sessions stay fully parallel — LLM-slow turns only block
+        # their own session's re-entry, not the global thread pool.
+        self.turn_lock = threading.Lock()
 
 

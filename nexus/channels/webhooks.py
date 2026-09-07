@@ -11,7 +11,9 @@ error. Staleness is a normal business path and follows the success contract
 (empty reply = channel side "do not send"), not an error code.
 """
 
+import hmac
 import logging
+import math
 import os
 import time
 import uuid
@@ -37,16 +39,27 @@ def build_channel_router(spec: Any, ops: EngineOps) -> APIRouter:
         # 1. Optional shared secret: validation is enabled only when the env var is set to a non-empty value
         if spec.token_env:
             expected = os.getenv(spec.token_env)
-            if expected and token != expected:
+            if not expected:
+                # 无 token = 无认证公开端点：每次请求告警一次（部署侧应尽快配置）
+                logger.warning(
+                    "[%s] 环境变量 %s 未设置，渠道处于无认证状态（请尽快配置）",
+                    spec.name, spec.token_env,
+                )
+            elif not hmac.compare_digest(token, expected):
+                # 恒定时间比较，防计时侧信道逐字节猜测
                 raise HTTPException(status_code=403, detail="channel token 校验失败")
 
         # 2. Channel difference point (1): payload -> normalized message
         msg = spec.parse(payload)
 
         # 3. Staleness filtering (reconnect replay protection): a normal
-        # business path; swallowed with an empty reply
+        # business path; swallowed with an empty reply. Non-finite timestamps
+        # (NaN/Inf parse artifacts) are treated as unfilterable-skipped, and the
+        # window is bidirectional — a far-future timestamp cannot freeze a
+        # session out of expiry either.
         session_id = f"{spec.name}:{msg.session_key}"
-        if msg.timestamp is not None and time.time() - msg.timestamp > spec.stale_seconds:
+        if msg.timestamp is not None and math.isfinite(msg.timestamp) and \
+                abs(time.time() - msg.timestamp) > spec.stale_seconds:
             logger.info(
                 "[%s] 丢弃过期消息: session=%s stale_seconds=%.0f",
                 spec.name, session_id, spec.stale_seconds,

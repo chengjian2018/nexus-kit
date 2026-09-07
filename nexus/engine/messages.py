@@ -82,6 +82,16 @@ def _clean_untrusted(text: str, tag: str) -> str:
     )
 
 
+def _sanitize_task_value(value: Any, limit: int = 256) -> str:
+    """Sanitize one task_info value heading into the system prompt: strip
+    control chars, fullwidth angle brackets, cap length. task_info values
+    originate from channel payloads (buyer-visible fields like nicknames
+    ride along) — treat them as untrusted display data, not instructions."""
+    text = "".join(
+        ch for ch in str(value or "") if ch in "\n\t" or ch.isprintable())
+    return text.replace("<", "＜").replace(">", "＞")[:limit]
+
+
 def _replay_segment(segment: List[Any]) -> List[Dict[str, Any]]:
     """Guarded replay of a history segment: protocol-faithful replay when the
     tool trace is fully paired, degraded replay when broken.
@@ -227,7 +237,10 @@ def build_system_prompt(module, cxt: "DialogueContext",
     if task_info:
         parts.append("\n## 任务信息")
         for key, value in task_info.items():
-            parts.append(f"- {key}: {value}")
+            # Values are channel-sourced (buyer-visible fields ride along):
+            # sanitize + cap so a crafted nickname can't smuggle prompt
+            # instructions into the system row
+            parts.append(f"- {_sanitize_task_value(key, 64)}: {_sanitize_task_value(value)}")
 
     if cxt.filled_slots:
         parts.append("\n## 已填充槽位")

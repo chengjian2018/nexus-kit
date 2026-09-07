@@ -631,7 +631,8 @@ def chat_turn(
             response = result.reply or ""
     except Exception as e:
         logger.exception("对话处理异常: session=%s", session_id)
-        response = f"对话处理异常: {e}"
+        # 对外脱敏：异常细节可能含路径/配置信息，只回统一话术（细节已进日志）
+        response = "对话处理异常，请稍后重试"
 
     # ------------------------------------------------------------------
     # 4. End of turn: append the assistant message to history

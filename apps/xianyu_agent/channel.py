@@ -17,7 +17,7 @@ Response contract (dictated by their parse_api_reply; verify before changing):
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from nexus.channels.base import InboundMessage
 from nexus.registry.channels import registry
@@ -38,6 +38,17 @@ class XianyuInboundMessage(BaseModel):
     send_user_name: Optional[str] = None
     msg_time: Optional[str] = None
 
+    @field_validator("account_id", "chat_id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        """ID fields act as session-key/db-key building blocks: limit length + character
+        set (alphanumerics and common separator characters). IDs containing ``:``
+        etc. are rejected with a 422 to prevent session_key prefix-collision forgery."""
+        v = (v or "").strip()
+        if not v or len(v) > 64 or not v.replace("-", "").replace("_", "").replace(".", "").isalnum():
+            raise ValueError("ID 字段须为 1-64 位字母数字（可含 -_.）")
+        return v
+
 
 def _parse_msg_time(msg_time: str) -> Optional[float]:
     """Best-effort parse of msg_time into epoch seconds; return None when
@@ -47,6 +58,8 @@ def _parse_msg_time(msg_time: str) -> Optional[float]:
         return None
     try:
         value = float(text)
+        if value != value or value in (float("inf"), float("-inf")):
+            return None  # nan/inf：无法参与 staleness 判定，视为不可解析
         return value / 1000.0 if value > 1e12 else value
     except ValueError:
         pass
@@ -76,15 +89,17 @@ class XianyuChannel:
         """Payload -> normalized inbound message (task_info mapping + best-effort msg_time parsing)."""
         task_info: Dict[str, str] = {"channel": "xianyu", "account_id": payload.account_id}
         if payload.item_id is not None:
-            task_info["item_id"] = payload.item_id
+            task_info["item_id"] = payload.item_id[:64]
         if payload.send_user_id is not None:
-            task_info["buyer_user_id"] = payload.send_user_id
+            task_info["buyer_user_id"] = payload.send_user_id[:64]
         if payload.send_user_name is not None:
-            task_info["buyer_user_name"] = payload.send_user_name
+            # Buyer-controlled nickname: truncate to display-only length (it
+            # enters task_info which the prompt assembles — keep it small)
+            task_info["buyer_user_name"] = payload.send_user_name[:64]
         timestamp = _parse_msg_time(payload.msg_time) if payload.msg_time else None
         return InboundMessage(
             channel=self.name,
-            text=payload.message,
+            text=payload.message[:4000],
             session_key=f"{payload.account_id}:{payload.chat_id}",
             timestamp=timestamp,
             task_info=task_info,

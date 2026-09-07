@@ -7,12 +7,14 @@ Differences from the old repo-root main.py:
   providers, generic channels) instead of the old flat packages.
 """
 
+import hmac
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import fastapi
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import host.config  # noqa: F401 -- side effect: inject config path into nexus.settings
 from nexus.channels.base import EngineOps
@@ -30,9 +32,45 @@ logger = logging.getLogger(__name__)
 
 
 # ----init----
-app = fastapi.FastAPI()
+app = fastapi.FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 discover_builtin_tools()
 discover_builtin_patterns()
+
+
+# ---------------------------------------------------------------------------
+# API-key middleware for /api/v1/* core endpoints (channel endpoints keep their
+# own per-channel token check). Enabled only when NEXUS_API_KEY is set to a
+# non-empty value; when unset every request is allowed through but a warning is
+# logged once per minute so a misconfigured deployment stays visible.
+# ---------------------------------------------------------------------------
+
+_API_KEY_WARN_INTERVAL_SECONDS = 60.0
+_last_api_key_warn: float = 0.0
+
+
+@app.middleware("http")
+async def _api_key_guard(request, call_next):
+    global _last_api_key_warn
+    path = request.url.path
+    if path.startswith("/api/v1/") and not path.startswith("/api/v1/channel/"):
+        expected = os.getenv("NEXUS_API_KEY", "")
+        if not expected:
+            now = time.monotonic()
+            if now - _last_api_key_warn >= _API_KEY_WARN_INTERVAL_SECONDS:
+                _last_api_key_warn = now
+                logger.warning(
+                    "NEXUS_API_KEY 未设置，核心 API 处于无认证状态（请尽快配置）"
+                )
+        else:
+            provided = (request.headers.get("X-API-Key") or
+                        request.query_params.get("api_key") or "")
+            if not hmac.compare_digest(provided, expected):
+                return fastapi.responses.JSONResponse(
+                    status_code=401,
+                    content={"code": "401", "status": False,
+                             "message": "API key 校验失败"},
+                )
+    return await call_next(request)
 
 # Session governance (TTL expiry + LRU cap); tunable via governor.ttl_seconds
 # / governor.max_sessions, replaceable wholesale in tests.
@@ -161,9 +199,9 @@ def _shutdown_stores() -> None:
 
 
 class DialogueRequest(BaseModel):
-    request_id: str
-    session_id: str
-    pattern_code: str
+    request_id: str = Field(max_length=128)
+    session_id: str = Field(max_length=256)
+    pattern_code: str = Field(max_length=128)
     task_info: Dict[str, str]
 
 
@@ -174,9 +212,9 @@ class DialogueResponse(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    request_id: str
-    session_id: str
-    query: str
+    request_id: str = Field(max_length=128)
+    session_id: str = Field(max_length=256)
+    query: str = Field(max_length=4000)
 
 
 class ChatResponse(BaseModel):
@@ -266,15 +304,16 @@ def _launch_session_core(
 
     # Audit persistence (after in-memory registration succeeded); failure is
     # only logged and never blocks launch.
-    # attach runs unconditionally — if create_session failed, sink write
-    # failures are swallowed anyway, so no messages are lost once the DB
-    # recovers mid-way.
+    # attach only when create_session succeeded: a session with no sessions row
+    # would make the sink write orphan message rows (epoch lookup falls back to
+    # 0, and restart-restore never revives them — silent audit loss). Better to
+    # lose persistence for a launch-time-broken DB than to write unreachable rows.
     if store is not None:
         try:
             store.create_session(session)
+            store.attach(session)
         except Exception:
-            logger.exception("会话落盘失败: session=%s", session_id)
-        store.attach(session)
+            logger.exception("会话落盘失败（本轮关闭消息持久化）: session=%s", session_id)
 
     return session, "0", f"对话任务发起成功: session_id={session_id}"
 
@@ -303,12 +342,17 @@ def _run_chat_turn_core(
     """
     error: Optional[Exception] = None
     try:
-        response_text = chat(
-            query=query,
-            session_id=session.session_id,
-            all_sessions=governor.sessions,
-            store=store,
-        )
+        # Per-session serialization: concurrent turns on the same session_id
+        # (buyer retries / channel replays) would otherwise interleave
+        # begin_turn resets and history appends. Cross-session parallelism is
+        # unaffected — each session holds only its own lock.
+        with session.turn_lock:
+            response_text = chat(
+                query=query,
+                session_id=session.session_id,
+                all_sessions=governor.sessions,
+                store=store,
+            )
     except Exception as e:
         logger.exception("对话处理异常")
         error = e
@@ -350,10 +394,11 @@ def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
     response_text, error = _run_chat_turn_core(session, chat_request.query)
 
     if error is not None:
+        # 对外脱敏：异常细节可能含路径/配置/SQL 信息，只回统一话术（细节已进日志）
         return ChatResponse(
             code="500",
             status=False,
-            message=f"对话处理异常: {error}",
+            message="对话处理异常，请稍后重试",
         )
 
     return ChatResponse(
@@ -398,7 +443,7 @@ def list_sessions(
         )
     except Exception as e:
         logger.exception("查询会话列表失败")
-        return SessionListResponse(code="500", status=False, message=f"查询会话列表失败: {e}")
+        return SessionListResponse(code="500", status=False, message="查询会话列表失败，请稍后重试")
 
     return SessionListResponse(
         code="0", status=True, message="success", data={"sessions": sessions}
@@ -415,7 +460,7 @@ def get_session_messages(session_id: str) -> SessionMessagesResponse:
         messages = store.get_messages(session_id)
     except Exception as e:
         logger.exception("查询会话消息失败")
-        return SessionMessagesResponse(code="500", status=False, message=f"查询会话消息失败: {e}")
+        return SessionMessagesResponse(code="500", status=False, message="查询会话消息失败，请稍后重试")
 
     if messages is None:
         return SessionMessagesResponse(

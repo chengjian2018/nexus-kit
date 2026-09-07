@@ -251,9 +251,11 @@ def test_mid_turn_failure_user_row_already_persisted(
 
     monkeypatch.setattr(FakeProvider, "_chat_completion_impl", llm_boom)
     body = chat(client, "crash-mid", "你好")
-    # The chat layer swallows the exception and turns it into error text (HTTP 200 + status True); the failure path is persisted too
+    # The chat layer swallows the exception and turns it into error text (HTTP 200 + status True); the failure path is persisted too.
+    # Sanitized reply: the generic message only — internal details ("llm down mid-turn") must not leak
     assert body["status"] is True
     assert "对话处理异常" in body["data"]["response"]
+    assert "llm down" not in body["data"]["response"]
 
     msgs = store.get_messages("crash-mid")
     roles = [m["role"] for m in msgs]
