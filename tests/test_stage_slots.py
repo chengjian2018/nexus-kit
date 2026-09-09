@@ -424,7 +424,7 @@ def test_fsm_node_level_generate_via_default_skeleton():
                       entry_module_code="m1", modules=[m])
     sessions = {}
     _launch(pattern, sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         _chat(sessions, "s1", "你好")
 
     assert ran == [("f1", "f1_nlu"), ("f1", "f1_nlg")]
@@ -460,7 +460,7 @@ def test_route_menu_node_generate_nlg_same_turn_e2e():
                       entry_module_code="r1", modules=[route])
     sessions = {}
     _launch(pattern, sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         _chat(sessions, "s1", "选A")
 
     # root turn: nlu uses the root layer; after detection switches to menu_a, nlg uses the menu
@@ -499,7 +499,7 @@ def test_route_menu_jump_module_silent_dispatch_e2e():
                       entry_module_code="r1", modules=[route, fsm])
     sessions = {}
     _launch(pattern, sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         reply = _chat(sessions, "s1", "选A")
 
     # After root nlu, menu_a.jump_module=m1 is detected → interrupt (root_nlg/menu_nlg do not run)
@@ -529,7 +529,7 @@ def test_pattern_stages_verbatim_and_mixed_slots():
     pattern.stages = [_Fixed("pre"), GenerateSlot()]
     sessions = {}
     _launch(pattern, sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         reply = _chat(sessions, "s1", "你好")
 
     assert ran == [("f1", "pre"), ("f1", "node_gen")]

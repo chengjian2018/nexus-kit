@@ -12,8 +12,6 @@ Import chain (circular-import safe):
     chat/chat.py, main.py, etc.
 """
 
-import ast
-import importlib
 import logging
 import os
 import threading
@@ -21,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 from nexus.llm.provider import BaseLLMProvider, ProviderEntry
+from nexus.registry.discovery import import_modules, module_registers
 
 logger = logging.getLogger(__name__)
 
@@ -28,35 +27,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Auto-discovery helpers
 # ---------------------------------------------------------------------------
-
-def _is_registry_register_call(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "registry"
-    )
-
-
-def _module_registers_providers(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call."""
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "registry" not in source or "register" not in source:
-        return False
-    try:
-        tree = ast.parse(source, filename=str(module_path))
-    except SyntaxError:
-        return False
-
-    return any(_is_registry_register_call(stmt) for stmt in tree.body)
-
 
 def discover_builtin_providers(providers_dir: Optional[Path] = None) -> List[str]:
     """Import self-registering provider modules under atoms/providers/ and return their names."""
@@ -68,17 +38,9 @@ def discover_builtin_providers(providers_dir: Optional[Path] = None) -> List[str
         f"atoms.providers.{path.stem}"
         for path in sorted(providers_path.glob("*.py"))
         if path.name != "__init__.py"
-        and _module_registers_providers(path)
+        and module_registers(path)
     ]
-
-    imported: List[str] = []
-    for mod_name in module_names:
-        try:
-            importlib.import_module(mod_name)
-            imported.append(mod_name)
-        except Exception as e:
-            logger.warning("Could not import provider module %s: %s", mod_name, e)
-    return imported
+    return import_modules(module_names, what="provider module")
 
 
 # ---------------------------------------------------------------------------

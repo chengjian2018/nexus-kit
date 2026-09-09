@@ -315,10 +315,10 @@ def test_run_agent_uses_custom_messages_builder():
     s = _mk_run_session(reception)
 
     provider = _ScriptedProvider([{"content": "99 包邮", "tool_calls": []}])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(s, reception, s.cxt.metadata["llm_override"])
 
-    assert result.reply == "99 包邮"
+    assert result.content == "99 包邮"
     seen_messages = provider.seen[0]["messages"]
     # the custom builder's output reaches the provider verbatim (few-shot row present, default history rows absent)
     assert seen_messages[0]["role"] == "system"
@@ -344,7 +344,7 @@ def test_run_agent_delivers_p1_fragments_to_custom_builder():
     s.pattern.agent_hooks = {"on_agent_start": [lambda e: "店铺在售：A"]}
 
     provider = _ScriptedProvider([{"content": "ok", "tool_calls": []}])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, reception, s.cxt.metadata["llm_override"])
 
     assert captured["blocks"] == ["店铺在售：A"]
@@ -362,7 +362,7 @@ def test_run_agent_force_close_suffix_survives_custom_builder():
                             messages_builder=builder_no_system)
     s = _mk_run_session(reception)
     provider = _ScriptedProvider([{"content": "收尾", "tool_calls": []}])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, reception, s.cxt.metadata["llm_override"],
                   force_close=True)
     messages = provider.seen[0]["messages"]
@@ -378,7 +378,7 @@ def test_run_agent_force_close_suffix_survives_custom_builder():
                              messages_builder=builder_with_system)
     s2 = _mk_run_session(reception2)
     provider2 = _ScriptedProvider([{"content": "收尾", "tool_calls": []}])
-    with patch("nexus.engine.loop.build_provider", return_value=provider2):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider2):
         run_agent(s2, reception2, s2.cxt.metadata["llm_override"],
                   force_close=True)
     assert provider2.seen[0]["messages"][0]["content"] == (

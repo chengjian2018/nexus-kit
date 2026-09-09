@@ -160,11 +160,11 @@ def test_run_agent_sends_migrated_messages(store):
 
     provider = _ScriptedProvider([{"content": "亲～推荐阅读器哦📖",
                                    "tool_calls": []}])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(session, customer_service,
                            session.cxt.metadata["llm_override"])
 
-    assert result.reply == "亲～推荐阅读器哦📖"
+    assert result.content == "亲～推荐阅读器哦📖"
     messages = provider.seen[0]["messages"]
     # Migrated assembly order: system (role + session info) -> catalog untrusted line -> explicit query
     assert messages[0]["role"] == "system"

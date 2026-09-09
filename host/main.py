@@ -24,6 +24,7 @@ from nexus.engine.session import Session
 from nexus.engine.store import SessionStore
 from nexus.registry.channels import discover_builtin_channels
 from nexus.registry.patterns import discover_builtin_patterns, registry as pattern_registry
+from nexus.registry.plugins import discover_builtin_plugins
 from nexus.registry.tools import discover_builtin_tools
 from nexus.settings import get_session_db_path, load_config
 from host.governor import SessionGovernor
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 app = fastapi.FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 discover_builtin_tools()
 discover_builtin_patterns()
+discover_builtin_plugins()
 
 
 # ---------------------------------------------------------------------------

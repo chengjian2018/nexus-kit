@@ -2,7 +2,7 @@
 P6 transfer / P7 exits / no firing on ROUTE turns.
 
 Idiom follows test_agent_inject_transfer.py: module-level registration of neutral
-mock tools + ScriptedProvider + patch("nexus.engine.loop.build_provider").
+mock tools + ScriptedProvider + patch("atoms.executors.loop_executor.build_provider").
 """
 
 import json
@@ -123,7 +123,7 @@ class ScriptedProvider:
 
 def _run(s, provider):
     from nexus.engine.loop import run_agent
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         return run_agent(s, s.cxt.module_map["main"],
                          s.cxt.metadata["llm_override"])
 
@@ -144,7 +144,7 @@ def test_p1_fragments_injected_into_system_prompt():
     })
     provider = ScriptedProvider([{"content": "好的。", "tool_calls": []}])
     result = _run(s, provider)
-    assert result.reply == "好的。"
+    assert result.content == "好的。"
     system = provider.seen[0]["messages"][0]["content"]
     assert system.strip().startswith("## 扩展上下文")
     assert "店铺在售：A、B" in system and "当前时段：午间" in system
@@ -159,7 +159,7 @@ def test_p1_hook_failure_degrades_silently():
     s = _mk_hooks_session(pattern_hooks={"on_agent_start": [boom]})
     provider = ScriptedProvider([{"content": "ok", "tool_calls": []}])
     result = _run(s, provider)
-    assert result.reply == "ok"
+    assert result.content == "ok"
     assert all("扩展上下文" not in (m.get("content") or "")
                for m in provider.seen[0]["messages"])
 
@@ -171,7 +171,7 @@ def test_p1_injection_precedes_force_close_suffix():
         "on_agent_start": [lambda e: "店铺在售：A"],
     })
     provider = ScriptedProvider([{"content": "直接答", "tool_calls": []}])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, s.cxt.module_map["main"],
                   s.cxt.metadata["llm_override"], force_close=True)
     system = provider.seen[0]["messages"][0]["content"]
@@ -193,7 +193,7 @@ def test_p2_p3_observer_events():
         {"content": "done", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "done"
+    assert result.content == "done"
     assert len(calls) == 2 and len(responses) == 2
     # P2: messages is the real outbound object (same list by reference), plus model and round_idx
     assert calls[0].messages is provider.seen[0]["messages"]
@@ -219,7 +219,7 @@ def test_p6_p7_transfer_outcome():
             name="transfer_to_peer", arguments='{"reason": "深入流程"}')]},
     ])
     result = _run(s, provider)
-    assert result.reply in (None, "")
+    assert result.content in (None, "")
     assert ("transfer", "peer", "深入流程") in seen
     assert ("end", "transfer", "peer") in seen
 
@@ -230,7 +230,7 @@ def test_p7_reply_and_max_rounds_outcomes():
     s = _mk_hooks_session(pattern_hooks={"on_agent_end": [ends.append]})
     provider = ScriptedProvider([{"content": "答案", "tool_calls": []}])
     result = _run(s, provider)
-    assert result.reply == "答案"
+    assert result.content == "答案"
     assert ends[-1].outcome == "reply" and ends[-1].reply == "答案"
     assert ends[-1].rounds == 1
 
@@ -240,7 +240,7 @@ def test_p7_reply_and_max_rounds_outcomes():
     script = [{"content": None, "tool_calls": [_tool_call(cid=f"c{i}")]}
               for i in range(10)]
     result2 = _run(s2, ScriptedProvider(script))
-    assert result2.reply == "抱歉，处理超时，请稍后重试。"
+    assert result2.content == "抱歉，处理超时，请稍后重试。"
     assert ends[-1].outcome == "max_rounds" and ends[-1].rounds == 10
 
 
@@ -320,7 +320,7 @@ def test_p4_args_rewrite_consistent_across_execution_payload_feed():
         {"content": "done", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "done"
+    assert result.content == "done"
 
     # Execution side: the tool receives the rewritten args
     rows = _tool_rows(s.cxt)
@@ -355,7 +355,7 @@ def test_p4_name_rewrite_to_allowed_tool_executes_target():
         {"content": "done", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "done"
+    assert result.content == "done"
     rows = _tool_rows(s.cxt)
     # The renamed tool is the one actually executed; metadata provenance follows the final name
     assert json.loads(rows[0].content)["tool"] == "hook_alt_tool"
@@ -397,7 +397,7 @@ def test_p4_rename_to_transfer_prefix_rejected():
         {"content": "done", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "done"
+    assert result.content == "done"
     assert not [a for a in s.cxt.actions if isinstance(a, ModuleJumpEvent)]
     assert json.loads(_tool_rows(s.cxt)[0].content)["tool"] == "hook_echo_tool"
 
@@ -431,7 +431,7 @@ def test_p5_result_rewrite_feeds_llm_and_history():
         {"content": "done", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "done"
+    assert result.content == "done"
     rows = _tool_rows(s.cxt)
     assert "北京" not in rows[0].content and "***" in rows[0].content
     # The model is fed back the same redacted result (no divergence)
@@ -469,7 +469,7 @@ def test_hallucinated_name_backfills_error_with_tools_list():
         {"content": "改好了，直接回答。", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "改好了，直接回答。"
+    assert result.content == "改好了，直接回答。"
     rows = _tool_rows(s.cxt)
     error = json.loads(rows[0].content)["error"]
     assert "no_such_tool" in error
@@ -490,7 +490,7 @@ def test_registered_but_unauthorized_name_intercepted():
         {"content": "直接回答。", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "直接回答。"
+    assert result.content == "直接回答。"
     rows = _tool_rows(s.cxt)
     payload = json.loads(rows[0].content)
     assert "不存在或本轮不可用" in payload["error"]
@@ -565,7 +565,7 @@ def test_invalid_transfer_branch_fires_p4_p5_on_normal_tools_only():
         {"content": "直接处理。", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.reply == "直接处理。"
+    assert result.content == "直接处理。"
     assert ("p4", "hook_echo_tool") in calls
     assert ("p5", "hook_echo_tool") in calls
     assert all(n != "transfer_to_ghost" for _, n in calls)

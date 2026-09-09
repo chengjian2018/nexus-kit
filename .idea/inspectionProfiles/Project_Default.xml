@@ -1,0 +1,34 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="aiofiles" />
+          <option value="aiohttp" />
+          <option value="jieba" />
+          <option value="litellm" />
+          <option value="loguru" />
+          <option value="numpy" />
+          <option value="openai" />
+          <option value="openpyxl" />
+          <option value="pandas" />
+          <option value="pillow" />
+          <option value="playwright" />
+          <option value="pydantic" />
+          <option value="pypdf" />
+          <option value="pyqt6" />
+          <option value="pyqt6-fluent-widgets" />
+          <option value="python-docx" />
+          <option value="requests" />
+          <option value="sqlalchemy" />
+          <option value="tiktoken" />
+          <option value="volcengine" />
+          <option value="websockets" />
+          <option value="xlrd" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

@@ -50,7 +50,7 @@ def test_same_turn_transfer_b_replies():
         # B: takes over and replies
         {"content": "看到您有售后需求，我先了解一下具体情况。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         reply = _chat(sessions, "s1", "帮我处理售后")
     assert reply == "看到您有售后需求，我先了解一下具体情况。"
     assert sessions["s1"].cxt.current_module_code == "after_sales"
@@ -68,7 +68,7 @@ def test_max_hops_exceeded_force_close():
         # reached -> it must reply directly
         {"content": "好的，我来处理您的售后问题。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         reply = _chat(sessions, "s1", "帮我处理售后")
     assert reply == "好的，我来处理您的售后问题。"
 
@@ -120,7 +120,7 @@ def test_force_close_route_returns_nonempty_reply():
             "name": "transfer_to_router",
             "arguments": '{"reason": "购车"}'}}]},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         reply = _chat(sessions, "sr", "我想买车")
     # force_close lands on ROUTE: no jump is triggered (otherwise menu_buy
     # would hit buy_agent -> empty reply)

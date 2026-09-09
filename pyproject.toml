@@ -31,6 +31,7 @@ packages = [
     "atoms", "atoms.stages", "atoms.stages.nlu", "atoms.stages.nlg", "atoms.stages.query",
     "atoms.stages.recaller", "atoms.stages.clarify", "atoms.augmentation",
     "atoms.tools", "atoms.providers", "atoms.knowledge", "atoms.channels",
+    "atoms.executors",
     "apps", "apps.xianyu_agent", "apps.customer_agent",
     "host", "host.config",
 ]

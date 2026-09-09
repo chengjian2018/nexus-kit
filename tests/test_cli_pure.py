@@ -409,7 +409,7 @@ def _run_chat_turn(tmp_path, session):
         return real(**kw)
 
     sessions = {session.session_id: session}
-    with _patch("nexus.engine.loop.build_provider"), \
+    with _patch("atoms.executors.loop_executor.build_provider"), \
          _patch.object(chat_mod, "get_llm_config", side_effect=spy):
         chat_fn(query="你好", session_id=session.session_id,
                 all_sessions=sessions)

@@ -195,7 +195,7 @@ def test_nlu_jump_breaks_stages_and_reroutes_same_turn():
                       entry_module_code="r1", modules=[route, target])
     sessions = {}
     _launch(pattern, sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         reply = _chat(sessions, "s1", "我要买车")
 
     assert reply == "已为您切换到目标模块"
@@ -272,7 +272,7 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
                       max_hops=2)
     sessions = {}
     _launch(pattern, sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         result = chat_turn("选A", "s1", sessions)
 
     # force_close lands on the last target m1 (FSM turns do not detect jumps;

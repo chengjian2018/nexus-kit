@@ -3,12 +3,20 @@ Dialogue processing — the turn orchestrator.
 
 Responsibility is narrowed to "orchestrating one turn": locate the session →
 cxt turn lifecycle → same-turn hop loop → produce a ChatResult. Per-module
-handling is inlined in this module by type:
+handling is dispatched to executor plugins (registry kind="executor";
+resolution module.executor > pattern.executor_<type> > type default code):
 
-- AGENT → loop.run_agent (inject answers directly / transfer writes a
-  ModuleJumpEvent and returns)
-- FSM   → _run_fsm_pipeline (stages execution + next_node jump)
-- ROUTE → _run_route_pipeline (stages execution + end-of-turn reset to root)
+- AGENT → default_loop (atoms/executors/loop_executor.py — inject answers
+  directly / transfer writes a ModuleJumpEvent and returns)
+- FSM   → default_fsm (atoms/executors/fsm_executor.py — stages execution +
+  next_node jump)
+- ROUTE → default_route (atoms/executors/route_executor.py — stages
+  execution + end-of-turn reset to root)
+
+This module keeps the kernel toolbox the executors import: the R1-R4
+_refresh_llm_config, _resolve_entry_node, _run_stages, and
+_fsm_node_transition (patch anchors — tests patch
+"nexus.engine.chat.get_llm_config").
 
 Module jumps all go through ModuleJumpEvent (written to cxt.actions,
 defined in dialogue/base.py). Events originate from only two entry points:
@@ -18,7 +26,7 @@ defined in dialogue/base.py). Events originate from only two entry points:
   the jump_module configured on the menu node after advancement. On a hit:
   merge slots, write the event, abort the remaining stages (the source
   module is suppressed and generates no reply).
-- AGENT transfer tool call: loop.run_agent writes the event directly and
+- AGENT transfer tool call: the loop executor writes the event directly and
   returns.
 - FSM produces no events: clarify is handled inside the loop by
   ClarifyStage (overwrites nlg_result without leaving the loop), and node
@@ -47,11 +55,13 @@ from typing import TYPE_CHECKING, Dict, Optional
 from nexus.settings import get_llm_config
 from nexus.engine.compression import maybe_compress
 from nexus.engine.context_lifecycle import TurnLifecycle
+from nexus.engine.execution import ExecutionContext
 from nexus.engine.loop import TurnResult, run_agent  # noqa: F401 (compat re-export)
 from nexus.engine.response import ChatResult, build_chat_result
 from nexus.engine.session import Session
 from nexus.context import ModuleJumpEvent
 from nexus.model.module import ModuleType
+from nexus.registry.plugins import registry as plugin_registry
 
 if TYPE_CHECKING:
     from nexus.engine.store import SessionStore
@@ -418,108 +428,49 @@ def _run_stages(cxt, module, pattern, force_close: bool = False
     return None
 
 
-def _run_fsm_pipeline(session: Session, module, force_close: bool = False
-                      ) -> TurnResult:
-    """One FSM module turn: node resolution → R3 refresh → stages →
-    next_node jump.
+def _resolve_executor_code(session: Session, module):
+    """Resolve the executor code for a module (plugin registry kind="executor").
 
-    FSM produces no jump events (clarify handled inside the loop, node
-    jumps at end of turn), so _run_stages always returns None.
+    Fallback chain (same shape as the stage slots): module.executor >
+    pattern.executor_<type> > the type default code
+    (plugins.DEFAULT_EXECUTOR_CODES). The pattern field suffix uses the
+    executor family name (loop/fsm/route — matching pattern.executor_loop
+    & friends), not the ModuleType value (agent/fsm/route). An unset
+    module/pattern declaration keeps today's behavior (default loop / fsm /
+    route executor).
     """
-    cxt = session.cxt
-    pattern = session.pattern
-
-    _resolve_entry_node(cxt, module)
-
-    # R3: after node resolution, refresh the LLM config by module+node (spec §4)
-    _refresh_llm_config(session, module_code=module.module_code,
-                        node_code=cxt.current_node_code)
-
-    _run_stages(cxt, module, pattern, force_close=force_close)
-
-    # FSM: next_node jump (the clarify-turn guard lives inside the transition function)
-    _fsm_node_transition(cxt, module)
-
-    # Terminal node action (reserved channel)
-    next_node = pattern.node_map.get(cxt.current_node_code)
-    if next_node is not None and getattr(next_node, "is_end", False):
-        cxt.actions.append({"conversation_end": True})
-
-    nlg_result = cxt.nlg_result or {}
-    return TurnResult(reply=nlg_result.get("content", ""))
-
-
-def _run_route_pipeline(session: Session, module, force_close: bool = False
-                        ) -> TurnResult:
-    """One ROUTE module turn: node resolution → R3 refresh → stages →
-    end-of-turn reset to root.
-
-    Module jumps are detected inside _run_stages (NLU jump_module field /
-    menu node jump_module config); this function does no jump_module
-    dispatch of its own. On a jump turn, return silently (the hop loop
-    reroutes and the target module resolves its own entry node); after
-    jumping to an AGENT/FSM module, the target carries the following turns
-    across turns (agent via history, FSM via node position) without
-    returning to routing — the end-of-turn reset to root happens only while
-    still parked in the ROUTE module (menu nodes have no sub_nodes; without
-    the reset the next turn's routing candidates would be empty). ROUTE
-    does not assemble a ClarifyStage (only FSM+enable_clarify gets one
-    inserted, see stage_slots.resolve_stage), and begin_turn already
-    cleared clarify at start of turn, so there is no clarify-turn branch.
-    """
-    cxt = session.cxt
-    pattern = session.pattern
-
-    _resolve_entry_node(cxt, module)
-
-    # R3: after node resolution, refresh the LLM config by module+node (spec §4)
-    _refresh_llm_config(session, module_code=module.module_code,
-                        node_code=cxt.current_node_code)
-
-    jump_event = _run_stages(cxt, module, pattern, force_close=force_close)
-
-    # Jump turn: slots were already merged at the detection point; the hop
-    # loop reroutes to the target module to continue in the same turn
-    if jump_event is not None:
-        return TurnResult()
-
-    # Slot merge (incremental: via the lifecycle entry point)
-    slots = (cxt.nlu_result or {}).get("slots", {})
-    _lifecycle.merge_slots(cxt, slots)
-
-    # End-of-turn reset to root (including force_close: jump detection is
-    # skipped, but menu nodes have no sub_nodes — without the reset the
-    # next turn's routing candidates would be empty)
-    root_code = module.module_nodes[0].node_code if module.module_nodes else None
-    cxt.current_node_code = root_code
-    logger.info("ROUTE 模块保持 root 节点: %s", root_code)
-
-    nlg_result = cxt.nlg_result or {}
-    return TurnResult(reply=nlg_result.get("content", ""))
-
-
-def _run_agent_pipeline(session: Session, module, force_close: bool = False
-                        ) -> TurnResult:
-    """One AGENT module turn: R2 refresh → loop.run_agent.
-
-    transfer tool calls are written by run_agent as a ModuleJumpEvent to
-    cxt.actions; this function does nothing further with them (consumed
-    uniformly by the chat layer's hop loop).
-    """
-    logger.info("Agent 模块处理: module=%s", module.module_code)
-    _refresh_llm_config(session, module_code=module.module_code)  # R2
-    return run_agent(session, module, session.cxt.llm_config,
-                     force_close=force_close)
+    module_decl = getattr(module, "executor", None)
+    if module_decl:
+        return module_decl
+    type_key = module.type.value
+    family = {"agent": "loop", "fsm": "fsm", "route": "route"}[type_key]
+    pattern_decl = getattr(session.pattern, f"executor_{family}", None)
+    if pattern_decl:
+        return pattern_decl
+    return plugin_registry.default_executor_code(type_key)
 
 
 def _handle_module(session: Session, module, force_close: bool = False
                    ) -> TurnResult:
-    """Dispatch single-module single-turn handling by module type."""
-    if module.type == ModuleType.AGENT:
-        return _run_agent_pipeline(session, module, force_close=force_close)
-    if module.type == ModuleType.ROUTE:
-        return _run_route_pipeline(session, module, force_close=force_close)
-    return _run_fsm_pipeline(session, module, force_close=force_close)
+    """Dispatch single-module single-turn handling via the executor plugin.
+
+    The ModuleType hard-coded dispatch is gone: the executor is resolved
+    from the plugin registry (module.executor > pattern.executor_<type> >
+    type default), and each executor receives an ExecutionContext (cxt /
+    pattern / module / force_close). The default implementations live in
+    atoms/executors/ — the kernel holds no default executor, so an un-warmed
+    registry fails fast with a pointer to atoms.executors (same
+    kernel-purity pattern as pipeline.register_default_generate).
+    """
+    ec = ExecutionContext(
+        cxt=session.cxt,
+        pattern=session.pattern,
+        module=module,
+        force_close=force_close,
+    )
+    executor = plugin_registry.resolve(
+        "executor", _resolve_executor_code(session, module))
+    return executor.execute(ec)
 
 
 def chat_turn(
@@ -610,7 +561,7 @@ def chat_turn(
 
             event = _jumps.pop(session.cxt)
             if event is None:
-                response = result.reply or ""
+                response = result.content or ""
                 break
             logger.info(
                 "same-turn jump 第 %d 跳: → %s (source=%s)",
@@ -628,7 +579,7 @@ def chat_turn(
                 session.cxt.current_module_code or pattern.entry_module_code
             ]
             result = _handle_module(session, current_module, force_close=True)
-            response = result.reply or ""
+            response = result.content or ""
     except Exception as e:
         logger.exception("对话处理异常: session=%s", session_id)
         # 对外脱敏：异常细节可能含路径/配置信息，只回统一话术（细节已进日志）

@@ -6,14 +6,13 @@ the system auto-discovers and imports these files through AST scanning.
 Follows the same registration pattern as llm/register.py.
 """
 
-import ast
-import importlib
 import logging
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from nexus.model.pattern import Pattern
+from nexus.registry.discovery import import_modules, module_registers
 
 logger = logging.getLogger(__name__)
 
@@ -21,43 +20,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Auto-discovery helpers
 # ---------------------------------------------------------------------------
-
-def _is_registry_register_call_pattern(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "registry"
-    )
-
-
-def _module_registers_patterns(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call.
-
-    Only inspects module-body statements so that helper modules which happen
-    to call ``registry.register()`` inside a function are not picked up.
-
-    A cheap text prefilter avoids the ``ast.parse`` cost for files that do not
-    mention both ``registry`` and ``register`` — a necessary condition for a
-    top-level ``registry.register()`` call to exist.
-    """
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "registry" not in source or "register" not in source:
-        return False
-    try:
-        tree = ast.parse(source, filename=str(module_path))
-    except SyntaxError:
-        return False
-
-    return any(_is_registry_register_call_pattern(stmt) for stmt in tree.body)
-
 
 def discover_builtin_patterns(apps_dir: Optional[Path] = None) -> List[str]:
     """Import self-registering pattern modules under apps/ and return their names.
@@ -75,17 +37,9 @@ def discover_builtin_patterns(apps_dir: Optional[Path] = None) -> List[str]:
     if apps_path.is_dir():
         for app_dir in sorted(p for p in apps_path.iterdir() if p.is_dir()):
             for path in sorted(app_dir.glob("*.py")):
-                if path.name != "__init__.py" and _module_registers_patterns(path):
+                if path.name != "__init__.py" and module_registers(path):
                     module_names.append(f"apps.{app_dir.name}.{path.stem}")
-
-    imported: List[str] = []
-    for mod_name in module_names:
-        try:
-            importlib.import_module(mod_name)
-            imported.append(mod_name)
-        except Exception as e:
-            logger.warning("Could not import module %s: %s", mod_name, e)
-    return imported
+    return import_modules(module_names, what="pattern module")
 
 
 # ---------------------------------------------------------------------------

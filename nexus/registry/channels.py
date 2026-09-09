@@ -8,7 +8,6 @@ tmp dirs — via spec_from_file_location). Default scan covers
 ``apps/`` (business adapters live next to their patterns).
 """
 
-import ast
 import importlib
 import importlib.util
 import logging
@@ -18,37 +17,11 @@ import threading
 from pathlib import Path
 from typing import Any, List, Optional
 
+from nexus.registry.discovery import module_registers
+
 logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # used in URL paths: lowercase snake/kebab
-
-
-def _is_registry_register_call(node: ast.AST) -> bool:
-    """True when *node* is a module-top-level ``registry.register(...)`` expression."""
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "registry"
-    )
-
-
-def _module_registers_channel(module_path: Path) -> bool:
-    """True when the module contains a module-level registry.register() call (text pre-filter + AST)."""
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "registry" not in source or "register" not in source:
-        return False
-    try:
-        tree = ast.parse(source, filename=str(module_path))
-    except SyntaxError:
-        return False
-    return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
 
 _EXCLUDED = {"__init__.py", "register.py", "base.py", "webhooks.py"}
@@ -112,7 +85,7 @@ def discover_builtin_channels(channels_dir: Optional[Path] = None) -> List[str]:
     imported: List[str] = []
     for scan_dir in scan_dirs:
         for path in sorted(scan_dir.glob("*.py")):
-            if path.name in _EXCLUDED or not _module_registers_channel(path):
+            if path.name in _EXCLUDED or not module_registers(path):
                 continue
             mod_name = _import_channel_module(path)
             if mod_name is not None:

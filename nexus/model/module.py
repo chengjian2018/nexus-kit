@@ -112,6 +112,7 @@ class BaseModule:
         agent_stage: Optional[Any] = None,
         messages_builder: Optional[Any] = None,
         agent_hooks: Optional[Any] = None,
+        executor: Optional[str] = None,
         enable_clarify: bool = False,
         is_end: Optional[bool] = False,
         answer_examples: Optional[List[str]] = None,
@@ -148,6 +149,12 @@ class BaseModule:
         # pattern-level declaration (no merge, same semantics as the stage
         # slots; form and consumer: chat/agent_hooks.py)
         self.agent_hooks = agent_hooks
+
+        # Executor plugin declaration (kind="executor"): module-level
+        # override with the highest priority (module.executor >
+        # pattern.executor_<type> > type default code); resolved at runtime
+        # from the plugin registry by the chat layer
+        self.executor = executor
 
         self.enable_clarify = enable_clarify
 

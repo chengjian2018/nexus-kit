@@ -1,70 +1,47 @@
-"""
-Agent dialogue loop — run_agent's dual-primitive executor
-(inject: projection answers directly / transfer: writes a jump event).
+"""Agent loop kernel module — TurnResult, the shared tool toolbox, and the
+run_agent compat facade.
 
-Supports:
-- Two-layer tool filtering: pattern permissions + module.use_tools
-- Lent tools from neighbor modules (via ModuleLink.lend_tools)
-- transfer_to_XX tools generated per sub_modules link; on call, a
-  ModuleJumpEvent is appended to cxt.actions and the module's turn ends —
-  the chat layer consumes the event and reroutes (no adjacency check /
-  rebound rejection; target existence in module_map is the only guard)
-- Tool round-trips recorded into DialogueContext history
-- Pluggable hooks at loop points (pattern.agent_hooks declaration; events,
-  dispatch and guard semantics see chat/agent_hooks.py)
+The loop's orchestration body moved to the executor atom
+(atoms/executors/loop_executor.py::DefaultLoopExecutor, plugin code
+"default_loop"); this kernel module keeps:
+
+- TurnResult — the executor return contract (content/actions/extra)
+- run_agent — compat facade (test anchor): builds an ExecutionContext and
+  delegates to the plugin-resolved executor
+- the tool-resolution / dispatch toolbox (_resolve_tools /
+  _resolve_lent_tools / _dispatch_tool_calls / _parse_args / _execute_tool /
+  build_transfer_tools / _transfer_reason) shared by the default executor
+  and custom loops — kept in the kernel so the layering stays one-directional
+  (atoms → nexus) and existing import anchors hold
+- framework-enforced prompt items (force-close suffix, prompt-length warning)
+
+Docs for the transfer semantics preserved by the toolbox live on the
+functions themselves; see atoms/executors/loop_executor.py for the loop.
 """
 
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from nexus.engine.agent_hooks import (
-    AgentEndEvent,
-    AgentStartEvent,
-    LLMCallEvent,
-    LLMResponseEvent,
     ToolCallEvent,
     ToolResultEvent,
-    TransferEvent,
-    collect_fragments,
-    fire,
-    resolve_agent_hooks,
     rewrite_tool_call,
     rewrite_tool_result,
 )
-from nexus.engine.messages import build_agent_messages
+from nexus.engine.execution import ExecutionContext
 from nexus.engine.session import Session
-from nexus.context import (
-    ModuleJumpEvent,
-    encode_tool_call_content,
-)
-from nexus.llm.resolve import build_provider
+from nexus.engine.turn_result import TurnResult  # noqa: F401 -- compat re-export (import anchor)
+from nexus.context import encode_tool_call_content
+from nexus.registry.plugins import registry as plugin_registry
 from nexus.registry.tools import registry as tool_registry
 
 logger = logging.getLogger(__name__)
 
 TRANSFER_TOOL_PREFIX = "transfer_to_"
 
-# Max tool calling rounds to prevent infinite loops
-_MAX_TOOL_ROUNDS = 10
-
 # Warn when the system prompt exceeds this length (projection bloat observability)
 _PROMPT_LENGTH_WARN = 4000
-
-
-@dataclass
-class TurnResult:
-    """Result of running one turn of a single module.
-
-    Empty reply + a ModuleJumpEvent in cxt.actions = this module silently
-    transferred; the chat layer's hop loop consumes the event and reroutes.
-    Otherwise reply is the outgoing response. actions is a reserved channel
-    (same shape as cxt.actions); the current executor never produces it.
-    """
-
-    reply: Optional[str] = None
-    actions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def conversation(
@@ -72,9 +49,9 @@ def conversation(
     module,
     llm_config: Dict[str, Any],
 ) -> str:
-    """Compatibility wrapper: calls run_agent and returns reply (the chat layer continues transfer turns)."""
+    """Compatibility wrapper: calls run_agent and returns the reply text (the chat layer continues transfer turns)."""
     result = run_agent(session, module, llm_config)
-    return result.reply or ""
+    return result.content or ""
 
 
 def run_agent(
@@ -83,195 +60,22 @@ def run_agent(
     llm_config: Dict[str, Any],
     force_close: bool = False,
 ) -> TurnResult:
-    """Run one turn of a single AGENT module: inject answers directly /
-    transfer writes a jump event and returns.
+    """Compat facade (test anchor): run one turn of a single AGENT module.
 
-    Args:
-        session: current session
-        module: current module object (AgentModule)
-        llm_config: LLM config dict with code, model, temperature, etc.
-        force_close: force close (max_hops exhausted): appends the close-out
-            hint (_FORCE_CLOSE_SUFFIX) and does not inject transfer tools
-
-    Returns:
-        TurnResult: reply is the response; on a transfer hit, reply is empty
-        and the jump event has already been written to cxt.actions
-        (ModuleJumpEvent) for the chat layer to consume.
+    Builds an ExecutionContext (llm_config written back to cxt.llm_config)
+    and delegates to the plugin-resolved default_loop executor — identical
+    behavior to the pre-pluginization function body.
     """
-    cxt = session.cxt
-    provider = build_provider(llm_config)
+    from nexus.model.module import ModuleType  # local: avoid import cycle at module import time
 
-    # Agent loop hooks (declared at pattern level; a non-empty module-level
-    # agent_hooks replaces it wholesale; when empty, every hook point is a
-    # zero-overhead pass-through)
-    hooks = resolve_agent_hooks(module, session.pattern)
-
-    # P1 on_agent_start: fetched and injected before the loop and messages
-    # assembly. Fragments reach the builder via extra_blocks (the contract
-    # requires including them); hooks do not write to cxt
-    fragments = collect_fragments(
-        hooks,
-        AgentStartEvent(session_id=cxt.session_id,
-                        module_code=module.module_code, cxt=cxt),
-    ) if hooks else []
-
-    own_tools = _resolve_tools(module, session.pattern)
-    lent_schemas, lent_by = _resolve_lent_tools(module, session.pattern)
-    transfer_tools = [] if force_close else build_transfer_tools(module, cxt.module_map)
-    tools = own_tools + lent_schemas + transfer_tools
-    # Available set for main-flow validation / the P4 guard (own + lent;
-    # transfer tools excluded — transfer turns skip tool dispatch, and a
-    # rename smuggling the prefix is blocked by both guard and validation)
-    allowed_names = {t.get("function", {}).get("name", "")
-                     for t in own_tools + lent_schemas}
-
-    # Integrated messages build (system content and list assembly share one
-    # source): module.messages_builder > pattern.messages_builder > default
-    # three-segment layout
-    messages = build_agent_messages(module, cxt, pattern=session.pattern,
-                                    extra_blocks=fragments)
-    # force_close close-out suffix is enforced framework-side (control-flow
-    # semantics; no builder may break it)
-    if force_close:
-        _append_force_close_suffix(messages)
-    _warn_prompt_length(messages, cxt, module)
-
-    model = llm_config["model"]
-    temperature = llm_config.get("temperature", 0.7)
-    max_tokens = llm_config.get("max_tokens", 2048)
-
-    for round_idx in range(_MAX_TOOL_ROUNDS):
-        logger.info(
-            "Agent loop 第 %d 轮: session=%s, module=%s, tools=%d",
-            round_idx + 1, cxt.session_id, module.module_code, len(tools),
-        )
-
-        # P2 on_llm_call: before each LLM call (messages passed by reference,
-        # read-only discipline)
-        if hooks:
-            fire(hooks, "on_llm_call", LLMCallEvent(
-                session_id=cxt.session_id, module_code=module.module_code,
-                round_idx=round_idx, messages=messages, model=model))
-
-        if tools:
-            result = provider.chat_completion(
-                messages=messages, model=model, temperature=temperature,
-                max_tokens=max_tokens, tools=tools, tool_choice="auto",
-            )
-        else:
-            result = provider.chat_completion(
-                messages=messages, model=model, temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-        content = result.get("content", "") or ""
-        tool_calls = result.get("tool_calls", []) or []
-
-        # P3 on_llm_response: after each LLM response (content/tool_calls
-        # already parsed)
-        if hooks:
-            fire(hooks, "on_llm_response", LLMResponseEvent(
-                session_id=cxt.session_id, module_code=module.module_code,
-                round_idx=round_idx, content=content,
-                tool_calls=tool_calls))
-
-        # No tool calls -> inject primitive: answer directly
-        if not tool_calls:
-            logger.info("Agent loop 完成，共 %d 轮", round_idx + 1)
-            # P7 on_agent_end: direct-answer exit
-            if hooks:
-                fire(hooks, "on_agent_end", AgentEndEvent(
-                    session_id=cxt.session_id, module_code=module.module_code,
-                    rounds=round_idx + 1, outcome="reply", reply=content))
-            return TurnResult(reply=content)
-
-        transfer_call = next(
-            (tc for tc in tool_calls
-             if tc.get("function", {}).get("name", "").startswith(TRANSFER_TOOL_PREFIX)),
-            None,
-        )
-        if transfer_call is not None:
-            target = transfer_call["function"]["name"][len(TRANSFER_TOOL_PREFIX):]
-            transfer_reason = _transfer_reason(transfer_call)
-
-            # Target missing (no sub_modules edge / hallucinated call): backfill
-            # an error and keep looping so the LLM can pick another path (a real
-            # OpenAI-compatible API requires an answer for every tool_call_id)
-            if target not in cxt.module_map:
-                logger.warning(
-                    "[transfer] 目标 %s 不在 module_map 中，错误回填继续 loop",
-                    target,
-                )
-                err = json.dumps(
-                    {"error": "转移目标不存在，请直接回应用户"},
-                    ensure_ascii=False)
-                _dispatch_tool_calls(
-                    cxt, module, messages, content, tool_calls,
-                    hooks, allowed_names, lent_by, round_idx,
-                    transfer_error=err)
-                continue
-
-            # Transfer hit: write the jump event and silently hand off from this
-            # module (content is suppressed from output but kept in history);
-            # the chat layer consumes the event and reroutes to the target
-            # module within the same turn. Every tool_call of this response
-            # gets a synthetic tool row (transfer entry logged as transferred,
-            # the rest as not executed) so assistant.tool_calls replay fully
-            # paired on the next round
-            cxt.add_message(
-                "assistant",
-                encode_tool_call_content(content or "", tool_calls),
-                stage="agent",
-                metadata={"suppressed": True},
-            )
-            for tc in tool_calls:
-                name = tc.get("function", {}).get("name", "")
-                if name.startswith(TRANSFER_TOOL_PREFIX):
-                    synthetic = f"[已移交至模块 {target}]"
-                else:
-                    synthetic = "[未执行：本轮已移交]"
-                cxt.add_message("tool", synthetic, stage="agent",
-                                metadata={"synthetic": True,
-                                          "tool_name": name,
-                                          "tool_call_id": tc.get("id", "")})
-            cxt.actions.append(ModuleJumpEvent(
-                target_module_code=target,
-                reason=transfer_reason,
-                source="handoff_tool",
-            ))
-            logger.info(
-                "[transfer] %s → %s（事件已写入 actions，移交 chat 层）",
-                module.module_code, target,
-            )
-            # P6 on_transfer + P7 on_agent_end: transfer exit
-            if hooks:
-                fire(hooks, "on_transfer", TransferEvent(
-                    session_id=cxt.session_id, module_code=module.module_code,
-                    round_idx=round_idx, target=target,
-                    reason=transfer_reason))
-                fire(hooks, "on_agent_end", AgentEndEvent(
-                    session_id=cxt.session_id, module_code=module.module_code,
-                    rounds=round_idx + 1, outcome="transfer",
-                    transfer_target=target))
-            return TurnResult()
-
-        # Ordinary tool calls: P4 rewrite -> main-flow validation -> execute
-        # -> P5 rewrite -> append to history
-        _dispatch_tool_calls(
-            cxt, module, messages, content, tool_calls,
-            hooks, allowed_names, lent_by, round_idx)
-
-    logger.warning(
-        "Agent loop 达到最大轮次 %d，强制终止: session=%s",
-        _MAX_TOOL_ROUNDS, cxt.session_id,
+    ec = ExecutionContext(
+        cxt=session.cxt, pattern=session.pattern, module=module,
+        force_close=force_close,
     )
-    # P7 on_agent_end: max-rounds-exceeded exit
-    if hooks:
-        fire(hooks, "on_agent_end", AgentEndEvent(
-            session_id=cxt.session_id, module_code=module.module_code,
-            rounds=_MAX_TOOL_ROUNDS, outcome="max_rounds",
-            reply="抱歉，处理超时，请稍后重试。"))
-    return TurnResult(reply="抱歉，处理超时，请稍后重试。")
+    session.cxt.llm_config = llm_config
+    executor = plugin_registry.resolve(
+        "executor", plugin_registry.default_executor_code(ModuleType.AGENT.value))
+    return executor.execute(ec)
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +210,7 @@ def _dispatch_tool_calls(
 
 
 # ---------------------------------------------------------------------------
-# Transfer tool builders (projection block building has moved to chat/messages.py)
+# Transfer tool builders (projection block building lives in engine/messages.py)
 # ---------------------------------------------------------------------------
 
 def build_transfer_tools(module, module_map) -> list:
@@ -438,15 +242,12 @@ def build_transfer_tools(module, module_map) -> list:
 
 
 # ---------------------------------------------------------------------------
-# System Prompt construction
-# (four-block structure + hooks extension blocks have moved to
-#  build_system_prompt in chat/messages.py — same source as the integrated
-#  messages build; this module keeps only framework-enforced items)
+# Framework-enforced prompt items
 # ---------------------------------------------------------------------------
 
 # force_close close-out suffix (control-flow semantics that prevents infinite
-# loops when hops are exhausted; no messages_builder may break it — run_agent
-# enforces it via _append_force_close_suffix after the builder returns)
+# loops when hops are exhausted; no messages_builder may break it — the loop
+# executor enforces it via append_force_close_suffix after the builder returns)
 _FORCE_CLOSE_SUFFIX = "\n请直接回应用户，勿再移交。"
 
 
@@ -473,6 +274,12 @@ def _warn_prompt_length(messages, cxt, module) -> None:
             "Agent system_prompt 过长 (%d 字符): session=%s, module=%s（投影膨胀观测）",
             length, cxt.session_id, module.module_code,
         )
+
+
+# Public aliases for executor atoms (the executor-facing names; the underscore
+# originals remain for existing test anchors)
+append_force_close_suffix = _append_force_close_suffix
+warn_prompt_length = _warn_prompt_length
 
 
 # ---------------------------------------------------------------------------

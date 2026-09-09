@@ -132,9 +132,9 @@ def test_run_agent_direct_reply_with_lent_tool():
             "name": "mock_lent_tool", "arguments": "{}"}}]},
         {"content": "您的工单已查到，预计明天完工。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
-    assert result.reply == "您的工单已查到，预计明天完工。"
+    assert result.content == "您的工单已查到，预计明天完工。"
     assert not [a for a in s.cxt.actions if isinstance(a, ModuleJumpEvent)]
     assert s.cxt.metadata["served_by_projection"] == {
         "module": "reception", "source": "after_sales"}
@@ -154,9 +154,9 @@ def test_run_agent_transfer_writes_jump_event():
             "id": "c1", "function": {"name": "transfer_to_after_sales",
                                      "arguments": '{"reason": "售后投诉"}'}}]},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
-    assert result.reply is None or result.reply == ""
+    assert result.content is None or result.content == ""
     events = [a for a in s.cxt.actions if isinstance(a, ModuleJumpEvent)]
     assert len(events) == 1
     assert events[0].target_module_code == "after_sales"
@@ -181,9 +181,9 @@ def test_run_agent_transfer_rejected_backfills_error_and_continues():
                                      "arguments": '{"reason": "不存在"}'}}]},
         {"content": "好的，我直接为您处理。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
-    assert result.reply == "好的，我直接为您处理。"
+    assert result.content == "好的，我直接为您处理。"
     assert s.cxt.current_module_code == "reception"
     assert not [a for a in s.cxt.actions if isinstance(a, ModuleJumpEvent)]
     tool_msgs = [m for m in s.cxt.history if m.role == "tool"]
@@ -224,7 +224,7 @@ def test_projection_recall_scoped_to_borrower():
     provider = ScriptedProvider([
         {"content": "好的，继续为您处理。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
     assert "上一轮提示" in provider.seen[0]["messages"][0]["content"]
 
@@ -243,9 +243,9 @@ def test_rejected_transfer_backfills_all_tool_calls():
         ]},
         {"content": "好的，为您处理完毕。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
-    assert result.reply == "好的，为您处理完毕。"
+    assert result.content == "好的，为您处理完毕。"
     # the second round's messages end with two role=tool rows (every tool_call_id gets a response)
     second = provider.seen[1]["messages"]
     tool_msgs = [m for m in second if m.get("role") == "tool"]
@@ -264,7 +264,7 @@ def test_force_close_no_transfer_tools_and_prompt():
     provider = ScriptedProvider([
         {"content": "好的，我直接处理。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"],
                   force_close=True)
     first = provider.seen[0]
@@ -288,7 +288,7 @@ def test_chat_hop_consumes_transfer_event_same_turn():
         # B (after_sales) answers in the same turn
         {"content": "看到您有售后需求，已为您登记。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         text = chat_fn(query="帮我处理售后", session_id="s", all_sessions=sessions)
     assert text == "看到您有售后需求，已为您登记。"
     assert s.cxt.current_module_code == "after_sales"
@@ -312,7 +312,7 @@ def test_tool_round_ids_paired_in_history():
             "name": "mock_lent_tool", "arguments": '{}'}}]},
         {"content": "查到了。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
 
     hist = [m for m in s.cxt.history if m.stage == "agent"]
@@ -342,10 +342,10 @@ def test_transfer_turn_synthesizes_all_tool_results():
                                       "arguments": '{"reason": "售后深入"}'}},
         ]},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         result = run_agent(s, s.cxt.module_map["reception"],
                            s.cxt.metadata["llm_override"])
-    assert result.reply in (None, "")
+    assert result.content in (None, "")
 
     suppressed = [m for m in s.cxt.history
                   if m.role == "assistant" and m.metadata.get("suppressed")]
@@ -374,7 +374,7 @@ def test_rejected_transfer_records_tool_calls_on_assistant():
             "name": "transfer_to_ghost", "arguments": '{}'}}]},
         {"content": "好的，我直接处理。", "tool_calls": []},
     ])
-    with patch("nexus.engine.loop.build_provider", return_value=provider):
+    with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
         run_agent(s, s.cxt.module_map["reception"], s.cxt.metadata["llm_override"])
 
     agent_hist = [m for m in s.cxt.history if m.stage == "agent"]

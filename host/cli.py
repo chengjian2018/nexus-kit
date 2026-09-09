@@ -30,6 +30,7 @@ from nexus.engine.chat import chat as chat_turn
 from nexus.engine.session import Session
 from nexus.engine.store import SessionStore
 from nexus.registry.patterns import discover_builtin_patterns, registry as pattern_registry
+from nexus.registry.plugins import discover_builtin_plugins
 from nexus.registry.providers import discover_builtin_providers, registry as llm_registry
 from nexus.registry.tools import discover_builtin_tools
 from nexus.registry.tools import registry as tool_registry
@@ -723,6 +724,7 @@ def _ensure_discovery() -> None:
     discover_builtin_patterns()
     discover_builtin_providers()
     discover_builtin_tools()
+    discover_builtin_plugins()
 
 
 def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str = "",

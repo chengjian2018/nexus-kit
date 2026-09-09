@@ -15,6 +15,9 @@ class Pattern:
                  post_recall: Optional[Any] = None,
                  agent_hooks: Optional[dict] = None,
                  messages_builder: Optional[Any] = None,
+                 executor_loop: Optional[str] = None,
+                 executor_fsm: Optional[str] = None,
+                 executor_route: Optional[str] = None,
                  **kwargs):
         self.code = code
         self.name = name
@@ -22,6 +25,14 @@ class Pattern:
         self.modules = modules
         self.stages = stages
         self.entry_module_code = entry_module_code
+
+        # Executor plugin declarations (kind="executor"; resolution order
+        # module.executor > pattern.executor_<type> > type default code —
+        # same shape as the stage slots; strings, resolved at runtime from
+        # the plugin registry by the chat layer's _resolve_executor_code)
+        self.executor_loop = executor_loop
+        self.executor_fsm = executor_fsm
+        self.executor_route = executor_route
 
         # Agent loop hooks (pattern-level declaration; the module-level
         # agent_hooks can wholesale-replace it; form {point: [hook,...]},

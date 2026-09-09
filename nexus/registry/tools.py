@@ -8,10 +8,8 @@ live here — they were inlined from the old hermes-agent ``model_tools.py``
 stub, which no longer exists.
 """
 
-import ast
 import asyncio
 import concurrent.futures
-import importlib
 import json
 import logging
 import re
@@ -20,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Union
+
+from nexus.registry.discovery import import_modules, module_registers
 
 logger = logging.getLogger(__name__)
 
@@ -82,43 +82,6 @@ def _sanitize_tool_error(error_msg: str) -> str:
     return f"[TOOL_ERROR] {sanitized}"
 
 
-def _is_registry_register_call(node: ast.AST) -> bool:
-    """Return True when *node* is a ``registry.register(...)`` call expression."""
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
-        return False
-    func = node.value.func
-    return (
-        isinstance(func, ast.Attribute)
-        and func.attr == "register"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "registry"
-    )
-
-
-def _module_registers_tools(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call.
-
-    Only inspects module-body statements so that helper modules which happen
-    to call ``registry.register()`` inside a function are not picked up.
-
-    A cheap text prefilter avoids the ``ast.parse`` cost for files that do not
-    mention both ``registry`` and ``register`` — a necessary condition for a
-    top-level ``registry.register()`` call to exist.
-    """
-    try:
-        source = module_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if "registry" not in source or "register" not in source:
-        return False
-    try:
-        tree = ast.parse(source, filename=str(module_path))
-    except SyntaxError:
-        return False
-
-    return any(_is_registry_register_call(stmt) for stmt in tree.body)
-
-
 def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     """Import self-registering tool modules under atoms/tools/ and return their names."""
     tools_path = (
@@ -129,17 +92,9 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
         f"atoms.tools.{path.stem}"
         for path in sorted(tools_path.glob("*.py"))
         if path.name != "__init__.py"
-        and _module_registers_tools(path)
+        and module_registers(path)
     ]
-
-    imported: List[str] = []
-    for mod_name in module_names:
-        try:
-            importlib.import_module(mod_name)
-            imported.append(mod_name)
-        except Exception as e:
-            logger.warning("Could not import tool module %s: %s", mod_name, e)
-    return imported
+    return import_modules(module_names, what="tool module")
 
 
 class ToolEntry:

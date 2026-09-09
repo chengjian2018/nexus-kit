@@ -51,7 +51,7 @@ def test_r1_passes_position_and_override():
     sessions = {}
     _launch(_fsm_pattern(), sessions)
     calls = []
-    with patch("nexus.engine.loop.build_provider"), \
+    with patch("atoms.executors.loop_executor.build_provider"), \
          patch("nexus.engine.chat.get_llm_config", side_effect=_record_calls(calls)):
         _chat(sessions, "s1", "你好")
     assert calls, "R1 应调用 get_llm_config"
@@ -81,7 +81,7 @@ def test_r2_agent_module_chat_path_uses_module_code():
                             tools=None, tool_choice=None, **kw):
             return {"content": "ok", "tool_calls": []}
 
-    with patch("nexus.engine.loop.build_provider", return_value=_Scripted()), \
+    with patch("atoms.executors.loop_executor.build_provider", return_value=_Scripted()), \
          patch("nexus.engine.chat.get_llm_config",
                side_effect=_record_calls(calls)):
         _chat(sessions, "s3", "你好")
@@ -96,7 +96,7 @@ def test_r3_refresh_after_node_resolution():
     sessions = {}
     _launch(_fsm_pattern(), sessions)
     calls = []
-    with patch("nexus.engine.loop.build_provider"), \
+    with patch("atoms.executors.loop_executor.build_provider"), \
          patch("nexus.engine.chat.get_llm_config", side_effect=_record_calls(calls)):
         _chat(sessions, "s1", "你好")
     r3 = [c for c in calls if c["module_code"] == "m1" and c["node_code"] == "f1"]
@@ -136,7 +136,7 @@ def test_r4_route_menu_node_takes_effect_same_turn():
             return ctx
     pattern.stages = [_StubNLU(), _StubNLG()]
     # R1-R3 and the R4 refresh all go through the chat namespace (R4 inside _detect_jump_after_stage)
-    with patch("nexus.engine.loop.build_provider"), \
+    with patch("atoms.executors.loop_executor.build_provider"), \
          patch("nexus.engine.chat.get_llm_config", side_effect=_record_calls(calls)):
         _chat(sessions, "s2", "选A")
     r4 = [c for c in calls if c["node_code"] == "menu_a"]
@@ -150,7 +150,7 @@ def test_override_wins_and_survives_turns():
     """The override lands in cxt.llm_config and is not washed away across turns."""
     sessions = {}
     _launch(_fsm_pattern(), sessions)
-    with patch("nexus.engine.loop.build_provider"):
+    with patch("atoms.executors.loop_executor.build_provider"):
         _chat(sessions, "s1", "你好")
         _chat(sessions, "s1", "继续")
     assert sessions["s1"].cxt.llm_config["model"] == "m"

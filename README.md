@@ -23,26 +23,13 @@ host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
 | `nexus/settings.py` | 运行时设置（LLM 三级配置、压缩、DB 路径）；宿主经 `set_config_path()` 注入文件 | `config/config.py` |
 | `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 | `channel/{base,webhooks}.py` |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 框架默认 prompt（`_prompts.py`） | `stages/` |
+| `atoms/executors/` | 三默认模块执行器插件（default_loop / default_fsm / default_route），经插件中心注册 | 新增（重构计划①） |
 | `atoms/tools/` | calculator / weather / knowledge 工具 | `tools/*_tool.py` |
 | `atoms/providers/` | OpenAICompatible Provider | `llm/openai_provider.py` |
 | `atoms/knowledge/` | SQLite 知识库 | `database/knowledge_store.py` |
 | `apps/<name>/` | 业务 pattern（route.py）+ prompt 资产（prompts.py）+ 渠道适配（channel.py） | `dialogue/*_route.py`、`channel/xianyu.py` |
 | `host/` | main.py / cli.py / governor.py（TTL+LRU 会话治理）/ config/ | 根目录 `main.py`、`cli.py` |
 
-## 迁移中的关键解耦（对照旧仓库的五个断点）
-
-1. **应用物理迁出框架包**：pattern 发现从"扫 `dialogue/` 自身"改为"扫 `apps/*/`"；
-2. **prompt 资产归位**：框架默认 prompt 随 stage 原子（`atoms/stages/_prompts.py`），
-   业务 prompt 随应用（`apps/*/prompts.py`），根级 `prompt.py` 消亡；
-3. **内核纯净**：`nexus/pipeline.py` 的内置兜底 stage 不再延迟 import `stages.*`，
-   改为 `register_default_generate / register_default_clarify` 注册钩子，由
-   `atoms.stages` 包在导入时注册（宿主/测试经 conftest 预热）；
-4. **配置单向注入**：内核与原子只读 `nexus.settings`（内核自己的设置契约），
-   yaml 文件路径由 `host/config` 在启动时 `set_config_path()` 注入；
-5. **hermes-agent 血统清理**：`model_tools.py` 桩删除，`_run_async` /
-   `_sanitize_tool_error` 内联进 `nexus/registry/tools.py`；
-6. **会话治理析出**：main.py 中的 TTL/LRU 逻辑成为 `host/governor.py` 的
-   `SessionGovernor`。
 
 ## 运行
 
@@ -61,4 +48,3 @@ python -m host.cli ask --pattern xianyu_agent --query "还在吗"
 `host → apps → atoms → nexus` 单向依赖，并禁止任何旧扁平包名回流。
 本地人工审计可再跑 `lint-imports`（配置在 `pyproject.toml [tool.importlinter]`）。
 
-迁移过程与后续步骤见 [MIGRATION.md](MIGRATION.md)。

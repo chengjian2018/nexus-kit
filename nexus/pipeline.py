@@ -57,29 +57,37 @@ logger = logging.getLogger(__name__)
 # The kernel must not depend on atom implementations: the builtin generate /
 # clarify fallbacks are registered at import time by ``atoms.stages`` (the
 # host and tests/conftest warm it up), keeping the layering one-directional.
-_default_generate_factories: Dict[Any, Callable[[], Tuple[Any, Any]]] = {}
-_default_clarify_factory: Optional[Callable[[], Any]] = None
+# Storage goes through the plugin registry (kind="stage_factory", keyed by
+# module type / "clarify") — the public register_default_* API is unchanged.
+from nexus.registry.plugins import registry as _plugin_registry
 
 
 def register_default_generate(module_type: Any,
                               factory: Callable[[], Tuple[Any, Any]]) -> None:
     """Register the builtin ``(nlu, nlg)`` fallback pair for a module type."""
-    _default_generate_factories[module_type] = factory
+    _plugin_registry.register(
+        "stage_factory", f"generate:{module_type}", factory)
 
 
 def register_default_clarify(factory: Callable[[], Any]) -> None:
     """Register the builtin clarify-stage factory (FSM ``enable_clarify`` fallback)."""
-    global _default_clarify_factory
-    _default_clarify_factory = factory
+    _plugin_registry.register("stage_factory", "clarify", factory)
+
+
+def _default_generate_factories_get(module_type: Any) -> Optional[Callable]:
+    code = f"generate:{module_type}"
+    if _plugin_registry.has("stage_factory", code):
+        return lambda: _plugin_registry.resolve("stage_factory", code)
+    return None
 
 
 def _builtin_clarify():
-    if _default_clarify_factory is None:
+    if not _plugin_registry.has("stage_factory", "clarify"):
         raise RuntimeError(
             "未注册内置 clarify 兜底 stage：请 import atoms.stages（宿主/测试的"
             "装配阶段会做）或在 module 上显式配置 clarify_stage"
         )
-    return _default_clarify_factory()
+    return _plugin_registry.resolve("stage_factory", "clarify")
 
 
 # ============================================================================
@@ -190,7 +198,7 @@ def _resolve_generate(ctx: DialogueContext, module: Any,
             layer_name, value,
         )
     # Builtin fallback (by module.type) — factory registered by atoms.stages
-    factory = _default_generate_factories.get(getattr(module, "type", None))
+    factory = _default_generate_factories_get(getattr(module, "type", None))
     if factory is None:
         raise RuntimeError(
             "未注册该 module type 的内置 generate 兜底 stage：请 import "
