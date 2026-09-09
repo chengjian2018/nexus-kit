@@ -25,8 +25,9 @@ class DefaultRouteExecutor(ModuleExecutor):
     node position) without returning to routing — the end-of-turn reset to
     root happens only while still parked in the ROUTE module (menu nodes
     have no sub_nodes; without the reset the next turn's routing candidates
-    would be empty). ROUTE does not assemble a ClarifyStage (only
-    FSM+enable_clarify gets one inserted, see stage_slots.resolve_stage),
+    would be empty). ROUTE does not wire the clarify slot in its apps (only FSM modules
+    declare it in practice; a ROUTE module declaring clarify would get it
+    resolved the same way via the skeleton),
     and begin_turn already cleared clarify at start of turn, so there is no
     clarify-turn branch.
     """

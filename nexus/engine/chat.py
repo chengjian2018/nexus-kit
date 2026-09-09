@@ -66,11 +66,8 @@ from nexus.registry.plugins import registry as plugin_registry
 if TYPE_CHECKING:
     from nexus.engine.store import SessionStore
 from nexus.pipeline import (
-    GenerateSlot,
-    PostRecallSlot,
-    PreRecallSlot,
-    QuerySlot,
-    resolve_stage,
+    default_skeleton,
+    resolve_execution_sequence,
 )
 
 logger = logging.getLogger(__name__)
@@ -249,14 +246,13 @@ _jumps = ModuleJumpChannel()
 # ============================================================================
 
 def _default_skeleton(module) -> list:
-    """Default pipeline skeleton (slots resolved lazily, not bound to a node).
+    """Default pipeline skeleton (kept as a patch/test anchor).
 
-    [PreRecallSlot, QuerySlot, PostRecallSlot, GenerateSlot]; the FSM/ROUTE
-    differences (advance / clarify insertion) are handled when GenerateSlot
-    expands (stage_slots.resolve_stage) — the skeleton itself is identical
-    across all module types.
+    The declarative skeleton now lives in pattern.stages (normalized at
+    construction); this returns the kernel default six-slot form — kept
+    because tests reference it and visualize/consumers may import it.
     """
-    return [PreRecallSlot(), QuerySlot(), PostRecallSlot(), GenerateSlot()]
+    return default_skeleton()
 
 
 def _refresh_llm_config(session: Session, module_code: str = "",
@@ -367,57 +363,58 @@ def _run_stages(cxt, module, pattern, force_close: bool = False
         The jump event awaiting consumption (already written to
         cxt.actions, popped by chat_turn's hop loop); None means no jump.
     """
-    stages = pattern.stages or _default_skeleton(module)
+    sequence = resolve_execution_sequence(cxt, module, pattern)
 
     logger.info(
         "Pipeline 开始: session=%s, module=%s, node=%s, stages=%s",
         cxt.session_id,
         module.module_code,
         cxt.current_node_code,
-        [s.stage_name for s in stages],
+        [f"{slot}:{getattr(stage, 'stage_name', type(stage).__name__)}"
+         for slot, stage in sequence],
     )
 
-    # Execute each stage in order; slots resolve against the *current* node
-    # at execution time
-    for stage in stages:
-        for concrete in resolve_stage(stage, cxt, module, pattern):
-            before_nlu = cxt.nlu_result
-            try:
-                cxt = concrete.execute(cxt)
-                logger.debug("Stage '%s' 执行完成", concrete.stage_name)
-            except Exception as e:
-                logger.error(
-                    "Stage '%s' 执行异常: %s", concrete.stage_name, e,
-                    exc_info=True
-                )
-                raise
+    # Execute each (slot, stage) in skeleton order; the sequence was resolved
+    # against the *current* node (unified dedup already applied)
+    for slot, concrete in sequence:
+        before_nlu = cxt.nlu_result
+        try:
+            cxt = concrete.execute(cxt)
+            logger.debug("Stage '%s'（slot=%s）执行完成",
+                         concrete.stage_name, slot)
+        except Exception as e:
+            logger.error(
+                "Stage '%s' 执行异常: %s", concrete.stage_name, e,
+                exc_info=True
+            )
+            raise
 
-            if force_close:
-                continue
+        if force_close:
+            continue
 
-            # Detection 1: the stage itself wrote a jump event (custom stage channel)
-            direct = _jumps.peek(cxt)
-            if direct is not None:
-                logger.info(
-                    "Stage '%s' 写入跳转事件: → %s",
-                    concrete.stage_name, direct.target_module_code,
-                )
-                return direct
+        # Detection 1: the stage itself wrote a jump event (custom stage channel)
+        direct = _jumps.peek(cxt)
+        if direct is not None:
+            logger.info(
+                "Stage '%s' 写入跳转事件: → %s",
+                concrete.stage_name, direct.target_module_code,
+            )
+            return direct
 
-            # Detection 2: nlu_result was updated and indicates a jump (NLU
-            # jump_module field / advanced node's jump_module config)
-            event = _jumps.detect_after_stage(cxt, module, before_nlu)
-            if event is not None:
-                # Incremental slot merge travels with the jump (the target module inherits the context)
-                _lifecycle.merge_slots(
-                    cxt, (cxt.nlu_result or {}).get("slots", {}))
-                cxt.actions.append(event)
-                logger.info(
-                    "Stage '%s' 后检测到模块跳转: %s → %s (source=%s)",
-                    concrete.stage_name, module.module_code,
-                    event.target_module_code, event.source,
-                )
-                return event
+        # Detection 2: nlu_result was updated and indicates a jump (NLU
+        # jump_module field / advanced node's jump_module config)
+        event = _jumps.detect_after_stage(cxt, module, before_nlu)
+        if event is not None:
+            # Incremental slot merge travels with the jump (the target module inherits the context)
+            _lifecycle.merge_slots(
+                cxt, (cxt.nlu_result or {}).get("slots", {}))
+            cxt.actions.append(event)
+            logger.info(
+                "Stage '%s' 后检测到模块跳转: %s → %s (source=%s)",
+                concrete.stage_name, module.module_code,
+                event.target_module_code, event.source,
+            )
+            return event
 
     # Stages running through naturally means no jump: events written
     # directly by a stage were already caught by detection 1 right after

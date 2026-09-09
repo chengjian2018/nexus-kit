@@ -120,17 +120,22 @@ def test_off_topic_turn_routes_kb_and_keeps_node(pattern):
     session.cxt.metadata["llm_override"] = fake_llm_config()
 
     # Enable clarify on the car-buying FSM module (test injection, leaves the
-    # fixture definition untouched)
+    # fixture definition untouched): register a KB-backed ClarifyStage under
+    # a unique code and declare that code in the module's stages
+    from stage_stubs import register_stage_stub
+    from nexus.registry.plugins import registry as plugin_registry
+    kb_clarify_code = "clarify_kb_it"
+    if not plugin_registry.has("stage", kb_clarify_code):
+        plugin_registry.register("stage", kb_clarify_code, lambda: ClarifyStage(
+            recaller=MultiPathRecaller(
+                recall_paths=[KeywordRecallPath(name="kb", documents=KB_DOCS)],
+                filters=[ScoreThresholdFilter(threshold=0.1)],
+                fusion=WeightedScoreFusion(),
+            ),
+            rule=ClarifyRouteRule(),
+        ))
     buy = pattern.module_map["demo_buy"]
-    buy.enable_clarify = True
-    buy.clarify_stage = ClarifyStage(
-        recaller=MultiPathRecaller(
-            recall_paths=[KeywordRecallPath(name="kb", documents=KB_DOCS)],
-            filters=[ScoreThresholdFilter(threshold=0.1)],
-            fusion=WeightedScoreFusion(),
-        ),
-        rule=ClarifyRouteRule(),
-    )
+    buy.stages = {"clarify": kb_clarify_code}
 
     sessions = {"it": session}
 

@@ -1,26 +1,32 @@
-"""Tests for the enable_clarify module flag + the clarify-intent directive in the FSM NLU prompt."""
+"""Tests for the clarify slot declaration (the plan-② replacement of the
+enable_clarify flag) + the clarify-intent directive in the FSM NLU prompt."""
 
 
-def test_default_disabled():
+def test_default_off():
+    """No stages declaration → no clarify slot (opt-in by declaration)."""
     from nexus.model.module import FSMModule
 
     m = FSMModule(module_code="m1")
-    assert m.enable_clarify is False
+    assert "clarify" not in (m.stages or {})
 
 
-def test_explicit_enabled():
+def test_declared_via_stages():
     from nexus.model.module import FSMModule
 
-    m = FSMModule(module_code="m1", enable_clarify=True)
-    assert m.enable_clarify is True
+    m = FSMModule(module_code="m1",
+                  stages={"clarify": "clarify_default"})
+    assert m.stages["clarify"] == "clarify_default"
 
 
-def test_kwargs_style_enabled():
-    """Declarative patterns pass kwargs; the flag must take effect the same way."""
-    from nexus.model.module import FSMModule
+def test_builtin_code_registered():
+    """The builtin clarify code resolves to the default ClarifyStage assembly."""
+    import atoms.stages  # noqa: F401
+    from nexus.registry.plugins import registry as plugin_registry
+    from atoms.stages.clarify import ClarifyStage
 
-    m = FSMModule(module_code="m1", **{"enable_clarify": True})
-    assert m.enable_clarify is True
+    assert plugin_registry.has("stage", "clarify_default")
+    assert isinstance(plugin_registry.resolve("stage", "clarify_default"),
+                      ClarifyStage)
 
 
 def test_fsm_nlu_prompt_contains_clarify_protocol():

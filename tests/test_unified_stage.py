@@ -81,7 +81,7 @@ def pattern():
                 answer_examples=["您好呀～有什么能帮到您的，随时告诉我！"],
             ),
         ],
-        generate=RouteUnifiedNLU(),
+        stages={"nlu": "route_unified", "nlg": "nlg_pass_through"},
     )
     buy = FSMModule(
         module_code="unified_buy",
@@ -118,7 +118,7 @@ def pattern():
                 is_end=True,
             ),
         ],
-        generate=FSMUnifiedNLU(),
+        stages={"nlu": "fsm_unified", "nlg": "nlg_pass_through"},
     )
     return Pattern(
         code="unified_demo",
@@ -191,8 +191,14 @@ def test_pattern_discovered_and_stage_wiring(pattern):
     assert buy_module.type == ModuleType.FSM
 
     # module-level unified stage injection (generate single-stage form, resolved via GenerateSlot)
-    assert isinstance(root_module.generate, RouteUnifiedNLU)
-    assert isinstance(buy_module.generate, FSMUnifiedNLU)
+    # module-level unified wiring declared by string codes (plugin registry)
+    assert root_module.stages["nlu"] == "route_unified"
+    assert buy_module.stages["nlu"] == "fsm_unified"
+    from nexus.registry.plugins import registry as plugin_registry
+    assert isinstance(plugin_registry.resolve("stage", "route_unified"),
+                      RouteUnifiedNLU)
+    assert isinstance(plugin_registry.resolve("stage", "fsm_unified"),
+                      FSMUnifiedNLU)
 
     # Routing structure and menu dispatch
     assert pattern.node_map["u_route_root"].sub_nodes == [
@@ -448,19 +454,24 @@ def test_unified_with_clarify_off_topic_turn(pattern, sessions):
         },
     ]
 
-    # Test injection: enable clarify on the buy sub-module (restored afterwards, so other cases in this file stay unpolluted)
+    # Test injection: declare the clarify slot on the buy sub-module with a
+    # KB-backed stage registered under a unique code (restored afterwards, so
+    # other cases in this file stay unpolluted)
+    from nexus.registry.plugins import registry as plugin_registry
+    from stage_stubs import register_stage_stub
     buy = pattern.module_map["unified_buy"]
-    saved_flag = getattr(buy, "enable_clarify", False)
-    saved_stage = getattr(buy, "clarify_stage", None)
-    buy.enable_clarify = True
-    buy.clarify_stage = ClarifyStage(
-        recaller=MultiPathRecaller(
-            recall_paths=[KeywordRecallPath(name="kb", documents=kb_docs)],
-            filters=[ScoreThresholdFilter(threshold=0.1)],
-            fusion=WeightedScoreFusion(),
-        ),
-        rule=ClarifyRouteRule(),
-    )
+    saved_stages = dict(buy.stages or {})
+    clarify_code = "clarify_kb_unified"
+    if not plugin_registry.has("stage", clarify_code):
+        plugin_registry.register("stage", clarify_code, lambda: ClarifyStage(
+            recaller=MultiPathRecaller(
+                recall_paths=[KeywordRecallPath(name="kb", documents=kb_docs)],
+                filters=[ScoreThresholdFilter(threshold=0.1)],
+                fusion=WeightedScoreFusion(),
+            ),
+            rule=ClarifyRouteRule(),
+        ))
+    buy.stages = {**saved_stages, "clarify": clarify_code}
 
     try:
         session = launch(pattern, sessions)
@@ -494,5 +505,4 @@ def test_unified_with_clarify_off_topic_turn(pattern, sessions):
         assert session.cxt.current_node_code == "u_confirm"
         assert session.cxt.filled_slots["budget"] == "20万左右"
     finally:
-        buy.enable_clarify = saved_flag
-        buy.clarify_stage = saved_stage
+        buy.stages = saved_stages

@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 from nexus.engine.session import Session
-from nexus.model.module import AgentModule, ModuleLink, RouteModule
+from nexus.model.module import AgentModule, RouteModule
 from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from test_agent_inject_transfer import ScriptedProvider, _mk_session
@@ -17,7 +17,7 @@ def _agent_pattern(**kw):
         sub_modules=["reception"])
     reception = AgentModule(
         module_code="reception", module_name="前台", module_description="接待",
-        sub_modules=[ModuleLink(target="after_sales")])
+        sub_modules=[{"target": "after_sales"}])
     return Pattern(code="p2", name="t", description="t",
                    entry_module_code="reception",
                    modules=[reception, after_sales], **kw)
@@ -80,6 +80,7 @@ def test_force_close_route_returns_nonempty_reply():
     from nexus.model.module import RouteModule
     from nexus.model.node import BaseNode
     from nexus.context import PipelineStage
+    from stage_stubs import register_stage_stub
 
     class _FakeRouteNLU(PipelineStage):
         stage_name = "fake_route_nlu"
@@ -95,6 +96,9 @@ def test_force_close_route_returns_nonempty_reply():
             ctx.nlg_result = {"content": "购车咨询由我来介绍吧"}
             return ctx
 
+    nlu_code = register_stage_stub(_FakeRouteNLU)
+    nlg_code = register_stage_stub(_FakeRouteNLG)
+
     root = BaseNode(node_code="route_root", node_name="路由根",
                     sub_nodes=["menu_buy"])
     menu = BaseNode(node_code="menu_buy", node_name="购车咨询菜单",
@@ -102,10 +106,10 @@ def test_force_close_route_returns_nonempty_reply():
     router = RouteModule(
         module_code="router", module_name="路由",
         module_nodes=[root, menu], sub_modules=["buy_agent"],
-        generate={"nlu": _FakeRouteNLU(), "nlg": _FakeRouteNLG()})
+        stages={"nlu": nlu_code, "nlg": nlg_code})
     reception = AgentModule(
         module_code="reception", module_name="前台", module_description="接待",
-        sub_modules=[ModuleLink(target="router")])
+        sub_modules=[{"target": "router"}])
     buy_agent = AgentModule(
         module_code="buy_agent", module_name="购车专员", module_description="购车")
     pattern = Pattern(code="p_route", name="t", description="t",

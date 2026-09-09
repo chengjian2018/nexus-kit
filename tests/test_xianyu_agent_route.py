@@ -114,17 +114,31 @@ def test_generate_wired_at_module_level(pattern):
     from apps.xianyu_agent.route import FixedNLG, XianyuIntentNLU
 
     root = pattern.module_map["xianyu_root"]
-    generate = root.generate
-    assert isinstance(generate, dict)
-    assert isinstance(generate["nlu"], XianyuIntentNLU)
-    assert isinstance(generate["nlg"], FixedNLG)
+    stages = root.stages
+    assert isinstance(stages, dict)
+    assert stages["nlu"] == "xianyu_intent_nlu"
+    assert stages["nlg"] == "xianyu_fixed_nlg"
+    # 声明的 code 可解析到实现类（插件中心 kind="stage"）
+    from nexus.registry.plugins import registry as plugin_registry
+    import atoms.stages  # noqa: F401
+    import apps.xianyu_agent.route  # noqa: F401 -- registers app-local codes
+    assert isinstance(plugin_registry.resolve("stage", "xianyu_intent_nlu"),
+                      XianyuIntentNLU)
+    assert isinstance(plugin_registry.resolve("stage", "xianyu_fixed_nlg"),
+                      FixedNLG)
 
 
 def test_query_slot_wired_with_time_aug(pattern):
     """The pattern-level query slot is wired with TimeAugQueryRewriter (time-augmented rewrite)."""
     from atoms.stages.query import TimeAugQueryRewriter
 
-    assert isinstance(pattern.query, TimeAugQueryRewriter)
+    # plan-②: the query slot is declared in the skeleton by string code
+    skeleton_values = {slot: code for e in pattern.stages
+                       for slot, code in e.items()}
+    assert skeleton_values.get("query") == "time_aug_query"
+    from nexus.registry.plugins import registry as plugin_registry
+    assert isinstance(plugin_registry.resolve("stage", "time_aug_query"),
+                      TimeAugQueryRewriter)
 
 
 # ============================================================================

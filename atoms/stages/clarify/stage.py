@@ -1,6 +1,7 @@
 """ClarifyStage — integrated dual-track clarify stage (discrimination + retrieval + gating + generation).
 
-Insertion point: between NLU and NLG in the FSM pipeline (only modules with enable_clarify=True are wired in).
+Insertion point: the clarify slot in the pipeline skeleton (only modules declaring
+the clarify slot in stages get it resolved in).
 
 Execution flow (see spec 5.1 for details):
 1. Reset ctx.metadata["clarify"] = {"triggered": False} each turn

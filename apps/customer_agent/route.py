@@ -202,11 +202,14 @@ customer_service = AgentModule(
         "list_products",
         "send_goods_link",
     ],
-    # Migrated MessageBuilder: session info block + per-turn catalog prefetch (untrusted line)
-    messages_builder=customer_agent_messages_builder,
+    # Migrated MessageBuilder (plugin code, kind="messages_builder"; registered
+    # at the bottom of this module): session info block + per-turn catalog
+    # prefetch (untrusted line)
+    messages_builder="customer_agent_messages_builder",
     # Declared edge -> the framework auto-generates transfer_to_human_handoff (human handoff,
     # corresponding to Customer-Agent move_conversation/transfer_conversation)
-    sub_modules=["human_handoff"],
+    sub_modules=[{"target": "human_handoff", "lend_knowledge": True,
+                  "lend_tools": []}],
 )
 
 human_handoff = AgentModule(
@@ -242,3 +245,15 @@ customer_agent_pattern = Pattern(
 )
 
 registry.register(customer_agent_pattern)
+
+
+# ============================================================================
+# Plugin registrations — module-level, same idiom as the pattern registration
+# above; the stages/messages_builder declarations reference these string codes
+# ============================================================================
+
+from nexus.registry.plugins import registry as plugin_registry  # noqa: E402
+
+plugin_registry.register(
+    "messages_builder", "customer_agent_messages_builder",
+    lambda: customer_agent_messages_builder)

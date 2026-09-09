@@ -154,8 +154,13 @@ class AgentEndEvent:
 def resolve_agent_hooks(module: Any, pattern: Any = None) -> HookMap:
     """Resolve the effective hooks: a non-empty module.agent_hooks replaces wholesale, else the pattern level.
 
-    Defensive validation (same degradation style as stage_slots): a non-dict declaration /
-    unknown point name / non-callable entry → warning and skip that item, no raise.
+    Since plan-② the declaration is a **string code** (plugin registry
+    kind="agent_hooks") resolving to a hooks package (a callable returning
+    the {point: [hook,...]} dict, or the dict itself). The legacy dict form
+    is still accepted inline (transitional). Defensive validation (same
+    degradation style as stage_slots): unknown form / unregistered code /
+    non-dict package / unknown point name / non-callable entry → warning
+    and skip, no raise.
     """
     raw = getattr(module, "agent_hooks", None)
     if not raw:
@@ -163,9 +168,23 @@ def resolve_agent_hooks(module: Any, pattern: Any = None) -> HookMap:
     if not raw:
         return {}
 
+    from nexus.registry.plugins import registry as plugin_registry
+
+    if isinstance(raw, str):
+        if plugin_registry.has("agent_hooks", raw):
+            raw = plugin_registry.resolve("agent_hooks", raw)
+        else:
+            logger.warning(
+                "[agent_hooks] agent_hooks=%r 未注册（kind=agent_hooks），"
+                "忽略", raw,
+            )
+            return {}
+    elif callable(raw):
+        raw = raw()
+
     if not isinstance(raw, dict):
         logger.warning(
-            "[agent_hooks] agent_hooks 须为 {点位: [hook,...]} dict，忽略: %r", raw,
+            "[agent_hooks] agent_hooks 解析结果须为 {点位: [hook,...]} dict，忽略: %r", raw,
         )
         return {}
 

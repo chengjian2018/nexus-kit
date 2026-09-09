@@ -2,7 +2,7 @@
 
 import pytest
 
-from nexus.model.module import AgentModule, FSMModule, ModuleLink
+from nexus.model.module import AgentModule, FSMModule
 from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 
@@ -15,7 +15,7 @@ def _mk_pattern(modules, **kw):
 
 
 def test_module_map_and_node_map_registered():
-    a = AgentModule(module_code="a", sub_modules=["b", ModuleLink(target="c")])
+    a = AgentModule(module_code="a", sub_modules=["b", {"target": "c"}])
     b = AgentModule(module_code="b")
     c = FSMModule(module_code="c")
     p = _mk_pattern([a, b, c])
@@ -45,7 +45,7 @@ def test_unauthorized_lend_raises():
     b = AgentModule(module_code="b", use_tools=["t1"])
     a = AgentModule(
         module_code="a",
-        sub_modules=[ModuleLink(target="b", lend_tools=["t_not_in_b"])],
+        sub_modules=[{"target": "b", "lend_tools": ["t_not_in_b"]}],
     )
     with pytest.raises(ValueError, match="借出"):
         _mk_pattern([a, b])

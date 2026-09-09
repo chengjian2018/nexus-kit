@@ -49,9 +49,10 @@ def test_pattern_registered_with_structure():
     assert p is not None and p is customer_agent_pattern
     assert p.entry_module_code == "customer_service"
     assert set(p.module_map) == {"customer_service", "human_handoff"}
-    assert customer_service.sub_modules[0].target == "human_handoff"
+    assert customer_service.sub_modules[0]["target"] == "human_handoff"
     # Migrated builder is attached to the module-level slot
-    assert customer_service.messages_builder is customer_agent_messages_builder
+    # plan-②: the builder slot holds the plugin code; the callable resolves via the registry
+    assert customer_service.messages_builder == "customer_agent_messages_builder"
 
 
 def test_resolves_knowledge_tools_and_transfer(store):

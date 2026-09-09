@@ -7,7 +7,8 @@ Contract:
   fallback as the LLM version)
 - time_base comes from ctx.metadata["time_base"] (current time when not injected)
 - slot-mechanism compatible: passes is_valid_stage and is reachable through
-  QuerySlot's three-layer resolution
+  the query slot's three-layer resolution (declared by string code since
+  plan-②)
 """
 
 import time as _time
@@ -19,7 +20,7 @@ from nexus.context import DialogueContext
 from nexus.model.node import BaseNode
 from nexus.model.module import FSMModule
 from atoms.stages.query import TimeAugQueryRewriter
-from nexus.pipeline import QuerySlot, is_valid_stage, resolve_stage
+from nexus.pipeline import is_valid_stage, resolve_execution_sequence
 
 # Fixed base: 2026-09-03 10:00:00 (Thursday) — next Monday = 2026-09-07
 TIME_BASE = _time.mktime(_time.strptime("2026-09-03 10:00:00", "%Y-%m-%d %H:%M:%S"))
@@ -69,7 +70,9 @@ def test_time_base_defaults_to_now(monkeypatch):
 
 
 def test_query_slot_resolves_to_time_aug_rewriter():
-    """Three-layer slot resolution: a module-level TimeAugQueryRewriter is hit by QuerySlot."""
+    """Three-layer slot resolution: a module-level "time_aug_query" code is
+    hit by the query slot of the skeleton."""
+    import atoms.stages  # noqa: F401 -- registers the named stage codes
     ctx = DialogueContext(session_id="t", user_query="q")
     ctx.current_module_code = "m1"
     ctx.current_node_code = "n1"
@@ -77,11 +80,20 @@ def test_query_slot_resolves_to_time_aug_rewriter():
         module_code="m1", module_name="m1", module_description="d",
         module_todo_description="t", sub_modules=[],
         module_nodes=[BaseNode(node_code="n1", node_name="节点一")],
-        query=TimeAugQueryRewriter(),
+        stages={"query": "time_aug_query"},
     )
-    out = resolve_stage(QuerySlot(), ctx, module, None)
-    assert len(out) == 1
-    assert isinstance(out[0], TimeAugQueryRewriter)
+    sequence = _resolve_with_skeleton(ctx, module)
+    assert [(slot, type(stage).__name__) for slot, stage in sequence] == [
+        ("query", "TimeAugQueryRewriter")]
+
+
+def _resolve_with_skeleton(ctx, module):
+    from nexus.pipeline import normalize_skeleton
+    from nexus.model.pattern import Pattern
+    pattern = Pattern(code="pt", name="t", description="t",
+                      entry_module_code="m1", modules=[module],
+                      stages=[{"query": None}])
+    return resolve_execution_sequence(ctx, module, pattern)
 
 
 def test_augment_time_consistency():

@@ -18,14 +18,15 @@ Stage output split-writes:
 - ctx.nlg_result = {"content": reply}          — downstream reply extraction unchanged
 - ctx.metadata["unified"] = observability info (invalid_next_node / parse_failed etc.)
 
-Wiring (module-level generate injection, resolved via the default skeleton's GenerateSlot):
-    FSMModule(generate=FSMUnifiedNLU())
-    RouteModule(generate=RouteUnifiedNLU())
-(node-level generate takes priority over module-level, see stage_slots.py; PassThroughNLG
-is kept as a standalone utility — with generate in single-stage form no placeholder
-NLG is needed)
+Wiring (plan-② declarative form — string codes in module/node ``stages``,
+resolved from the plugin registry at execution time):
+    FSMModule(stages={"nlu": "fsm_unified", "nlg": "nlg_pass_through"})
+    RouteModule(stages={"nlu": "route_unified", "nlg": "nlg_pass_through"})
+(node-level stages take priority over module-level, see pipeline.py; the unified
+stage writes both nlu_result and nlg_result — nlu/nlg may also share the unified
+code directly, the runner dedups to a single execution)
 
-Combined with dual-track clarify (FSM modules with enable_clarify=True):
+Combined with dual-track clarify (FSM modules declaring the clarify slot):
     The pipeline assembles as [unified stage, ClarifyStage, PassThroughNLG].
     The unified stage outputs next_node="clarify" per the off-topic special case in
     the template (admitted by the valid set); ClarifyStage overwrites nlg_result to
@@ -132,14 +133,15 @@ class _UnifiedBaseNLU(BaseNLU):
     def _valid_next_values(self, cxt: DialogueContext) -> set:
         """Legal values for next_node: candidate node codes + empty string (stay on current node).
 
-        When the module enables dual-track clarify (enable_clarify=True), "clarify" is
+        When the module declares the clarify slot (a non-None ``clarify`` in
+        module.stages — the plan-② replacement of enable_clarify), "clarify" is
         additionally admitted: once triggered, ClarifyStage overwrites nlg_result to
         generate the clarify reply, and the node transition guard skips via
         metadata["clarify"], so it never actually jumps to a nonexistent node.
         """
         valid = set(self._candidate_node_codes(cxt)) | {""}
         module = cxt.get_current_module()
-        if module is not None and getattr(module, "enable_clarify", False):
+        if module is not None and (getattr(module, "stages", None) or {}).get("clarify"):
             valid.add("clarify")
         return valid
 
@@ -347,7 +349,7 @@ class RouteUnifiedNLU(_UnifiedBaseNLU):
 class PassThroughNLG(PipelineStage):
     """Placeholder NLG stage: preserves the nlg_result already written by the unified stage, skipping a second generation.
 
-    Usage: ``module.generate = {"nlu": FSMUnifiedNLU()/RouteUnifiedNLU(),
+    Usage (plan-② declarative form): ``module.stages = {"nlu": "fsm_unified"/"route_unified",
     "nlg": PassThroughNLG()}`` (or the unified stage directly as the generate
     single-stage form, where the nlg component guard auto no-ops), replacing the
     default NLG's second LLM call.

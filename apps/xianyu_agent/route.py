@@ -59,7 +59,7 @@ from atoms.stages.nlu import BaseNLU
 from nexus.model.module import RouteModule
 from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
-from atoms.stages.query import TimeAugQueryRewriter
+from atoms.stages.query import TimeAugQueryRewriter  # noqa: F401 -- re-exported for tests
 from nexus.registry.patterns import registry
 from apps.xianyu_agent.prompts import (
     XIANYU_DEFAULT_NLG_PROMPT,
@@ -488,12 +488,12 @@ xianyu_root = RouteModule(
     module_todo_description="对每条买家消息做意图检测，分发到议价/技术/通用菜单节点生成回复",
     module_nodes=[xy_route_root, xy_menu_price, xy_menu_price_refuse,
                   xy_menu_tech, xy_menu_default],
-    generate={
-        "nlu": XianyuIntentNLU(),
+    stages={
+        "nlu": "xianyu_intent_nlu",
         # Module-level NLG: zero-LLM short-circuit for no_reply/refusal nodes; other
         # menu nodes generate from the node.base_nlg_prompt intent template
         # (temperature/length tuned per intent)
-        "nlg": FixedNLG(),
+        "nlg": "xianyu_fixed_nlg",
     },
 )
 
@@ -508,10 +508,26 @@ xianyu_agent_pattern = Pattern(
     description="对话管理：ROUTE 每轮独立意图检测（本地规则 + LLM 兜底）+ 议价轮数控制 + 意图级 prompt",
     entry_module_code="xianyu_root",
     modules=[xianyu_root],
-    # Query rewrite slot: time augmentation (zero LLM) — relative times in buyer
-    # messages ("tomorrow afternoon" etc.) are resolved into absolute-time
-    # annotations before entering the NLU/NLG prompts
-    query=TimeAugQueryRewriter(),
+    stages=[
+        # Query rewrite slot: time augmentation (zero LLM) — relative times in buyer
+        # messages ("tomorrow afternoon" etc.) are resolved into absolute-time
+        # annotations before entering the NLU/NLG prompts
+        {"query": "time_aug_query"},
+        {"nlu": None},
+        {"nlg": None},
+    ],
 )
 
 registry.register(xianyu_agent_pattern)
+
+
+# ============================================================================
+# App-local stages — module-level plugin registration (kind="stage"), same
+# idiom as the pattern registration above; referenced by string codes in the
+# stages declarations
+# ============================================================================
+
+from nexus.registry.plugins import registry as plugin_registry  # noqa: E402
+
+plugin_registry.register("stage", "xianyu_intent_nlu", XianyuIntentNLU)
+plugin_registry.register("stage", "xianyu_fixed_nlg", FixedNLG)

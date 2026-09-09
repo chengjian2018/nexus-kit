@@ -6,14 +6,18 @@ Modules come in three types with different dialogue flows:
 - FSM    : finite state machine with transitions across node layers (NLU → NLG path)
 - ROUTE  : root router + intent menu for top-level dispatch (NLU → NLG path)
 
-Each module can configure NLU / NLG / Agent stage instances at its own level;
-the framework default implementation is used when unset.
+All fields are declarative (str / bool / list / dict — no object references):
+pipeline slots go through ``stages: {slot_name: stage_code}`` (strings,
+resolved from the plugin registry at execution time), adjacency edges through
+``sub_modules: List[Dict]`` (the ModuleLink dataclass is gone; dict shape
+{"target": str, "lend_knowledge": bool, "lend_tools": [str]}), and pluggable
+callables (messages_builder / agent_hooks) through string codes registered in
+the plugin registry.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -22,42 +26,37 @@ logger = logging.getLogger(__name__)
 
 class ModuleType(Enum):
     """Module type enum."""
+
     AGENT = "agent"   # pure LLM agent replies directly
     FSM = "fsm"       # finite state machine (multi-layer node transitions)
     ROUTE = "route"   # root router + intent menu
 
 
-@dataclass
-class ModuleLink:
-    """Adjacency declaration: one edge in A's sub_modules.
+def _normalize_links(sub_modules: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    """Normalize sub_modules into List[Dict] adjacency declarations.
 
-    One field, two responsibilities: it declares the legal transfer targets
-    (the transfer-graph edge set) and defines the projection thickness of B
-    within A's context (knowledge/tool lending configuration).
+    Accepted element forms:
+    - dict (canonical): keys target / lend_knowledge (default True) /
+      lend_tools (default []); unknown keys are kept as-is
+    - str (legacy shorthand): auto-wrapped with lend_knowledge=True,
+      lend_tools=[]
     """
-
-    target: str
-    lend_knowledge: bool = True
-    lend_tools: Optional[List[str]] = None
-
-    def __post_init__(self):
-        self.lend_tools = self.lend_tools or []
-
-
-def _normalize_links(sub_modules: Optional[List[Any]]) -> List[ModuleLink]:
-    """Normalize a mixed list of str / ModuleLink into List[ModuleLink].
-
-    The str form (legacy compat) is auto-wrapped with lend_knowledge=True
-    and lend_tools=[].
-    """
-    links: List[ModuleLink] = []
+    links: List[Dict[str, Any]] = []
     for item in sub_modules or []:
-        if isinstance(item, ModuleLink):
-            links.append(item)
+        if isinstance(item, dict):
+            link = dict(item)  # copy: never mutate the caller's declaration
+            link.setdefault("lend_knowledge", True)
+            link.setdefault("lend_tools", [])
+            link["lend_tools"] = list(link["lend_tools"] or [])
+            links.append(link)
         elif isinstance(item, str):
-            links.append(ModuleLink(target=item))
+            links.append({"target": item, "lend_knowledge": True,
+                          "lend_tools": []})
         else:
-            raise ValueError(f"sub_modules 元素必须是 str 或 ModuleLink: {item!r}")
+            raise ValueError(
+                f"sub_modules 元素必须是 str 或 dict（target/lend_knowledge/"
+                f"lend_tools）: {item!r}"
+            )
     return links
 
 
@@ -76,19 +75,19 @@ class BaseModule:
         module_nodes: list of nodes in the module (used by FSM/ROUTE types).
         use_tools: list of tools available to the module.
         base_prompt: module base prompt (used by AGENT type).
-        agent_stage: module-level Agent stage instance (optional, default when unset).
-        messages_builder: custom LLM messages builder for AGENT modules, signature
-            ``(system_prompt, cxt) -> messages`` list; when unset the default
-            build applies (system + user/assistant history); falls back to the
-            default with a warning when not callable
-            (consumer: chat/messages.py).
-        agent_hooks: agent loop hooks declaration (``{point: [hook,...]}``);
-            when non-empty it wholesale-replaces the pattern-level declaration
-            (consumer: chat/agent_hooks.py).
-        generate/pre_recall/query/post_recall: pipeline slot config (node level
-            has highest priority).
-        enable_clarify: dual-track clarify switch; when True the FSM module
-            integrates ClarifyStage (see stages/clarify/).
+        stages: pipeline slot config ``{slot_name: stage_code}`` — the module
+            layer of node > module > skeleton.
+        sub_modules: adjacency declarations ``[{"target": str,
+            "lend_knowledge": bool, "lend_tools": [str]}]`` — the transfer-graph
+            edge set and the knowledge/tool lending (projection thickness).
+        executor: executor plugin code (module-level override, highest
+            priority; module.executor > pattern.executor_<family> > type
+            default).
+        messages_builder: messages-builder plugin code (kind=
+            "messages_builder"); module-level overrides the pattern-level
+            declaration.
+        agent_hooks: agent-hooks plugin code (kind="agent_hooks");
+            module-level wholesale-replaces the pattern-level declaration.
     """
 
     type: ModuleType = ModuleType.AGENT
@@ -105,15 +104,11 @@ class BaseModule:
         base_prompt: Optional[str] = None,
         base_nlu_prompt: Optional[str] = None,
         base_nlg_prompt: Optional[str] = None,
-        generate: Optional[Any] = None,
-        pre_recall: Optional[Any] = None,
-        query: Optional[Any] = None,
-        post_recall: Optional[Any] = None,
-        agent_stage: Optional[Any] = None,
-        messages_builder: Optional[Any] = None,
-        agent_hooks: Optional[Any] = None,
+        stages: Optional[Dict[str, str]] = None,
         executor: Optional[str] = None,
-        enable_clarify: bool = False,
+        agent_stage: Optional[str] = None,
+        messages_builder: Optional[str] = None,
+        agent_hooks: Optional[str] = None,
         is_end: Optional[bool] = False,
         answer_examples: Optional[List[str]] = None,
         **kwargs,
@@ -128,47 +123,32 @@ class BaseModule:
         self.base_nlu_prompt = base_nlu_prompt
         self.base_nlg_prompt = base_nlg_prompt
 
-        # Pipeline slot config (three-layer priority node > module > pattern,
-        # resolved lazily at execution time by stage_slots.resolve_stage;
-        # generate accepts a single stage or a {"nlu":…, "nlg":…} dict)
-        self.generate = generate
-        self.pre_recall = pre_recall
-        self.query = query
-        self.post_recall = post_recall
+        # Pipeline slot config (module layer of node > module > skeleton;
+        # codes are strings resolved via the plugin registry — declarative,
+        # no object references)
+        self.stages = dict(stages) if stages else {}
 
         self.sub_modules = _normalize_links(sub_modules)
         self.answer_examples = answer_examples or []
 
-        self.agent_stage = agent_stage
-
-        # AGENT module messages-builder slot (consumer lives in chat/messages.py;
-        # like agent_stage, a module-level pluggable component declaration)
-        self.messages_builder = messages_builder
-
-        # Agent loop hooks slot: when non-empty, wholesale-replaces the
-        # pattern-level declaration (no merge, same semantics as the stage
-        # slots; form and consumer: chat/agent_hooks.py)
-        self.agent_hooks = agent_hooks
-
         # Executor plugin declaration (kind="executor"): module-level
-        # override with the highest priority (module.executor >
-        # pattern.executor_<type> > type default code); resolved at runtime
-        # from the plugin registry by the chat layer
+        # override with the highest priority
         self.executor = executor
 
-        self.enable_clarify = enable_clarify
+        # agent_stage slot (kind="stage"): kept as a string code for custom
+        # agent-stage declarations; resolved by executors that consume it
+        self.agent_stage = agent_stage
+
+        # AGENT module messages-builder slot (kind="messages_builder";
+        # module-level overrides the pattern-level declaration)
+        self.messages_builder = messages_builder
+
+        # Agent loop hooks slot (kind="agent_hooks"; module-level
+        # wholesale-replaces the pattern-level declaration)
+        self.agent_hooks = agent_hooks
 
         self.is_end = is_end
 
-        for legacy in ("nlu_stage", "nlg_stage"):
-            if legacy in (kwargs or {}):
-                logger.warning(
-                    "[module] %s=%r 已废弃：槽位配置请改用 generate="
-                    "{'nlu':…, 'nlg':…} 或单 stage（stage_slots.py）",
-                    legacy, kwargs[legacy],
-                )
-
-        # Extra attributes
         for key, value in (kwargs or {}).items():
             setattr(self, key, value)
 
@@ -225,4 +205,3 @@ class RouteModule(BaseModule):
     """Route module — root router + intent menu, for top-level dispatch."""
 
     type = ModuleType.ROUTE
-

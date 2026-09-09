@@ -26,10 +26,14 @@ class BaseNode:
         node_todo_description: todo description — feeds the NLU cur_node facet
             (what this node is trying to understand/collect).
         sub_nodes: list of sub-nodes (forms the state-machine transition graph).
+        node_slots: slot definitions (prompt asset).
+        answer_examples: answer-paradigm examples (prompt asset / marker).
         base_nlu_prompt: node-level NLU prompt template string.
         base_nlg_prompt: node-level NLG prompt template string.
-        generate/pre_recall/query/post_recall: pipeline slot config (node level
-            has highest priority).
+        stages: pipeline slot config ``{slot_name: stage_code}`` — the node
+            layer of the three-layer resolution (node > module > skeleton);
+            stage codes are strings resolved from the plugin registry
+            (kind="stage") at execution time.
     """
 
     def __init__(
@@ -41,10 +45,7 @@ class BaseNode:
         sub_nodes: Optional[List[str]] = None,
         node_slots: Optional[dict[str, str]] = None,
         answer_examples: Optional[List[str]] = None,
-        generate: Optional[Any] = None,
-        pre_recall: Optional[Any] = None,
-        query: Optional[Any] = None,
-        post_recall: Optional[Any] = None,
+        stages: Optional[Dict[str, str]] = None,
         base_nlu_prompt: Optional[str] = None,
         base_nlg_prompt: Optional[str] = None,
         is_end: Optional[bool] = False,
@@ -59,25 +60,14 @@ class BaseNode:
         self.base_nlg_prompt = base_nlg_prompt
         self.answer_examples = answer_examples
 
-        # Pipeline slot config (three-layer priority node > module > pattern,
-        # resolved lazily at execution time by stage_slots.resolve_stage;
-        # generate accepts a single stage or a {"nlu":…, "nlg":…} dict)
-        self.generate = generate
-        self.pre_recall = pre_recall
-        self.query = query
-        self.post_recall = post_recall
+        # Pipeline slot config (node layer of node > module > skeleton;
+        # codes are strings resolved via the plugin registry — declarative,
+        # no object references)
+        self.stages = dict(stages) if stages else {}
 
         self.node_slots = node_slots
 
         self.is_end = is_end
-
-        for legacy in ("nlu_stage", "nlg_stage"):
-            if legacy in (kwargs or {}):
-                logger.warning(
-                    "[node] %s=%r 已废弃：槽位配置请改用 generate="
-                    "{'nlu':…, 'nlg':…} 或单 stage（stage_slots.py）",
-                    legacy, kwargs[legacy],
-                )
 
         for key, value in (kwargs or {}).items():
             setattr(self, key, value)

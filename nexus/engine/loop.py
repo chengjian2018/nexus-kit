@@ -217,13 +217,13 @@ def build_transfer_tools(module, module_map) -> list:
     """Generate transfer tools edge-by-edge from sub_modules (spec §4 §3.3)."""
     tools = []
     for link in module.sub_modules:
-        target = module_map.get(link.target)
+        target = module_map.get(link["target"])
         if target is None:
             continue
         tools.append({
             "type": "function",
             "function": {
-                "name": f"{TRANSFER_TOOL_PREFIX}{link.target}",
+                "name": f"{TRANSFER_TOOL_PREFIX}{link['target']}",
                 "description": (
                     f"移交给【{target.module_name}】。适用：该域的多轮深入流程。"
                     f"不适用：一句话或一次工具能解决的请求——那类直接自己处理。"
@@ -350,12 +350,12 @@ def _resolve_lent_tools(module, pattern):
     """
     schemas, lent_by = [], {}
     for link in module.sub_modules:
-        if not link.lend_tools:
+        if not link.get("lend_tools"):
             continue
-        target = (pattern.module_map if pattern else {}).get(link.target)
+        target = (pattern.module_map if pattern else {}).get(link["target"])
         if target is None:
             continue
-        allowed = set(target.use_tools or []) & set(link.lend_tools)
+        allowed = set(target.use_tools or []) & set(link.get("lend_tools") or [])
         # Second-pass filter: the lending path is bound by the same pattern-level
         # tool ACL (deny-by-default), with the borrower (target module) as the
         # ACL subject — this must not bypass get_allowed_tools_for_pattern
@@ -363,13 +363,13 @@ def _resolve_lent_tools(module, pattern):
             continue
         if pattern is not None:
             allowed &= tool_registry.get_allowed_tools_for_pattern(
-                pattern.code, link.target)
+                pattern.code, link["target"])
         else:
             allowed = set()
         for schema in tool_registry.get_definitions(allowed):
             name = schema["function"]["name"]
             schemas.append(schema)
-            lent_by[name] = link.target
+            lent_by[name] = link["target"]
     return schemas, lent_by
 
 

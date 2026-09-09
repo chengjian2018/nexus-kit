@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from nexus.engine.session import Session
 from nexus.context import DialogueContext, ModuleJumpEvent, SessionMessage
-from nexus.model.module import AgentModule, ModuleLink
+from nexus.model.module import AgentModule
 from nexus.model.pattern import Pattern
 from nexus.registry.tools import registry as tool_registry
 
@@ -71,8 +71,7 @@ def _mk_session():
         module_name="前台接待",
         module_description="接待与分诊",
         sub_modules=[
-            ModuleLink(target="after_sales",
-                       lend_tools=["mock_lent_tool"]),
+            {"target": "after_sales", "lend_tools": ["mock_lent_tool"]},
         ],
     )
     p = Pattern(code="p", name="t", description="t",

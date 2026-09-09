@@ -12,7 +12,7 @@ from unittest.mock import patch
 from nexus.engine.chat import ModuleJumpChannel
 from nexus.engine.session import Session
 from nexus.context import DialogueContext, ModuleJumpEvent, PipelineStage
-from nexus.model.module import AgentModule, FSMModule, ModuleLink, RouteModule
+from nexus.model.module import AgentModule, FSMModule, RouteModule
 from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 
@@ -154,13 +154,16 @@ def test_nlu_jump_breaks_stages_and_reroutes_same_turn():
     """NLU outputs jump_module -> the remaining stages are interrupted (NLG does
     not run), the source module stays silent, and the chat layer's hop
     consumption reroutes to the target module to continue in the same turn."""
+    from stage_stubs import register_stage_stub
+
+    jump_nlu_code = register_stage_stub(
+        lambda: _JumpNLU({"next_node": "", "jump_module": "m1",
+                          "reason": "选车", "slots": {"brand": "A"}}))
+    marker_nlg_code = register_stage_stub(_MarkerNLG)
+
     menu = BaseNode(node_code="menu_a", node_name="菜单A")
     root = BaseNode(node_code="root", node_name="根", sub_nodes=["menu_a"],
-                    generate={"nlu": _JumpNLU({"next_node": "",
-                                               "jump_module": "m1",
-                                               "reason": "选车",
-                                               "slots": {"brand": "A"}}),
-                              "nlg": _MarkerNLG()})
+                    stages={"nlu": jump_nlu_code, "nlg": marker_nlg_code})
     route = RouteModule(module_code="r1", module_name="r",
                         module_description="d", module_todo_description="t",
                         module_nodes=[root, menu])
@@ -175,12 +178,6 @@ def test_nlu_jump_breaks_stages_and_reroutes_same_turn():
             ctx.nlg_result = {"content": "已为您切换到目标模块"}
             return ctx
 
-    target = FSMModule(
-        module_code="m1", module_name="m", module_description="d",
-        module_todo_description="t", sub_modules=[],
-        module_nodes=[BaseNode(node_code="f1", node_name="F1",
-                               generate={"nlg": _TargetNLG()})])
-
     class _FSMNLUStub(PipelineStage):
         stage_name = "fsm_nlu"
 
@@ -189,7 +186,15 @@ def test_nlu_jump_breaks_stages_and_reroutes_same_turn():
             ctx.nlu_result = {"next_node": "", "slots": {}}
             return ctx
 
-    target.generate = {"nlu": _FSMNLUStub(), "nlg": _TargetNLG()}
+    target_nlg_code = register_stage_stub(_TargetNLG)
+    fsm_nlu_code = register_stage_stub(_FSMNLUStub)
+
+    target = FSMModule(
+        module_code="m1", module_name="m", module_description="d",
+        module_todo_description="t", sub_modules=[],
+        module_nodes=[BaseNode(node_code="f1", node_name="F1",
+                               stages={"nlg": target_nlg_code})],
+        stages={"nlu": fsm_nlu_code, "nlg": target_nlg_code})
 
     pattern = Pattern(code="pj1", name="t", description="t",
                       entry_module_code="r1", modules=[route, target])
@@ -216,6 +221,7 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
     by hop2) -> over the limit, force_close.
     """
     from nexus.engine.chat import chat_turn
+    from stage_stubs import register_stage_stub
 
     # The root NLU jumps to m1 the first time; on re-entry to r1 it jumps
     # straight via jump_module (creating the loop)
@@ -236,10 +242,13 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
                                   "slots": {}}
             return ctx
 
+    loop_nlu_code = register_stage_stub(_LoopRouteNLU)
+    marker_nlg_code = register_stage_stub(_MarkerNLG)
+
     menu = BaseNode(node_code="menu_a", node_name="菜单A",
                     jump_module="m1")
     root = BaseNode(node_code="root", node_name="根", sub_nodes=["menu_a"],
-                    generate={"nlu": _LoopRouteNLU(), "nlg": _MarkerNLG()})
+                    stages={"nlu": loop_nlu_code, "nlg": marker_nlg_code})
     route = RouteModule(module_code="r1", module_name="r",
                         module_description="d", module_todo_description="t",
                         module_nodes=[root, menu])
@@ -261,11 +270,14 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
             ctx.nlu_result = {"next_node": "", "slots": {}}
             return ctx
 
+    target_nlg_code = register_stage_stub(_TargetNLG)
+    target_nlu_code = register_stage_stub(_TargetNLU)
+
     target = FSMModule(
         module_code="m1", module_name="m", module_description="d",
         module_todo_description="t", sub_modules=[],
         module_nodes=[BaseNode(node_code="f1", node_name="F1")],
-        generate={"nlu": _TargetNLU(), "nlg": _TargetNLG()})
+        stages={"nlu": target_nlu_code, "nlg": target_nlg_code})
 
     pattern = Pattern(code="pj2", name="t", description="t",
                       entry_module_code="r1", modules=[route, target],

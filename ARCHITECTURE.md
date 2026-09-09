@@ -42,14 +42,16 @@ host POST /api/v1/chat
 | kind | 内容 | 注册者 |
 |---|---|---|
 | `executor` | 模块执行器：agent loop / FSM / ROUTE pipeline | `atoms/executors/` |
+| `stage` | 具名 stage（stages 声明引用的字符串 code） | `atoms/stages/__init__` + app 自有 stage |
 | `stage_factory` | 内置兜底 stage 工厂（`pipeline.register_default_*` 的内部存储） | `atoms/stages/__init__` |
-| （后续计划）`stage` / `messages_builder` / `agent_hooks` | 具名 stage、消息构建器、hooks 包 | 计划②/④ |
+| `messages_builder` | AGENT 消息构建器（内核注册 `default`） | apps（customer_agent 等） |
+| `agent_hooks` | hooks 包（计划④前保留 str 解析能力） | 计划④定案 |
 
 ### API
 
 ```python
 registry.register(kind, code, factory)   # 冲突：不同 factory 占同 (kind,code) → ValueError；同 factory 幂等
-registry.resolve(kind, code)             # 实例缓存（factory 只调一次；executor 约定无状态）
+registry.resolve(kind, code)             # 实例缓存（factory 只调一次；executor/stage 约定无状态）
 registry.has(kind, code)                 # 只查存在不实例化（校验用）
 registry.deregister(kind, code)
 registry.default_executor_code(type_value)  # "agent"→"default_loop" 等
@@ -74,6 +76,59 @@ registry.default_executor_code(type_value)  # "agent"→"default_loop" 等
 - AST 自动发现：`discover_builtin_plugins()` 扫 `atoms/executors/*.py` 的
   模块级 `registry.register(...)`（host/main.py 与 host/cli.py 装配时调用；
   tests/conftest.py 预热）。
+
+## 声明式模型（计划②引入）
+
+node/module/pattern 的所有字段均为常见值类型（str/bool/list/dict），
+**无对象引用**——为 yml 序列化（计划③）与配置化铺路。
+
+### stages 体系
+
+```python
+# pattern.stages：有序骨架，list[单键dict]（槽位名 → code 或 None）
+Pattern(stages=[
+    {"pre_recall": None},          # None = 运行时三层补值
+    {"query": "time_aug_query"},   # pattern 级默认
+    {"post_recall": None},
+    {"nlu": "route_unified"},      # unified：nlu/nlg 可同填一个 code
+    {"clarify": None},             # clarify：默认 None（声明即启用澄清）
+    {"nlg": "route_unified"},
+])
+# module.stages / node.stages：Dict[str, str]（槽位名 → code）
+RouteModule(stages={"nlu": "xianyu_intent_nlu", "nlg": "xianyu_fixed_nlg"})
+```
+
+- **默认骨架**（内核）：六槽 `[pre_recall, query, post_recall, nlu, clarify,
+  nlg]`，值全 None；`normalize_skeleton` 构造期 fail-fast（非 list/非单键
+  dict/非 str code → ValueError）
+- **解析链**：`node.stages > module.stages > pattern 骨架值 > builtin 兜底`
+  （nlu/nlg 兜底到 `register_default_generate` 注册的默认对；clarify **无
+  兜底**——声明即启用）
+- **通用跳过规则**：槽位三层解析后仍 None → 不执行（pre_recall/post_recall/
+  clarify 均此语义）
+- **unified 去重**：nlu/nlg 同 code → 只 execute 一次（unified stage 本就
+  同时写 nlu_result/nlg_result）；其它重复 code 仅首个生效（计划③校验报错）
+- **nlg 延迟解析**（继承旧 GenerateSlot 拆分的时序修复）：nlg 槽位在执行
+  瞬间按当前节点解析——ROUTE 菜单命中切节点后，菜单级 nlg 同轮生效
+  （pipeline `_DeferredNLG`）
+- **删除的字段**：node/module 的 generate/pre_recall/query/post_recall
+  显式槽位、module.enable_clarify（被 stages.clarify 吸收）、四个哨兵类
+  （PreRecallSlot 等）与 GenerateSlot 展开逻辑
+- **具名 stage codes**（atoms 注册）：`fsm_nlu/fsm_nlg/route_nlu/route_nlg/
+  fsm_unified/route_unified/nlg_pass_through/time_aug_query/clarify_default`
+  + app 自有 code（xianyu 的 `xianyu_intent_nlu/xianyu_fixed_nlg`）
+
+### ModuleLink → dict
+
+`sub_modules: List[Dict]`，形状 `{"target": str, "lend_knowledge": bool,
+"lend_tools": [str]}`（str 简写自动包装）。Pattern 图校验（悬边/自环/越权）
+与投影块构建均改读 dict。
+
+### callable 字段 str 化
+
+`messages_builder / agent_hooks`（module 与 pattern 层）均为 `Optional[str]`
+插件 code；内核注册 `messages_builder: default`。transitional 兼容：可调用
+对象仍可直接内联使用（messages.build_agent_messages 判断 callable）。
 
 ### 与四个领域 registry 的关系
 
@@ -129,3 +184,5 @@ agents.py 现仅为过渡性 re-export。
 
 - 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
   详见 `docs/refactor-notes/plan-1.md`。
+- 计划②（2026-09-09）：模型声明式重构（stages 体系 + ModuleLink→dict +
+  callable 字段 str 化）。详见 `docs/refactor-notes/plan-2.md`。

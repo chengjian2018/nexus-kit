@@ -182,18 +182,23 @@ def _replay_segment(segment: List[Any]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def build_projection_block(module, module_map) -> str:
-    """Adjacent projection block: one piece per lend_knowledge edge (spec §4 §3.2)."""
+    """Adjacent projection block: one piece per lend_knowledge edge (spec §4 §3.2).
+
+    sub_modules entries are declarative dicts ({"target", "lend_knowledge",
+    "lend_tools"}) since plan-②.
+    """
     blocks = []
     for link in module.sub_modules:
-        if not link.lend_knowledge:
+        if not link.get("lend_knowledge"):
             continue
-        target = module_map.get(link.target)
+        target = module_map.get(link["target"])
         if target is None:
             continue
         parts = [f"## 邻接能力：{target.module_name}（{target.module_code}）"]
         parts.append(target.to_projection_text())
-        if link.lend_tools:
-            parts.append(f"- 可借工具：{', '.join(link.lend_tools)}")
+        lend_tools = link.get("lend_tools") or []
+        if lend_tools:
+            parts.append(f"- 可借工具：{', '.join(lend_tools)}")
         blocks.append("\n".join(parts))
     return "\n\n".join(blocks)
 
@@ -296,6 +301,12 @@ def build_agent_messages(
     """AGENT module messages build entry: module > pattern > default
     (integrated contract).
 
+    The ``messages_builder`` slot is a string code (plugin registry
+    kind="messages_builder") since plan-②; the kernel registers the default
+    builder under code "default" at import time. An unregistered code falls
+    back to the default build with a warning (same degradation as an
+    uncallable builder pre-plan-②).
+
     Args:
         module: current module object (reads the ``messages_builder`` slot
             and its assembly raw material)
@@ -310,16 +321,49 @@ def build_agent_messages(
         OpenAI-format messages list (passed directly to
         provider.chat_completion)
     """
-    builder = getattr(module, "messages_builder", None)
+    from nexus.registry.plugins import registry as plugin_registry
+
+    code = getattr(module, "messages_builder", None)
     source = f"module {getattr(module, 'module_code', '?')}"
-    if builder is None and pattern is not None:
-        builder = getattr(pattern, "messages_builder", None)
+    if code is None and pattern is not None:
+        code = getattr(pattern, "messages_builder", None)
         source = f"pattern {getattr(pattern, 'code', '?')}"
-    if builder is not None:
-        if callable(builder):
-            return builder(module, cxt, extra_blocks or [])
-        logger.warning(
-            "[messages] %s 的 messages_builder 不可调用，降级默认构建: %r",
-            source, builder,
-        )
+    if code is not None:
+        if callable(code):
+            # Legacy object form (transitional; also used by in-repo apps
+            # until they migrate): call directly
+            return code(module, cxt, extra_blocks or [])
+        if isinstance(code, str):
+            if plugin_registry.has("messages_builder", code):
+                builder = plugin_registry.resolve("messages_builder", code)
+                return builder(module, cxt, extra_blocks or [])
+            logger.warning(
+                "[messages] %s 的 messages_builder=%r 未注册"
+                "（kind=messages_builder），降级默认构建",
+                source, code,
+            )
+        else:
+            logger.warning(
+                "[messages] %s 的 messages_builder 声明非法（str code 或"
+                " callable），降级默认构建: %r",
+                source, code,
+            )
     return default_build_messages(module, cxt, extra_blocks)
+
+
+# ---------------------------------------------------------------------------
+# Kernel-registered default builder (code "default", kind="messages_builder")
+# ---------------------------------------------------------------------------
+
+def _register_default_messages_builder() -> None:
+    from nexus.registry.plugins import registry as plugin_registry
+
+    if not plugin_registry.has("messages_builder", "default"):
+        plugin_registry.register(
+            "messages_builder", "default",
+            lambda module, cxt, extra_blocks: default_build_messages(
+                module, cxt, extra_blocks),
+        )
+
+
+_register_default_messages_builder()

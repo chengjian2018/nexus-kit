@@ -272,14 +272,16 @@ class _StaticNLG(PipelineStage):
 
 def test_route_module_turn_does_not_fire_agent_hooks():
     from nexus.engine.chat import chat_turn
+    from stage_stubs import register_stage_stub
     fired = []
     route = RouteModule(
         module_code="root", module_name="路由", module_description="",
         module_nodes=[BaseNode(node_code="root", node_name="路由")],
     )
+    nlg_code = register_stage_stub(_StaticNLG)
     p = Pattern(code="phr", name="t", description="t",
                 entry_module_code="root", modules=[route],
-                stages=[_StaticNLG()],
+                stages=[{"nlu": nlg_code}, {"nlg": nlg_code}],
                 agent_hooks={pt: [fired.append] for pt in
                              ("on_agent_start", "on_llm_call", "on_tool_call",
                               "on_tool_result", "on_transfer", "on_agent_end")})

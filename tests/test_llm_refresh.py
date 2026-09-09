@@ -118,11 +118,6 @@ def test_r4_route_menu_node_takes_effect_same_turn():
                         module_todo_description="t", sub_modules=[],
                         module_nodes=[root, menu])
     fsm_m = _fsm_pattern().module_map["m1"]
-    pattern = Pattern(code="pr", name="t", description="t",
-                      entry_module_code="r1", modules=[route, fsm_m])
-    sessions = {}
-    _launch(pattern, sessions, sid="s2")
-    calls = []
     # RouteNLU/FSMNLU stubbed to return a menu-hit intent (bypassing the real LLM protocol)
     class _StubNLU:
         stage_name = "nlu"
@@ -134,7 +129,15 @@ def test_r4_route_menu_node_takes_effect_same_turn():
         def execute(self, ctx):
             ctx.nlg_result = {"content": "ok"}
             return ctx
-    pattern.stages = [_StubNLU(), _StubNLG()]
+    from stage_stubs import register_stage_stub
+    nlu_code = register_stage_stub(_StubNLU)
+    nlg_code = register_stage_stub(_StubNLG)
+    pattern = Pattern(code="pr", name="t", description="t",
+                      entry_module_code="r1", modules=[route, fsm_m],
+                      stages=[{"nlu": nlu_code}, {"nlg": nlg_code}])
+    sessions = {}
+    _launch(pattern, sessions, sid="s2")
+    calls = []
     # R1-R3 and the R4 refresh all go through the chat namespace (R4 inside _detect_jump_after_stage)
     with patch("atoms.executors.loop_executor.build_provider"), \
          patch("nexus.engine.chat.get_llm_config", side_effect=_record_calls(calls)):

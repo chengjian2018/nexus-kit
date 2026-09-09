@@ -1,30 +1,46 @@
-"""Tests for ModuleLink normalization and module header projection."""
+"""Tests for sub_modules link normalization (dict form) and module header projection."""
 
-from nexus.model.module import AgentModule, FSMModule, ModuleLink
+from nexus.model.module import AgentModule, FSMModule
 
 
 def test_str_link_normalized_with_knowledge_default():
     mod = AgentModule(module_code="a", sub_modules=["b"])
     assert len(mod.sub_modules) == 1
     link = mod.sub_modules[0]
-    assert isinstance(link, ModuleLink)
-    assert link.target == "b"
-    assert link.lend_knowledge is True   # the legacy string form lends knowledge by default
-    assert link.lend_tools == []
+    assert isinstance(link, dict)
+    assert link["target"] == "b"
+    assert link["lend_knowledge"] is True   # the legacy string form lends knowledge by default
+    assert link["lend_tools"] == []
 
 
-def test_modulelink_direct_config():
-    link = ModuleLink(target="b", lend_knowledge=False, lend_tools=["t1"])
-    assert link.lend_tools == ["t1"]
+def test_dict_link_direct_config():
+    link = {"target": "b", "lend_knowledge": False, "lend_tools": ["t1"]}
     mod = AgentModule(module_code="a", sub_modules=[link, "c"])
-    assert mod.sub_modules[0] is link
-    assert mod.sub_modules[1].target == "c"
+    assert mod.sub_modules[0] == {"target": "b", "lend_knowledge": False,
+                                  "lend_tools": ["t1"]}
+    assert mod.sub_modules[1]["target"] == "c"
 
 
-def test_modulelink_defaults():
-    link = ModuleLink(target="b")
-    assert link.lend_knowledge is True
-    assert link.lend_tools == []
+def test_dict_link_defaults():
+    mod = AgentModule(module_code="a",
+                      sub_modules=[{"target": "b"}])
+    link = mod.sub_modules[0]
+    assert link["lend_knowledge"] is True
+    assert link["lend_tools"] == []
+
+
+def test_dict_link_copies_input():
+    """The declaration dict is copied — later mutation of the caller's dict never leaks in."""
+    raw = {"target": "b", "lend_tools": ["t1"]}
+    mod = AgentModule(module_code="a", sub_modules=[raw])
+    raw["lend_tools"].append("t2")
+    assert mod.sub_modules[0]["lend_tools"] == ["t1"]
+
+
+def test_invalid_link_raises():
+    import pytest
+    with pytest.raises(ValueError, match="sub_modules"):
+        AgentModule(module_code="a", sub_modules=[123])
 
 
 def test_answer_examples_field():

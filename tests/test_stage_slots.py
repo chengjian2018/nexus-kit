@@ -1,12 +1,14 @@
-"""Pipeline slots (pre_recall/query/post_recall/generate) and three-layer lazy-resolution tests.
+"""Pipeline skeleton + three-layer resolution tests (plan-② declarative
+stages).
 
-Core contracts (direct counterpart of the stage_slots.py design as the single source of truth):
-- Three-layer priority node > module > pattern; generate dual form (single / dict with exactly nlu+nlg)
-- Validation failure degrades the whole layer (uniform across slots); all three layers empty →
-  recall/rewrite no-op, generate builtin
-- generate expands into lazy sub-parts: nlu/nlg each independently resolve three layers at their
-  execution moment (under ROUTE, nlg resolves at the menu node — the core timing-fix assertion)
-- Calling execute on a slot directly must fail fast
+Core contracts (direct counterpart of the pipeline.py design):
+- Skeleton: ordered list of single-key dicts ({slot: code-or-None}); the
+  empty/None declaration normalizes to the kernel default six-slot skeleton
+- Per-slot resolution: node.stages > module.stages > skeleton value >
+  builtin default; None after all layers → slot skipped
+- Unified dedup: nlu/nlg sharing one code executes once; any other
+  duplicate code keeps only the first occurrence
+- Malformed skeleton declarations fail fast at construction
 """
 
 import pytest
@@ -14,19 +16,18 @@ import pytest
 from nexus.context import DialogueContext
 from nexus.model.module import FSMModule, ModuleType, RouteModule
 from nexus.model.node import BaseNode
+from nexus.model.pattern import Pattern
 from nexus.pipeline import (
-    GenerateSlot,
-    PostRecallSlot,
-    PreRecallSlot,
-    QuerySlot,
+    DEFAULT_SKELETON_SLOTS,
+    default_skeleton,
     is_valid_stage,
-    normalize_generate,
-    resolve_stage,
+    normalize_skeleton,
+    resolve_execution_sequence,
 )
 
 
 class _Marker:
-    """Duck-typed marker stage: records the (node, name) at execution time."""
+    """Marker stage: records the (node, name) at execution time."""
 
     def __init__(self, name):
         self.stage_name = name
@@ -36,7 +37,7 @@ class _Marker:
         return ctx
 
 
-ran = []  # Execution log shared by the whole _Marker class (cleared around each case)
+ran = []  # shared execution log (cleared around each case)
 
 
 @pytest.fixture(autouse=True)
@@ -46,15 +47,21 @@ def _clean_ran():
     ran.clear()
 
 
-def _fsm_module(generate=None, query=None, pre_recall=None, post_recall=None,
-                enable_clarify=False, clarify_stage=None):
+from stage_stubs import register_stage_stub  # noqa: E402
+
+
+def _marker_code(name, prefix="mk"):
+    """Register a _Marker stage under a unique code; returns the code."""
+    return register_stage_stub(lambda name=name: _Marker(name),
+                               prefix=prefix)
+
+
+def _fsm_module(stages=None):
     return FSMModule(
         module_code="m1", module_name="m1", module_description="d",
         module_todo_description="t", sub_modules=[],
         module_nodes=[BaseNode(node_code="n1", node_name="节点一")],
-        generate=generate, query=query, pre_recall=pre_recall,
-        post_recall=post_recall, enable_clarify=enable_clarify,
-        clarify_stage=clarify_stage,
+        stages=stages,
     )
 
 
@@ -77,16 +84,50 @@ def _ctx(node_code="n1", node=None, module_code="m1"):
     return ctx
 
 
-def _pattern(generate=None, query=None):
-    from nexus.model.pattern import Pattern
+def _pattern(stages=None):
     return Pattern(code="p1", name="t", description="t",
                    entry_module_code="m1",
                    modules=[_fsm_module()],
-                   generate=generate, query=query)
+                   stages=stages)
 
 
 # ============================================================================
-# is_valid_stage / normalize_generate
+# Skeleton normalization
+# ============================================================================
+
+def test_default_skeleton_six_slots():
+    skeleton = default_skeleton()
+    assert [list(e.keys())[0] for e in skeleton] == DEFAULT_SKELETON_SLOTS
+    assert all(list(e.values())[0] is None for e in skeleton)
+
+
+def test_normalize_skeleton_passes_valid():
+    decl = [{"query": "q1"}, {"nlu": None}, {"nlg": "u"}]
+    assert normalize_skeleton(decl) == decl
+
+
+def test_normalize_skeleton_empty_falls_back_to_default():
+    assert normalize_skeleton(None) == default_skeleton()
+    assert normalize_skeleton([]) == default_skeleton()
+
+
+def test_normalize_skeleton_malformed_fails_fast():
+    with pytest.raises(ValueError):
+        normalize_skeleton("not-a-list")
+    with pytest.raises(ValueError):
+        normalize_skeleton([{"nlu": "a", "nlg": "b"}])  # two keys
+    with pytest.raises(ValueError):
+        normalize_skeleton(["nlu"])  # not a dict
+    with pytest.raises(ValueError):
+        normalize_skeleton([{"nlu": 42}])  # non-str non-None code
+    # construction propagates the failure
+    with pytest.raises(ValueError):
+        Pattern(code="px", name="t", description="t", entry_module_code="m1",
+                modules=[_fsm_module()], stages=[{"nlu": 42}])
+
+
+# ============================================================================
+# is_valid_stage (duck typing)
 # ============================================================================
 
 def test_is_valid_stage():
@@ -98,305 +139,176 @@ def test_is_valid_stage():
     assert is_valid_stage(_Broken()) is False
 
 
-def test_normalize_generate_forms():
-    nlu, nlg, single = _Marker("nlu"), _Marker("nlg"), _Marker("single")
-    assert normalize_generate({"nlu": nlu, "nlg": nlg}) == ("dict", nlu, nlg)
-    assert normalize_generate(single) == ("single", single, None)
-    # Invalid: missing key / extra key / invalid value / wrong type
-    assert normalize_generate({"nlu": nlu}) is None
-    assert normalize_generate({"nlg": nlg}) is None
-    assert normalize_generate({"nlu": nlu, "nlg": nlg, "extra": 1}) is None
-    assert normalize_generate({"nlu": nlu, "nlg": "bad"}) is None
-    assert normalize_generate("bad") is None
-    assert normalize_generate(None) is None
-
-
 # ============================================================================
-# Recall/rewrite slots: three-layer resolution + degrade + no-op
+# Slot resolution: three layers + skip + builtin tail
 # ============================================================================
 
-def test_query_slot_three_layers_and_noop():
+def test_optional_slot_none_is_skipped():
     ctx = _ctx()
-    assert resolve_stage(QuerySlot(), ctx, _fsm_module(), None) == []
-    out = resolve_stage(QuerySlot(), ctx,
-                        _fsm_module(query=_Marker("mod_query")), None)
-    assert [s.stage_name for s in out] == ["mod_query"]
+    module = _fsm_module()  # no stages declaration
+    pattern = _pattern(stages=[{"query": None}])  # explicitly None
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    assert [slot for slot, _ in sequence] == []
 
 
-def test_query_slot_node_over_module_and_lazy_resolution():
-    n2 = BaseNode(node_code="n2", node_name="节点二", query=_Marker("n2_query"))
-    module = _fsm_module(query=_Marker("mod_query"))
-    ctx = _ctx(node_code="n1", node=n2)
-
-    out = resolve_stage(QuerySlot(), ctx, module, None)
-    out[0].execute(ctx)
+def test_module_layer_wins_over_skeleton():
+    q_code = _marker_code("mod_query")
+    ctx = _ctx()
+    module = _fsm_module(stages={"query": q_code})
+    pattern = _pattern(stages=[{"query": None}])
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    assert [slot for slot, _ in sequence] == ["query"]
+    sequence[0][1].execute(ctx)
     assert ran == [("n1", "mod_query")]
 
-    ctx.current_node_code = "n2"  # after switching nodes, resolution re-runs → node layer hits
-    out = resolve_stage(QuerySlot(), ctx, module, None)
-    out[0].execute(ctx)
-    assert ran[-1] == ("n2", "n2_query")
+
+def test_node_layer_wins_over_module():
+    n2_q = _marker_code("n2_query")
+    mod_q = _marker_code("mod_query")
+    n2 = BaseNode(node_code="n2", node_name="节点二", stages={"query": n2_q})
+    module = _fsm_module(stages={"query": mod_q})
+    ctx = _ctx(node_code="n1", node=n2)
+
+    sequence = resolve_execution_sequence(ctx, module, None)
+    sequence[0][1].execute(ctx)
+    assert ran == [("n1", "mod_query")]  # n1 has no stages: module layer
+
+    ctx.current_node_code = "n2"
+    sequence = resolve_execution_sequence(ctx, module, None)
+    sequence[0][1].execute(ctx)
+    assert ran[-1] == ("n2", "n2_query")  # node layer hits
 
 
-def test_query_slot_invalid_layers_degrade_to_noop():
-    """node/module layers all invalid → warning + no-op (no exception raised)."""
+def test_skeleton_value_is_pattern_layer():
+    q_code = _marker_code("pat_query")
     ctx = _ctx()
-    ctx.node_map["n1"] = BaseNode(node_code="n1", node_name="节点一",
-                                  query="bad")
-    module = _fsm_module(query=42)
-    assert resolve_stage(QuerySlot(), ctx, module, None) == []
+    module = _fsm_module()
+    pattern = _pattern(stages=[{"query": q_code}])
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    sequence[0][1].execute(ctx)
+    assert ran == [("n1", "pat_query")]
 
 
-def test_recall_slots_share_same_semantics():
+def test_builtin_generate_tail_when_unresolved():
+    """nlu/nlg unresolved after the declarative layers → builtin factories
+    (atoms.stages warmed; nlg resolves lazily — verify by executing)."""
+    import atoms.stages  # noqa: F401
     ctx = _ctx()
-    module = _fsm_module(pre_recall=_Marker("pre"), post_recall=None)
-    out = resolve_stage(PreRecallSlot(), ctx, module, None)
-    assert [s.stage_name for s in out] == ["pre"]
-    assert resolve_stage(PostRecallSlot(), ctx, module, None) == []
+    module = _fsm_module()
+    pattern = _pattern(stages=[{"nlu": None}, {"nlg": None}])
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+
+    from atoms.stages.nlu import FSMNLU
+    from atoms.stages.nlg import FSMNLG
+    orig_nlu, orig_nlg = FSMNLU.execute, FSMNLG.execute
+    FSMNLU.execute = lambda self, ctx: ran.append(("n1", "fsm_nlu")) or ctx
+    FSMNLG.execute = lambda self, ctx: ran.append(("n1", "fsm_nlg")) or ctx
+    try:
+        for _, stage in sequence:
+            stage.execute(ctx)
+    finally:
+        FSMNLU.execute, FSMNLG.execute = orig_nlu, orig_nlg
+    assert ran == [("n1", "fsm_nlu"), ("n1", "fsm_nlg")]
+
+
+def test_builtin_route_generate_tail():
+    import atoms.stages  # noqa: F401
+    ctx = _ctx(node_code="root", module_code="r1")
+    module = _route_module()
+    pattern = _pattern(stages=[{"nlu": None}, {"nlg": None}])
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+
+    from atoms.stages.nlu import RouteNLU
+    from atoms.stages.nlg import RouteNLG
+    orig_nlu, orig_nlg = RouteNLU.execute, RouteNLG.execute
+    RouteNLU.execute = lambda self, ctx: ran.append(("root", "route_nlu")) or ctx
+    RouteNLG.execute = lambda self, ctx: ran.append(("root", "route_nlg")) or ctx
+    try:
+        for _, stage in sequence:
+            stage.execute(ctx)
+    finally:
+        RouteNLU.execute, RouteNLG.execute = orig_nlu, orig_nlg
+    assert ran == [("root", "route_nlu"), ("root", "route_nlg")]
+
+
+def test_clarify_slot_declared_runs_between_nlu_and_nlg():
+    import atoms.stages  # noqa: F401
+    cl_code = _marker_code("my_clarify")
+    ctx = _ctx()
+    module = _fsm_module(stages={"clarify": cl_code})
+    pattern = _pattern(stages=[{"nlu": None}, {"clarify": None},
+                               {"nlg": None}])
+    # nlu/nlg fall to builtin which would call LLM — stub execute
+    from atoms.stages.nlu import FSMNLU
+    from atoms.stages.nlg import FSMNLG
+    orig_nlu, orig_nlg = FSMNLU.execute, FSMNLG.execute
+    FSMNLU.execute = lambda self, ctx: ran.append(("n1", "fsm_nlu")) or ctx
+    FSMNLG.execute = lambda self, ctx: ran.append(("n1", "fsm_nlg")) or ctx
+    try:
+        sequence = resolve_execution_sequence(ctx, module, pattern)
+        for slot, stage in sequence:
+            stage.execute(ctx)
+    finally:
+        FSMNLU.execute, FSMNLG.execute = orig_nlu, orig_nlg
+    assert ran == [("n1", "fsm_nlu"), ("n1", "my_clarify"), ("n1", "fsm_nlg")]
 
 
 # ============================================================================
-# GenerateSlot: structural expansion + per-part three-layer resolution + degrade + builtin
+# Unified dedup
 # ============================================================================
 
-def test_generate_expansion_shapes_by_stage_name():
-    """Expansion shapes: FSM default / FSM+clarify / ROUTE."""
-    class _Clarify:
-        stage_name = "my_clarify"
-        def execute(self, ctx):
-            return ctx
-
-    fsm = _fsm_module()
-    names = [s.stage_name for s in resolve_stage(GenerateSlot(), _ctx(), fsm, None)]
-    assert names == ["generate_nlu_part", "generate_nlg_part"]
-
-    cl = _fsm_module(enable_clarify=True, clarify_stage=_Clarify())
-    names = [s.stage_name for s in resolve_stage(GenerateSlot(), _ctx(), cl, None)]
-    assert names == ["generate_nlu_part", "my_clarify", "generate_nlg_part"]
-
-    route = _route_module()
-    ctx = _ctx(module_code="r1")
-    names = [s.stage_name for s in resolve_stage(GenerateSlot(), ctx, route, None)]
-    # ROUTE and FSM default to the same shape: menu-node advance/jump detection is done by the
-    # chat layer after the nlu part
-    assert names == ["generate_nlu_part", "generate_nlg_part"]
-
-
-def test_generate_parts_execute_dict_from_node_layer():
-    """dict form: the nlu/nlg parts each execute the node-layer config."""
-    gen = {"nlu": _Marker("node_nlu"), "nlg": _Marker("node_nlg")}
+def test_unified_pair_same_code_executes_once():
+    u_code = _marker_code("unified")
     ctx = _ctx()
-    ctx.node_map["n1"] = BaseNode(node_code="n1", node_name="节点一",
-                                  generate=gen)
-    module = _fsm_module(generate={"nlu": _Marker("m"), "nlg": _Marker("m")})
-
-    for part in resolve_stage(GenerateSlot(), ctx, module, None):
-        part.execute(ctx)
-
-    assert ran == [("n1", "node_nlu"), ("n1", "node_nlg")]
-
-
-def test_generate_parts_single_stage_runs_once():
-    """single form: the nlu part executes the stage, the nlg part is a no-op."""
-    ctx = _ctx()
-    module = _fsm_module(generate=_Marker("unified"))
-
-    for part in resolve_stage(GenerateSlot(), ctx, module, None):
-        part.execute(ctx)
-
+    module = _fsm_module(stages={"nlu": u_code, "nlg": u_code})
+    sequence = resolve_execution_sequence(ctx, module, None)
+    slots = [slot for slot, _ in sequence]
+    assert slots == ["nlu"]  # the nlg entry dropped: unified single execution
+    for _, stage in sequence:
+        stage.execute(ctx)
     assert ran == [("n1", "unified")]
 
 
-def test_generate_invalid_node_layer_degrades_to_module():
-    """node-layer dict missing nlg (invalid) → the whole layer degrades to the module layer."""
+def test_unified_pair_via_skeleton():
+    u_code = _marker_code("unified")
     ctx = _ctx()
-    ctx.node_map["n1"] = BaseNode(node_code="n1", node_name="节点一",
-                                  generate={"nlu": _Marker("broken")})
-    module = _fsm_module(generate=_Marker("mod_unified"))
-
-    for part in resolve_stage(GenerateSlot(), ctx, module, None):
-        part.execute(ctx)
-
-    assert ran == [("n1", "mod_unified")]
-
-
-def test_generate_all_layers_empty_falls_to_builtin():
-    from atoms.stages.nlu import FSMNLU
-    from atoms.stages.nlg import FSMNLG
-    # builtin real stages would call the LLM — here we only verify class assembly, no stubbed execution:
-    names = [type(p).__name__ for p in
-             resolve_stage(GenerateSlot(), _ctx(module_code="r1"),
-                           _route_module(), None)]
-    assert names == ["_GenerateNLUPart", "_GenerateNLGPart"]
-    # FSM builtin smoke: the nlu part resolves FSMNLU (monkeypatch its execute to avoid the LLM)
-    orig = FSMNLU.execute
-    FSMNLU.execute = lambda self, ctx: ran.append(("builtin", "fsm_nlu")) or ctx
-    orig_nlg = FSMNLG.execute
-    FSMNLG.execute = lambda self, ctx: ran.append(("builtin", "fsm_nlg")) or ctx
-    try:
-        ctx = _ctx()
-        for part in resolve_stage(GenerateSlot(), ctx, _fsm_module(), None):
-            part.execute(ctx)
-    finally:
-        FSMNLU.execute = orig
-        FSMNLG.execute = orig_nlg
-    assert ran == [("builtin", "fsm_nlu"), ("builtin", "fsm_nlg")]
+    module = _fsm_module()
+    pattern = _pattern(stages=[{"nlu": u_code}, {"nlg": u_code}])
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    assert [slot for slot, _ in sequence] == ["nlu"]
+    for _, stage in sequence:
+        stage.execute(ctx)
+    assert ran == [("n1", "unified")]
 
 
-def test_generate_builtin_route_executes_route_stages():
-    """ROUTE builtin smoke: with all three layers empty, RouteNLU/RouteNLG execute (stubbed, without LLM)."""
-    from atoms.stages.nlu import RouteNLU
-    from atoms.stages.nlg import RouteNLG
-    orig_nlu = RouteNLU.execute
-    orig_nlg = RouteNLG.execute
-    RouteNLU.execute = lambda self, ctx: ran.append(("builtin", "route_nlu")) or ctx
-    RouteNLG.execute = lambda self, ctx: ran.append(("builtin", "route_nlg")) or ctx
-    try:
-        ctx = _ctx(node_code="root", module_code="r1")
-        ctx.node_map["root"] = BaseNode(node_code="root", node_name="根")
-        module = _route_module()
-        ctx.module_map = {"r1": module}
-        module.module_nodes = [ctx.node_map["root"]]
-        for part in resolve_stage(GenerateSlot(), ctx, module, None):
-            part.execute(ctx)
-    finally:
-        RouteNLU.execute = orig_nlu
-        RouteNLG.execute = orig_nlg
-    assert ran == [("builtin", "route_nlu"), ("builtin", "route_nlg")]
-
-
-def test_generate_single_same_stage_at_root_and_menu_runs_once():
-    """single-form guard (same object): root and menu layers resolve to the same single stage → executes only once."""
-    unified = _Marker("shared_unified")
-    ctx = _ctx(node_code="root")
-    ctx.node_map["root"] = BaseNode(node_code="root", node_name="根",
-                                    generate=unified)
-    ctx.node_map["menu_a"] = BaseNode(node_code="menu_a", node_name="菜单A",
-                                      generate=unified)
-    module = _route_module()
-    ctx.module_map = {"m1": module}
-
-    for part in resolve_stage(GenerateSlot(), ctx, module, None):
-        part.execute(ctx)
-
-    assert ran == [("root", "shared_unified")]
-
-
-def test_generate_single_menu_stage_skipped_until_next_turn():
-    """single is always executed once by the nlu part: after the root-layer dict's nlu runs in
-    the nlu part, the chat layer detects the menu switch (manually simulated here); the menu
-    layer is a single → the nlg part is a no-op (the menu version takes effect next turn)."""
-    ctx = _ctx(node_code="root", module_code="r1")
-    ctx.node_map["root"] = BaseNode(
-        node_code="root", node_name="根",
-        generate={"nlu": _Marker("root_nlu"), "nlg": _Marker("root_nlg")})
-    ctx.node_map["menu_a"] = BaseNode(node_code="menu_a", node_name="菜单A",
-                                      generate=_Marker("menu_unified"))
-    module = _route_module()
-    ctx.module_map = {"r1": module}
-    ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
-    module.module_nodes = [ctx.node_map["root"], ctx.node_map["menu_a"]]
-
-    parts = resolve_stage(GenerateSlot(), ctx, module, None)
-    parts[0].execute(ctx)
-    ctx.current_node_code = "menu_a"  # simulate the chat layer's jump detection advancing to the menu node
-    parts[1].execute(ctx)
-
-    # the root dict nlu runs in the nlu part; the menu single does not run this turn (root_nlg
-    # does not either — the nlg part re-resolves to the menu-layer single → no-op)
-    assert ran == [("root", "root_nlu")]
-    assert ctx.current_node_code == "menu_a"
-    # Next turn: the nlu part resolves at the menu node → the menu single takes effect
-    ctx.nlu_result = {}
-    for part in resolve_stage(GenerateSlot(), ctx, module, None):
-        part.execute(ctx)
-    assert ran == [("root", "root_nlu"), ("menu_a", "menu_unified")]
-
-
-def test_generate_pattern_layer_used_when_node_module_unset():
-    pattern = _pattern(generate=_Marker("pat_unified"))
+def test_duplicate_code_across_other_slots_keeps_first():
+    q_code = _marker_code("shared")
+    nlu_code = q_code  # same code on query and nlu: not the unified pair
     ctx = _ctx()
-    for part in resolve_stage(GenerateSlot(), ctx, _fsm_module(), pattern):
-        part.execute(ctx)
-    assert ran == [("n1", "pat_unified")]
+    module = _fsm_module(stages={"query": q_code, "nlu": nlu_code,
+                                 "nlg": _marker_code("nlg")})
+    pattern = _pattern()
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    slots = [slot for slot, _ in sequence]
+    assert "nlu" not in slots  # duplicate dropped (declaration error caught by validation)
+    assert "query" in slots
+
+
+def test_unregistered_code_skips_slot():
+    ctx = _ctx()
+    module = _fsm_module(stages={"query": "no_such_stage"})
+    pattern = _pattern(stages=[{"query": None}])  # only query in skeleton
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    assert [slot for slot, _ in sequence] == []  # unregistered → skipped
 
 
 # ============================================================================
-# ROUTE timing fix (core): the nlg part resolves after the node switch
+# e2e: skeleton via chat()
 # ============================================================================
 
-def test_route_menu_node_nlg_resolves_after_advance():
-    """ROUTE: root executes the nlu part; after the chat layer detects the menu switch (manually
-    simulated here), the nlg part resolves at the menu-node layer (core timing-fix assertion)."""
-    ctx = _ctx(node_code="root", module_code="r1")
-    ctx.node_map["root"] = BaseNode(
-        node_code="root", node_name="根",
-        generate={"nlu": _Marker("root_nlu"), "nlg": _Marker("root_nlg")})
-    ctx.node_map["menu_a"] = BaseNode(
-        node_code="menu_a", node_name="菜单A",
-        generate={"nlu": _Marker("menu_nlu"), "nlg": _Marker("menu_nlg")})
-    ctx.module_map = {"r1": _route_module()}
-    # Detection requires nlu_result to point at a valid menu node
-    ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
-    ctx.module_map["r1"].module_nodes = [
-        ctx.node_map["root"], ctx.node_map["menu_a"]]
+from unittest.mock import patch  # noqa: E402
 
-    parts = resolve_stage(GenerateSlot(), ctx, ctx.module_map["r1"], None)
-    parts[0].execute(ctx)
-    ctx.current_node_code = "menu_a"  # simulate the chat layer's jump detection advancing to the menu node
-    parts[1].execute(ctx)
-
-    # nlu came from the root layer; the node has switched; nlg comes from the menu_a layer (timing fix)
-    assert ran == [("root", "root_nlu"), ("menu_a", "menu_nlg")]
-    assert ctx.current_node_code == "menu_a"
-
-
-# ============================================================================
-# Non-slot passthrough + slot fail fast
-# ============================================================================
-
-def test_non_slot_stage_passthrough():
-    concrete = _Marker("concrete")
-    out = resolve_stage(concrete, _ctx(), _fsm_module(), None)
-    assert out == [concrete]
-
-
-def test_slot_direct_execute_raises():
-    with pytest.raises(NotImplementedError):
-        GenerateSlot().execute(_ctx())
-
-
-# ============================================================================
-# Data-layer attributes: node / module / pattern, three layers, four slots
-# ============================================================================
-
-def test_data_layer_slot_attributes():
-    from nexus.model.pattern import Pattern
-
-    gen = {"nlu": _Marker("nlu"), "nlg": _Marker("nlg")}
-    node = BaseNode(node_code="n1", generate=gen, query=_Marker("q"))
-    module = _fsm_module(generate=gen, pre_recall=_Marker("pre"))
-    pattern = Pattern(code="p1", name="t", description="t",
-                      entry_module_code="m1",
-                      modules=[_fsm_module()], generate=_Marker("pat_gen"),
-                      post_recall=_Marker("pat_post"))
-
-    assert node.generate is gen
-    assert node.query.stage_name == "q"
-    assert module.generate is gen
-    assert module.pre_recall.stage_name == "pre"
-    assert pattern.generate.stage_name == "pat_gen"
-    assert pattern.post_recall.stage_name == "pat_post"
-
-
-# ============================================================================
-# e2e: default skeleton and pattern.stages skeleton via chat()
-# ============================================================================
-
-from unittest.mock import patch
-
-from nexus.engine.session import Session
-from nexus.model.pattern import Pattern
+from nexus.engine.session import Session  # noqa: E402
 
 
 def _launch(pattern, sessions, sid="s1"):
@@ -414,10 +326,12 @@ def _chat(sessions, sid, query):
     return chat_fn(query=query, session_id=sid, all_sessions=sessions)
 
 
-def test_fsm_node_level_generate_via_default_skeleton():
-    """Node-level generate dict takes effect under the default skeleton (FSM)."""
+def test_fsm_node_level_stages_via_default_skeleton():
+    """Node-level stages take effect under the default skeleton (FSM)."""
+    f1_nlu = _marker_code("f1_nlu")
+    f1_nlg = _marker_code("f1_nlg")
     n1 = BaseNode(node_code="f1", node_name="节点一",
-                  generate={"nlu": _Marker("f1_nlu"), "nlg": _Marker("f1_nlg")})
+                  stages={"nlu": f1_nlu, "nlg": f1_nlg})
     m = FSMModule(module_code="m1", module_name="m1", module_description="d",
                   module_todo_description="t", sub_modules=[], module_nodes=[n1])
     pattern = Pattern(code="pf", name="t", description="t",
@@ -430,28 +344,28 @@ def test_fsm_node_level_generate_via_default_skeleton():
     assert ran == [("f1", "f1_nlu"), ("f1", "f1_nlg")]
 
 
-def test_route_menu_node_generate_nlg_same_turn_e2e():
-    """ROUTE e2e: the menu-node-level nlg takes effect in the same turn after jump detection
-    switches the node (timing fix).
+def test_route_menu_node_nlg_same_turn_e2e():
+    """ROUTE e2e: the menu-node-level nlg takes effect in the same turn after
+    jump detection switches the node (the ROUTE nlg resolves per current node
+    in the ordered sequence — the nlg slot sits after the nlu slot)."""
 
-    The menu has no jump_module → detection only advances the node without jumping modules;
-    the nlg part resolves at the menu layer.
-    """
+    root_nlu_code = register_stage_stub(
+        lambda: _SelectingNLU("root_nlu"))
+
     class _SelectingNLU(_Marker):
-        """Root-layer nlu: records execution and writes an nlu_result pointing at the menu node
-        (the chat layer advances nodes by next_node; isomorphic to test_llm_refresh._StubNLU)."""
-
         def execute(self, ctx):
             super().execute(ctx)
             ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
             return ctx
 
+    menu_nlu = _marker_code("menu_nlu")
+    menu_nlg = _marker_code("menu_nlg")
+    root_nlg = _marker_code("root_nlg")
+
     menu = BaseNode(node_code="menu_a", node_name="菜单A",
-                    generate={"nlu": _Marker("menu_nlu"),
-                              "nlg": _Marker("menu_nlg")})
+                    stages={"nlu": menu_nlu, "nlg": menu_nlg})
     root = BaseNode(node_code="root", node_name="根",
-                    generate={"nlu": _SelectingNLU("root_nlu"),
-                              "nlg": _Marker("root_nlg")},
+                    stages={"nlu": root_nlu_code, "nlg": root_nlg},
                     sub_nodes=["menu_a"])
     route = RouteModule(module_code="r1", module_name="r",
                         module_description="d", module_todo_description="t",
@@ -463,35 +377,42 @@ def test_route_menu_node_generate_nlg_same_turn_e2e():
     with patch("atoms.executors.loop_executor.build_provider"):
         _chat(sessions, "s1", "选A")
 
-    # root turn: nlu uses the root layer; after detection switches to menu_a, nlg uses the menu
-    # layer (the timing-fix point)
+    # root turn: nlu from the root layer; after detection switches to menu_a,
+    # nlg resolves at the menu layer (the timing-fix point: the nlg slot
+    # executes after the node switch)
     assert ran == [("root", "root_nlu"), ("menu_a", "menu_nlg")]
-    # No jump_module → no module jump; reset back to root at end of turn
     assert sessions["s1"].cxt.current_module_code == "r1"
 
 
 def test_route_menu_jump_module_silent_dispatch_e2e():
-    """ROUTE e2e: the menu node configures jump_module → detection interrupts the remaining
-    stages (source module goes silent, nlg does not execute); the chat-layer hop consumes the
-    jump and the target module continues in the same turn."""
+    """ROUTE e2e: the menu node configures jump_module → detection interrupts
+    the remaining stages (source module goes silent, nlg does not execute);
+    the chat-layer hop consumes the jump and the target module continues in
+    the same turn."""
+
     class _SelectingNLU(_Marker):
         def execute(self, ctx):
             super().execute(ctx)
             ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
             return ctx
 
+    root_nlu_code = register_stage_stub(lambda: _SelectingNLU("root_nlu"))
+    menu_nlu = _marker_code("menu_nlu")
+    menu_nlg = _marker_code("menu_nlg")
+    root_nlg = _marker_code("root_nlg")
+    f1_nlu = _marker_code("f1_nlu")
+    f1_nlg = _marker_code("f1_nlg")
+
     menu = BaseNode(node_code="menu_a", node_name="菜单A", jump_module="m1",
-                    generate={"nlu": _Marker("menu_nlu"),
-                              "nlg": _Marker("menu_nlg")})
+                    stages={"nlu": menu_nlu, "nlg": menu_nlg})
     root = BaseNode(node_code="root", node_name="根",
-                    generate={"nlu": _SelectingNLU("root_nlu"),
-                              "nlg": _Marker("root_nlg")},
+                    stages={"nlu": root_nlu_code, "nlg": root_nlg},
                     sub_nodes=["menu_a"])
     route = RouteModule(module_code="r1", module_name="r",
                         module_description="d", module_todo_description="t",
                         sub_modules=["m1"], module_nodes=[root, menu])
     f1 = BaseNode(node_code="f1", node_name="节点一",
-                  generate={"nlu": _Marker("f1_nlu"), "nlg": _Marker("f1_nlg")})
+                  stages={"nlu": f1_nlu, "nlg": f1_nlg})
     fsm = FSMModule(module_code="m1", module_name="m1",
                     module_description="d", module_todo_description="t",
                     sub_modules=[], module_nodes=[f1])
@@ -502,34 +423,18 @@ def test_route_menu_jump_module_silent_dispatch_e2e():
     with patch("atoms.executors.loop_executor.build_provider"):
         reply = _chat(sessions, "s1", "选A")
 
-    # After root nlu, menu_a.jump_module=m1 is detected → interrupt (root_nlg/menu_nlg do not run)
-    # m1 continues in the same turn: f1's nlu/nlg
     assert ran == [("root", "root_nlu"), ("f1", "f1_nlu"), ("f1", "f1_nlg")]
     assert sessions["s1"].cxt.current_module_code == "m1"
 
 
-def test_pattern_stages_verbatim_and_mixed_slots():
-    """Concrete pattern.stages stages run verbatim; GenerateSlot still resolves three layers (node-level hit)."""
-    class _Fixed:
-        def __init__(self, name):
-            self.stage_name = name
-
-        def execute(self, ctx):
-            ran.append((ctx.current_node_code, self.stage_name))
-            if self.stage_name == "pre":
-                ctx.nlu_result = {"next_node": "", "slots": {}}
-            return ctx
-
-    n1 = BaseNode(node_code="f1", node_name="节点一",
-                  generate=_Marker("node_gen"))
-    m = FSMModule(module_code="m1", module_name="m1", module_description="d",
-                  module_todo_description="t", sub_modules=[], module_nodes=[n1])
-    pattern = Pattern(code="pm", name="t", description="t",
-                      entry_module_code="m1", modules=[m])
-    pattern.stages = [_Fixed("pre"), GenerateSlot()]
-    sessions = {}
-    _launch(pattern, sessions)
-    with patch("atoms.executors.loop_executor.build_provider"):
-        reply = _chat(sessions, "s1", "你好")
-
-    assert ran == [("f1", "pre"), ("f1", "node_gen")]
+def test_pattern_skeleton_subset_runs_verbatim():
+    """A pattern declaring only [query, nlu] skips the recall/clarify/nlg
+    slots entirely (skeleton shape is the author's choice — nlg absent from
+    the skeleton gets no builtin tail; only skeleton-declared slots do)."""
+    q_code = _marker_code("q")
+    nlu_code = _marker_code("nlu")
+    pattern = _pattern(stages=[{"query": q_code}, {"nlu": nlu_code}])
+    ctx = _ctx()
+    module = _fsm_module()
+    sequence = resolve_execution_sequence(ctx, module, pattern)
+    assert [slot for slot, _ in sequence] == ["query", "nlu"]
