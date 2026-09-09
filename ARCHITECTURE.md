@@ -180,9 +180,37 @@ agents.py 现仅为过渡性 re-export。
 | `apps/<name>/` | 业务 pattern（route.py）+ prompt 资产 + 渠道适配 |
 | `host/` | main.py / cli.py / governor.py / config/ |
 
+## Pattern 序列化与校验（计划③引入）
+
+### yml round-trip（`nexus/model/serialization.py`）
+
+- `pattern_to_dict / pattern_from_dict / pattern_to_yaml / pattern_from_yaml`
+- dict/yml 形状镜像构造参数（type: agent/fsm/route → 对应子类；nodes 内嵌
+  modules；jump_module 按可选属性带出）
+- `from_*` 走完整构造路径（normalize_skeleton + 图校验 fail-fast 照跑）；
+  **加载后校验是调用方责任**（CLI pattern-load 与 host 装配都会做）
+- CLI：`python -m host.cli pattern-export <code> --out f.yml` /
+  `pattern-load f.yml [--validate-only]`
+
+### 校验体系（`nexus/model/validation.py`）
+
+- `validate_base_info`：code/name/entry_module_code 非空且可解析、
+  module_code 唯一（原来 module_map 静默覆盖）、FSM/ROUTE ≥1 节点、
+  node_code 模块内唯一；name 缺失 = 软警告（仅日志）
+- `validate_plugin_declarations`：executor/stages/messages_builder/
+  agent_hooks 的字符串 code 经 `has()` 可解析（不实例化）；module/node
+  stages 声明的槽位必须存在于 pattern 骨架；stage code 唯一性（nlu/nlg
+  同 code 的 unified 形态是唯一合法重复）
+- `validate_pattern`：**收集全部错误一次性 raise 编号 ValueError**
+- 调用时机：host startup `_validate_registered_patterns`（发现预热后，
+  失败 SystemExit）+ CLI pattern-load
+- Pattern.__init__ 的图校验（悬边/自环/越权）不重复，保持原位
+
 ## 变更记录
 
 - 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
   详见 `docs/refactor-notes/plan-1.md`。
 - 计划②（2026-09-09）：模型声明式重构（stages 体系 + ModuleLink→dict +
   callable 字段 str 化）。详见 `docs/refactor-notes/plan-2.md`。
+- 计划③（2026-09-09）：pattern yml round-trip + 校验体系。详见
+  `docs/refactor-notes/plan-3.md`。

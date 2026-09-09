@@ -164,6 +164,22 @@ def _init_store() -> None:
         store = None
 
 
+def _validate_registered_patterns() -> None:
+    """Assembly-time validation (plan-③): every registered pattern passes
+    base-info + plugin-declaration checks. Runs after the discovery warm-ups
+    so plugin codes resolvable; a failure is a declaration bug, fail loudly
+    (startup refuses to serve a mis-declared pattern set)."""
+    from nexus.model.validation import validate_pattern
+
+    for code in pattern_registry.list_codes():
+        pattern = pattern_registry.get(code)
+        try:
+            validate_pattern(pattern)
+        except ValueError as e:
+            raise SystemExit(f"pattern 声明校验失败（启动终止）: {e}") from e
+    logger.info("pattern 校验通过: %d 个", len(pattern_registry.list_codes()))
+
+
 @app.on_event("startup")
 def _startup_persistence() -> None:
     """Service startup: initialize the session store + restore non-expired sessions + cross-check pattern_llm."""
@@ -181,6 +197,7 @@ def _startup_persistence() -> None:
     except Exception:
         logger.exception("初始化知识库失败，知识工具将在首次调用时重试")
     _cross_check_pattern_llm()
+    _validate_registered_patterns()
 
 
 @app.on_event("shutdown")

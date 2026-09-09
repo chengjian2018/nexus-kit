@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import fire
@@ -880,6 +881,52 @@ def knowledge_seed(scope: str = "xianyu:demo") -> None:
         close_knowledge_store()
 
 
+def pattern_export(pattern: str, out: str = "") -> None:
+    """Export a registered pattern to YAML (plan-③ round-trip).
+
+    Args:
+        pattern: pattern code (must be registered)
+        out: output file path; prints to stdout when omitted
+    """
+    _ensure_discovery()
+    p = pattern_registry.get(pattern)
+    if p is None:
+        print(red(f"pattern '{pattern}' 未注册"))
+        sys.exit(1)
+    from nexus.model.serialization import pattern_to_yaml
+    text = pattern_to_yaml(p)
+    if out:
+        Path(out).write_text(text, encoding="utf-8")
+        print(green(f"已导出 {pattern} → {out}"))
+    else:
+        print(text)
+
+
+def pattern_load(path: str, validate_only: bool = False) -> None:
+    """Load a pattern from a YAML file: construct → validate → register.
+
+    Args:
+        path: YAML file path
+        validate_only: only construct+validate, do not register
+    """
+    _ensure_discovery()
+    from nexus.model.serialization import pattern_from_yaml
+    from nexus.model.validation import validate_pattern
+
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        p = pattern_from_yaml(text)
+        validate_pattern(p)
+    except ValueError as e:
+        print(red(f"加载失败:\n{e}"))
+        sys.exit(1)
+    if validate_only:
+        print(green(f"校验通过: {p.code}（未注册）"))
+        return
+    pattern_registry.register(p)
+    print(green(f"已加载并注册 pattern: {p.code}（modules={len(p.module_map)}）"))
+
+
 if __name__ == "__main__":
     sys.argv[1:] = _expand_short_verbose(sys.argv[1:])
     fire.Fire({
@@ -888,4 +935,6 @@ if __name__ == "__main__":
         "list": list_cmd,
         "sessions": sessions,
         "knowledge-seed": knowledge_seed,
+        "pattern-export": pattern_export,
+        "pattern-load": pattern_load,
     })
