@@ -206,6 +206,32 @@ agents.py 现仅为过渡性 re-export。
   失败 SystemExit）+ CLI pattern-load
 - Pattern.__init__ 的图校验（悬边/自环/越权）不重复，保持原位
 
+## Agent hooks（计划④后状态：机制保留，默认 no-op）
+
+7 个点位（P1 on_agent_start / P2 on_llm_call / P3 on_llm_response /
+P4 on_tool_call / P5 on_tool_result / P6 on_transfer / P7 on_agent_end）
+在默认 loop executor 中照常调用；事件类、分发器签名、声明解析（str
+code / callable / legacy dict 三形态）完整保留于
+`nexus/engine/agent_hooks.py`。
+
+**当前无任何 in-repo hooks 包**——无声明时所有点位零开销直通，这是唯一
+受测契约（`tests/test_agent_hooks_contract.py`，13 用例）。恢复实现：注册
+kind="agent_hooks" 插件包 + 从 git 历史恢复行为测试（计划④删除了 35 个
+行为用例，4 个非 hooks 主Flow 的 loop 守卫用例迁移到
+`tests/test_loop_tool_guards.py` 保留）。
+
+| 点位 | 事件 | 语义（实现恢复后） |
+|---|---|---|
+| P1 | AgentStartEvent | 注入：返回 Optional[str] 片段 → builder 的 extra_blocks |
+| P2 | LLMCallEvent | 观察：每次 LLM 调用前（messages 只读） |
+| P3 | LLMResponseEvent | 观察：每次 LLM 响应后 |
+| P4 | ToolCallEvent | 改写：Optional[RewriteToolCall]（name/args，allowed_names 守卫） |
+| P5 | ToolResultEvent | 改写：Optional[str]（结果字符串） |
+| P6 | TransferEvent | 观察：transfer 命中写跳转事件时 |
+| P7 | AgentEndEvent | 观察：出口（reply / transfer / max_rounds） |
+
+错误语义（保留契约）：hook 异常一律吞掉记日志保原值，对话永不阻塞。
+
 ## 变更记录
 
 - 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
@@ -214,3 +240,5 @@ agents.py 现仅为过渡性 re-export。
   callable 字段 str 化）。详见 `docs/refactor-notes/plan-2.md`。
 - 计划③（2026-09-09）：pattern yml round-trip + 校验体系。详见
   `docs/refactor-notes/plan-3.md`。
+- 计划④（2026-09-09）：hooks 清理 + 默认置空。详见
+  `docs/refactor-notes/plan-4.md`。

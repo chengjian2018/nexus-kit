@@ -1,28 +1,48 @@
-"""Agent loop hooks — run_agent's multi-point additive extension mechanism (hook-point events + declaration parsing + dispatcher).
+"""Agent loop hooks — hook-point events + declaration parsing + dispatcher.
 
-Positioning (boundary with the existing extension points, see docs/plans/2026-09-04-agent-loop-hooks.md):
-- hooks = **additive across points**: N hooks on the same point run in declaration order, not mutually exclusive;
-  replacing messages belongs to ``module.messages_builder`` (final artifact, hooks read-only),
-  swapping the whole executor belongs to ``AgentRunner`` — this mechanism provides no second replacement path.
-- Capability level = ② mutation: can rewrite tool calls (name/args) and tool results, and can inject
-  system prompt fragments; **no ③ control** (cannot intercept/drop calls/forge transfers —
-  interception of illegal calls is the loop main flow's deterministic validation, not a hook decision).
+**Status (plan-④): mechanism retained, default no-op.** The 7 loop points
+stay wired (see atoms/executors/loop_executor.py) and this module keeps the
+event classes, the dispatcher signatures, and the declaration resolution —
+but no hooks package ships in-repo and the tested contract is exactly
+"declared nothing → every point is a zero-overhead pass-through". Reviving
+the implementation later only needs hooks packages registered under
+kind="agent_hooks" (plus behavioral tests — the pre-plan-④ behavioral suite
+lives in git history).
 
-Declaration (pattern level; a module-level declaration replaces it wholesale, no merge — same semantics as stage slots)::
+Point inventory (P1-P7, consumed at the loop's hook points):
 
-    pattern.agent_hooks = {
-        "on_agent_start":  [fetch_shop_data],   # P1 returns an Optional[str] fragment
-        "on_tool_call":    [fix_tool_alias],    # P4 returns Optional[RewriteToolCall]
-        "on_tool_result":  [redact_secrets],    # P5 returns Optional[str]
-        ...
-    }
+===== ================ =====================================================
+Point Event            Semantics (when implemented)
+===== ================ =====================================================
+P1    on_agent_start   inject: returns Optional[str] fragments, appended as
+                        extension-context blocks by the messages builder
+P2    on_llm_call      observe: before each LLM call (messages read-only)
+P3    on_llm_response  observe: after each LLM response
+P4    on_tool_call     mutate: returns Optional[RewriteToolCall]
+                        (name/args rewrite, guarded by allowed_names)
+P5    on_tool_result   mutate: returns Optional[str] (result rewrite)
+P6    on_transfer      observe: transfer hit writes a jump event
+P7    on_agent_end     observe: exits (reply / transfer / max_rounds)
+===== ================ =====================================================
 
-Error semantics (defensive): hook exceptions are always swallowed, logged, and the original value kept; the dialogue is never blocked;
-a mutating hook failing = continue with the value as it was before entering the chain.
+Declaration (pattern level; a module-level declaration replaces it
+wholesale, no merge — same semantics as the stage slots). Forms: a plugin
+code string (kind="agent_hooks", resolving to the map or a zero-arg factory
+of it — the plan-② declarative form), a zero-arg callable returning the
+map, or the inline legacy dict::
 
-Read-only discipline (docstring convention; the framework does not deep-copy — copying messages every
-turn is disproportionate): ``AgentStartEvent.cxt`` and ``LLMCallEvent.messages`` are passed by reference;
-hooks must not modify them in place; requests to change messages go through messages_builder.
+    pattern.agent_hooks = "my_hooks_pkg"
+    # or inline: {"on_tool_call": [fix_tool_alias], ...}
+
+Error semantics (defensive, part of the retained contract): hook exceptions
+are always swallowed, logged, and the original value kept; the dialogue is
+never blocked; a mutating hook failing = continue with the value as it was
+before entering the chain.
+
+Boundary with the sibling extension points: replacing the final messages
+belongs to messages_builder; swapping the whole executor belongs to the
+executor plugin — hooks are additive observation/mutation, never a second
+replacement path.
 """
 
 from __future__ import annotations
