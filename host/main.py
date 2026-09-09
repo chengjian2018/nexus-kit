@@ -432,6 +432,76 @@ def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
     )
 
 
+# func2b (debug-only, env-gated): streaming chat via SSE
+def _chat_dialogue_stream(chat_request: ChatRequest):
+    """SSE debug endpoint for the plan-⑤ streaming protocol.
+
+    Mounted only when NEXUS_STREAM_DEBUG=1 — a debugging/observability tool,
+    not a production API (the sync generator holds the request thread for
+    the whole turn; production front-ends should aggregate server-side
+    until an async provider path exists).
+
+    Event stream (text/event-stream, one JSON payload per line):
+        data: {"kind": "delta", "text": "..."}
+        data: {"kind": "round", "round_info": {...}}
+        data: {"kind": "done", "result": {"text": "...", "actions": [...]}}
+    """
+    import json as _json
+
+    from nexus.engine.chat import chat_turn_stream
+
+    session = _get_session(chat_request.session_id)
+    if session is None:
+        return fastapi.responses.JSONResponse(
+            status_code=404,
+            content={"code": "404", "status": False,
+                     "message": f"session_id '{chat_request.session_id}' 不存在或已过期"},
+        )
+
+    def _gen():
+        try:
+            with session.turn_lock:
+                gen = chat_turn_stream(
+                    query=chat_request.query,
+                    session_id=chat_request.session_id,
+                    all_sessions=governor.sessions,
+                    store=store,
+                )
+                result = None
+                for event in gen:
+                    if event.kind == "done":
+                        result = event.result
+                        yield "data: " + _json.dumps({
+                            "kind": "done",
+                            "result": {"text": result.text,
+                                       "actions": result.actions},
+                        }, ensure_ascii=False) + "\n\n"
+                    elif event.kind == "round":
+                        yield "data: " + _json.dumps({
+                            "kind": "round",
+                            "round_info": event.round_info,
+                        }, ensure_ascii=False) + "\n\n"
+                    else:
+                        yield "data: " + _json.dumps({
+                            "kind": "delta", "text": event.text,
+                        }, ensure_ascii=False) + "\n\n"
+                del result
+        except Exception:
+            logger.exception("流式对话异常")
+            yield "data: " + _json.dumps({
+                "kind": "error", "message": "对话处理异常，请稍后重试",
+            }, ensure_ascii=False) + "\n\n"
+
+    return fastapi.responses.StreamingResponse(
+        _gen(), media_type="text/event-stream")
+
+
+if os.getenv("NEXUS_STREAM_DEBUG", "") == "1":
+    # Env-gated mount: the SSE debug endpoint exists only when explicitly
+    # requested (keep the production surface minimal)
+    app.post("/api/v1/chat/stream")(_chat_dialogue_stream)
+
+
 # ----Channel wiring (external message sources -> engine ops)----
 # AST-discovers the declarative channels in atoms/channels/*.py and apps/*/
 # (token / default pattern come from each channel's declared env vars,

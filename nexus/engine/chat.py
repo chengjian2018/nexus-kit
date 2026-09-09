@@ -447,16 +447,17 @@ def _resolve_executor_code(session: Session, module):
     return plugin_registry.default_executor_code(type_key)
 
 
-def _handle_module(session: Session, module, force_close: bool = False
+def _handle_module(session: Session, module, force_close: bool = False,
+                   stream=None,
                    ) -> TurnResult:
     """Dispatch single-module single-turn handling via the executor plugin.
 
     The ModuleType hard-coded dispatch is gone: the executor is resolved
     from the plugin registry (module.executor > pattern.executor_<type> >
     type default), and each executor receives an ExecutionContext (cxt /
-    pattern / module / force_close). The default implementations live in
-    atoms/executors/ — the kernel holds no default executor, so an un-warmed
-    registry fails fast with a pointer to atoms.executors (same
+    pattern / module / force_close / stream). The default implementations
+    live in atoms/executors/ — the kernel holds no default executor, so an
+    un-warmed registry fails fast with a pointer to atoms.executors (same
     kernel-purity pattern as pipeline.register_default_generate).
     """
     ec = ExecutionContext(
@@ -464,35 +465,37 @@ def _handle_module(session: Session, module, force_close: bool = False
         pattern=session.pattern,
         module=module,
         force_close=force_close,
+        stream=stream,
     )
     executor = plugin_registry.resolve(
         "executor", _resolve_executor_code(session, module))
     return executor.execute(ec)
 
 
-def chat_turn(
+def chat_turn_stream(
         query: str,
         session_id: str,
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
-) -> ChatResult:
-    """Process one user dialogue turn, returning the full output (text +
-    reserved actions).
+):
+    """Generator form of chat_turn (plan-⑤): yields ChatStreamEvent objects
+    (delta / round / done), the final done event carrying the complete
+    ChatResult. See nexus/engine/streaming.py for the protocol and the
+    optimistic-forwarding caveat.
 
-    1. Locate the session by session_id, reset cxt at start of turn
-       (lifecycle.begin_turn)
-    2. Validate the pattern / entry module, resolve the LLM config (R1)
-    3. Same-turn hop loop (max_hops): dispatch handling by module type;
-       consume the ModuleJumpEvents in cxt.actions → reroute to the target
-       module to continue the reply in the same turn; exceeding the hop
-       budget forces a force_close close-out
-    4. End of turn: append to history (lifecycle.end_turn), snapshot the
-       output into ChatResult
-
-    ``store`` is consumed by history compression (None skips it); message
-    persistence is done per message by the message_sink attached at
-    launch/restore time and does not go through this parameter.
+    The turn orchestration is identical to the pre-streaming chat_turn (the
+    docstring below is retained verbatim); the only additions are the
+    StreamEmitter injection (executors forward deltas into it) and the
+    drain-and-yield after each module execution.
     """
+    from nexus.engine.streaming import ChatStreamEvent, StreamEmitter
+
+    emitter = StreamEmitter()
+
+    def _finish(text: str) -> ChatResult:
+        _lifecycle.end_turn(session.cxt, text)
+        return build_chat_result(text, session.cxt)
+
     # ------------------------------------------------------------------
     # 1. Locate the session; start-of-turn reset (user_query overwrite +
     #    per-turn fields zeroed — exactly once, before hopping)
@@ -500,14 +503,17 @@ def chat_turn(
     session = all_sessions.get(session_id)
     if session is None:
         logger.warning("会话不存在: %s", session_id)
-        return ChatResult(text="会话不存在，请先发起对话任务")
+        yield ChatStreamEvent(kind="done", result=ChatResult(
+            text="会话不存在，请先发起对话任务"))
+        return
 
     _lifecycle.begin_turn(session.cxt, query)
 
     pattern = session.pattern
     if pattern is None:
         logger.warning("会话 %s 未绑定对话模板", session_id)
-        return ChatResult(text="对话模板未配置")
+        yield ChatStreamEvent(kind="done", result=_finish("对话模板未配置"))
+        return
 
     # ------------------------------------------------------------------
     # 2. Locate the entry module (cxt.current_module_code first, fall back
@@ -516,7 +522,8 @@ def chat_turn(
     current_module_code = session.cxt.current_module_code or pattern.entry_module_code
     if not current_module_code:
         logger.warning("会话 %s 未找到入口模块", session_id)
-        return ChatResult(text="入口模块未配置")
+        yield ChatStreamEvent(kind="done", result=_finish("入口模块未配置"))
+        return
 
     # Write back to cxt: stages and transitions (jump detection /
     # _fsm_node_transition) both read the current position from cxt
@@ -525,7 +532,9 @@ def chat_turn(
     current_module = pattern.module_map.get(current_module_code)
     if current_module is None:
         logger.warning("模块不存在: %s", current_module_code)
-        return ChatResult(text=f"模块 '{current_module_code}' 不存在")
+        yield ChatStreamEvent(
+            kind="done", result=_finish(f"模块 '{current_module_code}' 不存在"))
+        return
 
     session.cxt.metadata["pattern_code"] = session.pattern_code
 
@@ -534,7 +543,9 @@ def chat_turn(
         _refresh_llm_config(session)
     except Exception as e:
         logger.error("加载 LLM 配置失败: %s", e)
-        return ChatResult(text=f"LLM 配置加载失败: {e}")
+        yield ChatStreamEvent(
+            kind="done", result=_finish(f"LLM 配置加载失败: {e}"))
+        return
 
     # History compression (silently skipped when the store is disabled /
     # threshold is 0 / too few messages; summarizes with the llm_config R1
@@ -554,7 +565,8 @@ def chat_turn(
             current_module = pattern.module_map[
                 session.cxt.current_module_code or pattern.entry_module_code
             ]
-            result = _handle_module(session, current_module)
+            result = _handle_module(session, current_module, stream=emitter)
+            yield from emitter.drain()
 
             event = _jumps.pop(session.cxt)
             if event is None:
@@ -575,7 +587,9 @@ def chat_turn(
             current_module = pattern.module_map[
                 session.cxt.current_module_code or pattern.entry_module_code
             ]
-            result = _handle_module(session, current_module, force_close=True)
+            result = _handle_module(session, current_module,
+                                    force_close=True, stream=emitter)
+            yield from emitter.drain()
             response = result.content or ""
     except Exception as e:
         logger.exception("对话处理异常: session=%s", session_id)
@@ -586,9 +600,23 @@ def chat_turn(
     # 4. End of turn: append the assistant message to history
     #    (incremental), snapshot the output
     # ------------------------------------------------------------------
-    _lifecycle.end_turn(session.cxt, response)
+    yield ChatStreamEvent(kind="done", result=_finish(response))
 
-    return build_chat_result(response, session.cxt)
+
+def chat_turn(
+        query: str,
+        session_id: str,
+        all_sessions: Dict[str, Session],
+        store: Optional["SessionStore"] = None,
+) -> ChatResult:
+    """Process one user dialogue turn, returning the full output (text +
+    reserved actions). Aggregates chat_turn_stream (plan-⑤) — behavior
+    identical to the pre-streaming implementation; see that generator's
+    docstring for the turn steps.
+    """
+    from nexus.engine.streaming import aggregate_turn
+    return aggregate_turn(chat_turn_stream(query, session_id, all_sessions,
+                                           store=store))
 
 
 # ---------------------------------------------------------------------------

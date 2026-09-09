@@ -116,16 +116,23 @@ class DefaultLoopExecutor(ModuleExecutor):
                     session_id=cxt.session_id, module_code=module.module_code,
                     round_idx=round_idx, messages=messages, model=model))
 
+            # Plan-⑤: stream each round natively; aggregate the chunks into
+            # this round's complete result (tool dispatch needs the merged
+            # tool_calls), forwarding text deltas optimistically (the wire
+            # finish_reason only arrives at a round's end, so a later round
+            # may turn out to be the real reply — round events carry the
+            # outcome; done is authoritative)
             if tools:
-                result = provider.chat_completion(
-                    messages=messages, model=model, temperature=temperature,
-                    max_tokens=max_tokens, tools=tools, tool_choice="auto",
+                round_result = _stream_round(
+                    provider, messages, model, temperature, max_tokens,
+                    ec.stream, tools=tools,
                 )
             else:
-                result = provider.chat_completion(
-                    messages=messages, model=model, temperature=temperature,
-                    max_tokens=max_tokens,
+                round_result = _stream_round(
+                    provider, messages, model, temperature, max_tokens,
+                    ec.stream,
                 )
+            result = round_result
 
             content = result.get("content", "") or ""
             tool_calls = result.get("tool_calls", []) or []
@@ -141,6 +148,7 @@ class DefaultLoopExecutor(ModuleExecutor):
             # No tool calls -> inject primitive: answer directly
             if not tool_calls:
                 logger.info("Agent loop 完成，共 %d 轮", round_idx + 1)
+                _emit_round(ec.stream, "final", round_idx)
                 # P7 on_agent_end: direct-answer exit
                 if hooks:
                     fire(hooks, "on_agent_end", AgentEndEvent(
@@ -222,6 +230,7 @@ class DefaultLoopExecutor(ModuleExecutor):
                         module_code=module.module_code,
                         rounds=round_idx + 1, outcome="transfer",
                         transfer_target=target))
+                _emit_round(ec.stream, "transfer", round_idx)
                 return TurnResult()
 
             # Ordinary tool calls: P4 rewrite -> main-flow validation -> execute
@@ -229,6 +238,7 @@ class DefaultLoopExecutor(ModuleExecutor):
             _dispatch_tool_calls(
                 cxt, module, messages, content, tool_calls,
                 hooks, allowed_names, lent_by, round_idx)
+            _emit_round(ec.stream, "tool", round_idx)
 
         logger.warning(
             "Agent loop 达到最大轮次 %d，强制终止: session=%s",
@@ -240,7 +250,53 @@ class DefaultLoopExecutor(ModuleExecutor):
                 session_id=cxt.session_id, module_code=module.module_code,
                 rounds=_MAX_TOOL_ROUNDS, outcome="max_rounds",
                 reply="抱歉，处理超时，请稍后重试。"))
+        _emit_round(ec.stream, "max_rounds", _MAX_TOOL_ROUNDS - 1)
         return TurnResult(content="抱歉，处理超时，请稍后重试。")
+
+
+# ---------------------------------------------------------------------------
+# Plan-⑤ streaming helpers
+# ---------------------------------------------------------------------------
+
+def _stream_round(provider, messages, model, temperature, max_tokens,
+                  stream_emitter, tools=None):
+    """One agent-loop LLM round, streamed: consume LLMChunks, forward text
+    deltas optimistically (when an emitter is attached), and aggregate the
+    round into the legacy dict (tool dispatch needs merged tool_calls).
+
+    Duck-typed providers without ``chat_completion_stream`` (test stubs /
+    legacy custom providers) fall back to ``chat_completion`` — no deltas
+    forwarded, the result shape is identical."""
+    from nexus.llm.aggregate import collect_stream
+
+    kwargs = {}
+    if tools:
+        kwargs = {"tools": tools, "tool_choice": "auto"}
+
+    if not hasattr(provider, "chat_completion_stream"):
+        return provider.chat_completion(
+            messages=messages, model=model, temperature=temperature,
+            max_tokens=max_tokens, **kwargs)
+
+    chunks = provider.chat_completion_stream(
+        messages=messages, model=model, temperature=temperature,
+        max_tokens=max_tokens, **kwargs)
+    if stream_emitter is None:
+        return collect_stream(chunks)
+
+    def _tap():
+        for chunk in chunks:
+            if chunk.text:
+                stream_emitter.emit_delta(chunk.text)
+            yield chunk
+
+    return collect_stream(_tap())
+
+
+def _emit_round(stream_emitter, outcome: str, round_idx: int) -> None:
+    """Emit a round-boundary event (no-op without an attached emitter)."""
+    if stream_emitter is not None:
+        stream_emitter.emit_round(outcome, round_idx)
 
 
 from nexus.engine.loop import run_agent  # noqa: E402,F401 -- test anchor re-export

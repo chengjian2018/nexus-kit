@@ -10,6 +10,9 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Generator, List, Optional
 
+from nexus.llm.aggregate import collect_stream
+from nexus.llm.types import LLMChunk
+
 
 class ProviderEntry:
     """Metadata for a single registered LLM provider."""
@@ -94,8 +97,8 @@ class ProviderEntry:
         temperature: float = 0.7,
         max_tokens: int = 2048,
         **kwargs,
-    ) -> Generator[str, None, None]:
-        """Convenience: instantiate and stream the response chunk by chunk."""
+    ) -> Generator["LLMChunk", None, None]:
+        """Convenience: instantiate and stream the response (LLMChunk objects)."""
         provider = self.instantiate()
         yield from provider.chat_completion_stream(
             messages=messages,
@@ -180,10 +183,15 @@ class BaseLLMProvider(ABC):
         stream: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Public entry point for chat-completion requests.
+        """Public entry point for chat-completion requests (plan-⑤: an
+        aggregated streaming call).
 
-        Validates inputs, resolves the model, and delegates to
-        ``_chat_completion_impl``.
+        Validates inputs, resolves the model, streams via
+        ``_chat_completion_stream_impl`` and aggregates the LLMChunks into
+        the legacy dict shape (llm/aggregate.py::collect_stream) — streaming
+        is the default wire form; non-streaming is its aggregation. The
+        ``stream`` parameter is accepted for call-site compatibility and no
+        longer changes the code path (the result is identical either way).
         """
         if not messages:
             raise ValueError("messages must be a non-empty list")
@@ -194,14 +202,14 @@ class BaseLLMProvider(ABC):
                 f"No model specified and provider '{self.code}' has no default_model"
             )
 
-        return self._chat_completion_impl(
+        chunks = self._chat_completion_stream_impl(
             messages=messages,
             model=resolved_model,
             temperature=temperature,
             max_tokens=max_tokens,
-            stream=stream,
             **kwargs,
         )
+        return collect_stream(chunks)
 
     @abstractmethod
     def _chat_completion_impl(
@@ -213,15 +221,18 @@ class BaseLLMProvider(ABC):
         stream: bool,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Provider-specific implementation of a chat-completion call.
+        """Provider-specific implementation of a NON-STREAMING call.
 
-        Must return a dict with at least ``{"content": str}``.
-        May also include ``{"usage": {...}, "model": str, ...}``.
+        Plan-⑤ role: the fallback behind the default stream bridge (providers
+        that do not override ``_chat_completion_stream_impl`` get their
+        non-streaming result wrapped as a single-chunk stream). Must return a
+        dict with at least ``{"content": str}``; may also include
+        ``{"tool_calls": [...], "usage": {...}, "finish_reason": str}``.
         """
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # Streaming API
+    # Streaming API (the native form since plan-⑤)
     # ------------------------------------------------------------------
 
     def chat_completion_stream(
@@ -231,13 +242,16 @@ class BaseLLMProvider(ABC):
         temperature: float = 0.7,
         max_tokens: int = 2048,
         **kwargs,
-    ) -> Generator[str, None, None]:
-        """Stream chat-completion response, yielding content chunks as they arrive.
+    ) -> Generator["LLMChunk", None, None]:
+        """Stream chat-completion response, yielding LLMChunk objects
+        (structured deltas — text / tool_call fragments / finish_reason /
+        usage; see llm/types.py).
 
         Usage::
 
             for chunk in provider.chat_completion_stream(messages):
-                print(chunk, end="", flush=True)
+                if chunk.text:
+                    print(chunk.text, end="", flush=True)
         """
         if not messages:
             raise ValueError("messages must be a non-empty list")
@@ -263,10 +277,14 @@ class BaseLLMProvider(ABC):
         temperature: float,
         max_tokens: int,
         **kwargs,
-    ) -> Generator[str, None, None]:
-        """Provider-specific streaming implementation. Override in subclasses.
+    ) -> Generator["LLMChunk", None, None]:
+        """Provider-specific streaming implementation. Override in subclasses
+        to stream natively (yield LLMChunk).
 
-        Default: falls back to non-streaming, yielding the whole content at once.
+        Default bridge: wrap the legacy non-streaming result as a single
+        chunk (text + tool_calls + finish_reason + usage) — providers that
+        only implement ``_chat_completion_impl`` (e.g. the offline
+        FakeProvider) survive plan-⑤ unchanged.
         """
         result = self._chat_completion_impl(
             messages=messages,
@@ -276,7 +294,12 @@ class BaseLLMProvider(ABC):
             stream=False,
             **kwargs,
         )
-        yield result["content"]
+        yield LLMChunk(
+            text=result.get("content", "") or "",
+            tool_calls=result.get("tool_calls", []) or [],
+            finish_reason=result.get("finish_reason", ""),
+            usage=result.get("usage", {}) or {},
+        )
 
     # ------------------------------------------------------------------
     # Connectivity

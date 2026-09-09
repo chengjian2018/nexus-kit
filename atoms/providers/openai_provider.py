@@ -13,6 +13,7 @@ from typing import Any, Dict, Generator, List, Optional
 import requests
 
 from nexus.llm.provider import BaseLLMProvider
+from nexus.llm.types import LLMChunk
 from nexus.registry.providers import registry
 
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         )
 
     # ------------------------------------------------------------------
-    # Streaming
+    # Streaming (native, plan-⑤: yields structured LLMChunks)
     # ------------------------------------------------------------------
 
     def _chat_completion_stream_impl(
@@ -142,8 +143,19 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         temperature: float,
         max_tokens: int,
         **kwargs,
-    ) -> Generator[str, None, None]:
-        """Stream chat-completion response via SSE, yielding content chunks."""
+    ) -> Generator["LLMChunk", None, None]:
+        """Stream chat-completion response via SSE, yielding LLMChunk
+        objects (text deltas / tool_call fragments / finish_reason / usage).
+
+        Wire quirks handled:
+        - ``stream_options.include_usage``: the usage arrives as a final
+          chunk whose ``choices`` is an EMPTY array — consumed here, not
+          skipped
+        - ``delta.tool_calls``: id/name appear on the first fragment of a
+          slot, arguments arrive as string fragments — passed through
+          as-is; merging is the aggregator's job (llm/aggregate.py)
+        - ``[DONE]`` sentinel terminates the stream
+        """
         api_key = self.resolve_api_key()
         url = self._build_url()
 
@@ -176,20 +188,34 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             if not line:
                 continue
             # SSE format: "data: {...}"
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                    choices = data.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
-                except json.JSONDecodeError:
-                    continue
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            usage = data.get("usage") or {}
+            choices = data.get("choices", [])
+            if not choices:
+                # usage-only tail chunk (include_usage): choices == []
+                if usage:
+                    yield LLMChunk(usage=usage)
+                continue
+
+            choice = choices[0]
+            delta = choice.get("delta", {}) or {}
+            text = delta.get("content", "") or ""
+            tool_calls = delta.get("tool_calls", []) or []
+            finish_reason = choice.get("finish_reason", "") or ""
+            if text or tool_calls or finish_reason:
+                yield LLMChunk(text=text, tool_calls=tool_calls,
+                               finish_reason=finish_reason)
+            elif usage:
+                yield LLMChunk(usage=usage)
 
 
 # ---------------------------------------------------------------------------

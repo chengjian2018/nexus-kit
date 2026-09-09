@@ -232,6 +232,42 @@ kind="agent_hooks" 插件包 + 从 git 历史恢复行为测试（计划④删�
 
 错误语义（保留契约）：hook 异常一律吞掉记日志保原值，对话永不阻塞。
 
+## 流式协议（计划⑤引入）
+
+**底层默认流式，非流式 = 聚合流式。** 全链路：
+
+```
+provider.chat_completion_stream ──yield LLMChunk──► collect_stream（聚合）
+        │                                          │
+        │ text deltas（乐观转发）                    ▼ 传统 dict 形状
+        ▼                                    provider.chat_completion
+   StreamEmitter                              （引擎中间产物照旧消费）
+        ▲
+        │ drain & re-yield
+chat_turn_stream ──yield ChatStreamEvent(delta|round|done)──► 消费者
+        │
+        └ 聚合 = chat_turn（外部行为字节级不变；HTTP/渠道零感知）
+```
+
+- **LLMChunk**（`nexus/llm/types.py`）：`text / tool_calls(delta 片段) /
+  finish_reason / usage`。openai_provider 原生流解析 SSE 三特形：delta
+  片段、usage-only 尾包（choices 为空数组）、finish_reason
+- **聚合器**（`nexus/llm/aggregate.py::collect_stream`）：text 拼接、
+  tool_calls 按 index 合并（id/name 取首个非空、**arguments 字符串增量
+  拼接**非 JSON 合并）、finish/usage 取末值
+- **双向桥**：基类 `chat_completion` 重写为聚合流式调用；默认流桥把只
+  实现非流式的 provider 包装为单 chunk 流（FakeProvider 等零改动存活）
+- **引擎层**（`nexus/engine/streaming.py`）：`ChatStreamEvent(kind:
+  delta|round|done)` + `StreamEmitter`（executor 经 `ec.stream` 注入）
+  + `aggregate_turn`。`chat_turn_stream` 为 generator 主体，`chat_turn`
+  聚合包装
+- **乐观转发 caveat**：finish_reason 轮末才到，无法预知最终轮——中间轮
+  的 text delta 实时转发，轮末发 round 事件（outcome: tool/final/
+  transfer/max_rounds），**done.result.text 是权威回复**；聚合消费者零
+  感知
+- **SSE 调试端点**：`POST /api/v1/chat/stream`（env `NEXUS_STREAM_DEBUG=1`
+  门控挂载），非生产 API（同步 generator 占线程）
+
 ## 变更记录
 
 - 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
@@ -242,3 +278,5 @@ kind="agent_hooks" 插件包 + 从 git 历史恢复行为测试（计划④删�
   `docs/refactor-notes/plan-3.md`。
 - 计划④（2026-09-09）：hooks 清理 + 默认置空。详见
   `docs/refactor-notes/plan-4.md`。
+- 计划⑤（2026-09-09）：LLM 默认流式 + 引擎流式协议。详见
+  `docs/refactor-notes/plan-5.md`。
