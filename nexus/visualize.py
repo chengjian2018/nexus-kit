@@ -182,6 +182,19 @@ def pattern_to_mermaid(pattern: Pattern) -> str:
                 # ROUTE menu node without jump_module -> reset back to the routing root node
                 add_edge(f"{nid} -.->|重置回根| {root_id}")
 
+        # plan-⑥ adjacency edges: projection (defer, end-of-turn switch)
+        # vs jump target — distinct edge styles per module-traffic model
+        mod_id = module_entry_id(module)
+        for link in getattr(module, "sub_modules", None) or []:
+            target = pattern.module_map.get(link.get("target"))
+            target_id = module_entry_id(target) if target is not None else None
+            if target_id is None:
+                continue
+            if getattr(target, "enable_project", True):
+                add_edge(f"{mod_id} ..>|投影·defer| {target_id}")
+            else:
+                add_edge(f"{mod_id} -.->|跳转目标| {target_id}")
+
     # ------------------------------------------------------------------
     # 3. Styling: modules colored by type (entry module bolded), terminal / Agent nodes, start node
     # ------------------------------------------------------------------

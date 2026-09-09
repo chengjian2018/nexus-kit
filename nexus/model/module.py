@@ -83,6 +83,9 @@ class BaseModule:
         executor: executor plugin code (module-level override, highest
             priority; module.executor > pattern.executor_<family> > type
             default).
+        enable_project: projection switch (plan-⑥, see above; default True —
+            projection is the only branch with default behavior once
+            transfer is gone).
         messages_builder: messages-builder plugin code (kind=
             "messages_builder"); module-level overrides the pattern-level
             declaration.
@@ -106,6 +109,7 @@ class BaseModule:
         base_nlg_prompt: Optional[str] = None,
         stages: Optional[Dict[str, str]] = None,
         executor: Optional[str] = None,
+        enable_project: bool = True,
         agent_stage: Optional[str] = None,
         messages_builder: Optional[str] = None,
         agent_hooks: Optional[str] = None,
@@ -134,6 +138,16 @@ class BaseModule:
         # Executor plugin declaration (kind="executor"): module-level
         # override with the highest priority
         self.executor = executor
+
+        # Projection switch (plan-⑥): True = this module serves its parent's
+        # context via knowledge projection (the parent answers this turn
+        # with the projected knowledge; a defer_to_module call schedules the
+        # deferred base switch); False = this module is a jump target
+        # (same-turn handoff via ModuleJumpEvent). A module that has handed
+        # off / deferred is force-projected afterwards (anti-ping-pong, via
+        # cxt.metadata["forced_projection"] — the shared Pattern/Module
+        # singletons are never mutated)
+        self.enable_project = enable_project
 
         # agent_stage slot (kind="stage"): kept as a string code for custom
         # agent-stage declarations; resolved by executors that consume it

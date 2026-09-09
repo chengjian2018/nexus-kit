@@ -268,6 +268,58 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|done)──► 消费�
 - **SSE 调试端点**：`POST /api/v1/chat/stream`（env `NEXUS_STREAM_DEBUG=1`
   门控挂载），非生产 API（同步 generator 占线程）
 
+## 模块间移动模型（计划⑥引入）
+
+transfer_to_XX 同轮移交工具族**已删除**。模块间移动现在是三条语义清晰的通道：
+
+| 通道 | 触发 | 事件 | 消费时点 | 语义 |
+|---|---|---|---|---|
+| **投影代答 + 延迟切换** | AGENT 调 `defer_to_module` 工具（投影邻接自动生成） | `DeferredModuleSwitch`（cxt.actions） | 轮末（hop 循环后、end_turn 前） | 本轮照常用投影知识回答完；下一轮以目标模块为底座 |
+| **同轮跳转** | ROUTE NLU `jump_module` / 菜单节点配置 / 自定义 executor 写事件 | `ModuleJumpEvent`（cxt.actions） | hop 循环（`ModuleJumpChannel`） | 同轮改道，目标模块立刻续答 |
+| **（无移动）** | 直接回答 | — | — | 投影知识够用时原地作答 |
+
+### enable_project 与互斥规则
+
+- `BaseModule.enable_project: bool = True`：**子模块**声明自己如何被父模块消费——
+  True = 投影服务（父 prompt 含投影块 + defer 工具）；False = 跳转目标
+  （投影块不出现，仅供 ROUTE 跳转/自定义 executor 使用）
+- 投影与同轮跳转互斥：一条邻接边要么投影要么可跳，不可同时
+- **防乒乓（forced_projection）**：模块发生跳转/被 defer 后记入
+  `cxt.metadata["forced_projection"]`（跨轮保留），此后任何模块枚举到它
+  一律按投影服务。**绝不 mutate Pattern/Module 单例**（跨会话共享）——
+  会话级覆盖走 cxt.metadata
+- 校验：enable_project=True 的边必须 lend_knowledge 或 lend_tools
+  （否则父模块无从代答，注册期报错）
+
+### 跳转多样化配方（自定义 executor）
+
+三种移动事件都可以在**自定义 executor 插件**中产生（需求 5.1 的
+agent-as-tool / delegate 等，框架不内置、按配方实现）：
+
+```python
+from nexus.context import ModuleJumpEvent, DeferredModuleSwitch
+
+class AgentAsToolExecutor(ModuleExecutor):
+    """把子 agent 当工具调：子模块本轮产出被父模块采编（不真移动）。"""
+    def execute(self, ec):
+        child = ec.pattern.module_map["child"]
+        # 在父的 loop 内把 run(child) 注册为普通工具；子回复作为工具结果
+        # 回到父的上下文。需要真正移交时写事件：
+        ec.cxt.actions.append(ModuleJumpEvent(
+            target_module_code="child", reason="...", source="agent_as_tool"))
+
+class DelegateExecutor(ModuleExecutor):
+    """委派任务：子模块完成后带着结果回父模块（deferred 往返）。"""
+    def execute(self, ec):
+        ec.cxt.actions.append(DeferredModuleSwitch(
+            target_module_code="worker", reason="task...", source="delegate"))
+```
+
+- 写 `ModuleJumpEvent` → 同轮续答（消费端是 hop 循环）
+- 写 `DeferredModuleSwitch` → 轮末换底座（消费端是 chat 层
+  `_apply_deferred_switch`）
+- 声明方式：`module.executor="my_delegate"`（插件中心 kind="executor"）
+
 ## 变更记录
 
 - 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
@@ -280,3 +332,5 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|done)──► 消费�
   `docs/refactor-notes/plan-4.md`。
 - 计划⑤（2026-09-09）：LLM 默认流式 + 引擎流式协议。详见
   `docs/refactor-notes/plan-5.md`。
+- 计划⑥（2026-09-09）：跳转/投影重构（transfer 删除 + enable_project +
+  DeferredModuleSwitch）。详见 `docs/refactor-notes/plan-6.md`。

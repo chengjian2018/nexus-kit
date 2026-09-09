@@ -49,13 +49,13 @@ from nexus.context import decode_tool_call_content, fill_prompt_template
 # belong to the engine's messages assembly, not to any stage atom or app)
 AGENT_TEAM_RULES_PROMPT = """## 团队协作规则
 1. 「邻接能力」块覆盖的问题：一句话能答或一次工具调用能解决的，直接以自己的身份回答，不要提及能力来源。
-2. 需要多轮深入流程（完整业务流程、复杂方案沟通）的，调用 transfer_to_XX 工具，reason 中带上已收集的用户信息。
-3. 调用 transfer 工具的那一次，不要对用户说任何话（包括"为您转接"）——接手方会直接回复用户，用户对这个切换无感知。
+2. 需要多轮深入流程（完整业务流程、复杂方案沟通）的：本轮先用你已掌握的邻接知识回答用户，同时调用 defer_to_module 工具（module_code 选目标、reason 带上已收集的用户信息）登记切换——回答完成后，后续轮次由该模块承接。
+3. defer_to_module 只是登记，不中断你本轮的回答；登记后请把本轮该说的话说完。
 """
 
 AGENT_PROJECTION_RECALL_PROMPT = """## 上一轮提示
-上一轮你借用了【{__projection_source__}】的能力处理了用户请求。用户若继续该话题：
-简单追问 → 继续直接答；需要深入流程 → 调用 transfer_to_{__projection_source__}。
+上一轮你借用了【{__projection_source__}】的能力处理了用户请求，并已登记切换到该模块。
+用户若继续该话题，相关的深入流程由该模块底座承接；简单追问你仍可直接回答。
 """
 
 if TYPE_CHECKING:
@@ -181,12 +181,17 @@ def _replay_segment(segment: List[Any]) -> List[Dict[str, Any]]:
 # builders)
 # ---------------------------------------------------------------------------
 
-def build_projection_block(module, module_map) -> str:
-    """Adjacent projection block: one piece per lend_knowledge edge (spec §4 §3.2).
+def build_projection_block(module, module_map, cxt=None) -> str:
+    """Adjacent projection block: one piece per projection-served edge.
 
     sub_modules entries are declarative dicts ({"target", "lend_knowledge",
-    "lend_tools"}) since plan-②.
+    "lend_tools"}) since plan-②. Plan-⑥: only edges whose target is
+    effectively projection-served (enable_project=True or force-projected —
+    `_effective_enable_project`) emit a block; enable_project=False targets
+    are same-turn jump targets, invisible here.
     """
+    from nexus.engine.chat import _effective_enable_project
+
     blocks = []
     for link in module.sub_modules:
         if not link.get("lend_knowledge"):
@@ -194,8 +199,11 @@ def build_projection_block(module, module_map) -> str:
         target = module_map.get(link["target"])
         if target is None:
             continue
+        if not _effective_enable_project(target, cxt):
+            continue
         parts = [f"## 邻接能力：{target.module_name}（{target.module_code}）"]
         parts.append(target.to_projection_text())
+        parts.append("- 深入流程：本轮直接用以上知识回答，需要承接时调用 defer_to_module 登记")
         lend_tools = link.get("lend_tools") or []
         if lend_tools:
             parts.append(f"- 可借工具：{', '.join(lend_tools)}")
@@ -225,7 +233,7 @@ def build_system_prompt(module, cxt: "DialogueContext",
     # without the accompanying rules ("a transfer turn says nothing to the
     # user" etc.)
     if module.sub_modules:
-        projection = build_projection_block(module, cxt.module_map)
+        projection = build_projection_block(module, cxt.module_map, cxt=cxt)
         if projection:
             parts.append(projection)
         parts.append(AGENT_TEAM_RULES_PROMPT)

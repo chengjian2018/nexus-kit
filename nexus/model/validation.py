@@ -106,6 +106,27 @@ def validate_base_info(pattern: Pattern) -> List[str]:
     return errors
 
 
+    # Projection-edge consistency (plan-⑥): an enable_project=True edge that
+    # lends no knowledge would give the parent nothing to answer with — a
+    # declaration error (lend_tools-only edges belong on jump targets,
+    # enable_project=False)
+    for module in pattern.modules or []:
+        for link in getattr(module, "sub_modules", None) or []:
+            target = pattern.module_map.get(link.get("target"))
+            if target is None:
+                continue  # dangling edge: Pattern.__init__ already raised
+            if (getattr(target, "enable_project", True)
+                    and not link.get("lend_knowledge")
+                    and not (link.get("lend_tools") or [])):
+                errors.append(
+                    f"module {module.module_code!r} 的投影边 "
+                    f"{link.get('target')!r}（enable_project=True）既不 "
+                    f"lend_knowledge 也不 lend_tools——父模块无从代答，"
+                    f"请补 lend_knowledge 或改 enable_project=False 走跳转")
+
+    return errors
+
+
 def validate_plugin_declarations(pattern: Pattern) -> List[str]:
     """Validate that all declared plugin codes resolve; returns the error
     list (empty = valid)."""

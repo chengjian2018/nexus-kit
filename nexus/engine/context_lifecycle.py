@@ -51,6 +51,9 @@ class TurnLifecycle:
         "task_info",
         "llm_override",
         "pattern_code",
+        # plan-⑥: modules recorded as force-projected (jumped away / deferred)
+        # stay projected for the rest of the session (anti-ping-pong)
+        "forced_projection",
     )
 
     # -- Per-turn reset: zeroed at turn start --------------------------------

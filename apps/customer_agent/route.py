@@ -206,8 +206,10 @@ customer_service = AgentModule(
     # at the bottom of this module): session info block + per-turn catalog
     # prefetch (untrusted line)
     messages_builder="customer_agent_messages_builder",
-    # Declared edge -> the framework auto-generates transfer_to_human_handoff (human handoff,
-    # corresponding to Customer-Agent move_conversation/transfer_conversation)
+    # Projection-served adjacency (plan-⑥): the customer_service agent answers
+    # handoff-scope requests this turn with human_handoff's projected knowledge
+    # and calls defer_to_module when a human really is needed — the next turn
+    # switches its base to human_handoff (no more same-turn transfer_to_XX)
     sub_modules=[{"target": "human_handoff", "lend_knowledge": True,
                   "lend_tools": []}],
 )
@@ -218,11 +220,12 @@ human_handoff = AgentModule(
     module_description="告知买家问题已记录，人工客服将尽快接入",
     module_todo_description="每轮直接回应买家，不再移交",
     base_prompt=(
-        "你负责店铺的人工交接环节。买家的问题已由 AI 客服记录并移交给你。\n\n"
+        "你负责店铺的人工交接环节。买家的问题已由 AI 客服处理并登记转人工，"
+        "当前会话以你为底座继续。\n\n"
         "每轮回复：\n"
         "- 告知买家问题已收到、已转给人工客服处理，会尽快回复\n"
         "- 如买家补充了新信息，简短确认收到\n"
-        "- 不要再尝试解答商品问题（AI 已判定需要人工），不要移交其他模块\n"
+        "- 不要再尝试解答商品问题（AI 已判定需要人工），不要再登记切换到其他模块\n"
         "- 语气友好，一两句话即可"
     ),
     is_end=True,

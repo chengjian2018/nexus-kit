@@ -9,14 +9,16 @@ The loop's orchestration body moved to the executor atom
 - run_agent — compat facade (test anchor): builds an ExecutionContext and
   delegates to the plugin-resolved executor
 - the tool-resolution / dispatch toolbox (_resolve_tools /
-  _resolve_lent_tools / _dispatch_tool_calls / _parse_args / _execute_tool /
-  build_transfer_tools / _transfer_reason) shared by the default executor
-  and custom loops — kept in the kernel so the layering stays one-directional
-  (atoms → nexus) and existing import anchors hold
+  _resolve_lent_tools / _dispatch_tool_calls / _parse_args / _execute_tool)
+  shared by the default executor and custom loops — kept in the kernel so
+  the layering stays one-directional (atoms → nexus) and existing import
+  anchors hold
 - framework-enforced prompt items (force-close suffix, prompt-length warning)
 
-Docs for the transfer semantics preserved by the toolbox live on the
-functions themselves; see atoms/executors/loop_executor.py for the loop.
+Plan-⑥: the transfer_to_XX tool family is gone (projection adjacency uses
+the generic defer_to_module tool — see loop_executor); _dispatch_tool_calls'
+error-backfill branch keys on the defer tool name. See
+atoms/executors/loop_executor.py for the loop.
 """
 
 import json
@@ -38,7 +40,9 @@ from nexus.registry.tools import registry as tool_registry
 
 logger = logging.getLogger(__name__)
 
-TRANSFER_TOOL_PREFIX = "transfer_to_"
+# The plan-⑥ generic defer tool name (error-backfill branch key in
+# _dispatch_tool_calls; the tool itself is built by the loop executor)
+_DEFER_TOOL_NAME = "defer_to_module"
 
 # Warn when the system prompt exceeds this length (projection bloat observability)
 _PROMPT_LENGTH_WARN = 4000
@@ -122,7 +126,7 @@ def _dispatch_tool_calls(
     rewrite_audits = {}
     for idx, tc in enumerate(tool_calls):
         name = tc.get("function", {}).get("name", "")
-        if transfer_error is not None and name.startswith(TRANSFER_TOOL_PREFIX):
+        if transfer_error is not None and name == _DEFER_TOOL_NAME:
             continue
         parsed_args = _parse_args(tc)
         if hooks:
@@ -131,7 +135,7 @@ def _dispatch_tool_calls(
                 round_idx=round_idx, tool_name=name, args=parsed_args)
             final_name, final_args, original = rewrite_tool_call(
                 hooks, event, allowed_names,
-                reserved_prefix=TRANSFER_TOOL_PREFIX)
+                reserved_prefix=_DEFER_TOOL_NAME)
         else:
             final_name, final_args, original = name, parsed_args, None
         if final_name != name:
@@ -163,7 +167,7 @@ def _dispatch_tool_calls(
         call_id = tc.get("id", "")
         metadata = {"tool_name": name, "tool_call_id": call_id}
 
-        if transfer_error is not None and name.startswith(TRANSFER_TOOL_PREFIX):
+        if transfer_error is not None and name == _DEFER_TOOL_NAME:
             result_content = transfer_error
         elif name not in allowed_names:
             logger.warning(
@@ -207,38 +211,6 @@ def _dispatch_tool_calls(
                         metadata=metadata)
         messages.append({"role": "tool", "tool_call_id": call_id,
                          "content": result_content})
-
-
-# ---------------------------------------------------------------------------
-# Transfer tool builders (projection block building lives in engine/messages.py)
-# ---------------------------------------------------------------------------
-
-def build_transfer_tools(module, module_map) -> list:
-    """Generate transfer tools edge-by-edge from sub_modules (spec §4 §3.3)."""
-    tools = []
-    for link in module.sub_modules:
-        target = module_map.get(link["target"])
-        if target is None:
-            continue
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": f"{TRANSFER_TOOL_PREFIX}{link['target']}",
-                "description": (
-                    f"移交给【{target.module_name}】。适用：该域的多轮深入流程。"
-                    f"不适用：一句话或一次工具能解决的请求——那类直接自己处理。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"reason": {
-                        "type": "string",
-                        "description": "移交原因及已收集的用户信息摘要，供接手方无缝承接",
-                    }},
-                    "required": ["reason"],
-                },
-            },
-        })
-    return tools
 
 
 # ---------------------------------------------------------------------------
@@ -397,12 +369,3 @@ def _execute_tool(tool_name: str, tool_args: Dict[str, Any]) -> str:
         return json.dumps({"error": f"工具执行失败: {e}"}, ensure_ascii=False)
 
 
-# ---------------------------------------------------------------------------
-# Transfer handling
-# ---------------------------------------------------------------------------
-
-def _transfer_reason(transfer_call) -> str:
-    """Parse the transfer context (reason) from a transfer tool call's arguments."""
-    args = _parse_args(transfer_call)
-    reason = args.get("reason", "") if isinstance(args, dict) else ""
-    return str(reason or "")

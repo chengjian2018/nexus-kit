@@ -23,8 +23,8 @@ _MODULE_FIELDS = [
     "module_code", "module_name", "module_description",
     "module_todo_description", "use_tools", "base_prompt",
     "base_nlu_prompt", "base_nlg_prompt", "stages", "sub_modules",
-    "executor", "agent_stage", "messages_builder", "agent_hooks",
-    "is_end", "answer_examples",
+    "executor", "enable_project", "agent_stage", "messages_builder",
+    "agent_hooks", "is_end", "answer_examples",
 ]
 
 # Node fields serialized

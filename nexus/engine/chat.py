@@ -134,7 +134,8 @@ class ModuleJumpChannel:
 
         If the target does not exist, stay in place (the pattern already
         fail-fasts on jump_module configuration at registration time; this
-        guards against hallucinated NLU output).
+        guards against hallucinated NLU output). Plan-⑥: the handing-off
+        module is recorded as force-projected (anti-ping-pong).
         """
         if event.target_module_code not in cxt.module_map:
             logger.warning(
@@ -146,6 +147,8 @@ class ModuleJumpChannel:
             "[jump] %s → %s (source=%s)",
             cxt.current_module_code, event.target_module_code, event.source,
         )
+        if cxt.current_module_code:
+            _record_forced_projection(cxt, cxt.current_module_code)
         cxt.current_module_code = event.target_module_code
         # Node cleared: the target module's _resolve_entry_node picks its own first node
         cxt.current_node_code = None
@@ -239,6 +242,90 @@ class ModuleJumpChannel:
 
 # Sole manager of the jump event channel (stateless, shared module-level instance)
 _jumps = ModuleJumpChannel()
+
+
+# ============================================================================
+# Projection / deferred-switch helpers (plan-⑥)
+# ============================================================================
+
+_FORCED_PROJECTION_KEY = "forced_projection"
+
+
+def _effective_enable_project(module, cxt) -> bool:
+    """Whether an adjacency target serves its parent via projection.
+
+    True when the module declares enable_project OR it has been force-
+    projected this session (a module that handed off / deferred was recorded
+    in cxt.metadata["forced_projection"] — the anti-ping-pong rule: never
+    mutate the shared Pattern/Module singletons, the override lives on the
+    session's context).
+    """
+    forced = cxt.metadata.get(_FORCED_PROJECTION_KEY) or set()
+    if module.module_code in forced:
+        return True
+    return bool(getattr(module, "enable_project", True))
+
+
+def _record_forced_projection(cxt, module_code: str) -> None:
+    """Record a module as force-projected for this session (idempotent).
+
+    Called when a module hands off (jump) or defers — afterwards any OTHER
+    module enumerating it as an adjacency serves it via projection only,
+    preventing A↔B ping-pong.
+    """
+    forced = set(cxt.metadata.get(_FORCED_PROJECTION_KEY) or set())
+    forced.add(module_code)
+    cxt.metadata[_FORCED_PROJECTION_KEY] = sorted(forced)
+
+
+def _pop_deferred_switch(cxt) -> Optional["DeferredModuleSwitch"]:
+    """Take the first DeferredModuleSwitch out of cxt.actions (consumption
+    removes it); None when the turn produced none."""
+    from nexus.context import DeferredModuleSwitch
+
+    for i, item in enumerate(cxt.actions):
+        if isinstance(item, DeferredModuleSwitch):
+            return cxt.actions.pop(i)
+    return None
+
+
+def _apply_deferred_switch(session: Session, pattern) -> None:
+    """End-of-turn consumption of a DeferredModuleSwitch (plan-⑥).
+
+    Runs AFTER the hop loop and BEFORE end_turn (so the end-of-turn history
+    append and the store snapshot see the applied base). Rewrites
+    current_module_code to the target (existence-checked; a hallucinated
+    target warns and keeps the current base) and records the SOURCE module
+    as force-projected (anti-ping-pong). The event stays observable: it is
+    re-appended to actions after application so build_chat_result
+    snapshots it into ChatResult.actions.
+    """
+    from nexus.context import DeferredModuleSwitch
+
+    cxt = session.cxt
+    switch = _pop_deferred_switch(cxt)
+    if switch is None:
+        return
+
+    source_module = cxt.current_module_code
+    target = switch.target_module_code
+    if target not in (pattern.module_map if pattern else {}):
+        logger.warning(
+            "[defer_switch] 目标模块 '%s' 不存在，保持当前底座: %s",
+            target, source_module,
+        )
+        return
+
+    logger.info(
+        "[defer_switch] %s → %s（轮末切换底座，下一轮生效, source=%s）",
+        source_module, target, switch.source,
+    )
+    cxt.current_module_code = target
+    cxt.current_node_code = None  # the target resolves its own entry node
+    if source_module:
+        _record_forced_projection(cxt, source_module)
+    # re-append for observability (ChatResult.actions snapshot)
+    cxt.actions.append(switch)
 
 
 # ============================================================================
@@ -597,9 +684,10 @@ def chat_turn_stream(
         response = "对话处理异常，请稍后重试"
 
     # ------------------------------------------------------------------
-    # 4. End of turn: append the assistant message to history
-    #    (incremental), snapshot the output
+    # 4. End of turn: apply the deferred base switch (plan-⑥, projection),
+    #    append the assistant message to history, snapshot the output
     # ------------------------------------------------------------------
+    _apply_deferred_switch(session, pattern)
     yield ChatStreamEvent(kind="done", result=_finish(response))
 
 

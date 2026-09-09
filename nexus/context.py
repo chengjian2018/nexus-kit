@@ -29,7 +29,8 @@ class ModuleJumpEvent:
     Producers (write to ``cxt.actions``):
     - NLU in-turn detection: ``nlu_result.jump_module`` points at another module
     - ROUTE menu node config: ``node.jump_module`` (after next_node hits)
-    - AGENT transfer tool call: ``transfer_to_{target}``
+    - custom executor plugins (agent-as-tool / delegate recipes — see
+      ARCHITECTURE.md's module-movement section)
 
     Consumer (chat layer hop loop): reroutes as long as the target exists in
     module_map (writes current_module_code, clears current_node_code) —
@@ -48,6 +49,42 @@ class ModuleJumpEvent:
         """Observation form: snapshotted into ChatResult.actions / rendered by the cli."""
         return {
             "module_jump": {
+                "target": self.target_module_code,
+                "reason": self.reason,
+                "source": self.source,
+            }
+        }
+
+
+# ============================================================================
+# Deferred module switch (end-of-turn base switch primitive, plan-⑥)
+# ============================================================================
+
+@dataclass
+class DeferredModuleSwitch:
+    """A deferred base switch — projection-served turn's exit signal.
+
+    Semantics (mutually exclusive with the same-turn ModuleJumpEvent): the
+    current module answered this turn using the target's projected knowledge
+    (enable_project=True adjacency); the LLM flagged via the defer_to_module
+    tool that deeper flow belongs to the target. Consumption happens at END
+    of turn (after the hop loop, before end_turn): current_module_code is
+    rewritten to the target, so the NEXT turn runs on the target as its
+    base. The event also snapshots into ChatResult.actions for observability.
+
+    Producers: the default loop executor's defer_to_module tool (and custom
+    executors writing this event).
+    Consumer: chat_turn_stream's end-of-turn apply (existence-checked; a
+    hallucinated target warns and keeps the current base).
+    """
+
+    target_module_code: str
+    reason: str = ""
+    source: str = "projection"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "module_switch": {
                 "target": self.target_module_code,
                 "reason": self.reason,
                 "source": self.source,
