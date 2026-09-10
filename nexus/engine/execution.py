@@ -54,7 +54,8 @@ class ModuleExecutor:
 
     Stateless by contract — all dialogue state lives on ec.cxt; the plugin
     registry caches one instance per code and shares it across sessions.
+    Async since the asyncio rewrite (executors drive LLM/tools I/O).
     """
 
-    def execute(self, ec: "ExecutionContext") -> TurnResult:
+    async def execute(self, ec: "ExecutionContext") -> TurnResult:
         raise NotImplementedError

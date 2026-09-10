@@ -32,7 +32,7 @@ class DefaultRouteExecutor(ModuleExecutor):
     clarify-turn branch.
     """
 
-    def execute(self, ec: "ExecutionContext") -> TurnResult:
+    async def execute(self, ec: "ExecutionContext") -> TurnResult:
         from nexus.engine.chat import (
             _refresh_llm_config,
             _resolve_entry_node,
@@ -51,7 +51,7 @@ class DefaultRouteExecutor(ModuleExecutor):
         from atoms.executors.fsm_executor import _refresh_llm_config_by_node
         _refresh_llm_config_by_node(ec, module)
 
-        jump_event = _run_stages(cxt, module, pattern, force_close=ec.force_close)
+        jump_event = await _run_stages(cxt, module, pattern, force_close=ec.force_close)
 
         # Jump turn: slots were already merged at the detection point; the hop
         # loop reroutes to the target module to continue in the same turn

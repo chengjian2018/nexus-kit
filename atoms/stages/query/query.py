@@ -44,7 +44,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
     # LLM client
     # ------------------------------------------------------------------
 
-    def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
+    async def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
         """Call the LLM and return the response text.
 
         When *llm_config* is None, the config is auto-loaded from
@@ -58,7 +58,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
         provider = build_provider(llm_config)
 
         messages = [{"role": "user", "content": prompt}]
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=messages,
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
@@ -130,7 +130,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
             "3. 只输出 JSON 对象，不要包裹 markdown 代码块或其他文字"
         )
 
-    def _execute_with_retry(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None, max_retries: int = 1) -> Dict[str, Any]:
+    async def _execute_with_retry(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None, max_retries: int = 1) -> Dict[str, Any]:
         """Run the Query Rewrite call, auto-retrying once when parsing fails.
 
         Args:
@@ -138,7 +138,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
             llm_config: LLM config, passed from ctx.llm_config.
             max_retries: max retry count, default 1.
         """
-        raw = self._call_llm(prompt, llm_config)
+        raw = await self._call_llm(prompt, llm_config)
         result = self._parse_rewrite_result(raw)
 
         if "raw" not in result:
@@ -150,7 +150,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
                 attempt, max_retries,
             )
             retry_prompt = self._build_retry_prompt(prompt, raw)
-            raw = self._call_llm(retry_prompt, llm_config)
+            raw = await self._call_llm(retry_prompt, llm_config)
             result = self._parse_rewrite_result(raw)
 
             if "raw" not in result:
@@ -208,7 +208,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
         ...
 
     @abstractmethod
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         """Run the Query Rewrite stage and write the result into ctx.rewritten_queries."""
         ...
 
@@ -232,9 +232,9 @@ class QueryRewriter(BaseQueryRewriter):
 
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         prompt = self.prompt_build(ctx)
-        result = self._execute_with_retry(prompt, ctx.llm_config)
+        result = await self._execute_with_retry(prompt, ctx.llm_config)
 
         rewritten_queries = result.get("rewritten_queries", [])
         rewrite_reason = result.get("reason", "")

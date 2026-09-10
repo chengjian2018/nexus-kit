@@ -105,9 +105,10 @@ def launch(pattern, sessions, session_id="s1", task_info=None):
 
 def chat(sessions, session_id, query):
     """Run one dialogue turn via nexus.engine.chat (one customer utterance)."""
+    from async_utils import arun
     from nexus.engine.chat import chat as chat_fn
 
-    return chat_fn(query=query, session_id=session_id, all_sessions=sessions)
+    return arun(chat_fn(query=query, session_id=session_id, all_sessions=sessions))
 
 
 def end_actions(cxt):

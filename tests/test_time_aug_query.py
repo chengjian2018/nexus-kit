@@ -15,6 +15,8 @@ import time as _time
 
 import pytest
 
+from async_utils import arun
+
 from atoms.augmentation import augment_time
 from nexus.context import DialogueContext
 from nexus.model.node import BaseNode
@@ -38,53 +40,53 @@ def test_valid_stage_duck_type():
 
 
 def test_time_entity_augmented():
-    ctx = TimeAugQueryRewriter().execute(_ctx())
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx()))
     assert ctx.rewritten_queries == ["我下周一(2026-09-07)可以去"]
 
 
 def test_no_time_entity_passthrough():
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="这个多少钱"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="这个多少钱")))
     assert ctx.rewritten_queries == ["这个多少钱"]
 
 
 def test_past_time_not_augmented():
     # entirely in the past (base 2026-09-03): "上周三" = 2026-08-26
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="我上周三去过"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="我上周三去过")))
     assert ctx.rewritten_queries == ["我上周三去过"]
 
 
 def test_past_time_span_not_augmented():
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="昨天下午三点到五点"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="昨天下午三点到五点")))
     assert ctx.rewritten_queries == ["昨天下午三点到五点"]
 
 
 def test_beyond_two_weeks_not_augmented():
     # badcase: "下下周" = 2026-09-14~2026-09-20, its end is 17 days past the
     # base (2026-09-03) — beyond the 2-week window, keep the original wording
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="我看下下周的"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="我看下下周的")))
     assert ctx.rewritten_queries == ["我看下下周的"]
 
 
 def test_far_future_month_not_augmented():
     # "下个月" = 2026-10, ends ~8 weeks out — beyond the 2-week window
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="下个月呢"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="下个月呢")))
     assert ctx.rewritten_queries == ["下个月呢"]
 
 
 def test_next_week_within_window_augmented():
     # "下周" = 2026-09-07~2026-09-13, ends within 2 weeks — still augmented
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="我看下周的"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="我看下周的")))
     assert ctx.rewritten_queries == ["我看下周(2026-09-07~2026-09-13)的"]
 
 
 def test_mixed_span_crossing_now_augmented():
     # "上周到这周五" starts in the past but ends 2026-09-04 (future) — augmented
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="上周到这周五怎么样"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="上周到这周五怎么样")))
     assert ctx.rewritten_queries == ["上周到这周五(2026-08-24~2026-09-04)怎么样"]
 
 
 def test_time_span_augmented():
-    ctx = TimeAugQueryRewriter().execute(_ctx(query="明天下午3点到5点有空吗"))
+    ctx = arun(TimeAugQueryRewriter().execute(_ctx(query="明天下午3点到5点有空吗")))
     assert ctx.rewritten_queries == ["明天下午3点到5点(2026-09-04 15:00~17:00)有空吗"]
 
 
@@ -100,7 +102,7 @@ def test_time_base_defaults_to_now(monkeypatch):
 
     monkeypatch.setattr("atoms.stages.query.time_aug.augment_time", _fake_augment)
     ctx = DialogueContext(session_id="t", user_query="下周一发货吗")
-    TimeAugQueryRewriter().execute(ctx)
+    arun(TimeAugQueryRewriter().execute(ctx))
     assert calls["time_base"] is None
     assert ctx.rewritten_queries == ["下周一发货吗"]
 
@@ -135,5 +137,5 @@ def _resolve_with_skeleton(ctx, module):
 def test_augment_time_consistency():
     """The rewrite result matches a direct augment_time call (passthrough contract)."""
     for query in ("我下周一可以去", "这个多少钱"):
-        ctx = TimeAugQueryRewriter().execute(_ctx(query=query))
+        ctx = arun(TimeAugQueryRewriter().execute(_ctx(query=query)))
         assert ctx.rewritten_queries == [augment_time(query, time_base=TIME_BASE)]

@@ -23,8 +23,8 @@ class ScriptedProvider:
         self.script = list(script)
         self.seen = []
 
-    def chat_completion(self, messages, model, temperature, max_tokens,
-                        tools=None, tool_choice=None, **kw):
+    async def achat_completion(self, messages, model, temperature, max_tokens,
+                               tools=None, tool_choice=None, **kw):
         self.seen.append({"messages": messages, "tools": tools})
         return self.script.pop(0)
 
@@ -59,7 +59,7 @@ class _JumpNLU(PipelineStage):
 
     stage_name = "jump_nlu"
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         ctx.nlu_result = {"next_node": "menu_buy", "slots": {}}
         return ctx
 
@@ -67,7 +67,7 @@ class _JumpNLU(PipelineStage):
 class _MarkerNLG(PipelineStage):
     stage_name = "marker_nlg"
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         ctx.nlg_result = {"content": "路由侧回复"}
         return ctx
 
@@ -84,7 +84,8 @@ def _launch(pattern, sessions, sid="s1"):
 
 def _chat(sessions, sid, query):
     from nexus.engine.chat import chat as chat_fn
-    return chat_fn(query=query, session_id=sid, all_sessions=sessions)
+    from async_utils import arun
+    return arun(chat_fn(query=query, session_id=sid, all_sessions=sessions))
 
 
 def test_route_jump_b_replies_same_turn():

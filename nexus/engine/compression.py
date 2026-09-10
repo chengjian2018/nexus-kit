@@ -115,7 +115,7 @@ def _build_summary_input(history: List[SessionMessage], end_idx: int) -> str:
     return "\n".join(lines)
 
 
-def compress_history(
+async def compress_history(
     session: "Session",
     store: "SessionStore",
     llm_config: Dict[str, Any],
@@ -137,7 +137,7 @@ def compress_history(
     # (e.g. the sink once failed) never delete — replace_history re-validates inside the
     # transaction (transaction-level fallback)
     try:
-        db_history = store.get_history(session.session_id)
+        db_history = await store.aget_history(session.session_id)
     except Exception:
         logger.exception("压缩前读 DB 失败，放弃: session=%s", session.session_id)
         return False
@@ -156,7 +156,7 @@ def compress_history(
     )
     try:
         provider = build_provider(llm_config)
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=[
                 {"role": "system", "content": "你是一个对话摘要助手。"},
                 {"role": "user", "content": prompt},
@@ -178,7 +178,7 @@ def compress_history(
 
     # DB reshuffle (one transaction: alignment check → delete all rows of the current generation → summary first + reinsert retained)
     try:
-        store.replace_history(session, summary, keep_idx=split)
+        await store.areplace_history(session, summary, keep_idx=split)
     except Exception:
         logger.exception(
             "DB 压缩重排失败，放弃（历史原样保留）: session=%s",
@@ -198,7 +198,7 @@ def compress_history(
     return True
 
 
-def maybe_compress(session: "Session", store: "SessionStore") -> None:
+async def maybe_compress(session: "Session", store: "SessionStore") -> None:
     """Compression trigger entry (called by chat_turn after R1 and before adding the user message).
 
     store None / threshold 0 / too few messages → skip silently; failures are only logged —
@@ -226,7 +226,7 @@ def maybe_compress(session: "Session", store: "SessionStore") -> None:
         threshold,
     )
     try:
-        compress_history(session, store, llm_config, retain_count)
+        await compress_history(session, store, llm_config, retain_count)
     except Exception:
         logger.exception(
             "压缩执行异常（历史原样保留）: session=%s", session.session_id)

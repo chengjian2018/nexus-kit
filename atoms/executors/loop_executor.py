@@ -52,7 +52,7 @@ class DefaultLoopExecutor(ModuleExecutor):
     """AGENT executor: inject (answer directly with projection knowledge) /
     transfer (write a ModuleJumpEvent and end the module turn)."""
 
-    def execute(self, ec: "ExecutionContext") -> TurnResult:
+    async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
         module = ec.module
         pattern = ec.pattern
@@ -134,12 +134,12 @@ class DefaultLoopExecutor(ModuleExecutor):
             # may turn out to be the real reply — round events carry the
             # outcome; done is authoritative)
             if tools:
-                round_result = _stream_round(
+                round_result = await _stream_round(
                     provider, messages, model, temperature, max_tokens,
                     ec.stream, tools=tools,
                 )
             else:
-                round_result = _stream_round(
+                round_result = await _stream_round(
                     provider, messages, model, temperature, max_tokens,
                     ec.stream,
                 )
@@ -186,7 +186,7 @@ class DefaultLoopExecutor(ModuleExecutor):
                         "[defer] 目标 %s 不是有效投影子模块，错误回填继续 loop",
                         target,
                     )
-                    _dispatch_tool_calls(
+                    await _dispatch_tool_calls(
                         cxt, module, messages, content, tool_calls,
                         hooks, allowed_names, lent_by, round_idx,
                         transfer_error=json.dumps(
@@ -220,7 +220,7 @@ class DefaultLoopExecutor(ModuleExecutor):
                              "message": f"已登记延迟切换至 {target}，本轮请继续以当前身份回答完用户"},
                             ensure_ascii=False)
                     else:
-                        tool_result = _execute_tool(name, _parse_args(tc))
+                        tool_result = await _execute_tool(name, _parse_args(tc))
                         result_content = tool_result
                     cxt.add_message("tool", result_content, stage="agent",
                                     metadata={"tool_name": name,
@@ -259,7 +259,7 @@ class DefaultLoopExecutor(ModuleExecutor):
 
             # Ordinary tool calls: P4 rewrite -> main-flow validation -> execute
             # -> P5 rewrite -> append to history
-            _dispatch_tool_calls(
+            await _dispatch_tool_calls(
                 cxt, module, messages, content, tool_calls,
                 hooks, allowed_names, lent_by, round_idx)
             _emit_round(ec.stream, "tool", round_idx)
@@ -344,39 +344,40 @@ def _build_defer_tool(module, pattern, cxt) -> list:
 # Plan-⑤ streaming helpers
 # ---------------------------------------------------------------------------
 
-def _stream_round(provider, messages, model, temperature, max_tokens,
-                  stream_emitter, tools=None):
-    """One agent-loop LLM round, streamed: consume LLMChunks, forward text
-    deltas optimistically (when an emitter is attached), and aggregate the
-    round into the legacy dict (tool dispatch needs merged tool_calls).
+async def _stream_round(provider, messages, model, temperature, max_tokens,
+                        stream_emitter, tools=None):
+    """One agent-loop LLM round, streamed (async since the asyncio
+    rewrite): consume LLMChunks, forward text deltas optimistically (when
+    an emitter is attached), and aggregate the round into the legacy dict
+    (tool dispatch needs merged tool_calls).
 
-    Duck-typed providers without ``chat_completion_stream`` (test stubs /
-    legacy custom providers) fall back to ``chat_completion`` — no deltas
+    Duck-typed providers without ``achat_completion_stream`` (test stubs /
+    legacy custom providers) fall back to ``achat_completion`` — no deltas
     forwarded, the result shape is identical."""
-    from nexus.llm.aggregate import collect_stream
+    from nexus.llm.aggregate import acollect_stream
 
     kwargs = {}
     if tools:
         kwargs = {"tools": tools, "tool_choice": "auto"}
 
-    if not hasattr(provider, "chat_completion_stream"):
-        return provider.chat_completion(
+    if not hasattr(provider, "achat_completion_stream"):
+        return await provider.achat_completion(
             messages=messages, model=model, temperature=temperature,
             max_tokens=max_tokens, **kwargs)
 
-    chunks = provider.chat_completion_stream(
+    chunks = provider.achat_completion_stream(
         messages=messages, model=model, temperature=temperature,
         max_tokens=max_tokens, **kwargs)
     if stream_emitter is None:
-        return collect_stream(chunks)
+        return await acollect_stream(chunks)
 
-    def _tap():
-        for chunk in chunks:
+    async def _tap():
+        async for chunk in chunks:
             if chunk.text:
                 stream_emitter.emit_delta(chunk.text)
             yield chunk
 
-    return collect_stream(_tap())
+    return await acollect_stream(_tap())
 
 
 def _emit_round(stream_emitter, outcome: str, round_idx: int) -> None:

@@ -2,6 +2,7 @@
 
 import logging
 from types import SimpleNamespace
+from async_utils import arun
 from unittest.mock import patch
 
 import pytest
@@ -269,7 +270,7 @@ class _ScriptedProvider:
         self.script = list(script)
         self.seen = []
 
-    def chat_completion(self, messages, model, temperature, max_tokens,
+    async def achat_completion(self, messages, model, temperature, max_tokens,
                         tools=None, tool_choice=None, **kw):
         self.seen.append({"messages": messages, "tools": tools})
         return self.script.pop(0)
@@ -316,7 +317,7 @@ def test_run_agent_uses_custom_messages_builder():
 
     provider = _ScriptedProvider([{"content": "99 包邮", "tool_calls": []}])
     with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
-        result = run_agent(s, reception, s.cxt.metadata["llm_override"])
+        result = arun(run_agent(s, reception, s.cxt.metadata["llm_override"]))
 
     assert result.content == "99 包邮"
     seen_messages = provider.seen[0]["messages"]
@@ -345,7 +346,7 @@ def test_run_agent_delivers_p1_fragments_to_custom_builder():
 
     provider = _ScriptedProvider([{"content": "ok", "tool_calls": []}])
     with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
-        run_agent(s, reception, s.cxt.metadata["llm_override"])
+        arun(run_agent(s, reception, s.cxt.metadata["llm_override"]))
 
     assert captured["blocks"] == ["店铺在售：A"]
     assert "店铺在售：A" in provider.seen[0]["messages"][0]["content"]
@@ -363,8 +364,8 @@ def test_run_agent_force_close_suffix_survives_custom_builder():
     s = _mk_run_session(reception)
     provider = _ScriptedProvider([{"content": "收尾", "tool_calls": []}])
     with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
-        run_agent(s, reception, s.cxt.metadata["llm_override"],
-                  force_close=True)
+        arun(run_agent(s, reception, s.cxt.metadata["llm_override"],
+                  force_close=True))
     messages = provider.seen[0]["messages"]
     assert messages[0] == {"role": "system",
                            "content": "请直接回应用户，勿再移交。"}
@@ -379,7 +380,7 @@ def test_run_agent_force_close_suffix_survives_custom_builder():
     s2 = _mk_run_session(reception2)
     provider2 = _ScriptedProvider([{"content": "收尾", "tool_calls": []}])
     with patch("atoms.executors.loop_executor.build_provider", return_value=provider2):
-        run_agent(s2, reception2, s2.cxt.metadata["llm_override"],
-                  force_close=True)
+        arun(run_agent(s2, reception2, s2.cxt.metadata["llm_override"],
+                       force_close=True))
     assert provider2.seen[0]["messages"][0]["content"] == (
         "你是前台\n请直接回应用户，勿再移交。")

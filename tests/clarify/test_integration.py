@@ -8,6 +8,7 @@ import pytest
 
 from fake_provider import fake_llm_config, register_fake_provider
 
+from async_utils import arun
 from nexus.engine.chat import chat as chat_fn
 from nexus.engine.session import Session
 from nexus.model.module import FSMModule, RouteModule
@@ -142,14 +143,14 @@ def test_off_topic_turn_routes_kb_and_keeps_node(pattern):
     # Round 1: route silently dispatches; the buy FSM first node buy_ask_brand
     # digests the sentence in the same turn, brand slot = the whole query,
     # node advances to buy_ask_budget
-    r1 = chat_fn("我想买车", "it", sessions)
+    r1 = arun(chat_fn("我想买车", "it", sessions))
     assert session.cxt.current_module_code == "demo_buy"
     assert session.cxt.current_node_code == "buy_ask_budget"
     assert session.cxt.filled_slots.get("brand") == "我想买车"
     assert "询问品牌" in r1  # FSMNLG generates the reply with the pre-transition node
 
     # Round 2: off-topic (asks about fees when budget should be asked)
-    r3 = chat_fn("还要收别的钱吗", "it", sessions)
+    r3 = arun(chat_fn("还要收别的钱吗", "it", sessions))
     clarify_info = session.cxt.metadata["clarify"]
     assert clarify_info["triggered"] is True
     assert clarify_info["mode"] == "kb"
@@ -160,7 +161,7 @@ def test_off_topic_turn_routes_kb_and_keeps_node(pattern):
     assert session.cxt.filled_slots.get("brand") == "我想买车"
 
     # Round 3: back to normal (answers the budget)
-    r4 = chat_fn("20万左右", "it", sessions)
+    r4 = arun(chat_fn("20万左右", "it", sessions))
     assert session.cxt.metadata["clarify"]["triggered"] is False
     assert session.cxt.current_node_code == "buy_ask_city"
     assert session.cxt.filled_slots["budget"] == "20万左右"

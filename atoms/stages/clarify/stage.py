@@ -47,7 +47,7 @@ class ClarifyStage(PipelineStage):
     # LLM generation (same call chain as NLU/NLG; can be wholly replaced in tests)
     # ------------------------------------------------------------------
 
-    def _generate(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
+    async def _generate(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
         """Call the LLM to generate the clarify reply."""
         if llm_config is None:
             from nexus.settings import get_llm_config
@@ -56,7 +56,7 @@ class ClarifyStage(PipelineStage):
         from nexus.llm.resolve import build_provider
         provider = build_provider(llm_config)
         messages = [{"role": "user", "content": prompt}]
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=messages,
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
@@ -111,7 +111,7 @@ class ClarifyStage(PipelineStage):
     # naturally falls back)
     # ------------------------------------------------------------------
 
-    def _do_recall(self, ctx: DialogueContext, search_query: str) -> List[Dict[str, Any]]:
+    async def _do_recall(self, ctx: DialogueContext, search_query: str) -> List[Dict[str, Any]]:
         """Run recall with the assembled query and return fused results; return an empty list on error.
 
         MultiPathRecaller.execute uses ctx.user_query as the search text and writes
@@ -124,7 +124,7 @@ class ClarifyStage(PipelineStage):
         try:
             ctx.user_query = search_query
             self.recaller.phase = "pre"
-            self.recaller.execute(ctx)
+            await self.recaller.execute(ctx)
             return list(ctx.pre_recall_results)
         except Exception as e:
             logger.warning("澄清检索异常，降级 fallback: %s", e, exc_info=True)
@@ -133,7 +133,7 @@ class ClarifyStage(PipelineStage):
             ctx.user_query = original_query
             ctx.pre_recall_results = original_recall
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         # 1. Per-turn reset (prevent cross-turn residue)
         ctx.metadata["clarify"] = {"triggered": False}
 
@@ -147,7 +147,7 @@ class ClarifyStage(PipelineStage):
 
         # 3-6. Recall + gating (exceptions degrade to fallback, never blocking
         # the main pipeline)
-        recall_results = self._do_recall(ctx, search_query)
+        recall_results = await self._do_recall(ctx, search_query)
         try:
             mode, adjusted = self.rule.route(
                 recall_results, open_slots["topic"], open_slots["keywords"]
@@ -165,7 +165,7 @@ class ClarifyStage(PipelineStage):
         # 7. Generate by mode (the only NLG call this turn)
         prompt = self._build_prompt(ctx, mode, open_slots, adjusted)
         try:
-            content = self._generate(prompt, ctx.llm_config).strip()
+            content = (await self._generate(prompt, ctx.llm_config)).strip()
         except Exception as e:
             logger.warning("澄清生成异常，使用兜底话术: %s", e, exc_info=True)
             content = "抱歉，这个问题我需要确认一下。我们继续刚才的任务好吗？"

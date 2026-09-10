@@ -85,8 +85,8 @@ class ScriptedProvider:
         self.script = list(script)
         self.seen = []
 
-    def chat_completion(self, messages, model, temperature=0.7,
-                        max_tokens=2048, tools=None, tool_choice=None):
+    async def achat_completion(self, messages, model, temperature=0.7,
+                               max_tokens=2048, tools=None, tool_choice=None):
         self.seen.append({"messages": list(messages), "tools": tools})
         return self.script.pop(0)
 
@@ -97,11 +97,12 @@ def _tool_call(cid="c1", name="guard_echo_tool", arguments="{}"):
 
 
 def _run(session, provider):
+    from async_utils import arun
     from nexus.engine.loop import run_agent
     with patch("atoms.executors.loop_executor.build_provider",
                return_value=provider):
-        return run_agent(session, session.cxt.module_map["main"],
-                         {"code": "x", "model": "m"})
+        return arun(run_agent(session, session.cxt.module_map["main"],
+                              {"code": "x", "model": "m"}))
 
 
 def _tool_rows(cxt):

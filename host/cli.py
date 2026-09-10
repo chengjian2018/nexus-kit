@@ -18,6 +18,7 @@ Usage examples:
     .venv/bin/python cli.py list patterns
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -500,10 +501,14 @@ def _snapshot(cxt) -> Dict[str, Any]:
 
 def run_turn(session: Session, query: str, sessions: Dict[str, Session],
              store: Optional[SessionStore], verbose: int = 0) -> str:
-    """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering."""
+    """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering.
+
+    TODO(phase4): temporary asyncio.run bridge — the engine core is async
+    since phase-2; the CLI gets its single persistent loop in phase-4.
+    """
     before = _snapshot(session.cxt)
 
-    reply = chat_turn(query, session.session_id, sessions, store=store)
+    reply = asyncio.run(chat_turn(query, session.session_id, sessions, store=store))
 
     if store is not None:
         try:

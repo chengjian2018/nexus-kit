@@ -41,7 +41,7 @@ class BaseNLG(PipelineStage, ABC):
     # LLM client
     # ------------------------------------------------------------------
 
-    def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
+    async def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
         """Call the LLM and return the response text.
 
         When *llm_config* is None, the config is auto-loaded from
@@ -55,7 +55,7 @@ class BaseNLG(PipelineStage, ABC):
         provider = build_provider(llm_config)
 
         messages = [{"role": "user", "content": prompt}]
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=messages,
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
@@ -119,7 +119,7 @@ class BaseNLG(PipelineStage, ABC):
         ...
 
     @abstractmethod
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         """Run the NLG stage and write the result into ctx.nlg_result."""
         ...
 
@@ -145,7 +145,7 @@ class FSMNLG(BaseNLG):
 
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         # Clarify turn: nlg_result was already written by ClarifyStage; skip to
         # avoid generating twice
         if (ctx.metadata.get("clarify") or {}).get("triggered"):
@@ -153,7 +153,7 @@ class FSMNLG(BaseNLG):
             return ctx
 
         prompt = self.prompt_build(ctx)
-        raw = self._call_llm(prompt, ctx.llm_config)
+        raw = await self._call_llm(prompt, ctx.llm_config)
         ctx.nlg_result = {"content": raw.strip()}
         logger.info(
             "FSM NLG 完成: session=%s, content_len=%d",
@@ -184,9 +184,9 @@ class RouteNLG(BaseNLG):
 
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         prompt = self.prompt_build(ctx)
-        raw = self._call_llm(prompt, ctx.llm_config)
+        raw = await self._call_llm(prompt, ctx.llm_config)
         ctx.nlg_result = {"content": raw.strip()}
         logger.info(
             "Route NLG 完成: session=%s, content_len=%d",

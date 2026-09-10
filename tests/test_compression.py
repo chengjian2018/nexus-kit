@@ -1,6 +1,7 @@
 """Session history compression tests — estimation / threshold / snap / summary-failure protection / end-to-end."""
 
 import json
+from async_utils import arun
 from unittest.mock import patch
 
 import pytest
@@ -93,8 +94,8 @@ class _SummaryProvider:
         self.fail = fail
         self.seen = []
 
-    def chat_completion(self, messages, model, temperature, max_tokens,
-                        **kw):
+    async def achat_completion(self, messages, model, temperature, max_tokens,
+                               **kw):
         self.seen.append(messages)
         if self.fail:
             raise RuntimeError("llm down")
@@ -121,7 +122,7 @@ def test_compress_success_rebuilds_db_and_cxt(tmp_path):
     llm_config = {"code": "fake", "model": "m", "temperature": 0.3,
                   "max_tokens": 1024}
     with patch("nexus.engine.compression.build_provider", return_value=provider):
-        ok = compress_history(session, store, llm_config, retain_count=4)
+        ok = arun(compress_history(session, store, llm_config, retain_count=4))
 
     assert ok is True
     # DB: summary first + 4 retained entries
@@ -152,8 +153,8 @@ def test_compress_llm_failure_keeps_everything(tmp_path):
 
     provider = _SummaryProvider(fail=True)
     with patch("nexus.engine.compression.build_provider", return_value=provider):
-        ok = compress_history(session, store,
-                              {"code": "f", "model": "m"}, retain_count=4)
+        ok = arun(compress_history(session, store,
+                                   {"code": "f", "model": "m"}, retain_count=4))
 
     assert ok is False
     assert store.get_history("comp-1") == before_db
@@ -170,8 +171,8 @@ def test_compress_aborts_when_db_memory_mismatch(tmp_path):
 
     provider = _SummaryProvider()
     with patch("nexus.engine.compression.build_provider", return_value=provider):
-        ok = compress_history(session, store,
-                              {"code": "f", "model": "m"}, retain_count=4)
+        ok = arun(compress_history(session, store,
+                                   {"code": "f", "model": "m"}, retain_count=4))
 
     assert ok is False
     assert not provider.seen  # LLM not called (validation runs first)
@@ -186,8 +187,8 @@ def test_compress_empty_summary_aborts(tmp_path):
 
     provider = _SummaryProvider(reply="   ")
     with patch("nexus.engine.compression.build_provider", return_value=provider):
-        ok = compress_history(session, store,
-                              {"code": "f", "model": "m"}, retain_count=4)
+        ok = arun(compress_history(session, store,
+                                   {"code": "f", "model": "m"}, retain_count=4))
     assert ok is False
     assert len(store.get_history("comp-1")) == 20
     store.close()
@@ -208,8 +209,8 @@ def test_after_compress_query_appears_once(tmp_path):
 
     with patch("nexus.engine.compression.build_provider",
                return_value=_SummaryProvider("摘要：此前咨询")):
-        ok = compress_history(session, store,
-                              {"code": "f", "model": "m"}, retain_count=4)
+        ok = arun(compress_history(session, store,
+                                   {"code": "f", "model": "m"}, retain_count=4))
     assert ok is True
 
     messages = default_build_messages(AgentModule(module_code="m"), session.cxt)
@@ -224,8 +225,8 @@ def test_after_compress_query_appears_once(tmp_path):
 def test_maybe_compress_skips_without_store_or_threshold():
     """store None / threshold 0: skip silently without raising."""
     session = _mk_session_with_history()
-    maybe_compress(session, None)  # no-op
+    arun(maybe_compress(session, None))  # no-op
     with patch("nexus.settings.get_session_compress_config",
                return_value=(0, 12)):
-        maybe_compress(session, object())
+        arun(maybe_compress(session, object()))
     assert len(session.cxt.history) == 20

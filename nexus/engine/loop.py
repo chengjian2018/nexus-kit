@@ -48,17 +48,17 @@ _DEFER_TOOL_NAME = "defer_to_module"
 _PROMPT_LENGTH_WARN = 4000
 
 
-def conversation(
+async def conversation(
     session: Session,
     module,
     llm_config: Dict[str, Any],
 ) -> str:
     """Compatibility wrapper: calls run_agent and returns the reply text (the chat layer continues transfer turns)."""
-    result = run_agent(session, module, llm_config)
+    result = await run_agent(session, module, llm_config)
     return result.content or ""
 
 
-def run_agent(
+async def run_agent(
     session: Session,
     module,
     llm_config: Dict[str, Any],
@@ -79,14 +79,14 @@ def run_agent(
     session.cxt.llm_config = llm_config
     executor = plugin_registry.resolve(
         "executor", plugin_registry.default_executor_code(ModuleType.AGENT.value))
-    return executor.execute(ec)
+    return await executor.execute(ec)
 
 
 # ---------------------------------------------------------------------------
 # Tool round dispatch (P4/P5 + main-flow tool-name validation)
 # ---------------------------------------------------------------------------
 
-def _dispatch_tool_calls(
+async def _dispatch_tool_calls(
     cxt, module, messages, content, tool_calls, hooks, allowed_names,
     lent_by, round_idx, transfer_error=None,
 ) -> None:
@@ -183,7 +183,7 @@ def _dispatch_tool_calls(
             }, ensure_ascii=False)
             metadata["synthetic"] = True
         else:
-            tool_result = _execute_tool(name, _parse_args(tc))
+            tool_result = await _execute_tool(name, _parse_args(tc))
             result_original = None
             if hooks:
                 event = ToolResultEvent(
@@ -359,10 +359,10 @@ def _parse_args(tc) -> Dict[str, Any]:
     return args if isinstance(args, dict) else {}
 
 
-def _execute_tool(tool_name: str, tool_args: Dict[str, Any]) -> str:
+async def _execute_tool(tool_name: str, tool_args: Dict[str, Any]) -> str:
     """Execute a single tool call, returning a JSON string result."""
     try:
-        result = tool_registry.dispatch(tool_name, tool_args)
+        result = await tool_registry.dispatch(tool_name, tool_args)
         return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
     except Exception as e:
         logger.exception("工具执行异常: %s", tool_name)

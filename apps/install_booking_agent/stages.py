@@ -75,7 +75,7 @@ class InstallRecommendNLG:
     RECOMMEND_LEAD = "最近可以约 "
     RECOMMEND_TAIL = "，您看哪个时间段合适？"
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         task_info = ctx.task_basic_info or ctx.metadata.get("task_info") or {}
         available = parse_available_slots(task_info)
         if not available:
@@ -138,10 +138,10 @@ class InstallBookingUnifiedNLU(FSMUnifiedNLU):
         super().__init__()
         self._recommend_nlg = InstallRecommendNLG()
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
-        super().execute(ctx)  # the builtin single call (reply/next_node/slots)
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
+        await super().execute(ctx)  # the builtin single call (reply/next_node/slots)
         self._apply_booking_guard(ctx)
-        self._apply_recommend_rewrite(ctx)
+        await self._apply_recommend_rewrite(ctx)
         self._apply_callback_close(ctx)
         return ctx
 
@@ -206,12 +206,12 @@ class InstallBookingUnifiedNLU(FSMUnifiedNLU):
             display, suggest_slots(available),
         )
 
-    def _apply_recommend_rewrite(self, ctx: DialogueContext) -> None:
+    async def _apply_recommend_rewrite(self, ctx: DialogueContext) -> None:
         """Deterministic recommend reply on EVERY transition into the
         recommend node (guarded reroute or the model's own pick)."""
         next_node = (ctx.nlu_result or {}).get("next_node", "")
         if next_node == self.RECOMMEND_NODE:
-            self._recommend_nlg.execute(ctx)
+            await self._recommend_nlg.execute(ctx)
 
     def _requested_slot(self, ctx: DialogueContext):
         """The customer's requested time from the time-augmented query.
@@ -501,7 +501,7 @@ class KeywordClarifyStage(ClarifyStage):
             answer = answer.replace("{" + str(key) + "}", str(value))
         return prompt.replace("{__faq_answer__}", answer)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         # 1. Per-turn reset (same contract as the parent)
         ctx.metadata["clarify"] = {"triggered": False}
 
@@ -532,7 +532,7 @@ class KeywordClarifyStage(ClarifyStage):
                                            recall_items, template)
         prompt = self._fill_faq_answer(prompt, ctx)
         try:
-            content = self._generate(prompt, ctx.llm_config).strip()
+            content = (await self._generate(prompt, ctx.llm_config)).strip()
         except Exception as e:
             logger.warning("澄清生成异常，使用兜底话术: %s", e, exc_info=True)
             content = self.CLARIFY_FALLBACK_REPLY

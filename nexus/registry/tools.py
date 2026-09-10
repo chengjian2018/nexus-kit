@@ -771,10 +771,12 @@ class ToolRegistry:
             "result_type": result_type,
         }, ensure_ascii=False)
 
-    def dispatch(self, name: str, args: dict, **kwargs) -> Union[str, dict]:
-        """Execute a tool handler by name.
+    async def dispatch(self, name: str, args: dict, **kwargs) -> Union[str, dict]:
+        """Execute a tool handler by name (async since the asyncio rewrite).
 
-        * Async handlers are bridged automatically via ``_run_async()``.
+        * Async handlers are awaited directly; sync handlers run in a worker
+          thread via ``asyncio.to_thread`` (they may block — sqlite, jieba
+          first-load, MCP's sync bridge during the migration).
         * Handler results are normalized to a string or supported multimodal
           envelope before leaving the registry.
         * All exceptions are caught and returned as ``{"error": "..."}``
@@ -785,9 +787,9 @@ class ToolRegistry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         try:
             if entry.is_async:
-                result = _run_async(entry.handler(args, **kwargs))
+                result = await entry.handler(args, **kwargs)
             else:
-                result = entry.handler(args, **kwargs)
+                result = await asyncio.to_thread(entry.handler, args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)

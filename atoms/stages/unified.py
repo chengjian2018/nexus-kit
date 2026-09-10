@@ -94,7 +94,7 @@ class _UnifiedBaseNLU(BaseNLU):
     # LLM call: passes response_format through on top of BaseNLU as needed
     # ------------------------------------------------------------------
 
-    def _call_llm(
+    async def _call_llm(
         self, prompt: str, llm_config: Optional[Dict[str, Any]] = None
     ) -> str:
         """Call the LLM (single call per turn) and return the raw response text."""
@@ -109,7 +109,7 @@ class _UnifiedBaseNLU(BaseNLU):
         if self.response_format is not None:
             extra_kwargs["response_format"] = self.response_format
 
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=[{"role": "user", "content": prompt}],
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
@@ -228,10 +228,10 @@ class _UnifiedBaseNLU(BaseNLU):
     # Single-call main logic: parse → hard validation → split-write nlu_result / nlg_result
     # ------------------------------------------------------------------
 
-    def _execute_unified(self, ctx: DialogueContext) -> None:
+    async def _execute_unified(self, ctx: DialogueContext) -> None:
         """One call and split-write of the outputs; any failure degrades to the fallback reply, never raising upward."""
         prompt = self.prompt_build(ctx)
-        parsed = self._execute_with_retry(prompt, ctx.llm_config)
+        parsed = await self._execute_with_retry(prompt, ctx.llm_config)
 
         unified_meta: Dict[str, Any] = {"triggered": True}
 
@@ -298,8 +298,8 @@ class FSMUnifiedNLU(_UnifiedBaseNLU):
         kwargs = self._build_template_kwargs(cxt)
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
-        self._execute_unified(ctx)
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
+        await self._execute_unified(ctx)
         logger.info(
             "FSM 统一阶段完成: session=%s, next_node=%s, reply_len=%d",
             ctx.session_id,
@@ -331,8 +331,8 @@ class RouteUnifiedNLU(_UnifiedBaseNLU):
         kwargs = self._build_template_kwargs(cxt)
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
-        self._execute_unified(ctx)
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
+        await self._execute_unified(ctx)
         logger.info(
             "Route 统一阶段完成: session=%s, next_node=%s, reply_len=%d",
             ctx.session_id,
@@ -361,7 +361,7 @@ class PassThroughNLG(PipelineStage):
 
     stage_name = "nlg_pass_through"
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         if ctx.nlg_result is None:
             logger.warning(
                 "PassThroughNLG 未检测到已生成的 nlg_result，"
@@ -434,7 +434,7 @@ class OpeningBroadcastNLG(PipelineStage):
         parts.extend(f"{key}: {value}" for key, value in task_info.items())
         return "\n".join(parts)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         content = self._build_content(ctx)
         ctx.nlg_result = {"content": content}
         logger.info(

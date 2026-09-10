@@ -141,8 +141,8 @@ class _ScriptedProvider:
         self.script = list(script)
         self.seen = []
 
-    def chat_completion(self, messages, model, temperature, max_tokens,
-                        tools=None, tool_choice=None, **kw):
+    async def achat_completion(self, messages, model, temperature, max_tokens,
+                               tools=None, tool_choice=None, **kw):
         self.seen.append({"messages": messages, "tools": tools})
         return self.script.pop(0)
 
@@ -162,8 +162,9 @@ def test_run_agent_sends_migrated_messages(store):
     provider = _ScriptedProvider([{"content": "亲～推荐阅读器哦📖",
                                    "tool_calls": []}])
     with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
-        result = run_agent(session, customer_service,
-                           session.cxt.metadata["llm_override"])
+        from async_utils import arun
+        result = arun(run_agent(session, customer_service,
+                                session.cxt.metadata["llm_override"]))
 
     assert result.content == "亲～推荐阅读器哦📖"
     messages = provider.seen[0]["messages"]

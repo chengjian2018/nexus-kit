@@ -220,13 +220,13 @@ class XianyuIntentNLU(BaseNLU):
         prompt += "\n### 买家消息\n" + _effective_query(cxt)
         return prompt
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         # 1-2. Local rule layer (tech first, zero LLM)
         intent = detect_intent(_effective_query(ctx))
 
         # 3. LLM fallback: run ClassifyAgent when the local layer misses (default)
         if intent == "default":
-            intent = self._classify_via_llm(ctx)
+            intent = await self._classify_via_llm(ctx)
 
         # Backfill intent onto the current turn's user message (already in history:
         # chat() adds the message before running the pipeline) — bargain counting
@@ -267,10 +267,10 @@ class XianyuIntentNLU(BaseNLU):
         }
         return ctx
 
-    def _classify_via_llm(self, ctx) -> str:
+    async def _classify_via_llm(self, ctx) -> str:
         """LLM intent fallback — replicates ClassifyAgent (including the no_reply anti-flooding class)."""
         try:
-            raw = self._call_llm(self.prompt_build(ctx), ctx.llm_config)
+            raw = await self._call_llm(self.prompt_build(ctx), ctx.llm_config)
         except Exception as e:
             logger.warning("LLM 意图兜底失败，回落 default: %s", e)
             return "default"
@@ -346,7 +346,7 @@ class FixedNLG(BaseNLG):
         prompt += "\n### 买家消息\n" + _effective_query(cxt)
         return prompt
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         intent = (ctx.nlu_result or {}).get("intent")
 
         # 1. no_reply: empty reply, the channel does not send it (zero LLM)
@@ -364,7 +364,7 @@ class FixedNLG(BaseNLG):
 
         # 3. Intent menu node: single LLM generation + blocked-word filtering
         prompt = self.prompt_build(ctx)
-        raw = self._call_llm(prompt, self._tuned_llm_config(ctx))
+        raw = await self._call_llm(prompt, self._tuned_llm_config(ctx))
         ctx.nlg_result = {"content": self._safe_filter(raw.strip())}
         return ctx
 

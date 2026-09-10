@@ -29,7 +29,7 @@ class _JumpNLU(PipelineStage):
     def __init__(self, nlu_result):
         self.nlu_result = nlu_result
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         ctx.nlu_result = dict(self.nlu_result)
         return ctx
 
@@ -37,7 +37,7 @@ class _JumpNLU(PipelineStage):
 class _MarkerNLG(PipelineStage):
     stage_name = "marker_nlg"
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         ctx.nlg_result = {"content": "nlg_ran"}
         return ctx
 
@@ -74,7 +74,8 @@ def _launch(pattern, sessions, sid="s1"):
 
 def _chat(sessions, sid, query):
     from nexus.engine.chat import chat as chat_fn
-    return chat_fn(query=query, session_id=sid, all_sessions=sessions)
+    from async_utils import arun
+    return arun(chat_fn(query=query, session_id=sid, all_sessions=sessions))
 
 
 # ============================================================================
@@ -173,7 +174,7 @@ def test_nlu_jump_breaks_stages_and_reroutes_same_turn():
     class _TargetNLG(PipelineStage):
         stage_name = "target_nlg"
 
-        def execute(self, ctx):
+        async def execute(self, ctx):
             ran.append("target_nlg")
             ctx.nlg_result = {"content": "已为您切换到目标模块"}
             return ctx
@@ -181,7 +182,7 @@ def test_nlu_jump_breaks_stages_and_reroutes_same_turn():
     class _FSMNLUStub(PipelineStage):
         stage_name = "fsm_nlu"
 
-        def execute(self, ctx):
+        async def execute(self, ctx):
             ran.append("fsm_nlu")
             ctx.nlu_result = {"next_node": "", "slots": {}}
             return ctx
@@ -231,7 +232,7 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
         def __init__(self):
             self.calls = 0
 
-        def execute(self, ctx):
+        async def execute(self, ctx):
             self.calls += 1
             # First time via the menu node (route_menu), afterwards directly
             # via nlu_jump (covers both sources)
@@ -258,7 +259,7 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
     class _TargetNLG(PipelineStage):
         stage_name = "target_nlg"
 
-        def execute(self, ctx):
+        async def execute(self, ctx):
             ran.append("target_nlg")
             ctx.nlg_result = {"content": "target 回复"}
             return ctx
@@ -266,7 +267,7 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
     class _TargetNLU(PipelineStage):
         stage_name = "target_nlu"
 
-        def execute(self, ctx):
+        async def execute(self, ctx):
             ctx.nlu_result = {"next_node": "", "slots": {}}
             return ctx
 
@@ -285,7 +286,8 @@ def test_jump_event_via_actions_snapshot_when_hops_exhausted():
     sessions = {}
     _launch(pattern, sessions)
     with patch("atoms.executors.loop_executor.build_provider"):
-        result = chat_turn("选A", "s1", sessions)
+        from async_utils import arun
+        result = arun(chat_turn("选A", "s1", sessions))
 
     # force_close lands on the last target m1 (FSM turns do not detect jumps;
     # stages run to completion and produce the reply)

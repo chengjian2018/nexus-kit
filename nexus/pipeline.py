@@ -299,7 +299,7 @@ class _DeferredNLG:
         self.module = module
         self.pattern = pattern
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         code = resolve_stage_code("nlg", ctx, self.module, self.pattern,
                                   skeleton_value=self.fallback_code)
         if code is None:
@@ -307,7 +307,7 @@ class _DeferredNLG:
         stage = _resolve_code_to_stage(code)
         if stage is None:
             return ctx
-        return stage.execute(ctx)
+        return await stage.execute(ctx)
 
 
 # ============================================================================

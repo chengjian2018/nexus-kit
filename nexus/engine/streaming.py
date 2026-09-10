@@ -24,7 +24,7 @@ the final round; done.result.text is always the authoritative reply.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from nexus.engine.response import ChatResult
 
@@ -66,12 +66,12 @@ class StreamEmitter:
         return out
 
 
-def aggregate_turn(events: Generator[ChatStreamEvent, None, None]
-                   ) -> ChatResult:
-    """Aggregate a chat_turn_stream generator into its ChatResult (the last
-    done event; raises if the stream produced none)."""
+async def aggregate_turn(events: AsyncGenerator[ChatStreamEvent, None]
+                         ) -> ChatResult:
+    """Aggregate a chat_turn_stream async generator into its ChatResult (the
+    last done event; raises if the stream produced none)."""
     result: Optional[ChatResult] = None
-    for event in events:
+    async for event in events:
         if event.kind == "done" and event.result is not None:
             result = event.result
     if result is None:

@@ -23,7 +23,8 @@ def store(tmp_path, monkeypatch):
 
 
 def _dispatch(name: str, **args) -> str:
-    return registry.dispatch(name, args)
+    from async_utils import arun
+    return arun(registry.dispatch(name, args))
 
 
 # ---------------------------------------------------------------------------

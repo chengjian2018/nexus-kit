@@ -25,7 +25,7 @@ class DefaultFSMExecutor(ModuleExecutor):
     at end of turn), so _run_stages always returns None.
     """
 
-    def execute(self, ec: "ExecutionContext") -> TurnResult:
+    async def execute(self, ec: "ExecutionContext") -> TurnResult:
         from nexus.engine.chat import (
             _fsm_node_transition,
             _refresh_llm_config,
@@ -44,7 +44,7 @@ class DefaultFSMExecutor(ModuleExecutor):
         # anchor keeps working
         _refresh_llm_config_by_node(ec, module)
 
-        _run_stages(cxt, module, pattern, force_close=ec.force_close)
+        await _run_stages(cxt, module, pattern, force_close=ec.force_close)
 
         # FSM: next_node jump (the clarify-turn guard lives inside the
         # transition function)

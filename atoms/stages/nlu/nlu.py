@@ -41,7 +41,7 @@ class BaseNLU(PipelineStage, ABC):
     # LLM client
     # ------------------------------------------------------------------
 
-    def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
+    async def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
         """Call the LLM and return the response text.
 
         When *llm_config* is None, the config is auto-loaded from
@@ -55,7 +55,7 @@ class BaseNLU(PipelineStage, ABC):
         provider = build_provider(llm_config)
 
         messages = [{"role": "user", "content": prompt}]
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=messages,
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
@@ -138,7 +138,7 @@ class BaseNLU(PipelineStage, ABC):
             "3. 只输出 JSON 对象，不要包裹 markdown 代码块或其他文字"
         )
 
-    def _execute_with_retry(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None, max_retries: int = 1) -> Dict[str, Any]:
+    async def _execute_with_retry(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None, max_retries: int = 1) -> Dict[str, Any]:
         """Run the NLU call, auto-retrying once when parsing fails.
 
         On retry, the last failed output is fed back as supplementary input to guide the LLM in fixing the format.
@@ -151,7 +151,7 @@ class BaseNLU(PipelineStage, ABC):
         Returns:
             parsed NLU result dict.
         """
-        raw = self._call_llm(prompt, llm_config)
+        raw = await self._call_llm(prompt, llm_config)
         result = self._parse_nlu_result(raw)
 
         # Parsed successfully (no "raw" fallback key), return directly
@@ -165,7 +165,7 @@ class BaseNLU(PipelineStage, ABC):
                 attempt, max_retries,
             )
             retry_prompt = self._build_retry_prompt(prompt, raw)
-            raw = self._call_llm(retry_prompt, llm_config)
+            raw = await self._call_llm(retry_prompt, llm_config)
             result = self._parse_nlu_result(raw)
 
             if "raw" not in result:
@@ -230,7 +230,7 @@ class BaseNLU(PipelineStage, ABC):
         ...
 
     @abstractmethod
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         """Run the NLU stage and write the result into ctx.nlu_result."""
         ...
 
@@ -256,9 +256,9 @@ class FSMNLU(BaseNLU):
 
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         prompt = self.prompt_build(ctx)
-        nlu_result = self._execute_with_retry(prompt, ctx.llm_config)
+        nlu_result = await self._execute_with_retry(prompt, ctx.llm_config)
         ctx.nlu_result = nlu_result
         logger.info(
             "FSM NLU 完成: session=%s, next_node=%s",
@@ -289,9 +289,9 @@ class RouteNLU(BaseNLU):
 
         return self._fill_template(prompt_template, kwargs)
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         prompt = self.prompt_build(ctx)
-        ctx.nlu_result = self._execute_with_retry(prompt, ctx.llm_config)
+        ctx.nlu_result = await self._execute_with_retry(prompt, ctx.llm_config)
         logger.info(
             "Route NLU 完成: session=%s, next_node=%s",
             ctx.session_id,

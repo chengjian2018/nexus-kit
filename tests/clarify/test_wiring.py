@@ -4,6 +4,7 @@ Post-plan-②: clarify is a skeleton slot declared via module.stages
 ({"clarify": code}); the default skeleton keeps clarify=None (opt-in).
 """
 
+from async_utils import arun
 import pytest
 
 from nexus.engine.chat import _default_skeleton, _handle_node_transition
@@ -42,7 +43,7 @@ class TestBuildStages:
         class _Clarify:
             stage_name = "my_clarify"
 
-            def execute(self, ctx):
+            async def execute(self, ctx):
                 return ctx
 
         cl_code = register_stage_stub(_Clarify)
@@ -58,7 +59,7 @@ class TestBuildStages:
         class _Noop:
             stage_name = "noop"
 
-            def execute(self, ctx):
+            async def execute(self, ctx):
                 ran.append(self.stage_name)
                 return ctx
 
@@ -74,7 +75,7 @@ class TestBuildStages:
         names = [getattr(s, "stage_name", "?") for _, s in sequence]
         assert names == ["noop", "my_clarify", "nlg(deferred)"]
         for _, stage in sequence:
-            stage.execute(ctx)
+            arun(stage.execute(ctx))
         assert ran == ["noop", "noop"]  # clarify + nlu/nlg executed
 
     def test_undeclared_clarify_never_inserted(self):
@@ -98,7 +99,7 @@ class TestNlgSkipGuard:
         calls = []
         FSMNLG._call_llm = lambda self, prompt, cfg=None: calls.append(prompt) or "x"
         try:
-            FSMNLG().execute(ctx)
+            arun(FSMNLG().execute(ctx))
         finally:
             del FSMNLG._call_llm
         assert calls == []

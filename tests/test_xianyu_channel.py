@@ -278,7 +278,7 @@ def fake_chat(monkeypatch):
 
     calls = []
 
-    def _chat(query, session_id, all_sessions, store=None):
+    async def _chat(query, session_id, all_sessions, store=None):
         calls.append((session_id, query))
         session = all_sessions[session_id]
         session.cxt.add_message("user", query, stage="chat")

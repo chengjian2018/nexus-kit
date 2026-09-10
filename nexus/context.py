@@ -105,8 +105,9 @@ class PipelineStage(ABC):
     stage_name: str = ""
 
     @abstractmethod
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
-        """Run this stage's logic and return the modified context."""
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
+        """Run this stage's logic and return the modified context
+        (async since the asyncio rewrite — stages may drive LLM/recall I/O)."""
         ...
 
     def __repr__(self) -> str:

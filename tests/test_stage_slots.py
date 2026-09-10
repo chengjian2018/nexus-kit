@@ -11,6 +11,7 @@ Core contracts (direct counterpart of the pipeline.py design):
 - Malformed skeleton declarations fail fast at construction
 """
 
+from async_utils import arun
 import pytest
 
 from nexus.context import DialogueContext
@@ -32,7 +33,7 @@ class _Marker:
     def __init__(self, name):
         self.stage_name = name
 
-    def execute(self, ctx):
+    async def execute(self, ctx):
         ran.append((ctx.current_node_code, self.stage_name))
         return ctx
 
@@ -158,7 +159,7 @@ def test_module_layer_wins_over_skeleton():
     pattern = _pattern(stages=[{"query": None}])
     sequence = resolve_execution_sequence(ctx, module, pattern)
     assert [slot for slot, _ in sequence] == ["query"]
-    sequence[0][1].execute(ctx)
+    arun(sequence[0][1].execute(ctx))
     assert ran == [("n1", "mod_query")]
 
 
@@ -170,12 +171,12 @@ def test_node_layer_wins_over_module():
     ctx = _ctx(node_code="n1", node=n2)
 
     sequence = resolve_execution_sequence(ctx, module, None)
-    sequence[0][1].execute(ctx)
+    arun(sequence[0][1].execute(ctx))
     assert ran == [("n1", "mod_query")]  # n1 has no stages: module layer
 
     ctx.current_node_code = "n2"
     sequence = resolve_execution_sequence(ctx, module, None)
-    sequence[0][1].execute(ctx)
+    arun(sequence[0][1].execute(ctx))
     assert ran[-1] == ("n2", "n2_query")  # node layer hits
 
 
@@ -185,7 +186,7 @@ def test_skeleton_value_is_pattern_layer():
     module = _fsm_module()
     pattern = _pattern(stages=[{"query": q_code}])
     sequence = resolve_execution_sequence(ctx, module, pattern)
-    sequence[0][1].execute(ctx)
+    arun(sequence[0][1].execute(ctx))
     assert ran == [("n1", "pat_query")]
 
 
@@ -201,11 +202,16 @@ def test_builtin_generate_tail_when_unresolved():
     from atoms.stages.nlu import FSMNLU
     from atoms.stages.nlg import FSMNLG
     orig_nlu, orig_nlg = FSMNLU.execute, FSMNLG.execute
-    FSMNLU.execute = lambda self, ctx: ran.append(("n1", "fsm_nlu")) or ctx
-    FSMNLG.execute = lambda self, ctx: ran.append(("n1", "fsm_nlg")) or ctx
+    async def _nlu(self, ctx):
+        ran.append(("n1", "fsm_nlu"))
+        return ctx
+    async def _nlg(self, ctx):
+        ran.append(("n1", "fsm_nlg"))
+        return ctx
+    FSMNLU.execute, FSMNLG.execute = _nlu, _nlg
     try:
         for _, stage in sequence:
-            stage.execute(ctx)
+            arun(stage.execute(ctx))
     finally:
         FSMNLU.execute, FSMNLG.execute = orig_nlu, orig_nlg
     assert ran == [("n1", "fsm_nlu"), ("n1", "fsm_nlg")]
@@ -221,11 +227,16 @@ def test_builtin_route_generate_tail():
     from atoms.stages.nlu import RouteNLU
     from atoms.stages.nlg import RouteNLG
     orig_nlu, orig_nlg = RouteNLU.execute, RouteNLG.execute
-    RouteNLU.execute = lambda self, ctx: ran.append(("root", "route_nlu")) or ctx
-    RouteNLG.execute = lambda self, ctx: ran.append(("root", "route_nlg")) or ctx
+    async def _nlu(self, ctx):
+        ran.append(("root", "route_nlu"))
+        return ctx
+    async def _nlg(self, ctx):
+        ran.append(("root", "route_nlg"))
+        return ctx
+    RouteNLU.execute, RouteNLG.execute = _nlu, _nlg
     try:
         for _, stage in sequence:
-            stage.execute(ctx)
+            arun(stage.execute(ctx))
     finally:
         RouteNLU.execute, RouteNLG.execute = orig_nlu, orig_nlg
     assert ran == [("root", "route_nlu"), ("root", "route_nlg")]
@@ -242,12 +253,17 @@ def test_clarify_slot_declared_runs_between_nlu_and_nlg():
     from atoms.stages.nlu import FSMNLU
     from atoms.stages.nlg import FSMNLG
     orig_nlu, orig_nlg = FSMNLU.execute, FSMNLG.execute
-    FSMNLU.execute = lambda self, ctx: ran.append(("n1", "fsm_nlu")) or ctx
-    FSMNLG.execute = lambda self, ctx: ran.append(("n1", "fsm_nlg")) or ctx
+    async def _nlu(self, ctx):
+        ran.append(("n1", "fsm_nlu"))
+        return ctx
+    async def _nlg(self, ctx):
+        ran.append(("n1", "fsm_nlg"))
+        return ctx
+    FSMNLU.execute, FSMNLG.execute = _nlu, _nlg
     try:
         sequence = resolve_execution_sequence(ctx, module, pattern)
         for slot, stage in sequence:
-            stage.execute(ctx)
+            arun(stage.execute(ctx))
     finally:
         FSMNLU.execute, FSMNLG.execute = orig_nlu, orig_nlg
     assert ran == [("n1", "fsm_nlu"), ("n1", "my_clarify"), ("n1", "fsm_nlg")]
@@ -265,7 +281,7 @@ def test_unified_pair_same_code_executes_once():
     slots = [slot for slot, _ in sequence]
     assert slots == ["nlu"]  # the nlg entry dropped: unified single execution
     for _, stage in sequence:
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
     assert ran == [("n1", "unified")]
 
 
@@ -277,7 +293,7 @@ def test_unified_pair_via_skeleton():
     sequence = resolve_execution_sequence(ctx, module, pattern)
     assert [slot for slot, _ in sequence] == ["nlu"]
     for _, stage in sequence:
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
     assert ran == [("n1", "unified")]
 
 
@@ -323,7 +339,7 @@ def _launch(pattern, sessions, sid="s1"):
 
 def _chat(sessions, sid, query):
     from nexus.engine.chat import chat as chat_fn
-    return chat_fn(query=query, session_id=sid, all_sessions=sessions)
+    return arun(chat_fn(query=query, session_id=sid, all_sessions=sessions))
 
 
 def test_fsm_node_level_stages_via_default_skeleton():
@@ -353,8 +369,8 @@ def test_route_menu_node_nlg_same_turn_e2e():
         lambda: _SelectingNLU("root_nlu"))
 
     class _SelectingNLU(_Marker):
-        def execute(self, ctx):
-            super().execute(ctx)
+        async def execute(self, ctx):
+            await super().execute(ctx)
             ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
             return ctx
 
@@ -391,8 +407,8 @@ def test_route_menu_jump_module_silent_dispatch_e2e():
     the same turn."""
 
     class _SelectingNLU(_Marker):
-        def execute(self, ctx):
-            super().execute(ctx)
+        async def execute(self, ctx):
+            await super().execute(ctx)
             ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
             return ctx
 

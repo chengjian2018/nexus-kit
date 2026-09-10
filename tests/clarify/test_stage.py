@@ -2,6 +2,8 @@
 
 import pytest
 
+from async_utils import arun
+
 from atoms.stages.clarify.rule import ClarifyRouteRule
 from atoms.stages.clarify.stage import ClarifyStage
 from nexus.context import DialogueContext
@@ -48,7 +50,7 @@ def make_stage(kb_docs=None, rule=None):
 def make_gen_stage(mode_to_return, captured):
     """LLM generation mock: records the received prompt and returns a mode-tagged reply."""
 
-    def fake_generate(prompt: str, *args, **kwargs) -> str:
+    async def fake_generate(prompt: str, *args, **kwargs) -> str:
         captured.append(prompt)
         return f"[clarify:{mode_to_return}] 回复内容"
 
@@ -68,7 +70,7 @@ class TestTrigger:
         ctx = make_ctx(next_node="buy_ask_budget")
         captured = []
         stage = make_gen_stage("kb", captured)
-        ctx2 = stage.execute(ctx)
+        ctx2 = arun(stage.execute(ctx))
         assert captured == []
         assert ctx2.metadata["clarify"]["triggered"] is False
 
@@ -78,14 +80,14 @@ class TestTrigger:
         ctx.metadata["clarify"] = {"triggered": True, "mode": "kb"}
         captured = []
         stage = make_gen_stage("kb", captured)
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
         assert ctx.metadata["clarify"] == {"triggered": False}
 
     def test_triggered_writes_metadata(self):
         ctx = make_ctx()
         captured = []
         stage = make_gen_stage("kb", captured)
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
         info = ctx.metadata["clarify"]
         assert info["triggered"] is True
         assert info["mode"] in ("kb", "fallback", "mixed")
@@ -104,7 +106,7 @@ class TestRecallAndRoute:
         ctx = make_ctx()
         captured = []
         stage = make_gen_stage("kb", captured)
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
         assert ctx.metadata["clarify"]["mode"] == "kb"
         assert "上牌费与服务费" in captured[0]
 
@@ -116,29 +118,31 @@ class TestRecallAndRoute:
         stage.recaller = MultiPathRecaller(
             recall_paths=[KeywordRecallPath(name="kb", documents=[])],
         )
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
         assert ctx.metadata["clarify"]["mode"] == "fallback"
         assert ctx.nlg_result["content"].startswith("[clarify:fallback]")
 
     def test_search_error_falls_back(self):
         """Recall error -> fallback, no exception raised."""
         class BoomPath(KeywordRecallPath):
-            def recall(self, query, ctx, **kwargs):
+            async def recall(self, query, ctx, **kwargs):
                 raise RuntimeError("es down")
 
         ctx = make_ctx()
         stage = ClarifyStage(
             recaller=MultiPathRecaller(recall_paths=[BoomPath(name="kb")]),
         )
-        stage._generate = lambda prompt, *a, **k: "[clarify:fallback] 兜底"
-        stage.execute(ctx)
+        async def _gen_fallback(prompt, *a, **k):
+            return "[clarify:fallback] 兜底"
+        stage._generate = _gen_fallback
+        arun(stage.execute(ctx))
         assert ctx.metadata["clarify"]["mode"] == "fallback"
         assert ctx.nlg_result["content"] == "[clarify:fallback] 兜底"
 
     def test_nlg_result_written(self):
         ctx = make_ctx()
         stage = make_gen_stage("kb", [])
-        stage.execute(ctx)
+        arun(stage.execute(ctx))
         assert ctx.nlg_result == {"content": "[clarify:kb] 回复内容"}
 
 
@@ -153,14 +157,16 @@ class TestQueryBuild:
         seen_queries = []
 
         class SpyPath(KeywordRecallPath):
-            def recall(self, query, ctx, **kwargs):
+            async def recall(self, query, ctx, **kwargs):
                 seen_queries.append(query)
-                return super().recall(query, ctx, **kwargs)
+                return await super().recall(query, ctx, **kwargs)
 
         ctx = make_ctx()
         stage = ClarifyStage(
             recaller=MultiPathRecaller(recall_paths=[SpyPath(name="kb")]),
         )
-        stage._generate = lambda p, *a, **k: "ok"
-        stage.execute(ctx)
+        async def _gen_ok(p, *a, **k):
+            return "ok"
+        stage._generate = _gen_ok
+        arun(stage.execute(ctx))
         assert seen_queries == ["还要收别的钱吗 费用 额外收费"]

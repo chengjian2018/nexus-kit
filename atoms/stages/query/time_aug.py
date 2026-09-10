@@ -33,7 +33,7 @@ class TimeAugQueryRewriter(PipelineStage):
 
     stage_name = "time_aug_query_rewrite"
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         time_base: Optional[float] = ctx.metadata.get("time_base")
         augmented = augment_time(ctx.user_query, time_base=time_base)
 

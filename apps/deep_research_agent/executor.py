@@ -78,7 +78,7 @@ _TODO_MARK = "○"
 class DeepResearchExecutor(ModuleExecutor):
     """deep_research 模块的结构化研究 executor(PLAN → SEARCH → SYNTHESIZE)。"""
 
-    def execute(self, ec: "ExecutionContext") -> TurnResult:
+    async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
         module = ec.module
         pattern = ec.pattern
@@ -125,16 +125,16 @@ class DeepResearchExecutor(ModuleExecutor):
             warn_prompt_length(base_messages, cxt, module)
 
             # ---- PLAN ----
-            plan = self._plan_phase(
+            plan = await self._plan_phase(
                 provider, base_messages, llm_config, hooks, trace)
 
             # ---- SEARCH(含反思状态板)----
-            findings, search_stats = self._search_phase(
+            findings, search_stats = await self._search_phase(
                 provider, base_messages, plan, tools, allowed_names,
                 ec, hooks, trace)
 
         # ---- SYNTHESIZE ----
-        report = self._synthesize_phase(
+        report = await self._synthesize_phase(
             provider, user_query, plan, findings, llm_config, ec, hooks, trace)
 
         trace.update({
@@ -164,9 +164,9 @@ class DeepResearchExecutor(ModuleExecutor):
     # PLAN
     # ------------------------------------------------------------------
 
-    def _plan_phase(self, provider, messages: List[Dict[str, Any]],
-                    llm_config: Dict[str, Any], hooks,
-                    trace: Dict[str, Any]) -> Dict[str, Any]:
+    async def _plan_phase(self, provider, messages: List[Dict[str, Any]],
+                          llm_config: Dict[str, Any], hooks,
+                          trace: Dict[str, Any]) -> Dict[str, Any]:
         """一次无工具 LLM 调用产研究计划。
 
         JSON 容错提取(首个 ``{...}`` 平衡块);失败重试 _PLAN_RETRIES 次,
@@ -188,7 +188,7 @@ class DeepResearchExecutor(ModuleExecutor):
 
         plan: Dict[str, Any] = {}
         for attempt in range(1 + _PLAN_RETRIES):
-            result = _stream_round(
+            result = await _stream_round(
                 provider, plan_messages, model, temperature, max_tokens,
                 None)  # 不转发 delta
             content = result.get("content", "") or ""
@@ -217,11 +217,11 @@ class DeepResearchExecutor(ModuleExecutor):
     # SEARCH
     # ------------------------------------------------------------------
 
-    def _search_phase(self, provider, base_messages: List[Dict[str, Any]],
-                      plan: Dict[str, Any], tools: List[Dict[str, Any]],
-                      allowed_names: set, ec: "ExecutionContext", hooks,
-                      trace: Dict[str, Any]
-                      ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    async def _search_phase(self, provider, base_messages: List[Dict[str, Any]],
+                            plan: Dict[str, Any], tools: List[Dict[str, Any]],
+                            allowed_names: set, ec: "ExecutionContext", hooks,
+                            trace: Dict[str, Any]
+                            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """带工具研究循环:私有 messages 工作区(不落 cxt.history)。
 
         每轮开始重写 system[0] 的状态板段;tool_calls 经
@@ -277,7 +277,7 @@ class DeepResearchExecutor(ModuleExecutor):
                         module_code=module.module_code,
                         round_idx=round_idx, messages=workspace, model=model))
 
-                result = _stream_round(
+                result = await _stream_round(
                     provider, workspace, model, temperature, max_tokens,
                     None, tools=tools)  # 中间轮不转发 delta
                 content = result.get("content", "") or ""
@@ -295,7 +295,7 @@ class DeepResearchExecutor(ModuleExecutor):
                     reflection_note = content
                     break
 
-                new_findings = self._dispatch_research_round(
+                new_findings = await self._dispatch_research_round(
                     workspace, tool_calls, hooks, allowed_names, round_idx,
                     cxt, module, findings, tool_stats)
                 findings.extend(new_findings)
@@ -319,7 +319,7 @@ class DeepResearchExecutor(ModuleExecutor):
             "reflection_note": reflection_note,
         }
 
-    def _dispatch_research_round(
+    async def _dispatch_research_round(
             self, messages: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]],
             hooks, allowed_names: set, round_idx: int,
             cxt, module, findings: List[Dict[str, Any]],
@@ -379,7 +379,7 @@ class DeepResearchExecutor(ModuleExecutor):
                               f"可用工具:{sorted(allowed_names)}。")
                 }, ensure_ascii=False)
             else:
-                tool_result = _execute_tool(name, parsed_args)
+                tool_result = await _execute_tool(name, parsed_args)
                 if hooks:
                     event = ToolResultEvent(
                         session_id=session_id, module_code=module_code,
@@ -411,12 +411,12 @@ class DeepResearchExecutor(ModuleExecutor):
     # SYNTHESIZE
     # ------------------------------------------------------------------
 
-    def _synthesize_phase(self, provider, user_query: str,
-                          plan: Dict[str, Any],
-                          findings: List[Dict[str, Any]],
-                          llm_config: Dict[str, Any],
-                          ec: "ExecutionContext", hooks,
-                          trace: Dict[str, Any]) -> str:
+    async def _synthesize_phase(self, provider, user_query: str,
+                                plan: Dict[str, Any],
+                                findings: List[Dict[str, Any]],
+                                llm_config: Dict[str, Any],
+                                ec: "ExecutionContext", hooks,
+                                trace: Dict[str, Any]) -> str:
         """精简 messages 流式生成报告(唯一转发 delta 的相位)。"""
         model = llm_config["model"]
         temperature = llm_config.get("temperature", 0.7)
@@ -448,7 +448,7 @@ class DeepResearchExecutor(ModuleExecutor):
                 module_code=ec.module.module_code,
                 round_idx=0, messages=synth_messages, model=model))
 
-        result = _stream_round(
+        result = await _stream_round(
             provider, synth_messages, model, temperature, max_tokens,
             ec.stream)  # 报告 delta 乐观转发
         report = result.get("content", "") or ""

@@ -29,8 +29,9 @@ def _launch(pattern, sessions, sid="s1"):
 
 
 def _chat(sessions, sid, query):
+    from async_utils import arun
     from nexus.engine.chat import chat as chat_fn
-    return chat_fn(query=query, session_id=sid, all_sessions=sessions)
+    return arun(chat_fn(query=query, session_id=sid, all_sessions=sessions))
 
 
 def _record_calls(calls):
@@ -121,12 +122,12 @@ def test_r4_route_menu_node_takes_effect_same_turn():
     # RouteNLU/FSMNLU stubbed to return a menu-hit intent (bypassing the real LLM protocol)
     class _StubNLU:
         stage_name = "nlu"
-        def execute(self, ctx):
+        async def execute(self, ctx):
             ctx.nlu_result = {"next_node": "menu_a", "slots": {}}
             return ctx
     class _StubNLG:
         stage_name = "nlg"
-        def execute(self, ctx):
+        async def execute(self, ctx):
             ctx.nlg_result = {"content": "ok"}
             return ctx
     from stage_stubs import register_stage_stub

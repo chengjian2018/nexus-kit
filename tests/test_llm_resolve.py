@@ -101,7 +101,8 @@ def test_call_llm_with_none_config_uses_loaded_config(monkeypatch):
         lambda: {"code": FAKE_PROVIDER_CODE, "model": "fake-model"},
     )
 
-    out = FSMNLU()._call_llm("ping", None)  # must not raise TypeError
+    from async_utils import arun
+    out = arun(FSMNLU()._call_llm("ping", None))  # must not raise TypeError
     assert isinstance(out, str)
 
 
@@ -113,7 +114,7 @@ def test_call_llm_with_none_config_loads_real_yaml(monkeypatch):
     built = {}
 
     class _StubProvider:
-        def chat_completion(self, **kwargs):
+        async def achat_completion(self, **kwargs):
             return {"content": "stub"}
 
     def spy(cfg):
@@ -121,7 +122,8 @@ def test_call_llm_with_none_config_loads_real_yaml(monkeypatch):
         return _StubProvider()
 
     monkeypatch.setattr(nlg_module, "build_provider", spy)
-    FSMNLG()._call_llm("ping", None)
+    from async_utils import arun
+    arun(FSMNLG()._call_llm("ping", None))
 
     assert built.get("code") == "openai"  # the code from local_config.yaml
     assert built.get("api_base")  # yaml's api_base flows into build_provider with the config

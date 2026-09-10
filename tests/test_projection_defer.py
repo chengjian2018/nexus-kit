@@ -112,19 +112,20 @@ class ScriptedProvider:
         self.script = list(script)
         self.seen = []
 
-    def chat_completion(self, messages, model, temperature, max_tokens,
-                        tools=None, tool_choice=None, **kw):
+    async def achat_completion(self, messages, model, temperature, max_tokens,
+                               tools=None, tool_choice=None, **kw):
         self.seen.append({"messages": messages, "tools": tools})
         return self.script.pop(0)
 
 
 def _run(s, provider, module_code="reception", force_close=False):
+    from async_utils import arun
     from nexus.engine.loop import run_agent
     with patch("atoms.executors.loop_executor.build_provider",
                return_value=provider):
-        return run_agent(s, s.cxt.module_map[module_code],
-                         s.cxt.metadata["llm_override"],
-                         force_close=force_close)
+        return arun(run_agent(s, s.cxt.module_map[module_code],
+                              s.cxt.metadata["llm_override"],
+                              force_close=force_close))
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +239,9 @@ def test_chat_applies_deferred_switch_end_of_turn():
     ])
     with patch("atoms.executors.loop_executor.build_provider",
                return_value=provider):
-        text = chat_fn(query="帮我全程处理售后", session_id="s",
-                       all_sessions=sessions)
+        from async_utils import arun
+        text = arun(chat_fn(query="帮我全程处理售后", session_id="s",
+                            all_sessions=sessions))
     assert text == "本轮答复完成，后续由售后底座承接。"
     # end-of-turn switch applied: next turn runs on after_sales
     assert s.cxt.current_module_code == "after_sales"

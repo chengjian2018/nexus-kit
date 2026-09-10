@@ -24,6 +24,7 @@ LLM call chain: config/local_config.yaml → build_provider → chat_completion.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -91,10 +92,12 @@ class RecallPath(ABC):
         self.top_k = top_k
 
     @abstractmethod
-    def recall(
+    async def recall(
         self, query: str, ctx: DialogueContext, **kwargs
     ) -> List[Dict[str, Any]]:
-        """Run a single-path recall.
+        """Run a single-path recall (async since the asyncio rewrite;
+        injected search/call_llm callbacks may be sync OR async — the
+        call sites duck-type via inspect.iscoroutinefunction).
 
         Args:
             query: query text.
@@ -172,12 +175,14 @@ class KeywordRecallPath(RecallPath):
             for token in self._tokenize(content):
                 self._inverted_index.setdefault(token, []).append(start_idx + i)
 
-    def recall(
+    async def recall(
         self, query: str, ctx: DialogueContext, **kwargs
     ) -> List[Dict[str, Any]]:
-        # Prefer the external search function when provided
+        # Prefer the external search function when provided (sync or async)
         if self._search_func is not None:
             raw = self._search_func(query, top_k=self.top_k, **kwargs)
+            if inspect.iscoroutine(raw):
+                raw = await raw
             return [_standardize_result(r, source=self.name) for r in raw[: self.top_k]]
 
         # Use the built-in inverted index
@@ -233,7 +238,7 @@ class EmbeddingRecallPath(RecallPath):
         super().__init__(name=name, weight=weight, top_k=top_k)
         self._search_func = search_func
 
-    def recall(
+    async def recall(
         self, query: str, ctx: DialogueContext, **kwargs
     ) -> List[Dict[str, Any]]:
         if self._search_func is None:
@@ -241,6 +246,8 @@ class EmbeddingRecallPath(RecallPath):
             return []
 
         raw = self._search_func(query, top_k=self.top_k, **kwargs)
+        if inspect.iscoroutine(raw):
+            raw = await raw
         results = [_standardize_result(r, source=self.name) for r in raw[: self.top_k]]
         logger.debug("EmbeddingRecallPath '%s' 召回 %d 条结果", self.name, len(results))
         return results
@@ -276,7 +283,7 @@ class ESRecallPath(RecallPath):
         self._search_func = search_func
         self.index_type = index_type
 
-    def recall(
+    async def recall(
         self, query: str, ctx: DialogueContext, **kwargs
     ) -> List[Dict[str, Any]]:
         if self._search_func is None:
@@ -286,6 +293,8 @@ class ESRecallPath(RecallPath):
         raw = self._search_func(
             query, top_k=self.top_k, index_type=self.index_type, **kwargs
         )
+        if inspect.iscoroutine(raw):
+            raw = await raw
         results = [_standardize_result(r, source=self.name) for r in raw[: self.top_k]]
         logger.debug("ESRecallPath '%s' (%s) 召回 %d 条结果", self.name, self.index_type, len(results))
         return results
@@ -319,7 +328,7 @@ class LLMRecallPath(RecallPath):
         self._call_llm = call_llm
         self._prompt_template = prompt_template or RECALL_LLM_DEFAULT_PROMPT
 
-    def recall(
+    async def recall(
         self, query: str, ctx: DialogueContext, **kwargs
     ) -> List[Dict[str, Any]]:
         if self._call_llm is None:
@@ -339,6 +348,8 @@ class LLMRecallPath(RecallPath):
         prompt = fill_prompt_template(template, slots)
 
         raw_response = self._call_llm(prompt)
+        if inspect.iscoroutine(raw_response):
+            raw_response = await raw_response
 
         try:
             parsed = self._parse_llm_response(raw_response)
@@ -399,7 +410,7 @@ class CustomRecallPath(RecallPath):
         super().__init__(name=name, weight=weight, top_k=top_k)
         self._recall_func = recall_func
 
-    def recall(
+    async def recall(
         self, query: str, ctx: DialogueContext, **kwargs
     ) -> List[Dict[str, Any]]:
         if self._recall_func is None:
@@ -407,6 +418,8 @@ class CustomRecallPath(RecallPath):
             return []
 
         raw = self._recall_func(query=query, ctx=ctx, top_k=self.top_k, **kwargs)
+        if inspect.iscoroutine(raw):
+            raw = await raw
         results = [_standardize_result(r, source=self.name) for r in raw[: self.top_k]]
         logger.debug("CustomRecallPath '%s' 召回 %d 条结果", self.name, len(results))
         return results
@@ -1004,6 +1017,12 @@ class LLMReranker(BaseReranker):
         prompt = prompt.replace("{__candidates__}", candidates_text)
 
         raw_response = self._call_llm(prompt)
+        if inspect.iscoroutine(raw_response):
+            # async callback: bridge on a private loop (rerank stays a sync
+            # hook inside MultiPathRecaller.execute; the injected default is
+            # sync — this branch only serves exotic async rerankers)
+            import asyncio as _asyncio
+            raw_response = _asyncio.run(raw_response)
 
         try:
             reranked_data = self._parse_rerank_response(raw_response)
@@ -1227,7 +1246,7 @@ class MultiPathRecaller(PipelineStage):
     # PipelineStage interface
     # ------------------------------------------------------------------
 
-    def execute(self, ctx: DialogueContext) -> DialogueContext:
+    async def execute(self, ctx: DialogueContext) -> DialogueContext:
         """Run the complete multi-path recall flow.
 
         Args:
@@ -1257,7 +1276,7 @@ class MultiPathRecaller(PipelineStage):
         for path in self.recall_paths:
             logger.debug("执行召回路径: %s", path.name)
             try:
-                results = path.recall(
+                results = await path.recall(
                     query, ctx, prompt_template=prompt_template, **prompt_slots
                 )
                 path_results.append((path.name, results))

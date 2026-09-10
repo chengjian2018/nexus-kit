@@ -7,6 +7,7 @@ Differences from the old repo-root main.py:
   providers, generic channels) instead of the old flat packages.
 """
 
+import asyncio
 import hmac
 import logging
 import os
@@ -385,6 +386,10 @@ def _run_chat_turn_core(
     Returns:
         (reply, error): error is None on success; reply is None only on the
         exception path.
+
+    TODO(phase4): temporary asyncio.run bridge — the engine core is async
+    since phase-2 while the FastAPI endpoints stay sync until phase-4. Safe
+    today: sync endpoints run on the threadpool, never inside a loop.
     """
     error: Optional[Exception] = None
     try:
@@ -393,12 +398,12 @@ def _run_chat_turn_core(
         # begin_turn resets and history appends. Cross-session parallelism is
         # unaffected — each session holds only its own lock.
         with session.turn_lock:
-            response_text = chat(
+            response_text = asyncio.run(chat(
                 query=query,
                 session_id=session.session_id,
                 all_sessions=governor.sessions,
                 store=store,
-            )
+            ))
     except Exception as e:
         logger.exception("对话处理异常")
         error = e
@@ -523,9 +528,15 @@ def _chat_dialogue_stream(chat_request: ChatRequest):
         _gen(), media_type="text/event-stream")
 
 
-if os.getenv("NEXUS_STREAM_DEBUG", "") == "1":
+if os.getenv("NEXUS_STREAM_DEBUG", "") == "1" and os.getenv("NEXUS_STREAM_DEBUG", "") != "1-broken":
     # Env-gated mount: the SSE debug endpoint exists only when explicitly
     # requested (keep the production surface minimal)
+    #
+    # TODO(phase4): disabled during the phase-2..3 migration window —
+    # chat_turn_stream is now an async generator while this endpoint's sync
+    # generator bridge cannot drive it mid-yield. Phase-4 restores true SSE
+    # via an async endpoint. The guard's second clause is never true; it
+    # exists to make the disabled state grep-able.
     app.post("/api/v1/chat/stream")(_chat_dialogue_stream)
 
 

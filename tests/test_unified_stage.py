@@ -16,6 +16,7 @@ import logging
 
 import pytest
 
+from async_utils import arun
 from fake_provider import (
     FakeProvider,
     fake_llm_config,
@@ -152,9 +153,10 @@ def launch(pattern, sessions, session_id="s1"):
 
 def chat(sessions, session_id, query):
     """Call nexus.engine.chat to process one dialogue turn."""
+    from async_utils import arun
     from nexus.engine.chat import chat as chat_fn
 
-    return chat_fn(query=query, session_id=session_id, all_sessions=sessions)
+    return arun(chat_fn(query=query, session_id=session_id, all_sessions=sessions))
 
 
 def chat_once(pattern, sessions, query, expect_calls=1):
@@ -350,11 +352,11 @@ def test_pass_through_nlg_keeps_existing_result():
 
     ctx = DialogueContext(session_id="s-1", user_query="q")
     ctx.nlg_result = {"content": "已生成的回复"}
-    ctx = stage.execute(ctx)
+    ctx = arun(stage.execute(ctx))
     assert ctx.nlg_result == {"content": "已生成的回复"}
 
     ctx_empty = DialogueContext(session_id="s-2", user_query="q")
-    ctx_empty = stage.execute(ctx_empty)
+    ctx_empty = arun(stage.execute(ctx_empty))
     assert ctx_empty.nlg_result == {"content": ""}
 
 
@@ -369,7 +371,7 @@ def test_opening_broadcast_default_fallback():
 
     ctx = DialogueContext(session_id="s-ob-1", user_query="q")
     ctx.metadata["task_info"] = {"product_name": "闲置iPhone", "price": "3000"}
-    ctx = OpeningBroadcastNLG().execute(ctx)
+    ctx = arun(OpeningBroadcastNLG().execute(ctx))
 
     assert ctx.nlg_result["content"] == (
         "您好，很高兴为您服务！\nproduct_name: 闲置iPhone\nprice: 3000"
@@ -384,7 +386,7 @@ def test_opening_broadcast_template_fields():
     ctx = DialogueContext(session_id="s-ob-2", user_query="q")
     ctx.task_basic_info = {"product_name": "闲置iPhone"}
     stage = OpeningBroadcastNLG(template="您好，我是{product_name}的智能助手")
-    ctx = stage.execute(ctx)
+    ctx = arun(stage.execute(ctx))
 
     assert ctx.nlg_result["content"] == "您好，我是闲置iPhone的智能助手"
 
@@ -397,7 +399,7 @@ def test_opening_broadcast_template_missing_field_falls_back():
     ctx = DialogueContext(session_id="s-ob-3", user_query="q")
     ctx.task_basic_info = {"product_name": "闲置iPhone"}
     stage = OpeningBroadcastNLG(template="您好，我是{seller_name}的助手")
-    ctx = stage.execute(ctx)
+    ctx = arun(stage.execute(ctx))
 
     assert ctx.nlg_result["content"] == (
         "您好，很高兴为您服务！\nproduct_name: 闲置iPhone"

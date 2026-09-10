@@ -11,6 +11,7 @@ Single connection + lock serialization (FastAPI sync endpoints run on a
 thread pool; write traffic is tiny).
 """
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -363,3 +364,18 @@ class SessionStore:
                 d["metadata"] = json.loads(d["metadata"] or "{}")
                 messages.append(d)
             return messages
+
+    # ------------------------------------------------------------------
+    # Async twins (asyncio rewrite migration): the sync sqlite3 core is kept
+    # during the phase-2..4 window; async callers go through asyncio.to_thread
+    # so the blocking core never runs on the event loop. Phase-⑤ replaces the
+    # core with aiosqlite and merges the twins into one async method family.
+    # ------------------------------------------------------------------
+
+    async def aget_history(self, session_id: str) -> List[SessionMessage]:
+        return await asyncio.to_thread(self.get_history, session_id)
+
+    async def areplace_history(self, session: Session, summary_text: str,
+                               keep_idx: int) -> None:
+        await asyncio.to_thread(self.replace_history, session,
+                                summary_text, keep_idx)

@@ -428,8 +428,8 @@ def _resolve_entry_node(cxt, module) -> None:
         )
 
 
-def _run_stages(cxt, module, pattern, force_close: bool = False
-                ) -> Optional[ModuleJumpEvent]:
+async def _run_stages(cxt, module, pattern, force_close: bool = False
+                      ) -> Optional[ModuleJumpEvent]:
     """Execute the pipeline stages in order (slots resolved lazily as
     node > module > pattern).
 
@@ -466,7 +466,7 @@ def _run_stages(cxt, module, pattern, force_close: bool = False
     for slot, concrete in sequence:
         before_nlu = cxt.nlu_result
         try:
-            cxt = concrete.execute(cxt)
+            cxt = await concrete.execute(cxt)
             logger.debug("Stage '%s'（slot=%s）执行完成",
                          concrete.stage_name, slot)
         except Exception as e:
@@ -534,9 +534,9 @@ def _resolve_executor_code(session: Session, module):
     return plugin_registry.default_executor_code(type_key)
 
 
-def _handle_module(session: Session, module, force_close: bool = False,
-                   stream=None,
-                   ) -> TurnResult:
+async def _handle_module(session: Session, module, force_close: bool = False,
+                         stream=None,
+                         ) -> TurnResult:
     """Dispatch single-module single-turn handling via the executor plugin.
 
     The ModuleType hard-coded dispatch is gone: the executor is resolved
@@ -556,19 +556,19 @@ def _handle_module(session: Session, module, force_close: bool = False,
     )
     executor = plugin_registry.resolve(
         "executor", _resolve_executor_code(session, module))
-    return executor.execute(ec)
+    return await executor.execute(ec)
 
 
-def chat_turn_stream(
+async def chat_turn_stream(
         query: str,
         session_id: str,
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
 ):
-    """Generator form of chat_turn (plan-⑤): yields ChatStreamEvent objects
-    (delta / round / done), the final done event carrying the complete
-    ChatResult. See nexus/engine/streaming.py for the protocol and the
-    optimistic-forwarding caveat.
+    """Async generator form of chat_turn (plan-⑤): yields ChatStreamEvent
+    objects (delta / round / done), the final done event carrying the
+    complete ChatResult. See nexus/engine/streaming.py for the protocol and
+    the optimistic-forwarding caveat.
 
     The turn orchestration is identical to the pre-streaming chat_turn (the
     docstring below is retained verbatim); the only additions are the
@@ -638,7 +638,7 @@ def chat_turn_stream(
     # threshold is 0 / too few messages; summarizes with the llm_config R1
     # just refreshed; failure never blocks the dialogue). Must run before
     # add user — compression rebuilds history and fixes turn_history_start
-    maybe_compress(session, store)
+    await maybe_compress(session, store)
 
     # Record user message
     session.cxt.add_message("user", query, stage="chat")
@@ -652,8 +652,10 @@ def chat_turn_stream(
             current_module = pattern.module_map[
                 session.cxt.current_module_code or pattern.entry_module_code
             ]
-            result = _handle_module(session, current_module, stream=emitter)
-            yield from emitter.drain()
+            result = await _handle_module(session, current_module,
+                                          stream=emitter)
+            for ev in emitter.drain():
+                yield ev
 
             event = _jumps.pop(session.cxt)
             if event is None:
@@ -674,9 +676,10 @@ def chat_turn_stream(
             current_module = pattern.module_map[
                 session.cxt.current_module_code or pattern.entry_module_code
             ]
-            result = _handle_module(session, current_module,
-                                    force_close=True, stream=emitter)
-            yield from emitter.drain()
+            result = await _handle_module(session, current_module,
+                                          force_close=True, stream=emitter)
+            for ev in emitter.drain():
+                yield ev
             response = result.content or ""
     except Exception as e:
         logger.exception("对话处理异常: session=%s", session_id)
@@ -691,7 +694,7 @@ def chat_turn_stream(
     yield ChatStreamEvent(kind="done", result=_finish(response))
 
 
-def chat_turn(
+async def chat_turn(
         query: str,
         session_id: str,
         all_sessions: Dict[str, Session],
@@ -703,8 +706,8 @@ def chat_turn(
     docstring for the turn steps.
     """
     from nexus.engine.streaming import aggregate_turn
-    return aggregate_turn(chat_turn_stream(query, session_id, all_sessions,
-                                           store=store))
+    return await aggregate_turn(chat_turn_stream(query, session_id, all_sessions,
+                                                 store=store))
 
 
 # ---------------------------------------------------------------------------
@@ -714,11 +717,12 @@ def chat_turn(
 _handle_node_transition = _fsm_node_transition  # noqa: F401 (clarify test anchor)
 
 
-def chat(
+async def chat(
         query: str,
         session_id: str,
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
 ) -> str:
     """Compat entry: process one dialogue turn, returning the reply text (equivalent to chat_turn(...).text)."""
-    return chat_turn(query, session_id, all_sessions, store=store).text
+    return (await chat_turn(query, session_id, all_sessions,
+                            store=store)).text

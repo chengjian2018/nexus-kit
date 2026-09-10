@@ -138,9 +138,10 @@ def test_offline_definitions_carry_real_schemas(offline_register):
 
 def test_offline_handler_dispatch_roundtrip(offline_register):
     """离线桩 handler 经 ToolRegistry.dispatch 真实分派(执行管线回归)。"""
+    from async_utils import arun
     tool_registry, calls = offline_register
-    result = tool_registry.dispatch(
-        "web_search_prime", {"search_query": "离线回归"})
+    result = arun(tool_registry.dispatch(
+        "web_search_prime", {"search_query": "离线回归"}))
     payload = json.loads(result)
     assert payload["offline"] is True
     assert payload["server"] == "websearch"

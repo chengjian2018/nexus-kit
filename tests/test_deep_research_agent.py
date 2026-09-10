@@ -25,6 +25,8 @@ import logging
 import pytest
 from unittest.mock import patch
 
+from async_utils import arun
+
 logging.basicConfig(level=logging.WARNING)
 
 from apps.deep_research_agent import executor as dr_executor
@@ -108,8 +110,8 @@ class DeepResearchScriptedProvider:
             return "synth"
         return "search"  # 兜底按 search 处理
 
-    def chat_completion(self, messages, model, temperature=0.7,
-                        max_tokens=2048, tools=None, tool_choice=None):
+    async def achat_completion(self, messages, model, temperature=0.7,
+                               max_tokens=2048, tools=None, tool_choice=None):
         self.call_count += 1
         kind = self._kind(messages, tools)
         if kind == "plan":
@@ -132,8 +134,8 @@ class DeepResearchScriptedProvider:
         return {"content": self.report, "tool_calls": [],
                 "finish_reason": "stop"}
 
-    def chat_completion_stream(self, messages, model, temperature=0.7,
-                               max_tokens=2048, **kwargs):
+    async def achat_completion_stream(self, messages, model, temperature=0.7,
+                                      max_tokens=2048, **kwargs):
         """流式形态:按相位把同一脚本切成 LLMChunk 序列(SYNTHESIZE 才有
         文本 delta;PLAN/SEARCH 中间相位零 delta——恰好回归 executor 的
         「中间轮不转发」决策)。"""
@@ -183,10 +185,11 @@ def launch(pattern, sessions, session_id="s1"):
 
 
 def chat(sessions, session_id, query):
+    from async_utils import arun
     from nexus.engine.chat import chat as chat_fn
 
-    return chat_fn(query=query, session_id=session_id,
-                   all_sessions=sessions)
+    return arun(chat_fn(query=query, session_id=session_id,
+                        all_sessions=sessions))
 
 
 def run_research(pattern, provider):
@@ -338,9 +341,13 @@ def test_streaming_deltas_only_synthesize(pattern, fake_mcp_tools):
     launch(pattern, sessions)
     provider = DeepResearchScriptedProvider(
         report="# 分段报告\n第一段。\n第二段。")
+
+    async def _collect():
+        return [e async for e in chat_turn_stream("量子计算进展", "s1", sessions)]
+
     with patch.object(dr_executor, "build_provider",
                       return_value=provider):
-        events = list(chat_turn_stream("量子计算进展", "s1", sessions))
+        events = arun(_collect())
 
     kinds = [e.kind for e in events]
     assert "done" in kinds and kinds[-1] == "done"
