@@ -1,7 +1,8 @@
-"""deep_research_agent offline tests — PLAN→SEARCH→SYNTHESIZE 结构化研究循环。
+"""deep_research_agent offline tests — PREPLAN→PLAN→SEARCH→SYNTHESIZE 结构化研究循环。
 
 两层 mock(全程离线,不真连 MCP server):
-- LLM:DeepResearchScriptedProvider 按相位特征脚本化(PLAN 请求含
+- LLM:DeepResearchScriptedProvider 按相位特征脚本化(PREPLAN 请求含
+  ``preliminary_search`` 锚文本 → 按配置跳过或发 tool_calls;PLAN 请求含
   ``research_plan`` 锚文本 → 计划 JSON;SEARCH 轮带 tools → 先 tool_calls
   后收敛;SYNTHESIZE 请求含``撰写最终研究报告`` → 报告)。patch 目标是
   apps.deep_research_agent.executor.build_provider(FakeProvider 不能产
@@ -17,6 +18,8 @@
 4. SEARCH 持续产 tool_calls → 恰在 _MAX_SEARCH_ROUNDS 截断
 5. 流式:delta 仅来自 SYNTHESIZE 相位;round 事件含 plan/search/synthesize
 6. mcp_servers 配置校验(_validate_mcp_servers 的 fail-fast 分支)
+7. 预检索:模型决定先搜 → 工具结果进 PLAN 请求、findings 并入 SEARCH
+8. PLAN 自纠:首次坏 JSON → 重试请求带回坏输出 + 错误信息,模型自纠成功
 """
 
 import json
@@ -30,7 +33,7 @@ from async_utils import arun
 logging.basicConfig(level=logging.WARNING)
 
 from apps.deep_research_agent import executor as dr_executor
-from apps.deep_research_agent.prompts import PLAN_ANCHOR
+from apps.deep_research_agent.prompts import PLAN_ANCHOR, PREPLAN_ANCHOR
 
 
 # ============================================================================
@@ -82,25 +85,37 @@ class DeepResearchScriptedProvider:
     """按相位特征脚本化的 provider(记录调用与请求特征供断言)。
 
     请求识别(与 executor 的 prompt 布局一一对应):
+    - PREPLAN:最后一条 user 消息含 PREPLAN_ANCHOR("preliminary_search")
     - PLAN:最后一条 user 消息含 PLAN_ANCHOR("research_plan")
     - SEARCH:tools 参数非空
     - SYNTHESIZE:system 或 user 含 ``撰写最终研究报告``
+
+    可配置行为:preplan_rounds(预检索发 tool_calls 的次数,0=跳过)、
+    plan_fail_first(首次 PLAN 输出坏 JSON,验证自纠重试)。
+    self.requests 记录 (kind, messages 快照) 供请求级断言。
     """
 
-    def __init__(self, plan_json=None, search_rounds=1, report="# 研究报告"):
+    def __init__(self, plan_json=None, search_rounds=1, report="# 研究报告",
+                 preplan_rounds=0, plan_fail_first=False):
         self.plan_json = plan_json or json.dumps(
             {"sub_questions": ["子问题A", "子问题B"],
              "notes": "测试计划"}, ensure_ascii=False)
         self.search_rounds = search_rounds  # 产 tool_calls 的轮数,之后收敛
         self.report = report
+        self.preplan_rounds = preplan_rounds  # 预检索发工具的次数,0=跳过
+        self.plan_fail_first = plan_fail_first
         self.call_count = 0
         self.search_calls = 0
         self.plan_calls = 0
         self.synth_calls = 0
+        self.preplan_calls = 0
+        self.requests = []  # (kind, messages 快照)
 
     def _kind(self, messages, tools):
         last_user = next((m["content"] for m in reversed(messages)
                           if m.get("role") == "user"), "")
+        if PREPLAN_ANCHOR in (last_user or ""):
+            return "preplan"
         if PLAN_ANCHOR in (last_user or ""):
             return "plan"
         if tools:
@@ -110,12 +125,34 @@ class DeepResearchScriptedProvider:
             return "synth"
         return "search"  # 兜底按 search 处理
 
+    def _record(self, kind, messages):
+        self.requests.append((kind, [dict(m) for m in messages]))
+
+    def _preplan_reply(self):
+        self.preplan_calls += 1
+        if self.preplan_calls <= self.preplan_rounds:
+            return {"content": None, "tool_calls": [{
+                "id": f"p{self.preplan_calls}", "type": "function",
+                "function": {"name": "mcp_fake_search",
+                             "arguments": json.dumps(
+                                 {"query": f"预检索查询{self.preplan_calls}"},
+                                 ensure_ascii=False)},
+            }], "finish_reason": "tool_calls"}
+        return {"content": "跳过预检索。", "tool_calls": [],
+                "finish_reason": "stop"}
+
     async def achat_completion(self, messages, model, temperature=0.7,
                                max_tokens=2048, tools=None, tool_choice=None):
         self.call_count += 1
         kind = self._kind(messages, tools)
+        self._record(kind, messages)
+        if kind == "preplan":
+            return self._preplan_reply()
         if kind == "plan":
             self.plan_calls += 1
+            if self.plan_fail_first and self.plan_calls == 1:
+                return {"content": "好的,我的计划是:先看子问题A再看子问题B。",
+                        "tool_calls": [], "finish_reason": "stop"}
             return {"content": self.plan_json, "tool_calls": [],
                     "finish_reason": "stop"}
         if kind == "search":
@@ -143,6 +180,7 @@ class DeepResearchScriptedProvider:
 
         self.call_count += 1
         kind = self._kind(messages, kwargs.get("tools"))
+        self._record(kind, messages)
         if kind == "synth":
             self.synth_calls += 1
             text = self.report
@@ -153,8 +191,20 @@ class DeepResearchScriptedProvider:
                 yield LLMChunk(text=p)
             yield LLMChunk(finish_reason="stop")
             return
+        if kind == "preplan":
+            reply = self._preplan_reply()
+            if reply["tool_calls"]:
+                tc = dict(reply["tool_calls"][0], index=0)
+                yield LLMChunk(tool_calls=[tc], finish_reason="tool_calls")
+            else:
+                yield LLMChunk(text=reply["content"], finish_reason="stop")
+            return
         if kind == "plan":
             self.plan_calls += 1
+            if self.plan_fail_first and self.plan_calls == 1:
+                yield LLMChunk(text="好的,我的计划是:先看子问题A再看子问题B。",
+                               finish_reason="stop")
+                return
             yield LLMChunk(text=self.plan_json)
             yield LLMChunk(finish_reason="stop")
             return
@@ -251,12 +301,12 @@ def test_ensure_mcp_ready_is_noop_without_servers():
         gm.return_value.wait_ready = _AsyncSpy()
         arun(ensure_mcp_ready(timeout=0.1))
         gm.assert_called_once()
-        gm.return_value.wait_ready.calls == [dict(timeout=0.1)]
+        assert gm.return_value.wait_ready.calls == [dict(timeout=0.1)]
 
     # 异常吞没契约:manager 抛错也绝不向对话层传播
     with _patch("atoms.mcp.manager.get_mcp_manager") as gm:
         gm.return_value.wait_ready.side_effect = RuntimeError("boom")
-        ensure_mcp_ready()  # 不抛即通过
+        arun(ensure_mcp_ready(timeout=0.1))  # 不抛即通过
 
 
 # ============================================================================
@@ -272,7 +322,9 @@ def test_full_research_turn(pattern, fake_mcp_tools):
     assert "研究报告" in reply
     assert "[S1]" in reply
 
-    # 相位都走到:plan 1 次 + search(1 轮工具 + 1 轮收敛)+ synth 1 次
+    # 相位都走到:preplan 1 次(默认跳过)+ plan 1 次 + search(1 轮工具
+    # + 1 轮收敛)+ synth 1 次
+    assert provider.preplan_calls == 1
     assert provider.plan_calls == 1
     assert provider.synth_calls == 1
     assert provider.search_calls == 2
@@ -323,6 +375,64 @@ def test_plan_json_degraded(pattern, fake_mcp_tools):
     assert trace["sub_questions"] == ["量子计算的最新进展是什么?"]
     # 整轮仍产出报告
     assert reply
+
+
+# ============================================================================
+# 3b. PLAN 自纠重试
+# ============================================================================
+
+def test_plan_json_self_correct(pattern, fake_mcp_tools):
+    """首次 PLAN 输出坏 JSON → 重试请求带回坏输出(assistant)+ 错误信息
+    (user),模型自纠成功,不降级。"""
+    provider = DeepResearchScriptedProvider(plan_fail_first=True)
+    session, reply = run_research(pattern, provider)
+
+    # 失败一次 + 自纠成功
+    assert provider.plan_calls == 2
+
+    # 重试请求包含:坏输出回填(assistant)+ 自纠指令(user)
+    plan_requests = [m for kind, m in provider.requests if kind == "plan"]
+    retry_msgs = plan_requests[1]
+    assert any(m.get("role") == "assistant"
+               and "先看子问题A" in str(m.get("content", ""))
+               for m in retry_msgs)
+    assert any(m.get("role") == "user"
+               and "无法解析为研究计划" in str(m.get("content", ""))
+               for m in retry_msgs)
+
+    # 自纠成功:不降级,计划为模型修正后的 JSON
+    trace = session.cxt.metadata["deep_research"]
+    assert not trace["degraded"]
+    assert trace["sub_questions"] == ["子问题A", "子问题B"]
+    assert reply
+
+
+# ============================================================================
+# 3c. 预检索相位
+# ============================================================================
+
+def test_preplan_search_feeds_plan_and_search(pattern, fake_mcp_tools):
+    """模型决定预检索 → 工具结果进 PLAN 请求、findings 并入 SEARCH
+    (sources 含 round=0 的预检索条目)。"""
+    provider = DeepResearchScriptedProvider(preplan_rounds=1)
+    session, reply = run_research(pattern, provider)
+
+    assert provider.preplan_calls == 1
+    # 预检索 1 次 + SEARCH 1 轮
+    assert fake_mcp_tools["n"] >= 2
+
+    # PLAN 请求里能看到预检索的 tool 结果行
+    plan_requests = [m for kind, m in provider.requests if kind == "plan"]
+    assert any(m.get("role") == "tool" for m in plan_requests[0])
+
+    trace = session.cxt.metadata["deep_research"]
+    assert trace["phases"] == ["preplan_search", "plan", "search",
+                               "synthesize"]
+    # 预检索 findings 并入 sources / 工具统计
+    assert trace["tool_stats"].get("mcp_fake_search") >= 2
+    assert len(trace["sources"]) >= 2
+    assert trace["sources"][0]["round"] == 0  # round=0 标记预检索
+    assert not trace["degraded"]
 
 
 # ============================================================================

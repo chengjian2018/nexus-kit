@@ -2,8 +2,12 @@
 
 结构化研究循环(deep research = 一次 execute 内完成全部相位):
 
+    PREPLAN  一次带工具 LLM 调用:模型自行决定是否先检索一轮获取背景
+            信息(无 tool_calls 即跳过);检索结果留在 messages 供 PLAN
+            参考,findings 直接并入 SEARCH
     PLAN    一次无工具 LLM 调用 → {"sub_questions": [...]}(JSON 容错提取,
-            失败重试,再失败降级为 [原问题])
+            失败把坏输出 + 错误信息回填 messages 让模型自纠重试,
+            再失败降级为 [原问题])
     SEARCH  带工具 ReAct 循环(≤ _MAX_SEARCH_ROUNDS):每轮把「研究状态板」
             重写进 system(子问题勾选进度 / 剩余轮次 / 命中统计),模型据此
             决策继续检索还是收工;无 tool_calls 即收工信号(REFLECT 并入
@@ -54,6 +58,8 @@ from apps.deep_research_agent.prompts import (
     DEEP_RESEARCH_BASE_PROMPT,
     PLAN_ANCHOR,
     PLAN_PHASE_PROMPT,
+    PLAN_RETRY_PROMPT,
+    PREPLAN_SEARCH_PROMPT,
     SEARCH_STATE_BOARD_TMPL,
     SYNTHESIZE_PROMPT_TEMPLATE,
 )
@@ -61,7 +67,7 @@ from apps.deep_research_agent.prompts import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 防失控预算(总 LLM 调用硬上限 ≈ 1 + 1(重试) + 12 + 1 = 15)
+# 防失控预算(总 LLM 调用硬上限 ≈ 1(预检索) + 1 + 1(自纠重试) + 12 + 1 = 16)
 # ---------------------------------------------------------------------------
 
 _MAX_SEARCH_ROUNDS = 12        # SEARCH 相位轮次上限
@@ -76,7 +82,7 @@ _TODO_MARK = "○"
 
 
 class DeepResearchExecutor(ModuleExecutor):
-    """deep_research 模块的结构化研究 executor(PLAN → SEARCH → SYNTHESIZE)。"""
+    """deep_research 模块的结构化研究 executor(PREPLAN → PLAN → SEARCH → SYNTHESIZE)。"""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -124,14 +130,22 @@ class DeepResearchExecutor(ModuleExecutor):
                 module, cxt, pattern=pattern, extra_blocks=fragments)
             warn_prompt_length(base_messages, cxt, module)
 
+            # ---- PREPLAN(可选预检索,模型自行决定)----
+            plan_base, preplan_findings, preplan_stats = (
+                await self._preplan_phase(
+                    provider, base_messages, tools, allowed_names,
+                    ec, hooks, trace))
+
             # ---- PLAN ----
             plan = await self._plan_phase(
-                provider, base_messages, llm_config, hooks, trace)
+                provider, plan_base, llm_config, hooks, trace)
 
-            # ---- SEARCH(含反思状态板)----
+            # ---- SEARCH(含反思状态板;预检索 findings 并入)----
             findings, search_stats = await self._search_phase(
                 provider, base_messages, plan, tools, allowed_names,
-                ec, hooks, trace)
+                ec, hooks, trace,
+                initial_findings=preplan_findings,
+                initial_tool_stats=preplan_stats)
 
         # ---- SYNTHESIZE ----
         report = await self._synthesize_phase(
@@ -161,17 +175,83 @@ class DeepResearchExecutor(ModuleExecutor):
         return TurnResult(content=report, extra={"deep_research": trace})
 
     # ------------------------------------------------------------------
+    # PREPLAN
+    # ------------------------------------------------------------------
+
+    async def _preplan_phase(self, provider,
+                             base_messages: List[Dict[str, Any]],
+                             tools: List[Dict[str, Any]], allowed_names: set,
+                             ec: "ExecutionContext", hooks,
+                             trace: Dict[str, Any]
+                             ) -> Tuple[List[Dict[str, Any]],
+                                        List[Dict[str, Any]],
+                                        Dict[str, int]]:
+        """PLAN 前的可选预检索:模型自行决定是否先搜一轮获取背景信息。
+
+        一次带工具调用(无后续追问轮):有 tool_calls → 经
+        _dispatch_research_round 执行,结果留在 messages 里供 PLAN 参考,
+        findings/tool_stats 并入 SEARCH;无 tool_calls → 模型判定无需预检索,
+        跳过(其"跳过"回复仍入 messages,保持 user/assistant 交替)。
+        不转发 delta(预检索不是回复)。
+
+        Returns: (供 PLAN 使用的 messages, findings, tool_stats)。
+        """
+        if not tools:
+            return list(base_messages), [], {}
+
+        cxt = ec.cxt
+        module = ec.module
+        model = (cxt.llm_config or {})["model"]
+        temperature = (cxt.llm_config or {}).get("temperature", 0.7)
+        max_tokens = (cxt.llm_config or {}).get("max_tokens", 2048)
+
+        messages = list(base_messages) + [
+            {"role": "user", "content": PREPLAN_SEARCH_PROMPT}]
+
+        if hooks:
+            fire(hooks, "on_llm_call", LLMCallEvent(
+                session_id=cxt.session_id, module_code=module.module_code,
+                round_idx=0, messages=messages, model=model))
+
+        result = await _stream_round(
+            provider, messages, model, temperature, max_tokens,
+            None, tools=tools)  # 不转发 delta
+        content = result.get("content", "") or ""
+        tool_calls = result.get("tool_calls", []) or []
+
+        if hooks:
+            fire(hooks, "on_llm_response", LLMResponseEvent(
+                session_id=cxt.session_id, module_code=module.module_code,
+                round_idx=0, content=content, tool_calls=tool_calls))
+
+        findings: List[Dict[str, Any]] = []
+        tool_stats: Dict[str, int] = {}
+        if tool_calls:
+            # round_idx=-1 → findings 记 round=0(预检索标记,区别于 SEARCH 轮)
+            findings = await self._dispatch_research_round(
+                messages, tool_calls, hooks, allowed_names, -1,
+                cxt, module, findings, tool_stats)
+            _truncate_workspace(messages)
+            trace["phases"].append("preplan_search")
+            _emit_round(ec.stream, "preplan", 0)
+        else:
+            messages.append({"role": "assistant", "content": content})
+        return messages, findings, tool_stats
+
+    # ------------------------------------------------------------------
     # PLAN
     # ------------------------------------------------------------------
 
     async def _plan_phase(self, provider, messages: List[Dict[str, Any]],
                           llm_config: Dict[str, Any], hooks,
                           trace: Dict[str, Any]) -> Dict[str, Any]:
-        """一次无工具 LLM 调用产研究计划。
+        """一次无工具 LLM 调用产研究计划(messages 含预检索上下文,若有)。
 
-        JSON 容错提取(首个 ``{...}`` 平衡块);失败重试 _PLAN_RETRIES 次,
-        仍失败降级为 ``{"sub_questions": [原问题]}`` 并标记 degraded——
-        PLAN 失败绝不阻塞研究本身。不转发 delta(计划 JSON 不是回复)。
+        JSON 容错提取(首个 ``{...}`` 平衡块);失败不原样重发——把坏输出
+        (assistant 行)+ 解析错误(user 行)回填 messages,让模型基于
+        自己的错误自纠重试 _PLAN_RETRIES 次,仍失败降级为
+        ``{"sub_questions": [原问题]}`` 并标记 degraded——PLAN 失败绝不
+        阻塞研究本身。不转发 delta(计划 JSON 不是回复)。
         """
         model = llm_config["model"]
         temperature = llm_config.get("temperature", 0.7)
@@ -180,14 +260,13 @@ class DeepResearchExecutor(ModuleExecutor):
         plan_messages = list(messages) + [
             {"role": "user", "content": PLAN_PHASE_PROMPT}]
 
-        if hooks:
-            fire(hooks, "on_llm_call", LLMCallEvent(
-                session_id=trace.get("session_id", ""),
-                module_code=trace.get("module_code", ""),
-                round_idx=0, messages=plan_messages, model=model))
-
         plan: Dict[str, Any] = {}
         for attempt in range(1 + _PLAN_RETRIES):
+            if hooks:
+                fire(hooks, "on_llm_call", LLMCallEvent(
+                    session_id=trace.get("session_id", ""),
+                    module_code=trace.get("module_code", ""),
+                    round_idx=0, messages=plan_messages, model=model))
             result = await _stream_round(
                 provider, plan_messages, model, temperature, max_tokens,
                 None)  # 不转发 delta
@@ -197,11 +276,18 @@ class DeepResearchExecutor(ModuleExecutor):
                     session_id=trace.get("session_id", ""),
                     module_code=trace.get("module_code", ""),
                     round_idx=0, content=content, tool_calls=[]))
-            plan = _extract_plan_json(content)
+            plan, err = _extract_plan_json(content)
             if plan:
                 break
-            logger.warning("[deep_research] PLAN JSON 解析失败(第 %d 次)",
-                           attempt + 1)
+            logger.warning("[deep_research] PLAN JSON 解析失败(第 %d 次): %s",
+                           attempt + 1, err)
+            if attempt < _PLAN_RETRIES:
+                # 自纠重试:坏输出 + 错误信息回填 messages(而非原样重发)
+                plan_messages.append(
+                    {"role": "assistant", "content": content or "(空输出)"})
+                plan_messages.append(
+                    {"role": "user",
+                     "content": PLAN_RETRY_PROMPT.replace("{error}", err)})
 
         if not plan:
             plan = {"sub_questions": [trace.get("question", "")],
@@ -220,13 +306,19 @@ class DeepResearchExecutor(ModuleExecutor):
     async def _search_phase(self, provider, base_messages: List[Dict[str, Any]],
                             plan: Dict[str, Any], tools: List[Dict[str, Any]],
                             allowed_names: set, ec: "ExecutionContext", hooks,
-                            trace: Dict[str, Any]
+                            trace: Dict[str, Any],
+                            initial_findings: Optional[List[Dict[str, Any]]] = None,
+                            initial_tool_stats: Optional[Dict[str, int]] = None,
                             ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """带工具研究循环:私有 messages 工作区(不落 cxt.history)。
 
         每轮开始重写 system[0] 的状态板段;tool_calls 经
         _dispatch_research_round 执行并追加协议对;无 tool_calls 即模型
         判定信息足够,content 留作 reflection_note 进 SYNTHESIZE。
+
+        工作区从 base_messages 重建(预检索结果不进 SEARCH 工作区——
+        其结论已蒸馏进 plan;但预检索 findings/tool_stats 作为初始状态
+        并入,状态板从真实进度起步)。
         """
         cxt = ec.cxt
         module = ec.module
@@ -237,14 +329,20 @@ class DeepResearchExecutor(ModuleExecutor):
         user_query = trace["question"]
         sub_questions = plan.get("sub_questions") or [user_query]
 
+        findings: List[Dict[str, Any]] = list(initial_findings or [])
+        tool_stats: Dict[str, int] = dict(initial_tool_stats or {})
+
         # 工作区初始形态:system(角色 + 计划 + 状态板占位)+ user(原问题)
         system_base = _system_content(base_messages)
+        covered = _covered_questions(sub_questions, findings)
         question_lines = [
-            f"{i + 1}. {_TODO_MARK} {q}" for i, q in enumerate(sub_questions)]
+            f"{i + 1}. {_DONE_MARK if q in covered else _TODO_MARK} {q}"
+            for i, q in enumerate(sub_questions)]
         board = SEARCH_STATE_BOARD_TMPL.format(
             question_lines="\n".join(question_lines),
             rounds_left=_MAX_SEARCH_ROUNDS, total_rounds=_MAX_SEARCH_ROUNDS,
-            findings_count=0, tool_stats="{}")
+            findings_count=len(findings),
+            tool_stats=json.dumps(tool_stats, ensure_ascii=False))
         workspace: List[Dict[str, Any]] = [
             {"role": "system",
              "content": f"{system_base}\n\n【研究计划】\n" + "\n".join(
@@ -252,8 +350,6 @@ class DeepResearchExecutor(ModuleExecutor):
             {"role": "user", "content": user_query},
         ]
 
-        findings: List[Dict[str, Any]] = []
-        tool_stats: Dict[str, int] = {}
         reflection_note = ""
         rounds_done = 0
 
@@ -494,25 +590,29 @@ def _system_content(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
-def _extract_plan_json(content: str) -> Dict[str, Any]:
+def _extract_plan_json(content: str) -> Tuple[Dict[str, Any], str]:
     """容错提取 PLAN JSON:首个平衡的 ``{...}`` 块 → 解析 → 校验
-    sub_questions 为非空字符串列表;不合法返回空 dict。"""
+    sub_questions 为非空字符串列表。
+
+    Returns: (plan, err) — 成功时 plan 非空、err 为空串;失败时 plan 为
+    空 dict、err 为面向模型的自纠错误描述(回填进 PLAN_RETRY_PROMPT)。
+    """
     match = re.search(r"\{.*\}", content, re.DOTALL)
     if not match:
-        return {}
+        return {}, "输出中找不到 JSON 对象(缺少 {...})"
     try:
         data = json.loads(match.group(0))
-    except (json.JSONDecodeError, ValueError):
-        return {}
+    except (json.JSONDecodeError, ValueError) as e:
+        return {}, f"JSON 语法错误: {e}"
     if not isinstance(data, dict):
-        return {}
+        return {}, "JSON 顶层不是对象"
     questions = data.get("sub_questions")
     if (not isinstance(questions, list)
             or not questions
             or not all(isinstance(q, str) and q.strip() for q in questions)):
-        return {}
+        return {}, "缺少合法的 sub_questions 字段(需非空字符串数组)"
     return {"sub_questions": [q.strip() for q in questions],
-            "notes": str(data.get("notes", ""))}
+            "notes": str(data.get("notes", ""))}, ""
 
 
 def _covered_questions(sub_questions: List[str],
