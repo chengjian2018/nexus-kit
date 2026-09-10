@@ -191,7 +191,8 @@ class DefaultLoopExecutor(ModuleExecutor):
                         hooks, allowed_names, lent_by, round_idx,
                         transfer_error=json.dumps(
                             {"error": "延迟切换目标无效，请直接回应用户"},
-                            ensure_ascii=False))
+                            ensure_ascii=False),
+                        stream=ec.stream)
                     continue
 
                 # Defer hit: this turn KEEPS answering with the projected
@@ -214,6 +215,10 @@ class DefaultLoopExecutor(ModuleExecutor):
                 for tc in tool_calls:
                     name = tc.get("function", {}).get("name", "")
                     call_id = tc.get("id", "")
+                    _emit_trace(ec.stream, "tool_call",
+                                module_code=module.module_code,
+                                call_id=call_id, tool_name=name,
+                                args=_parse_args(tc), round_idx=round_idx)
                     if name == DEFER_TOOL_NAME:
                         result_content = json.dumps(
                             {"ok": True,
@@ -222,6 +227,10 @@ class DefaultLoopExecutor(ModuleExecutor):
                     else:
                         tool_result = await _execute_tool(name, _parse_args(tc))
                         result_content = tool_result
+                    _emit_trace(ec.stream, "tool_result",
+                                module_code=module.module_code,
+                                call_id=call_id, tool_name=name,
+                                result=result_content, round_idx=round_idx)
                     await cxt.add_message("tool", result_content, stage="agent",
                                           metadata={"tool_name": name,
                                                     "tool_call_id": call_id})
@@ -261,7 +270,8 @@ class DefaultLoopExecutor(ModuleExecutor):
             # -> P5 rewrite -> append to history
             await _dispatch_tool_calls(
                 cxt, module, messages, content, tool_calls,
-                hooks, allowed_names, lent_by, round_idx)
+                hooks, allowed_names, lent_by, round_idx,
+                stream=ec.stream)
             _emit_round(ec.stream, "tool", round_idx)
 
         logger.warning(
@@ -384,6 +394,12 @@ def _emit_round(stream_emitter, outcome: str, round_idx: int) -> None:
     """Emit a round-boundary event (no-op without an attached emitter)."""
     if stream_emitter is not None:
         stream_emitter.emit_round(outcome, round_idx)
+
+
+def _emit_trace(stream_emitter, event: str, **data) -> None:
+    """Emit a trace event (no-op without an attached emitter)."""
+    if stream_emitter is not None:
+        stream_emitter.emit_trace(event, **data)
 
 
 from nexus.engine.loop import run_agent  # noqa: E402,F401 -- test anchor re-export

@@ -293,7 +293,7 @@ provider.chat_completion_stream ──yield LLMChunk──► collect_stream（�
    StreamEmitter                              （引擎中间产物照旧消费）
         ▲
         │ drain & re-yield
-chat_turn_stream ──yield ChatStreamEvent(delta|round|done)──► 消费者
+chat_turn_stream ──yield ChatStreamEvent(delta|round|trace|done)──► 消费者
         │
         └ 聚合 = chat_turn（外部行为字节级不变；HTTP/渠道零感知）
 ```
@@ -307,9 +307,30 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|done)──► 消费�
 - **双向桥**：基类 `chat_completion` 重写为聚合流式调用；默认流桥把只
   实现非流式的 provider 包装为单 chunk 流（FakeProvider 等零改动存活）
 - **引擎层**（`nexus/engine/streaming.py`）：`ChatStreamEvent(kind:
-  delta|round|done)` + `StreamEmitter`（executor 经 `ec.stream` 注入）
+  delta|round|trace|done)` + `StreamEmitter`（executor 经 `ec.stream` 注入）
   + `aggregate_turn`。`chat_turn_stream` 为 generator 主体，`chat_turn`
   聚合包装
+- **trace 事件**（状态迁移可观测性）：`TraceEvent(event, module_code,
+  node_code, data)`，事件名开放集合——module_jump（hop loop 同轮改道）/
+  node_jump（FSM 轮末节点跳转）/ route_hit（ROUTE 命中菜单节点）/
+  route_root（ROUTE 轮末回 root）/ tool_call+tool_result（agent 工具
+  分派）/ defer_switch（轮末底座切换）/ conversation_end。**仅在状态真
+  实变化时发射**（原地保持轮零事件），`aggregate_turn` 忽略 trace，
+  chat()/chat_turn 行为不变。消费者：CLI events 模式
+  （`host/cli.py::StreamEventPrinter`，REPL 默认开启，`--events=false`
+  关闭）与 SSE 调试端点（`{"kind":"trace",...}`）
+- **实时桥**：`chat_turn_stream` 把整轮编排放进后台 task，所有 emit
+  经 `StreamEmitter(sink=queue.put_nowait)` 即时入队、generator 逐条
+  转发——事件在发生瞬间到达消费者（LLM 分块、工具分派），而非模块
+  执行完毕后一股脑 drain；task 异常有兜底 done，消费端提前关闭会
+  cancel task
+- **stage 层回复流式**：stage 的 execute 只拿 cxt，流式发射器经
+  contextvar（`current_emitter`）注入——unified 单次调用用
+  `ReplyFieldTap` 增量提取 JSON 的 `reply` 字段值（转义/代理对/围栏
+  容错，其余字段不外泄），两段式 NLG 的纯文本分块直接转发；已转发
+  文本记录在 `current_streamed_reply`，executor 据此去重（兜底回复仍
+  整段补发）。ROUTE 跳转轮的源模块过渡文本同样乐观转发（done 权威，
+  与 agent 工具轮语义一致）
 - **乐观转发 caveat**：finish_reason 轮末才到，无法预知最终轮——中间轮
   的 text delta 实时转发，轮末发 round 事件（outcome: tool/final/
   transfer/max_rounds），**done.result.text 是权威回复**；聚合消费者零

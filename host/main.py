@@ -488,6 +488,7 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
     Event stream (text/event-stream, one JSON payload per line):
         data: {"kind": "delta", "text": "..."}
         data: {"kind": "round", "round_info": {...}}
+        data: {"kind": "trace", "trace": {"event": "...", ...}}
         data: {"kind": "done", "result": {"text": "...", "actions": [...]}}
     """
     import json as _json
@@ -524,6 +525,12 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
                         yield "data: " + _json.dumps({
                             "kind": "round",
                             "round_info": event.round_info,
+                        }, ensure_ascii=False) + "\n\n"
+                    elif event.kind == "trace":
+                        yield "data: " + _json.dumps({
+                            "kind": "trace",
+                            "trace": (event.trace.to_dict()
+                                      if event.trace is not None else {}),
                         }, ensure_ascii=False) + "\n\n"
                     else:
                         yield "data: " + _json.dumps({

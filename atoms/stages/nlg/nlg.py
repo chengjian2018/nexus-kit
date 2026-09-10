@@ -47,6 +47,12 @@ class BaseNLG(PipelineStage, ABC):
         When *llm_config* is None, the config is auto-loaded from
         ``config/local_config.yaml`` and the model is taken from the loaded
         config (not from the caller's argument).
+
+        When the provider streams natively AND a turn emitter is attached
+        (chat_turn_stream path), the call runs streamed: the generated
+        wording is user-visible text, so every chunk forwards as a delta
+        while still aggregating into the full result. Non-streaming
+        providers / plain chat_turn turns take the legacy path unchanged.
         """
         if llm_config is None:
             from nexus.settings import get_llm_config
@@ -55,12 +61,18 @@ class BaseNLG(PipelineStage, ABC):
         provider = build_provider(llm_config)
 
         messages = [{"role": "user", "content": prompt}]
-        result = await provider.achat_completion(
-            messages=messages,
+        kwargs: Dict[str, Any] = dict(
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
             max_tokens=llm_config.get("max_tokens", 2048),
         )
+        from nexus.engine.streaming import current_emitter, stream_llm_reply
+        if (hasattr(provider, "achat_completion_stream")
+                and current_emitter.get() is not None):
+            result = await stream_llm_reply(
+                provider.achat_completion_stream(messages=messages, **kwargs))
+        else:
+            result = await provider.achat_completion(messages=messages, **kwargs)
 
         content = result.get("content", "")
         logger.debug("NLG LLM 返回: %s", content[:200])

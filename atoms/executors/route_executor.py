@@ -12,6 +12,8 @@ import logging
 from nexus.engine.execution import ExecutionContext, ModuleExecutor
 from nexus.engine.turn_result import TurnResult
 
+from atoms.executors.fsm_executor import _emit_reply_delta  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,12 +53,21 @@ class DefaultRouteExecutor(ModuleExecutor):
         from atoms.executors.fsm_executor import _refresh_llm_config_by_node
         _refresh_llm_config_by_node(ec, module)
 
-        jump_event = await _run_stages(cxt, module, pattern, force_close=ec.force_close)
+        node_before = cxt.current_node_code
+        jump_event = await _run_stages(cxt, module, pattern,
+                                       force_close=ec.force_close)
 
         # Jump turn: slots were already merged at the detection point; the hop
         # loop reroutes to the target module to continue in the same turn
+        # (menu advancement already switched the node — surface it before
+        # the module_jump so consumers see route → target ordering)
         if jump_event is not None:
+            _emit_route_hit(ec.stream, module.module_code,
+                            node_before, cxt.current_node_code)
             return TurnResult()
+
+        _emit_route_hit(ec.stream, module.module_code,
+                        node_before, cxt.current_node_code)
 
         # Slot merge (incremental: via the lifecycle entry point)
         lifecycle = TurnLifecycle()
@@ -68,8 +79,36 @@ class DefaultRouteExecutor(ModuleExecutor):
         # next turn's routing candidates would be empty)
         root_code = (module.module_nodes[0].node_code
                      if module.module_nodes else None)
+        parked = cxt.current_node_code
         cxt.current_node_code = root_code
         logger.info("ROUTE 模块保持 root 节点: %s", root_code)
+        # route_root trace — only when a menu node was actually parked (a
+        # root→root no-op turn stays silent, same suppression contract as
+        # route_hit / node_jump)
+        if parked and parked != root_code:
+            _emit_trace(ec.stream, "route_root",
+                        module_code=module.module_code,
+                        node_code=root_code or "",
+                        from_node=parked, to_node=root_code or "")
 
         nlg_result = cxt.nlg_result or {}
-        return TurnResult(content=nlg_result.get("content", ""))
+        content = nlg_result.get("content", "")
+        _emit_reply_delta(ec.stream, content)
+        return TurnResult(content=content)
+
+
+def _emit_trace(stream_emitter, event: str, **data) -> None:
+    """Emit a trace event (no-op without an attached emitter)."""
+    if stream_emitter is not None:
+        stream_emitter.emit_trace(event, **data)
+
+
+def _emit_route_hit(stream_emitter, module_code: str,
+                    before: str, after: str) -> None:
+    """route_hit trace — only when the turn actually landed on a menu node
+    (root→root stays silent; suppression keeps exact event-sequence pins
+    intact)."""
+    if stream_emitter is not None and after and after != before:
+        stream_emitter.emit_trace(
+            "route_hit", module_code=module_code, node_code=after,
+            from_node=before or "", to_node=after)

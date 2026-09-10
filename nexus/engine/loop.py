@@ -88,7 +88,7 @@ async def run_agent(
 
 async def _dispatch_tool_calls(
     cxt, module, messages, content, tool_calls, hooks, allowed_names,
-    lent_by, round_idx, transfer_error=None,
+    lent_by, round_idx, transfer_error=None, stream=None,
 ) -> None:
     """Unified dispatch of a tool round: P4 rewrite -> validate -> append
     assistant payload -> execute -> P5 -> append tool rows.
@@ -117,12 +117,17 @@ async def _dispatch_tool_calls(
     Audit metadata: when a rewrite happens, ``rewritten=True`` plus
     ``original_call`` (P4, original name/args) / ``original_result``
     (P5, original string).
+
+    stream: optional StreamEmitter — each issued / returned call is
+    forwarded as trace events (tool_call / tool_result) for real-time
+    consumers; None = no emission (pre-streaming callers unchanged).
     """
     session_id = cxt.session_id
     module_code = module.module_code
+    _emit = getattr(stream, "emit_trace", None)
 
     # 1. P4 chained rewrite -> applied back to tc (transfer entries skipped:
-    #    their determination already happened earlier)
+    #    their determination happened earlier)
     rewrite_audits = {}
     for idx, tc in enumerate(tool_calls):
         name = tc.get("function", {}).get("name", "")
@@ -167,6 +172,10 @@ async def _dispatch_tool_calls(
         call_id = tc.get("id", "")
         metadata = {"tool_name": name, "tool_call_id": call_id}
 
+        if _emit is not None:
+            _emit("tool_call", module_code=module_code, call_id=call_id,
+                  tool_name=name, args=_parse_args(tc), round_idx=round_idx)
+
         if transfer_error is not None and name == _DEFER_TOOL_NAME:
             result_content = transfer_error
         elif name not in allowed_names:
@@ -206,6 +215,11 @@ async def _dispatch_tool_calls(
         if idx in rewrite_audits:
             metadata["rewritten"] = True
             metadata["original_call"] = rewrite_audits[idx]
+
+        if _emit is not None:
+            _emit("tool_result", module_code=module_code, call_id=call_id,
+                  tool_name=name, result=result_content, round_idx=round_idx,
+                  synthetic=bool(metadata.get("synthetic")))
 
         await cxt.add_message("tool", result_content, stage="agent",
                               metadata=metadata)

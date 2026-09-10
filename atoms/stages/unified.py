@@ -97,25 +97,49 @@ class _UnifiedBaseNLU(BaseNLU):
     async def _call_llm(
         self, prompt: str, llm_config: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Call the LLM (single call per turn) and return the raw response text."""
+        """Call the LLM (single call per turn) and return the raw response text.
+
+        When the provider streams natively AND a turn emitter is attached
+        (chat_turn_stream path), the call runs streamed: the ``reply``
+        field's value is forwarded to the consumer incrementally as it
+        arrives (ReplyFieldTap — the other JSON fields never leak), while
+        the chunks still aggregate into the full raw text for parsing.
+        Non-streaming providers / plain chat_turn turns take the legacy
+        one-shot path unchanged.
+        """
         if llm_config is None:
             from nexus.settings import get_llm_config
             llm_config = get_llm_config()
 
         from nexus.llm.resolve import build_provider
+        from nexus.engine.streaming import current_emitter, stream_llm_reply
 
         provider = build_provider(llm_config)
         extra_kwargs: Dict[str, Any] = {}
         if self.response_format is not None:
             extra_kwargs["response_format"] = self.response_format
 
-        result = await provider.achat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            model=llm_config["model"],
-            temperature=llm_config.get("temperature", 0.7),
-            max_tokens=llm_config.get("max_tokens", 2048),
-            **extra_kwargs,
-        )
+        messages = [{"role": "user", "content": prompt}]
+        if (hasattr(provider, "achat_completion_stream")
+                and current_emitter.get() is not None):
+            result = await stream_llm_reply(
+                provider.achat_completion_stream(
+                    messages=messages,
+                    model=llm_config["model"],
+                    temperature=llm_config.get("temperature", 0.7),
+                    max_tokens=llm_config.get("max_tokens", 2048),
+                    **extra_kwargs,
+                ),
+                field="reply",
+            )
+        else:
+            result = await provider.achat_completion(
+                messages=messages,
+                model=llm_config["model"],
+                temperature=llm_config.get("temperature", 0.7),
+                max_tokens=llm_config.get("max_tokens", 2048),
+                **extra_kwargs,
+            )
 
         content = result.get("content", "")
         logger.debug("Unified LLM 返回: %s", content[:200])

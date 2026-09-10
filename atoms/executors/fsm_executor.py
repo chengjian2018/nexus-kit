@@ -44,19 +44,66 @@ class DefaultFSMExecutor(ModuleExecutor):
         # anchor keeps working
         _refresh_llm_config_by_node(ec, module)
 
+        node_before = cxt.current_node_code
         await _run_stages(cxt, module, pattern, force_close=ec.force_close)
 
         # FSM: next_node jump (the clarify-turn guard lives inside the
         # transition function)
         _fsm_node_transition(cxt, module)
+        _emit_node_jump(ec.stream, module.module_code,
+                        node_before, cxt.current_node_code)
 
         # Terminal node action (reserved channel)
         next_node = pattern.node_map.get(cxt.current_node_code)
         if next_node is not None and getattr(next_node, "is_end", False):
             cxt.actions.append({"conversation_end": True})
+            _emit_trace(ec.stream, "conversation_end",
+                        module_code=module.module_code,
+                        node_code=cxt.current_node_code or "")
 
+        # FSM/ROUTE reply: when the stage streamed it natively (unified
+        # reply-field tap / NLG token stream), the deltas already reached
+        # the consumer — emit only what was NOT forwarded (fallback replies
+        # after parse failure / replaced wording)
         nlg_result = cxt.nlg_result or {}
-        return TurnResult(content=nlg_result.get("content", ""))
+        content = nlg_result.get("content", "")
+        _emit_reply_delta(ec.stream, content)
+        return TurnResult(content=content)
+
+
+def _emit_trace(stream_emitter, event: str, **data) -> None:
+    """Emit a trace event (no-op without an attached emitter)."""
+    if stream_emitter is not None:
+        stream_emitter.emit_trace(event, **data)
+
+
+def _emit_reply_delta(stream_emitter, content: str) -> None:
+    """Forward the reply as a delta — unless the stage already streamed it.
+
+    The unified/NLG stages forward reply text natively while the LLM runs
+    (stream_llm_reply records what was forwarded in the
+    current_streamed_reply contextvar, same task context); identical text
+    here would duplicate on the consumer's screen. Fallback / replaced
+    wording still emits in full. The comparison is whitespace-tolerant
+    (stages strip the raw generation before writing nlg_result).
+    """
+    from nexus.engine.streaming import current_streamed_reply
+
+    streamed = current_streamed_reply.get()
+    if not content or content == streamed or streamed.strip() == content:
+        return
+    if stream_emitter is not None:
+        stream_emitter.emit_delta(content)
+
+
+def _emit_node_jump(stream_emitter, module_code: str,
+                    before: str, after: str) -> None:
+    """node_jump trace — only when the node actually moved (suppress noise
+    on stay-in-place turns so exact event-sequence pins stay intact)."""
+    if stream_emitter is not None and after and after != before:
+        stream_emitter.emit_trace(
+            "node_jump", module_code=module_code, node_code=after,
+            from_node=before or "", to_node=after)
 
 
 def _refresh_llm_config_by_node(ec, module):

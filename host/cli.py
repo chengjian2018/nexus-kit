@@ -42,6 +42,7 @@ import fire  # noqa: E402
 import host.config  # noqa: E402,F401
 
 from nexus.engine.chat import chat as chat_turn  # noqa: E402
+from nexus.engine.chat import chat_turn_stream  # noqa: E402
 from nexus.engine.session import Session
 from nexus.engine.store import SessionStore
 from nexus.registry.patterns import discover_builtin_patterns, registry as pattern_registry
@@ -151,6 +152,95 @@ def _safe_json(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return repr(obj)
+
+
+# ============================================================================
+# Events-mode rendering: trace events + live stream (plan-⑤ consumers)
+# ============================================================================
+
+def render_trace_event(trace) -> str:
+    """Render one TraceEvent as a compact CLI trace line (events mode).
+
+    Unknown event names fall through to a generic one-liner — the set is
+    open (custom executors may emit their own names).
+    """
+    d = getattr(trace, "data", None) or {}
+    ev = getattr(trace, "event", "")
+    if ev == "module_jump":
+        src = f" ({d.get('source', '')})" if d.get("source") else ""
+        return cyan(f"  [jump] {d.get('from_module', '')} → {d.get('to_module', '')}{src}")
+    if ev == "node_jump":
+        return cyan(f"  [node] {d.get('from_node', '')} → {d.get('to_node', '')}")
+    if ev == "route_hit":
+        return cyan(f"  [route] 命中菜单节点 {d.get('to_node', '')}")
+    if ev == "route_root":
+        return cyan(f"  [route] 回到 root（{d.get('from_node', '')} → {d.get('to_node', '')}）")
+    if ev == "tool_call":
+        args = _safe_json(d.get("args") or {})
+        return yellow(f"  [tool_call] {d.get('tool_name', '')} {args}")
+    if ev == "tool_result":
+        result = str(d.get("result", ""))
+        shown = result if len(result) <= 120 else result[:117] + "..."
+        flag = "（拦截回填）" if d.get("synthetic") else ""
+        return yellow(f"  [tool_result] {d.get('tool_name', '')}{flag}: {shown}")
+    if ev == "defer_switch":
+        return cyan(f"  [defer] 底座轮末切换 → {d.get('to_module', '')}（下一轮生效）")
+    if ev == "conversation_end":
+        return cyan(f"  [end] 到达终节点 {getattr(trace, 'node_code', '')}，流程结束")
+    return dim(f"  [{ev}] {getattr(trace, 'module_code', '')}".rstrip())
+
+
+class StreamEventPrinter:
+    """Live renderer of ChatStreamEvents for the CLI events mode.
+
+    Line discipline: delta text streams without a trailing newline
+    (real-time feel); any trace/round event first closes the pending line
+    so interleaved output stays readable. done is handled by close(): when
+    the authoritative reply differs from the streamed text (optimistic
+    forwarding superseded a tool round's interim text), the final reply is
+    re-printed; otherwise the streamed line IS the reply.
+
+    write(text, nl) is injectable so the unit tests can capture output.
+    """
+
+    def __init__(self, write=None):
+        self._write = write or self._default_write
+        self._streamed: List[str] = []
+        self._midline = False
+
+    @staticmethod
+    def _default_write(text: str, nl: bool = True) -> None:
+        sys.stdout.write(text + ("\n" if nl else ""))
+        sys.stdout.flush()
+
+    def _close_line(self) -> None:
+        if self._midline:
+            self._write("", nl=True)
+            self._midline = False
+
+    def handle(self, ev) -> None:
+        if ev.kind == "delta":
+            if not ev.text:
+                return
+            if not self._midline:
+                self._write(green("助手: "), nl=False)
+                self._midline = True
+            self._write(ev.text, nl=False)
+            self._streamed.append(ev.text)
+        elif ev.kind == "trace":
+            line = render_trace_event(ev.trace)
+            if line:
+                self._close_line()
+                self._write(line)
+        elif ev.kind == "round":
+            info = ev.round_info or {}
+            self._close_line()
+            self._write(dim(f"  [round {info.get('round_idx', '?')}] {info.get('outcome', '?')}"))
+
+    def close(self, final_text: str) -> None:
+        self._close_line()
+        if final_text and "".join(self._streamed) != final_text:
+            self._write(green(f"助手: {final_text}"))
 
 
 def parse_slash_command(line: str) -> Optional[Dict[str, Any]]:
@@ -501,11 +591,30 @@ def _snapshot(cxt) -> Dict[str, Any]:
 
 async def run_turn(session: Session, query: str,
                    sessions: Dict[str, Session],
-                   store: Optional[SessionStore], verbose: int = 0) -> str:
-    """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering."""
+                   store: Optional[SessionStore], verbose: int = 0,
+                   events: bool = False,
+                   printer: Optional[StreamEventPrinter] = None) -> str:
+    """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering.
+
+    events=True switches the engine entry to chat_turn_stream: trace
+    (jump/node/route/tool) and round events render live via the printer and
+    the reply streams as deltas. The caller must NOT print the reply again
+    in that mode — it was already rendered (the return value stays the
+    reply text for callers that need it). chat() behavior is untouched.
+    """
     before = _snapshot(session.cxt)
 
-    reply = await chat_turn(query, session.session_id, sessions, store=store)
+    if events:
+        p = printer or StreamEventPrinter()
+        reply = ""
+        async for ev in chat_turn_stream(query, session.session_id,
+                                         sessions, store=store):
+            p.handle(ev)
+            if ev.kind == "done" and ev.result is not None:
+                reply = ev.result.text
+        p.close(reply)
+    else:
+        reply = await chat_turn(query, session.session_id, sessions, store=store)
 
     if store is not None:
         try:
@@ -603,7 +712,8 @@ def _prompt_text(session: Session):
 async def repl_loop(pattern_code: str, session_id: str,
                     llm_overrides: Dict[str, Any],
                     persist: bool, verbose: int,
-                    task_info: Optional[Dict[str, str]] = None) -> None:
+                    task_info: Optional[Dict[str, str]] = None,
+                    events: bool = True) -> None:
     """Interactive chat main loop (one asyncio.run drives the whole session:
     MCP connections, turn locks and the store all live on this single loop)."""
     sessions: Dict[str, Session] = {}
@@ -642,8 +752,10 @@ async def repl_loop(pattern_code: str, session_id: str,
         if cmd is None:
             if not line.strip():
                 continue
-            reply = await run_turn(session, line.strip(), sessions, store, verbose)
-            print(green(f"助手: {reply}"))
+            reply = await run_turn(session, line.strip(), sessions, store,
+                                   verbose, events=events)
+            if not events:
+                print(green(f"助手: {reply}"))
             continue
 
         name, arg = cmd["name"], cmd["arg"]
@@ -778,7 +890,8 @@ def _ensure_discovery() -> None:
 
 
 def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str = "",
-         task_info: str = "", verbose: int = 0, persist: bool = True) -> None:
+         task_info: str = "", verbose: int = 0, persist: bool = True,
+         events: bool = True) -> None:
     """Interactive REPL for exercising template dialogues.
 
     Args:
@@ -789,6 +902,8 @@ def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str =
         task_info: JSON string (input prompt after the pattern is picked when omitted; Enter skips)
         verbose: debug level 0/1/2 (-v/-vv expand automatically on the command line)
         persist: persist to data/dialogue.db (on by default)
+        events: live event output (jump/node/route transitions, tool calls,
+            streamed reply); --events=false restores the plain reply-only mode
     """
     _ensure_discovery()
     # Restore precedence: an explicit --pattern starts a new session; otherwise an
@@ -823,13 +938,17 @@ def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str =
     # in the db that would swap out the just-picked pattern
     sid = session_id if (sid_specified or pattern) else f"{session_id}-{os.getpid()}"
     asyncio.run(repl_loop(pattern_code, sid, llm_overrides, persist,
-                          verbose, task_info_dict))
+                          verbose, task_info_dict, events=events))
 
 
 def ask(query: str, pattern: str = "", session_id: str = "cli-ask", llm: str = "",
         model: str = "", task_info: str = "", verbose: int = 0,
-        persist: bool = True) -> None:
-    """One-shot Q&A (--session-id resumes a session from the db)."""
+        persist: bool = True, events: bool = False) -> None:
+    """One-shot Q&A (--session-id resumes a session from the db).
+
+    events=True enables the same live event output as the REPL
+    (jump/tool traces + streamed reply); off by default for clean output.
+    """
     _ensure_discovery()
     pattern_code = pattern
     if not pattern_code:
@@ -862,8 +981,10 @@ def ask(query: str, pattern: str = "", session_id: str = "cli-ask", llm: str = "
                                         llm_overrides, store, sessions,
                                         task_info_dict)
         try:
-            reply = await run_turn(session, query, sessions, store, verbose)
-            print(reply)
+            reply = await run_turn(session, query, sessions, store, verbose,
+                                   events=events)
+            if not events:
+                print(reply)
         finally:
             try:
                 from atoms.mcp.manager import get_mcp_manager

@@ -289,7 +289,7 @@ def _pop_deferred_switch(cxt) -> Optional["DeferredModuleSwitch"]:
     return None
 
 
-def _apply_deferred_switch(session: Session, pattern) -> None:
+def _apply_deferred_switch(session: Session, pattern, stream=None) -> None:
     """End-of-turn consumption of a DeferredModuleSwitch (plan-⑥).
 
     Runs AFTER the hop loop and BEFORE end_turn (so the end-of-turn history
@@ -299,6 +299,9 @@ def _apply_deferred_switch(session: Session, pattern) -> None:
     as force-projected (anti-ping-pong). The event stays observable: it is
     re-appended to actions after application so build_chat_result
     snapshots it into ChatResult.actions.
+
+    stream: optional StreamEmitter — a successful switch is forwarded as a
+    defer_switch trace event for real-time consumers.
     """
     from nexus.context import DeferredModuleSwitch
 
@@ -324,6 +327,11 @@ def _apply_deferred_switch(session: Session, pattern) -> None:
     cxt.current_node_code = None  # the target resolves its own entry node
     if source_module:
         _record_forced_projection(cxt, source_module)
+    if stream is not None:
+        stream.emit_trace(
+            "defer_switch", module_code=target,
+            from_module=source_module or "", to_module=target,
+            source=switch.source, reason=switch.reason)
     # re-append for observability (ChatResult.actions snapshot)
     cxt.actions.append(switch)
 
@@ -450,6 +458,12 @@ async def _run_stages(cxt, module, pattern, force_close: bool = False
         The jump event awaiting consumption (already written to
         cxt.actions, popped by chat_turn's hop loop); None means no jump.
     """
+    from nexus.engine.streaming import reset_streamed_reply
+
+    # Zero the stage-streaming marker per module execution (a hop into the
+    # next module must not inherit the previous module's streamed text)
+    reset_streamed_reply()
+
     sequence = resolve_execution_sequence(cxt, module, pattern)
 
     logger.info(
@@ -570,132 +584,194 @@ async def chat_turn_stream(
         store: Optional["SessionStore"] = None,
 ):
     """Async generator form of chat_turn (plan-⑤): yields ChatStreamEvent
-    objects (delta / round / done), the final done event carrying the
-    complete ChatResult. See nexus/engine/streaming.py for the protocol and
-    the optimistic-forwarding caveat.
+    objects (delta / round / trace / done), the final done event carrying
+    the complete ChatResult. See nexus/engine/streaming.py for the protocol
+    and the optimistic-forwarding caveat.
 
-    The turn orchestration is identical to the pre-streaming chat_turn (the
-    docstring below is retained verbatim); the only additions are the
-    StreamEmitter injection (executors forward deltas into it) and the
-    drain-and-yield after each module execution.
+    REAL-TIME bridge (not step-drained): the whole turn orchestration runs
+    in a background task; every emit (deltas as LLM chunks arrive, traces
+    at transition time) is pushed onto an asyncio.Queue and re-yielded
+    here the moment it happens — consumers see events live while the turn
+    is still executing, not in a burst after each module finishes. The
+    turn's last push is always the done event; if the task dies early the
+    bridge pushes an error done so the consumer never hangs.
+
+    The turn steps are unchanged from the pre-streaming chat_turn:
+    1. locate session → begin_turn; 2. locate entry module → R1 refresh →
+    compression → record user; 3. hop loop (jump events reroute same-turn,
+    max_hops force-close); 4. deferred base switch → end_turn → snapshot.
     """
-    from nexus.engine.streaming import ChatStreamEvent, StreamEmitter
+    import asyncio
 
-    emitter = StreamEmitter()
+    from nexus.engine.streaming import (
+        ChatStreamEvent,
+        StreamEmitter,
+        current_emitter,
+    )
 
-    async def _finish(text: str) -> ChatResult:
-        await _lifecycle.end_turn(session.cxt, text)
-        return build_chat_result(text, session.cxt)
+    queue: "asyncio.Queue[ChatStreamEvent]" = asyncio.Queue()
+    emitter = StreamEmitter(sink=queue.put_nowait)
 
-    # ------------------------------------------------------------------
-    # 1. Locate the session; start-of-turn reset (user_query overwrite +
-    #    per-turn fields zeroed — exactly once, before hopping)
-    # ------------------------------------------------------------------
-    session = all_sessions.get(session_id)
-    if session is None:
-        logger.warning("会话不存在: %s", session_id)
-        yield ChatStreamEvent(kind="done", result=ChatResult(
-            text="会话不存在，请先发起对话任务"))
-        return
+    async def _run_turn() -> None:
+        token = current_emitter.set(emitter)
+        try:
+            await _run_turn_body()
+        except Exception:
+            # safety net: the consumer loop terminates on done only — an
+            # escaped exception must still produce one (details already
+            # logged by the body's own handling; this is a last resort)
+            logger.exception("流式轮次异常: session=%s", session_id)
+            queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
+                text="对话处理异常，请稍后重试")))
+        finally:
+            current_emitter.reset(token)
 
-    _lifecycle.begin_turn(session.cxt, query)
+    async def _run_turn_body() -> None:
+        async def _finish(text: str) -> ChatResult:
+            await _lifecycle.end_turn(session.cxt, text)
+            return build_chat_result(text, session.cxt)
 
-    pattern = session.pattern
-    if pattern is None:
-        logger.warning("会话 %s 未绑定对话模板", session_id)
-        yield ChatStreamEvent(kind="done", result=await _finish("对话模板未配置"))
-        return
+        # ----------------------------------------------------------------
+        # 1. Locate the session; start-of-turn reset (user_query overwrite
+        #    + per-turn fields zeroed — exactly once, before hopping)
+        # ----------------------------------------------------------------
+        session = all_sessions.get(session_id)
+        if session is None:
+            logger.warning("会话不存在: %s", session_id)
+            queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
+                text="会话不存在，请先发起对话任务")))
+            return
 
-    # ------------------------------------------------------------------
-    # 2. Locate the entry module (cxt.current_module_code first, fall back
-    #    to the entry)
-    # ------------------------------------------------------------------
-    current_module_code = session.cxt.current_module_code or pattern.entry_module_code
-    if not current_module_code:
-        logger.warning("会话 %s 未找到入口模块", session_id)
-        yield ChatStreamEvent(kind="done", result=await _finish("入口模块未配置"))
-        return
+        _lifecycle.begin_turn(session.cxt, query)
 
-    # Write back to cxt: stages and transitions (jump detection /
-    # _fsm_node_transition) both read the current position from cxt
-    session.cxt.current_module_code = current_module_code
+        pattern = session.pattern
+        if pattern is None:
+            logger.warning("会话 %s 未绑定对话模板", session_id)
+            queue.put_nowait(ChatStreamEvent(
+                kind="done", result=await _finish("对话模板未配置")))
+            return
 
-    current_module = pattern.module_map.get(current_module_code)
-    if current_module is None:
-        logger.warning("模块不存在: %s", current_module_code)
-        yield ChatStreamEvent(
-            kind="done", result=await _finish(f"模块 '{current_module_code}' 不存在"))
-        return
+        # ----------------------------------------------------------------
+        # 2. Locate the entry module (cxt.current_module_code first, fall
+        #    back to the entry)
+        # ----------------------------------------------------------------
+        current_module_code = session.cxt.current_module_code or pattern.entry_module_code
+        if not current_module_code:
+            logger.warning("会话 %s 未找到入口模块", session_id)
+            queue.put_nowait(ChatStreamEvent(
+                kind="done", result=await _finish("入口模块未配置")))
+            return
 
-    session.cxt.metadata["pattern_code"] = session.pattern_code
+        # Write back to cxt: stages and transitions (jump detection /
+        # _fsm_node_transition) both read the current position from cxt
+        session.cxt.current_module_code = current_module_code
 
-    # R1: resolve the LLM config by current position each turn, override takes precedence (spec §4)
-    try:
-        _refresh_llm_config(session)
-    except Exception as e:
-        logger.error("加载 LLM 配置失败: %s", e)
-        yield ChatStreamEvent(
-            kind="done", result=await _finish(f"LLM 配置加载失败: {e}"))
-        return
+        current_module = pattern.module_map.get(current_module_code)
+        if current_module is None:
+            logger.warning("模块不存在: %s", current_module_code)
+            queue.put_nowait(ChatStreamEvent(
+                kind="done",
+                result=await _finish(f"模块 '{current_module_code}' 不存在")))
+            return
 
-    # History compression (silently skipped when the store is disabled /
-    # threshold is 0 / too few messages; summarizes with the llm_config R1
-    # just refreshed; failure never blocks the dialogue). Must run before
-    # add user — compression rebuilds history and fixes turn_history_start
-    await maybe_compress(session, store)
+        session.cxt.metadata["pattern_code"] = session.pattern_code
 
-    # Record user message
-    await session.cxt.add_message("user", query, stage="chat")
+        # R1: resolve the LLM config by current position each turn, override takes precedence (spec §4)
+        try:
+            _refresh_llm_config(session)
+        except Exception as e:
+            logger.error("加载 LLM 配置失败: %s", e)
+            queue.put_nowait(ChatStreamEvent(
+                kind="done", result=await _finish(f"LLM 配置加载失败: {e}")))
+            return
 
-    # ------------------------------------------------------------------
-    # 3. Reentry loop: consume same-turn jump events (cxt.actions channel)
-    # ------------------------------------------------------------------
-    max_hops = getattr(pattern, "max_hops", 2)
-    try:
-        for hop in range(max_hops):
-            current_module = pattern.module_map[
-                session.cxt.current_module_code or pattern.entry_module_code
-            ]
-            result = await _handle_module(session, current_module,
-                                          stream=emitter)
-            for ev in emitter.drain():
-                yield ev
+        # History compression (silently skipped when the store is disabled /
+        # threshold is 0 / too few messages; summarizes with the llm_config
+        # R1 just refreshed; failure never blocks the dialogue). Must run
+        # before add user — compression rebuilds history and fixes
+        # turn_history_start
+        await maybe_compress(session, store)
 
-            event = _jumps.pop(session.cxt)
-            if event is None:
+        # Record user message
+        await session.cxt.add_message("user", query, stage="chat")
+
+        # ----------------------------------------------------------------
+        # 3. Reentry loop: consume same-turn jump events (cxt.actions
+        #    channel). Emissions flow straight to the queue (sink mode).
+        # ----------------------------------------------------------------
+        max_hops = getattr(pattern, "max_hops", 2)
+        try:
+            for hop in range(max_hops):
+                current_module = pattern.module_map[
+                    session.cxt.current_module_code or pattern.entry_module_code
+                ]
+                result = await _handle_module(session, current_module,
+                                              stream=emitter)
+
+                event = _jumps.pop(session.cxt)
+                if event is None:
+                    response = result.content or ""
+                    break
+                logger.info(
+                    "same-turn jump 第 %d 跳: → %s (source=%s)",
+                    hop + 1, event.target_module_code, event.source,
+                )
+                # Emitted before reroute so from_module still reads the source
+                emitter.emit_trace(
+                    "module_jump",
+                    module_code=event.target_module_code,
+                    from_module=session.cxt.current_module_code or "",
+                    to_module=event.target_module_code,
+                    source=event.source, reason=event.reason, hop=hop + 1)
+                _jumps.reroute(session.cxt, event)
+            else:
+                # Max hops exceeded: first consume the leftover event to land
+                # on the final target, then force-close with that module
+                logger.warning("达到 max_hops=%d，强制收尾", max_hops)
+                pending = _jumps.pop(session.cxt)
+                if pending is not None:
+                    emitter.emit_trace(
+                        "module_jump",
+                        module_code=pending.target_module_code,
+                        from_module=session.cxt.current_module_code or "",
+                        to_module=pending.target_module_code,
+                        source=pending.source, reason=pending.reason,
+                        hop=max_hops)
+                    _jumps.reroute(session.cxt, pending)
+                current_module = pattern.module_map[
+                    session.cxt.current_module_code or pattern.entry_module_code
+                ]
+                result = await _handle_module(session, current_module,
+                                              force_close=True, stream=emitter)
                 response = result.content or ""
-                break
-            logger.info(
-                "same-turn jump 第 %d 跳: → %s (source=%s)",
-                hop + 1, event.target_module_code, event.source,
-            )
-            _jumps.reroute(session.cxt, event)
-        else:
-            # Max hops exceeded: first consume the leftover event to land on
-            # the final target, then force-close with that module
-            logger.warning("达到 max_hops=%d，强制收尾", max_hops)
-            pending = _jumps.pop(session.cxt)
-            if pending is not None:
-                _jumps.reroute(session.cxt, pending)
-            current_module = pattern.module_map[
-                session.cxt.current_module_code or pattern.entry_module_code
-            ]
-            result = await _handle_module(session, current_module,
-                                          force_close=True, stream=emitter)
-            for ev in emitter.drain():
-                yield ev
-            response = result.content or ""
-    except Exception as e:
-        logger.exception("对话处理异常: session=%s", session_id)
-        # 对外脱敏：异常细节可能含路径/配置信息，只回统一话术（细节已进日志）
-        response = "对话处理异常，请稍后重试"
+        except Exception:
+            logger.exception("对话处理异常: session=%s", session_id)
+            # 对外脱敏：异常细节可能含路径/配置信息，只回统一话术（细节已进日志）
+            response = "对话处理异常，请稍后重试"
 
-    # ------------------------------------------------------------------
-    # 4. End of turn: apply the deferred base switch (plan-⑥, projection),
-    #    append the assistant message to history, snapshot the output
-    # ------------------------------------------------------------------
-    _apply_deferred_switch(session, pattern)
-    yield ChatStreamEvent(kind="done", result=await _finish(response))
+        # ----------------------------------------------------------------
+        # 4. End of turn: apply the deferred base switch (plan-⑥,
+        #    projection), append the assistant message to history, snapshot
+        # ----------------------------------------------------------------
+        _apply_deferred_switch(session, pattern, stream=emitter)
+        queue.put_nowait(ChatStreamEvent(kind="done",
+                                         result=await _finish(response)))
+
+    task = asyncio.create_task(_run_turn())
+    try:
+        while True:
+            ev = await queue.get()
+            yield ev
+            if ev.kind == "done":
+                break
+    finally:
+        if not task.done():
+            # consumer closed the generator early — don't leak the turn task
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def chat_turn(
