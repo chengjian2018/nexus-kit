@@ -17,7 +17,10 @@ import time as _time
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from jionlp.algorithm.ner import extract_time
+# jionlp 在 import 时向 stdout 打印公众号广告；redirect 包住 import 本身，
+# 否则所有 CLI 子命令的 stdout 首行都会被污染（仅包 extract_time 调用不够）。
+with contextlib.redirect_stdout(io.StringIO()):
+    from jionlp.algorithm.ner import extract_time
 
 
 def _fmt_clock(s: str) -> str:
