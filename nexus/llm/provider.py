@@ -1,16 +1,19 @@
 """Base LLM provider abstract classes.
 
 Defines the contract that every LLM provider must implement:
-- ``BaseLLMProvider``: the core interface for chat-completion requests.
+- ``BaseLLMProvider``: the core interface for chat-completion requests
+  (async — the asyncio rewrite; the legacy sync method names are temporary
+  bridges and will be removed in phase-③).
 - ``ProviderEntry``: metadata record for a registered provider.
 """
 
+import asyncio
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Generator, List, Optional
 
-from nexus.llm.aggregate import collect_stream
+from nexus.llm.aggregate import acollect_stream, collect_stream
 from nexus.llm.types import LLMChunk
 
 
@@ -67,6 +70,57 @@ class ProviderEntry:
         }
         return self.provider_class(code=self.code, **config)
 
+    async def achat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        stream: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Convenience: instantiate the provider and call achat_completion in one shot.
+
+        Each call creates a fresh provider instance (no state is retained).
+        """
+        provider = self.instantiate()
+        return await provider.achat_completion(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream,
+            **kwargs,
+        )
+
+    async def achat_completion_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs,
+    ) -> AsyncGenerator["LLMChunk", None]:
+        """Convenience: instantiate and stream the response (LLMChunk objects)."""
+        provider = self.instantiate()
+        async for chunk in provider.achat_completion_stream(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        ):
+            yield chunk
+
+    async def acheck_connection(
+        self,
+        model: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Convenience: instantiate the provider and probe its connectivity."""
+        provider = self.instantiate()
+        return await provider.acheck_connection(model=model, **kwargs)
+
     def chat_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -76,19 +130,10 @@ class ProviderEntry:
         stream: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Convenience: instantiate the provider and call chat_completion in one shot.
-
-        Each call creates a fresh provider instance (no state is retained).
-        """
-        provider = self.instantiate()
-        return provider.chat_completion(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=stream,
-            **kwargs,
-        )
+        """Sync bridge (TODO(phase3): delete once all callers are async)."""
+        return asyncio.run(self.achat_completion(
+            messages=messages, model=model, temperature=temperature,
+            max_tokens=max_tokens, stream=stream, **kwargs))
 
     def chat_completion_stream(
         self,
@@ -98,24 +143,20 @@ class ProviderEntry:
         max_tokens: int = 2048,
         **kwargs,
     ) -> Generator["LLMChunk", None, None]:
-        """Convenience: instantiate and stream the response (LLMChunk objects)."""
-        provider = self.instantiate()
-        yield from provider.chat_completion_stream(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs,
-        )
+        """Sync bridge (TODO(phase3): delete once all callers are async)."""
+        async def _collect():
+            return [c async for c in self.achat_completion_stream(
+                messages=messages, model=model, temperature=temperature,
+                max_tokens=max_tokens, **kwargs)]
+        yield from asyncio.run(_collect())
 
     def check_connection(
         self,
         model: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Convenience: instantiate the provider and probe its connectivity."""
-        provider = self.instantiate()
-        return provider.check_connection(model=model, **kwargs)
+        """Sync bridge (TODO(phase3): delete once all callers are async)."""
+        return asyncio.run(self.acheck_connection(model=model, **kwargs))
 
 
 class BaseLLMProvider(ABC):
@@ -171,10 +212,10 @@ class BaseLLMProvider(ABC):
         return ""
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API (async — the asyncio rewrite)
     # ------------------------------------------------------------------
 
-    def chat_completion(
+    async def achat_completion(
         self,
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
@@ -187,8 +228,8 @@ class BaseLLMProvider(ABC):
         aggregated streaming call).
 
         Validates inputs, resolves the model, streams via
-        ``_chat_completion_stream_impl`` and aggregates the LLMChunks into
-        the legacy dict shape (llm/aggregate.py::collect_stream) — streaming
+        ``_achat_completion_stream_impl`` and aggregates the LLMChunks into
+        the legacy dict shape (llm/aggregate.py::acollect_stream) — streaming
         is the default wire form; non-streaming is its aggregation. The
         ``stream`` parameter is accepted for call-site compatibility and no
         longer changes the code path (the result is identical either way).
@@ -202,17 +243,17 @@ class BaseLLMProvider(ABC):
                 f"No model specified and provider '{self.code}' has no default_model"
             )
 
-        chunks = self._chat_completion_stream_impl(
+        agen = self._achat_completion_stream_impl(
             messages=messages,
             model=resolved_model,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
         )
-        return collect_stream(chunks)
+        return await acollect_stream(agen)
 
     @abstractmethod
-    def _chat_completion_impl(
+    def _achat_completion_impl(
         self,
         messages: List[Dict[str, Any]],
         model: str,
@@ -224,7 +265,7 @@ class BaseLLMProvider(ABC):
         """Provider-specific implementation of a NON-STREAMING call.
 
         Plan-⑤ role: the fallback behind the default stream bridge (providers
-        that do not override ``_chat_completion_stream_impl`` get their
+        that do not override ``_achat_completion_stream_impl`` get their
         non-streaming result wrapped as a single-chunk stream). Must return a
         dict with at least ``{"content": str}``; may also include
         ``{"tool_calls": [...], "usage": {...}, "finish_reason": str}``.
@@ -232,24 +273,25 @@ class BaseLLMProvider(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # Streaming API (the native form since plan-⑤)
+    # Streaming API (the native form since plan-⑤; async since the
+    # asyncio rewrite)
     # ------------------------------------------------------------------
 
-    def chat_completion_stream(
+    async def achat_completion_stream(
         self,
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 2048,
         **kwargs,
-    ) -> Generator["LLMChunk", None, None]:
+    ) -> AsyncGenerator["LLMChunk", None]:
         """Stream chat-completion response, yielding LLMChunk objects
         (structured deltas — text / tool_call fragments / finish_reason /
         usage; see llm/types.py).
 
         Usage::
 
-            for chunk in provider.chat_completion_stream(messages):
+            async for chunk in provider.achat_completion_stream(messages):
                 if chunk.text:
                     print(chunk.text, end="", flush=True)
         """
@@ -262,31 +304,33 @@ class BaseLLMProvider(ABC):
                 f"No model specified and provider '{self.code}' has no default_model"
             )
 
-        yield from self._chat_completion_stream_impl(
+        agen = self._achat_completion_stream_impl(
             messages=messages,
             model=resolved_model,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
         )
+        async for chunk in agen:
+            yield chunk
 
-    def _chat_completion_stream_impl(
+    async def _achat_completion_stream_impl(
         self,
         messages: List[Dict[str, Any]],
         model: str,
         temperature: float,
         max_tokens: int,
         **kwargs,
-    ) -> Generator["LLMChunk", None, None]:
+    ) -> AsyncGenerator["LLMChunk", None]:
         """Provider-specific streaming implementation. Override in subclasses
         to stream natively (yield LLMChunk).
 
         Default bridge: wrap the legacy non-streaming result as a single
         chunk (text + tool_calls + finish_reason + usage) — providers that
-        only implement ``_chat_completion_impl`` (e.g. the offline
-        FakeProvider) survive plan-⑤ unchanged.
+        only implement ``_achat_completion_impl`` (e.g. the offline
+        FakeProvider) survive unchanged.
         """
-        result = self._chat_completion_impl(
+        result = await self._achat_completion_impl(
             messages=messages,
             model=model,
             temperature=temperature,
@@ -302,10 +346,68 @@ class BaseLLMProvider(ABC):
         )
 
     # ------------------------------------------------------------------
+    # Sync bridges (TODO(phase3): delete once all callers are async)
+    # ------------------------------------------------------------------
+
+    def chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        stream: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        return asyncio.run(self.achat_completion(
+            messages=messages, model=model, temperature=temperature,
+            max_tokens=max_tokens, stream=stream, **kwargs))
+
+    def chat_completion_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs,
+    ) -> Generator["LLMChunk", None, None]:
+        async def _collect():
+            return [c async for c in self.achat_completion_stream(
+                messages=messages, model=model, temperature=temperature,
+                max_tokens=max_tokens, **kwargs)]
+        yield from asyncio.run(_collect())
+
+    def _chat_completion_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        stream: bool,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        return asyncio.run(self._achat_completion_impl(
+            messages=messages, model=model, temperature=temperature,
+            max_tokens=max_tokens, stream=stream, **kwargs))
+
+    def _chat_completion_stream_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        **kwargs,
+    ) -> Generator["LLMChunk", None, None]:
+        async def _collect():
+            return [c async for c in self._achat_completion_stream_impl(
+                messages=messages, model=model, temperature=temperature,
+                max_tokens=max_tokens, **kwargs)]
+        yield from asyncio.run(_collect())
+
+    # ------------------------------------------------------------------
     # Connectivity
     # ------------------------------------------------------------------
 
-    def check_connection(
+    async def acheck_connection(
         self,
         model: Optional[str] = None,
         prompt: str = "ping",
@@ -342,7 +444,7 @@ class BaseLLMProvider(ABC):
 
         started = time.perf_counter()
         try:
-            response = self.chat_completion(
+            response = await self.achat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 model=resolved_model,
                 temperature=0.0,
@@ -360,8 +462,23 @@ class BaseLLMProvider(ABC):
 
         return result
 
-    def is_available(self, model: Optional[str] = None, **kwargs) -> bool:
+    async def ais_available(self, model: Optional[str] = None, **kwargs) -> bool:
         """Return True when the provider answers a minimal probe request."""
+        return (await self.acheck_connection(model=model, **kwargs))["ok"]
+
+    def check_connection(
+        self,
+        model: Optional[str] = None,
+        prompt: str = "ping",
+        max_tokens: int = 16,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Sync bridge (TODO(phase3): delete once all callers are async)."""
+        return asyncio.run(self.acheck_connection(
+            model=model, prompt=prompt, max_tokens=max_tokens, **kwargs))
+
+    def is_available(self, model: Optional[str] = None, **kwargs) -> bool:
+        """Sync bridge (TODO(phase3): delete once all callers are async)."""
         return self.check_connection(model=model, **kwargs)["ok"]
 
     # ------------------------------------------------------------------

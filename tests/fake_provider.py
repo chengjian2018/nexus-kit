@@ -17,7 +17,7 @@ class FakeProvider(BaseLLMProvider):
 
     call_count = 0
 
-    def _chat_completion_impl(
+    async def _achat_completion_impl(
         self,
         messages,
         model,

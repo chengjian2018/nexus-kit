@@ -12,6 +12,7 @@ Import chain (circular-import safe):
     chat/chat.py, main.py, etc.
 """
 
+import asyncio
 import logging
 import os
 import threading
@@ -210,7 +211,7 @@ class LLMProviderRegistry:
             )
         return entry.instantiate(**overrides)
 
-    def chat_completion(
+    async def achat_completion(
         self,
         messages: List[Dict[str, Any]],
         code: Optional[str] = None,
@@ -237,7 +238,7 @@ class LLMProviderRegistry:
                 f"Provider '{resolved_code}' is not registered. "
                 f"Available: {self.list_codes()}"
             )
-        return entry.chat_completion(
+        return await entry.achat_completion(
             messages=messages,
             model=model,
             temperature=temperature,
@@ -246,7 +247,7 @@ class LLMProviderRegistry:
             **kwargs,
         )
 
-    def chat_completion_stream(
+    async def achat_completion_stream(
         self,
         messages: List[Dict[str, Any]],
         code: Optional[str] = None,
@@ -254,7 +255,7 @@ class LLMProviderRegistry:
         temperature: float = 0.7,
         max_tokens: int = 2048,
         **kwargs,
-    ) -> Generator[str, None, None]:
+    ):
         """Dispatch a streaming chat request to the active provider (or *code*)."""
         resolved_code = code or self._active_provider_code
         if resolved_code is None:
@@ -268,13 +269,47 @@ class LLMProviderRegistry:
                 f"Provider '{resolved_code}' is not registered. "
                 f"Available: {self.list_codes()}"
             )
-        yield from entry.chat_completion_stream(
+        agen = entry.achat_completion_stream(
             messages=messages,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs,
         )
+        async for chunk in agen:
+            yield chunk
+
+    # -- sync bridges (TODO(phase3): delete once all callers are async) ----
+
+    def chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        code: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        stream: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        return asyncio.run(self.achat_completion(
+            messages=messages, code=code, model=model,
+            temperature=temperature, max_tokens=max_tokens,
+            stream=stream, **kwargs))
+
+    def chat_completion_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        code: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        **kwargs,
+    ) -> Generator[str, None, None]:
+        async def _collect():
+            return [c async for c in self.achat_completion_stream(
+                messages=messages, code=code, model=model,
+                temperature=temperature, max_tokens=max_tokens, **kwargs)]
+        yield from asyncio.run(_collect())
 
 
 # Module-level singleton

@@ -4,13 +4,19 @@ Supports any OpenAI-compatible API endpoint (OpenAI, Azure, local vLLM, etc.).
 
 Register pattern: call ``registry.register(...)`` at module level so
 ``discover_builtin_providers()`` picks it up automatically.
+
+Async since the asyncio rewrite: httpx.AsyncClient, a fresh client per call
+(the requests top-level API behaviour — no cross-loop pooled connections;
+a loop-keyed client cache is a possible later optimization).
 """
 
+import asyncio
 import json
 import logging
-from typing import Any, Dict, Generator, List, Optional
+import re
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
-import requests
+import httpx
 
 from nexus.llm.provider import BaseLLMProvider
 from nexus.llm.types import LLMChunk
@@ -53,12 +59,18 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         base = self.api_base.rstrip("/")
         # Versioned bases (…/v1 OpenAI/dashscope, …/v4 zhipu/zai api/paas)
         # already carry the version segment — append the endpoint directly
-        import re
         if re.search(r"/v\d+$", base):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
 
-    def _chat_completion_impl(
+    def _build_headers(self) -> Dict[str, str]:
+        api_key = self.resolve_api_key()
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    async def _achat_completion_impl(
         self,
         messages: List[Dict[str, Any]],
         model: str,
@@ -68,12 +80,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         **kwargs,
     ) -> Dict[str, Any]:
         """Call the OpenAI-compatible chat completions endpoint."""
-        api_key = self.resolve_api_key()
         url = self._build_url()
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
 
         payload = {
             "model": model,
@@ -87,49 +94,48 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         }
 
         last_exc = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                data = response.json()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for attempt in range(self.max_retries + 1):
+                try:
+                    response = await client.post(
+                        url,
+                        headers=self._build_headers(),
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
 
-                # Extract content from the OpenAI response shape
-                choices = data.get("choices", [])
-                content = ""
-                tool_calls = []
-                finish_reason = ""
-                if choices:
-                    msg = choices[0].get("message", {})
-                    content = msg.get("content", "") or ""
-                    tool_calls = msg.get("tool_calls", []) or []
-                    finish_reason = choices[0].get("finish_reason", "")
+                    # Extract content from the OpenAI response shape
+                    choices = data.get("choices", [])
+                    content = ""
+                    tool_calls = []
+                    finish_reason = ""
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        content = msg.get("content", "") or ""
+                        tool_calls = msg.get("tool_calls", []) or []
+                        finish_reason = choices[0].get("finish_reason", "")
 
-                return {
-                    "content": content,
-                    "tool_calls": tool_calls,
-                    "model": data.get("model", model),
-                    "usage": data.get("usage", {}),
-                    "finish_reason": finish_reason,
-                    "raw": data,
-                }
+                    return {
+                        "content": content,
+                        "tool_calls": tool_calls,
+                        "model": data.get("model", model),
+                        "usage": data.get("usage", {}),
+                        "finish_reason": finish_reason,
+                        "raw": data,
+                    }
 
-            except requests.exceptions.RequestException as e:
-                last_exc = e
-                logger.warning(
-                    "Provider '%s' attempt %d/%d failed: %s",
-                    self.code,
-                    attempt + 1,
-                    self.max_retries + 1,
-                    e,
-                )
-                if attempt < self.max_retries:
-                    import time
-                    time.sleep(1 * (attempt + 1))  # linear backoff
+                except httpx.HTTPError as e:
+                    last_exc = e
+                    logger.warning(
+                        "Provider '%s' attempt %d/%d failed: %s",
+                        self.code,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        e,
+                    )
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(1 * (attempt + 1))  # linear backoff
 
         raise RuntimeError(
             f"Provider '{self.code}' failed after {self.max_retries + 1} attempts: {last_exc}"
@@ -139,14 +145,14 @@ class OpenAICompatibleProvider(BaseLLMProvider):
     # Streaming (native, plan-⑤: yields structured LLMChunks)
     # ------------------------------------------------------------------
 
-    def _chat_completion_stream_impl(
+    async def _achat_completion_stream_impl(
         self,
         messages: List[Dict[str, Any]],
         model: str,
         temperature: float,
         max_tokens: int,
         **kwargs,
-    ) -> Generator["LLMChunk", None, None]:
+    ) -> AsyncGenerator["LLMChunk", None]:
         """Stream chat-completion response via SSE, yielding LLMChunk
         objects (text deltas / tool_call fragments / finish_reason / usage).
 
@@ -159,12 +165,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
           as-is; merging is the aggregator's job (llm/aggregate.py)
         - ``[DONE]`` sentinel terminates the stream
         """
-        api_key = self.resolve_api_key()
         url = self._build_url()
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
 
         payload = {
             "model": model,
@@ -178,47 +179,44 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             **kwargs,
         }
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=self.timeout,
-            stream=True,
-        )
-        response.raise_for_status()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with client.stream(
+                "POST", url, headers=self._build_headers(), json=payload,
+            ) as response:
+                response.raise_for_status()
 
-        for line in response.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            # SSE format: "data: {...}"
-            if not line.startswith("data: "):
-                continue
-            data_str = line[6:]
-            if data_str.strip() == "[DONE]":
-                break
-            try:
-                data = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    # SSE format: "data: {...}"
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-            usage = data.get("usage") or {}
-            choices = data.get("choices", [])
-            if not choices:
-                # usage-only tail chunk (include_usage): choices == []
-                if usage:
-                    yield LLMChunk(usage=usage)
-                continue
+                    usage = data.get("usage") or {}
+                    choices = data.get("choices", [])
+                    if not choices:
+                        # usage-only tail chunk (include_usage): choices == []
+                        if usage:
+                            yield LLMChunk(usage=usage)
+                        continue
 
-            choice = choices[0]
-            delta = choice.get("delta", {}) or {}
-            text = delta.get("content", "") or ""
-            tool_calls = delta.get("tool_calls", []) or []
-            finish_reason = choice.get("finish_reason", "") or ""
-            if text or tool_calls or finish_reason:
-                yield LLMChunk(text=text, tool_calls=tool_calls,
-                               finish_reason=finish_reason)
-            elif usage:
-                yield LLMChunk(usage=usage)
+                    choice = choices[0]
+                    delta = choice.get("delta", {}) or {}
+                    text = delta.get("content", "") or ""
+                    tool_calls = delta.get("tool_calls", []) or []
+                    finish_reason = choice.get("finish_reason", "") or ""
+                    if text or tool_calls or finish_reason:
+                        yield LLMChunk(text=text, tool_calls=tool_calls,
+                                       finish_reason=finish_reason)
+                    elif usage:
+                        yield LLMChunk(usage=usage)
 
 
 # ---------------------------------------------------------------------------
@@ -237,5 +235,3 @@ registry.register(
     api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
     api_key_env="DASHSCOPE_API_KEY",
 )
-
-

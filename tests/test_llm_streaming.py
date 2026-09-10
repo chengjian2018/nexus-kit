@@ -2,7 +2,8 @@
 (the plan-⑤ safety net), tool_call fragment merging, and the default
 bridge (legacy non-streaming providers wrapped as single-chunk streams)."""
 
-from nexus.llm.aggregate import collect_stream
+from async_utils import arun
+from nexus.llm.aggregate import acollect_stream, collect_stream
 from nexus.llm.types import LLMChunk
 
 
@@ -140,12 +141,16 @@ def test_aggregation_matches_legacy_shape():
 # Default bridge: legacy non-streaming providers wrapped as one-chunk streams
 # ============================================================================
 
+async def _collect_chunks(agen):
+    return [c async for c in agen]
+
+
 def test_default_stream_bridge_wraps_nonstreaming():
     from tests.test_llm_streaming import _LegacyProvider
 
     p = _LegacyProvider()
-    chunks = list(p.chat_completion_stream(
-        messages=[{"role": "user", "content": "q"}], model="m"))
+    chunks = arun(_collect_chunks(p.achat_completion_stream(
+        messages=[{"role": "user", "content": "q"}], model="m")))
     assert len(chunks) == 1
     assert chunks[0].text == "完整回复"
     assert chunks[0].finish_reason == "stop"
@@ -153,8 +158,8 @@ def test_default_stream_bridge_wraps_nonstreaming():
 
 
 # ============================================================================
-# Test fixture: a legacy provider that only implements _chat_completion_impl
-# (the FakeProvider situation — zero changes needed to survive plan-⑤)
+# Test fixture: a legacy provider that only implements _achat_completion_impl
+# (the FakeProvider situation — zero changes needed to survive the rewrite)
 # ============================================================================
 
 class _LegacyProvider:
@@ -165,7 +170,7 @@ class _LegacyProvider:
 
     # The bridge lives on BaseLLMProvider; the test exercises it via a real
     # subclass below, this stub documents the legacy surface.
-    def chat_completion_stream(self, messages, model=None, **kw):
+    async def achat_completion_stream(self, messages, model=None, **kw):
         from nexus.llm.types import LLMChunk
         yield LLMChunk(text="完整回复", finish_reason="stop")
 
@@ -178,18 +183,27 @@ def test_real_base_class_bridge_via_subclass():
             super().__init__(code="sub", api_base="http://x",
                              api_key="k", default_model="m")
 
-        def _chat_completion_impl(self, messages, model, temperature,
-                                  max_tokens, stream, **kwargs):
+        async def _achat_completion_impl(self, messages, model, temperature,
+                                         max_tokens, stream, **kwargs):
             return {"content": "完整回复", "tool_calls": [],
                     "finish_reason": "stop", "usage": {"t": 1}}
 
-    p = _Sub()
-    chunks = list(p.chat_completion_stream(
-        messages=[{"role": "user", "content": "q"}], model="m"))
-    assert [c.text for c in chunks if c.text] == ["完整回复"]
-    # and the non-streaming entry aggregates back identically
-    result = p.chat_completion(messages=[{"role": "user", "content": "q"}],
-                               model="m")
-    assert result["content"] == "完整回复"
-    assert result["finish_reason"] == "stop"
-    assert result["usage"] == {"t": 1}
+    async def _run():
+        p = _Sub()
+        chunks = [c async for c in p.achat_completion_stream(
+            messages=[{"role": "user", "content": "q"}], model="m")]
+        assert [c.text for c in chunks if c.text] == ["完整回复"]
+        # and the non-streaming entry aggregates back identically
+        result = await p.achat_completion(
+            messages=[{"role": "user", "content": "q"}], model="m")
+        assert result["content"] == "完整回复"
+        assert result["finish_reason"] == "stop"
+        assert result["usage"] == {"t": 1}
+        # async aggregation of the async stream produces the same shape
+        agen = p.achat_completion_stream(
+            messages=[{"role": "user", "content": "q"}], model="m")
+        agg = await acollect_stream(agen)
+        assert agg["content"] == "完整回复"
+        assert agg["usage"] == {"t": 1}
+
+    arun(_run())

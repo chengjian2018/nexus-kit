@@ -246,10 +246,10 @@ def test_mid_turn_failure_user_row_already_persisted(
 
     from fake_provider import FakeProvider
 
-    def llm_boom(self, *args, **kwargs):
+    async def llm_boom(self, *args, **kwargs):
         raise RuntimeError("llm down mid-turn")
 
-    monkeypatch.setattr(FakeProvider, "_chat_completion_impl", llm_boom)
+    monkeypatch.setattr(FakeProvider, "_achat_completion_impl", llm_boom)
     body = chat(client, "crash-mid", "你好")
     # The chat layer swallows the exception and turns it into error text (HTTP 200 + status True); the failure path is persisted too.
     # Sanitized reply: the generic message only — internal details ("llm down mid-turn") must not leak
