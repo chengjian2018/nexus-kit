@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from async_utils import arun
 from nexus.engine.store import SessionStore
 from nexus.channels.base import EngineOps
 from nexus.channels.webhooks import build_channel_router
@@ -244,12 +245,12 @@ def store(tmp_path):
     """Inject a tmp-DB store into main; restore and close afterwards."""
     import host.main as main
 
-    s = SessionStore(str(tmp_path / "channel.db"))
+    s = arun(SessionStore.create(str(tmp_path / "channel.db")))
     prev = main.store
     main.store = s
     yield s
     main.store = prev
-    s.close()
+    arun(s.close())
 
 
 @pytest.fixture()
@@ -281,9 +282,9 @@ def fake_chat(monkeypatch):
     async def _chat(query, session_id, all_sessions, store=None):
         calls.append((session_id, query))
         session = all_sessions[session_id]
-        session.cxt.add_message("user", query, stage="chat")
+        await session.cxt.add_message("user", query, stage="chat")
         reply = f"auto:{query}"
-        session.cxt.add_message("assistant", reply, stage="chat")
+        await session.cxt.add_message("assistant", reply, stage="chat")
         return reply
 
     monkeypatch.setattr(main, "chat", _chat)
@@ -305,11 +306,11 @@ def test_channel_end_to_end(client, store, registry_guard, fake_chat, monkeypatc
     assert session.pattern_code == "xianyu_agent"
     assert session.cxt.metadata["task_info"]["item_id"] == "item1"
 
-    rows = store.list_sessions()
+    rows = arun(store.list_sessions())
     assert [r["session_id"] for r in rows] == ["xianyu:acc1:chat1"]
     assert rows[0]["pattern_code"] == "xianyu_agent"
 
-    msgs = store.get_messages("xianyu:acc1:chat1")
+    msgs = arun(store.get_messages("xianyu:acc1:chat1"))
     assert msgs[0]["role"] == "user" and msgs[0]["content"] == "你好"
 
 
@@ -319,12 +320,12 @@ def test_channel_second_turn_appends(
     """Second message reuses the session: persisted messages append, no duplicate session row."""
     monkeypatch.setenv("XIANYU_CHANNEL_PATTERN", "xianyu_agent")
     client.post("/api/v1/channel/xianyu", json=inbound())
-    first_count = len(store.get_messages("xianyu:acc1:chat1"))
+    first_count = len(arun(store.get_messages("xianyu:acc1:chat1")))
 
     client.post("/api/v1/channel/xianyu", json=inbound(message="能便宜点吗"))
-    msgs = store.get_messages("xianyu:acc1:chat1")
+    msgs = arun(store.get_messages("xianyu:acc1:chat1"))
     assert len(msgs) > first_count
-    assert len(store.list_sessions()) == 1
+    assert len(arun(store.list_sessions())) == 1
     assert fake_chat[-1] == ("xianyu:acc1:chat1", "能便宜点吗")
 
 

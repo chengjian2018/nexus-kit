@@ -499,20 +499,17 @@ def _snapshot(cxt) -> Dict[str, Any]:
     }
 
 
-def run_turn(session: Session, query: str, sessions: Dict[str, Session],
-             store: Optional[SessionStore], verbose: int = 0) -> str:
-    """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering.
-
-    TODO(phase4): temporary asyncio.run bridge — the engine core is async
-    since phase-2; the CLI gets its single persistent loop in phase-4.
-    """
+async def run_turn(session: Session, query: str,
+                   sessions: Dict[str, Session],
+                   store: Optional[SessionStore], verbose: int = 0) -> str:
+    """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering."""
     before = _snapshot(session.cxt)
 
-    reply = asyncio.run(chat_turn(query, session.session_id, sessions, store=store))
+    reply = await chat_turn(query, session.session_id, sessions, store=store)
 
     if store is not None:
         try:
-            store.save_snapshot(session)
+            await store.save_snapshot(session)
         except Exception:
             logging.getLogger(__name__).exception("轮末快照失败（不影响对话）")
 
@@ -527,25 +524,26 @@ def run_turn(session: Session, query: str, sessions: Dict[str, Session],
     return reply
 
 
-def _open_store(persist) -> Optional[SessionStore]:
+async def _open_store(persist) -> Optional[SessionStore]:
     # fire parses --persist=false into the string 'false' (truthy!); normalize:
     if persist in (False, "false", "False", "0", 0, None):
         return None
     try:
-        return SessionStore(get_session_db_path())
+        return await SessionStore.create(get_session_db_path())
     except Exception:
         logging.getLogger(__name__).exception("会话存储不可用，降级为内存态")
         return None
 
 
-def _find_or_create(session_id: str, pattern_code: str,
-                    llm_overrides: Dict[str, Any],
-                    store: Optional[SessionStore],
-                    sessions: Dict[str, Session],
-                    task_info: Optional[Dict[str, str]] = None) -> Session:
+async def _find_or_create(session_id: str, pattern_code: str,
+                         llm_overrides: Dict[str, Any],
+                         store: Optional[SessionStore],
+                         sessions: Dict[str, Session],
+                         task_info: Optional[Dict[str, str]] = None) -> Session:
     """Restore and continue when --session-id matches an unexpired session in the db; otherwise create new and persist."""
     if store is not None:
-        for restored, _ in store.load_active_sessions(ttl_seconds=7 * 24 * 3600):
+        active = await store.load_active_sessions(ttl_seconds=7 * 24 * 3600)
+        for restored, _ in active:
             if restored.session_id == session_id:
                 pattern = pattern_registry.get(restored.pattern_code)
                 if pattern is None:
@@ -568,7 +566,7 @@ def _find_or_create(session_id: str, pattern_code: str,
     session = build_session(session_id, pattern_code, llm_overrides, task_info)
     sessions[session_id] = session
     if store is not None:
-        store.create_session(session)
+        await store.create_session(session)
         store.attach(session)
     return session
 
@@ -601,30 +599,40 @@ def _prompt_text(session: Session):
     return text
 
 
-def repl_loop(pattern_code: str, session_id: str, llm_overrides: Dict[str, Any],
-              persist: bool, verbose: int,
-              task_info: Optional[Dict[str, str]] = None) -> None:
-    """Interactive chat main loop."""
+async def repl_loop(pattern_code: str, session_id: str,
+                    llm_overrides: Dict[str, Any],
+                    persist: bool, verbose: int,
+                    task_info: Optional[Dict[str, str]] = None) -> None:
+    """Interactive chat main loop (one asyncio.run drives the whole session:
+    MCP connections, turn locks and the store all live on this single loop)."""
     sessions: Dict[str, Session] = {}
-    store = _open_store(persist)
+    store = await _open_store(persist)
 
-    session = _find_or_create(session_id, pattern_code, llm_overrides,
-                              store, sessions, task_info)
+    session = await _find_or_create(session_id, pattern_code, llm_overrides,
+                                    store, sessions, task_info)
 
     PtkPromptSession = _ptk_import()[0]
     ptk_session = PtkPromptSession() if PtkPromptSession else None
     completer = SlashCompleter().get_completer()
 
+    # MCP: spawn server connections on this loop up-front (no-op when none
+    # configured); best-effort teardown at exit
+    try:
+        from atoms.mcp.manager import get_mcp_manager
+        await get_mcp_manager().ensure_started()
+    except Exception:
+        logging.getLogger(__name__).warning("MCP 启动失败（忽略，首轮对话会重试）")
+
     print(dim("输入对话内容；/help 查看命令；Ctrl-D 或 /exit 退出"))
     while True:
         try:
             if ptk_session is not None and completer is not None:
-                line = ptk_session.prompt(_prompt_text(session),
-                                          completer=completer)
+                line = await ptk_session.prompt_async(
+                    _prompt_text(session), completer=completer)
             elif ptk_session is not None:
-                line = ptk_session.prompt(_prompt_text(session))
+                line = await ptk_session.prompt_async(_prompt_text(session))
             else:
-                line = input(_prompt_text(session))
+                line = await asyncio.to_thread(input, _prompt_text(session))
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -633,7 +641,7 @@ def repl_loop(pattern_code: str, session_id: str, llm_overrides: Dict[str, Any],
         if cmd is None:
             if not line.strip():
                 continue
-            reply = run_turn(session, line.strip(), sessions, store, verbose)
+            reply = await run_turn(session, line.strip(), sessions, store, verbose)
             print(green(f"助手: {reply}"))
             continue
 
@@ -645,21 +653,26 @@ def repl_loop(pattern_code: str, session_id: str, llm_overrides: Dict[str, Any],
         elif name == "exit":
             break
         elif name == "reset":
-            session = _do_reset(session, sessions, store, verbose)
+            session = await _do_reset(session, sessions, store, verbose)
         elif name == "slots":
             _print_slots(session)
         elif name == "new":
-            session = _do_new(arg, sessions, store, llm_overrides, verbose)
+            session = await _do_new(arg, sessions, store, llm_overrides, verbose)
             if session is None:
                 continue
         elif name == "llm":
             _do_llm(session, arg)
 
+    try:
+        from atoms.mcp.manager import get_mcp_manager
+        await get_mcp_manager().shutdown()
+    except Exception:
+        pass
     if store is not None:
-        store.close()
+        await store.close()
 
 
-def _do_reset(session: Session, sessions: Dict[str, Session], store, verbose: int):
+async def _do_reset(session: Session, sessions: Dict[str, Session], store, verbose: int):
     """/reset: reopen a new session with the same pattern (keeps the original session_id, llm config and task_info)."""
     llm_override = session.cxt.metadata.get("llm_override")
     new_session = build_session(session.session_id, session.pattern_code,
@@ -668,13 +681,13 @@ def _do_reset(session: Session, sessions: Dict[str, Session], store, verbose: in
         new_session.cxt.metadata["llm_override"] = llm_override
     sessions[session.session_id] = new_session
     if store is not None:
-        store.create_session(new_session)  # same id counts as a new generation (launch_epoch+1)
+        await store.create_session(new_session)  # same id counts as a new generation (launch_epoch+1)
         store.attach(new_session)
     print(green(f"会话已重置: {session.session_id}"))
     return new_session
 
 
-def _do_new(arg: str, sessions: Dict[str, Session], store, llm_overrides, verbose: int):
+async def _do_new(arg: str, sessions: Dict[str, Session], store, llm_overrides, verbose: int):
     """/new [pattern]: new session under a different pattern."""
     code = arg.strip() or _pick_pattern()
     if not code:
@@ -691,7 +704,7 @@ def _do_new(arg: str, sessions: Dict[str, Session], store, llm_overrides, verbos
     new_session = build_session(new_id, code, llm_overrides, task_info)
     sessions[new_id] = new_session
     if store is not None:
-        store.create_session(new_session)
+        await store.create_session(new_session)
         store.attach(new_session)
     print(green(f"新会话: {new_id} ({code})"))
     return new_session
@@ -769,15 +782,19 @@ def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str =
                         for a in sys.argv)
     restored_code = ""
     if not pattern and sid_specified:
-        store = _open_store(persist)
-        if store is not None:
+        async def _probe_pattern():
+            st = await _open_store(persist)
+            if st is None:
+                return None
             try:
-                for restored, _ in store.load_active_sessions(7 * 24 * 3600):
+                active = await st.load_active_sessions(7 * 24 * 3600)
+                for restored, _ in active:
                     if restored.session_id == session_id:
-                        restored_code = restored.pattern_code
-                        break
+                        return restored.pattern_code
+                return None
             finally:
-                store.close()
+                await st.close()
+        restored_code = asyncio.run(_probe_pattern()) or ""
     pattern_code = pattern or restored_code or _pick_pattern()
     if not pattern_code:
         print(yellow("未选择 pattern，退出"))
@@ -787,7 +804,8 @@ def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str =
     # Default session-id gets the pid appended: avoids matching any old session
     # in the db that would swap out the just-picked pattern
     sid = session_id if (sid_specified or pattern) else f"{session_id}-{os.getpid()}"
-    repl_loop(pattern_code, sid, llm_overrides, persist, verbose, task_info_dict)
+    asyncio.run(repl_loop(pattern_code, sid, llm_overrides, persist,
+                          verbose, task_info_dict))
 
 
 def ask(query: str, pattern: str = "", session_id: str = "cli-ask", llm: str = "",
@@ -799,27 +817,45 @@ def ask(query: str, pattern: str = "", session_id: str = "cli-ask", llm: str = "
     if not pattern_code:
         # one-shot shows no menu: when restoring an existing session the pattern
         # comes from the db; otherwise an explicit --pattern is required
-        store = _open_store(persist)
-        if store is not None:
-            for restored, _ in store.load_active_sessions(7 * 24 * 3600):
-                if restored.session_id == session_id:
-                    pattern_code = restored.pattern_code
-                    break
-            store.close()
+        async def _probe_pattern():
+            st = await _open_store(persist)
+            if st is None:
+                return None
+            try:
+                active = await st.load_active_sessions(7 * 24 * 3600)
+                for restored, _ in active:
+                    if restored.session_id == session_id:
+                        return restored.pattern_code
+                return None
+            finally:
+                await st.close()
+        pattern_code = asyncio.run(_probe_pattern()) or pattern_code
         if not pattern_code:
             raise SystemExit(red("ask 需要显式 --pattern，或 --session-id 命中已有会话"))
     # one-shot skips the extra prompt: parse --task-info when explicitly passed,
     # otherwise no task_info
     task_info_dict = parse_task_info(task_info)
     llm_overrides = resolve_llm_choice(llm, model, interactive=False)
-    sessions: Dict[str, Session] = {}
-    store = _open_store(persist)
-    session = _find_or_create(session_id, pattern_code, llm_overrides,
-                              store, sessions, task_info_dict)
-    reply = run_turn(session, query, sessions, store, verbose)
-    print(reply)
-    if store is not None:
-        store.close()
+
+    async def _ask_once():
+        sessions: Dict[str, Session] = {}
+        store = await _open_store(persist)
+        session = await _find_or_create(session_id, pattern_code,
+                                        llm_overrides, store, sessions,
+                                        task_info_dict)
+        try:
+            reply = await run_turn(session, query, sessions, store, verbose)
+            print(reply)
+        finally:
+            try:
+                from atoms.mcp.manager import get_mcp_manager
+                await get_mcp_manager().shutdown()
+            except Exception:
+                pass
+            if store is not None:
+                await store.close()
+
+    asyncio.run(_ask_once())
 
 
 def list_cmd(target: str = "all") -> None:
@@ -829,11 +865,16 @@ def list_cmd(target: str = "all") -> None:
     """List registered objects: patterns | llms | tools | all."""
     _ensure_discovery()
     if target in ("tools", "all"):
-        # MCP 工具是 bootstrap 后台异步注册的——观测命令等待连接终态,
-        # 让列表反映真实状态(无 server 配置时立即返回)
-        try:
+        # MCP 工具是启动期异步注册的——观测命令等待连接终态,让列表反映
+        # 真实状态(无 server 配置时立即返回)。一次性命令:单次 asyncio.run
+        # 起 连接 + 等待 + 收尾
+        async def _wait_mcp():
             from atoms.mcp.manager import get_mcp_manager
-            get_mcp_manager().wait_ready(timeout=15.0)
+            await get_mcp_manager().ensure_started()
+            await get_mcp_manager().wait_ready(timeout=15.0)
+            await get_mcp_manager().shutdown()
+        try:
+            asyncio.run(_wait_mcp())
         except Exception:
             pass
     if target in ("patterns", "all"):
@@ -859,15 +900,19 @@ def list_cmd(target: str = "all") -> None:
 
 def sessions(pattern_code: str = "", limit: int = 20) -> None:
     """List persisted sessions (last_active_at descending)."""
+
+    async def _list_sessions():
+        store = await SessionStore.create(get_session_db_path())
+        try:
+            return await store.list_sessions(pattern_code=pattern_code or None,
+                                             limit=limit)
+        finally:
+            await store.close()
+
     try:
-        store = SessionStore(get_session_db_path())
+        rows = asyncio.run(_list_sessions())
     except Exception as e:
         raise SystemExit(red(f"会话存储不可用: {e}"))
-    try:
-        rows = store.list_sessions(pattern_code=pattern_code or None,
-                                   limit=limit)
-    finally:
-        store.close()
     if not rows:
         print(yellow("（无会话记录）"))
         return
@@ -970,7 +1015,7 @@ def _setup_logging() -> None:
     )
     if level >= logging.DEBUG:
         for noisy in ("httpx", "httpcore", "mcp.client", "asyncio",
-                      "urllib3", "requests"):
+                      "urllib3"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

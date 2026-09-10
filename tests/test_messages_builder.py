@@ -18,10 +18,11 @@ from nexus.model.module import AgentModule, BaseModule
 
 def _mk_cxt() -> DialogueContext:
     cxt = DialogueContext(session_id="s", user_query="在吗")
-    cxt.add_message("user", "你好", stage="chat")
-    cxt.add_message("assistant", "亲，在的～", stage="chat")
-    cxt.add_message("tool", '{"ok": true}', stage="agent")  # orphan tool row (from a prior-turn segment)
-    cxt.add_message("user", "在吗", stage="chat")            # this turn's user row
+    arun(cxt.add_message("user", "你好", stage="chat"))
+    arun(cxt.add_message("assistant", "亲，在的～", stage="chat"))
+    # orphan tool row (from a prior-turn segment)
+    arun(cxt.add_message("tool", '{"ok": true}', stage="agent"))
+    arun(cxt.add_message("user", "在吗", stage="chat"))  # this turn's user row
     cxt.turn_history_start = 3  # equivalent of the begin_turn snapshot
     return cxt
 
@@ -89,13 +90,13 @@ def test_paired_tool_trace_replayed_as_protocol():
     tool_calls = [{"id": "c1", "type": "function",
                    "function": {"name": "weather", "arguments": "{}"}}]
     cxt = DialogueContext(session_id="s", user_query="北京天气怎么样")
-    cxt.add_message("user", "查下天气", stage="chat")
-    cxt.add_message("assistant", encode_tool_call_content("查询中", tool_calls),
-                    stage="agent")
-    cxt.add_message("tool", "晴 22 度", stage="agent",
-                    metadata={"tool_call_id": "c1"})
-    cxt.add_message("assistant", "北京晴 22 度", stage="chat")
-    cxt.add_message("user", "北京天气怎么样", stage="chat")
+    arun(cxt.add_message("user", "查下天气", stage="chat"))
+    arun(cxt.add_message(
+        "assistant", encode_tool_call_content("查询中", tool_calls), stage="agent"))
+    arun(cxt.add_message("tool", "晴 22 度", stage="agent",
+                         metadata={"tool_call_id": "c1"}))
+    arun(cxt.add_message("assistant", "北京晴 22 度", stage="chat"))
+    arun(cxt.add_message("user", "北京天气怎么样", stage="chat"))
     cxt.turn_history_start = 4
 
     messages = default_build_messages(_bare_module(), cxt)
@@ -114,11 +115,11 @@ def test_broken_pair_degrades_to_plain_text():
     tool_calls = [{"id": "c1", "type": "function",
                    "function": {"name": "weather", "arguments": "{}"}}]
     cxt = DialogueContext(session_id="s", user_query="q")
-    cxt.add_message("assistant", encode_tool_call_content("查询中", tool_calls),
-                    stage="agent")
+    arun(cxt.add_message(
+        "assistant", encode_tool_call_content("查询中", tool_calls), stage="agent"))
     # the c1 tool row is missing; a plain assistant row follows directly
-    cxt.add_message("assistant", "结果如下", stage="chat")
-    cxt.add_message("user", "q", stage="chat")
+    arun(cxt.add_message("assistant", "结果如下", stage="chat"))
+    arun(cxt.add_message("user", "q", stage="chat"))
     cxt.turn_history_start = 2
 
     messages = default_build_messages(_bare_module(), cxt)
@@ -135,9 +136,9 @@ def test_trailing_pending_assistant_degrades():
     tool_calls = [{"id": "c1", "type": "function",
                    "function": {"name": "weather", "arguments": "{}"}}]
     cxt = DialogueContext(session_id="s", user_query="q")
-    cxt.add_message("assistant", encode_tool_call_content("", tool_calls),
-                    stage="agent")
-    cxt.add_message("user", "q", stage="chat")
+    arun(cxt.add_message(
+        "assistant", encode_tool_call_content("", tool_calls), stage="agent"))
+    arun(cxt.add_message("user", "q", stage="chat"))
     cxt.turn_history_start = 1
 
     messages = default_build_messages(_bare_module(), cxt)
@@ -148,8 +149,8 @@ def test_trailing_pending_assistant_degrades():
 def test_summary_wrapped_as_untrusted_user():
     """summary row → user role with untrusted wrapping (gains no instruction authority)."""
     cxt = DialogueContext(session_id="s", user_query="q")
-    cxt.add_message("summary", "此前用户咨询了手机价格", stage="compress")
-    cxt.add_message("user", "q", stage="chat")
+    arun(cxt.add_message("summary", "此前用户咨询了手机价格", stage="compress"))
+    arun(cxt.add_message("user", "q", stage="chat"))
     cxt.turn_history_start = 1
 
     messages = default_build_messages(_bare_module(), cxt)
@@ -162,12 +163,12 @@ def test_summary_wrapped_as_untrusted_user():
 def test_query_not_duplicated_with_hop_segment():
     """Three-segment form: this turn's user row is replaced by the explicit query, while earlier-module rows of this turn's hop segment replay as usual."""
     cxt = DialogueContext(session_id="s", user_query="帮我处理售后")
-    cxt.add_message("user", "上一轮问题", stage="chat")
-    cxt.add_message("assistant", "上一轮回答", stage="chat")
-    cxt.add_message("user", "帮我处理售后", stage="chat")  # this turn's user row
+    arun(cxt.add_message("user", "上一轮问题", stage="chat"))
+    arun(cxt.add_message("assistant", "上一轮回答", stage="chat"))
+    arun(cxt.add_message("user", "帮我处理售后", stage="chat"))  # this turn's user row
     # activity of the earlier module inside the hop (the transfer sender)
-    cxt.add_message("assistant", "转接中", stage="agent",
-                    metadata={"suppressed": True})
+    arun(cxt.add_message("assistant", "转接中", stage="agent",
+                         metadata={"suppressed": True}))
     cxt.turn_history_start = 2
 
     messages = default_build_messages(_bare_module(), cxt)
@@ -290,7 +291,7 @@ def _mk_run_session(module, pattern=None):
     s.cxt.current_module_code = module.module_code
     s.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
     s.cxt.user_query = "多少钱"
-    s.cxt.add_message("user", "多少钱", stage="chat")
+    arun(s.cxt.add_message("user", "多少钱", stage="chat"))
     return s
 
 

@@ -111,9 +111,9 @@ class TurnLifecycle:
             cxt.session_id, user_query,
         )
 
-    def end_turn(self, cxt: DialogueContext, response_text: str) -> None:
+    async def end_turn(self, cxt: DialogueContext, response_text: str) -> None:
         """Turn end: append the assistant message to history (the incremental-update entry point)."""
-        cxt.add_message("assistant", response_text, stage="chat")
+        await cxt.add_message("assistant", response_text, stage="chat")
 
     # ------------------------------------------------------------------
     # Incremental updates

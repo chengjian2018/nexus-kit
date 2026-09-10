@@ -579,8 +579,8 @@ async def chat_turn_stream(
 
     emitter = StreamEmitter()
 
-    def _finish(text: str) -> ChatResult:
-        _lifecycle.end_turn(session.cxt, text)
+    async def _finish(text: str) -> ChatResult:
+        await _lifecycle.end_turn(session.cxt, text)
         return build_chat_result(text, session.cxt)
 
     # ------------------------------------------------------------------
@@ -599,7 +599,7 @@ async def chat_turn_stream(
     pattern = session.pattern
     if pattern is None:
         logger.warning("会话 %s 未绑定对话模板", session_id)
-        yield ChatStreamEvent(kind="done", result=_finish("对话模板未配置"))
+        yield ChatStreamEvent(kind="done", result=await _finish("对话模板未配置"))
         return
 
     # ------------------------------------------------------------------
@@ -609,7 +609,7 @@ async def chat_turn_stream(
     current_module_code = session.cxt.current_module_code or pattern.entry_module_code
     if not current_module_code:
         logger.warning("会话 %s 未找到入口模块", session_id)
-        yield ChatStreamEvent(kind="done", result=_finish("入口模块未配置"))
+        yield ChatStreamEvent(kind="done", result=await _finish("入口模块未配置"))
         return
 
     # Write back to cxt: stages and transitions (jump detection /
@@ -620,7 +620,7 @@ async def chat_turn_stream(
     if current_module is None:
         logger.warning("模块不存在: %s", current_module_code)
         yield ChatStreamEvent(
-            kind="done", result=_finish(f"模块 '{current_module_code}' 不存在"))
+            kind="done", result=await _finish(f"模块 '{current_module_code}' 不存在"))
         return
 
     session.cxt.metadata["pattern_code"] = session.pattern_code
@@ -631,7 +631,7 @@ async def chat_turn_stream(
     except Exception as e:
         logger.error("加载 LLM 配置失败: %s", e)
         yield ChatStreamEvent(
-            kind="done", result=_finish(f"LLM 配置加载失败: {e}"))
+            kind="done", result=await _finish(f"LLM 配置加载失败: {e}"))
         return
 
     # History compression (silently skipped when the store is disabled /
@@ -641,7 +641,7 @@ async def chat_turn_stream(
     await maybe_compress(session, store)
 
     # Record user message
-    session.cxt.add_message("user", query, stage="chat")
+    await session.cxt.add_message("user", query, stage="chat")
 
     # ------------------------------------------------------------------
     # 3. Reentry loop: consume same-turn jump events (cxt.actions channel)
@@ -691,7 +691,7 @@ async def chat_turn_stream(
     #    append the assistant message to history, snapshot the output
     # ------------------------------------------------------------------
     _apply_deferred_switch(session, pattern)
-    yield ChatStreamEvent(kind="done", result=_finish(response))
+    yield ChatStreamEvent(kind="done", result=await _finish(response))
 
 
 async def chat_turn(

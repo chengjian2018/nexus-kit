@@ -7,6 +7,7 @@ and context passing consistent.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -267,14 +268,16 @@ class DialogueContext:
     # Convenience methods
     # ------------------------------------------------------------------
 
-    def add_message(
+    async def add_message(
         self,
         role: str,
         content: str,
         stage: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Append a standardized message to history.
+        """Append a standardized message to history (async since the asyncio
+        rewrite: the message_sink is a coroutine — the store persists each
+        message on its aiosqlite worker).
 
         Tool traces go through the content/metadata payload (see the
         SessionMessage docstring): assistant tool-round content is encoded
@@ -290,7 +293,9 @@ class DialogueContext:
         self.history.append(msg)
         if self.message_sink is not None:
             try:
-                self.message_sink(msg)
+                result = self.message_sink(msg)
+                if inspect.iscoroutine(result):
+                    await result
             except Exception:
                 logger.exception(
                     "message_sink 写入失败（不影响对话）: session=%s role=%s stage=%s",

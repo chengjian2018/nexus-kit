@@ -154,7 +154,7 @@ async def _dispatch_tool_calls(
     #    replay pairing)
     messages.append({"role": "assistant", "content": content or None,
                      "tool_calls": tool_calls})
-    cxt.add_message(
+    await cxt.add_message(
         "assistant",
         encode_tool_call_content(content or "", tool_calls),
         stage="agent",
@@ -207,8 +207,8 @@ async def _dispatch_tool_calls(
             metadata["rewritten"] = True
             metadata["original_call"] = rewrite_audits[idx]
 
-        cxt.add_message("tool", result_content, stage="agent",
-                        metadata=metadata)
+        await cxt.add_message("tool", result_content, stage="agent",
+                              metadata=metadata)
         messages.append({"role": "tool", "tool_call_id": call_id,
                          "content": result_content})
 

@@ -1,5 +1,6 @@
 """SessionMessage -- tool-trail JSON payload + summary role + sink pass-through."""
 
+from async_utils import arun
 from nexus.context import (
     DialogueContext,
     SessionMessage,
@@ -67,7 +68,7 @@ def test_message_sink_receives_appended_message():
     received = []
     cxt = DialogueContext(session_id="s1", user_query="q",
                           message_sink=received.append)
-    cxt.add_message("user", "你好", stage="chat")
+    arun(cxt.add_message("user", "你好", stage="chat"))
     assert len(received) == 1
     assert received[0] is cxt.history[0]
 
@@ -77,7 +78,7 @@ def test_message_sink_failure_does_not_break_dialogue():
         raise RuntimeError("db down")
 
     cxt = DialogueContext(session_id="s1", user_query="q", message_sink=bad_sink)
-    cxt.add_message("user", "你好", stage="chat")
+    arun(cxt.add_message("user", "你好", stage="chat"))
     assert len(cxt.history) == 1
     assert cxt.history[0].content == "你好"
 
@@ -88,16 +89,16 @@ def test_message_sink_failure_does_not_break_dialogue():
 
 def test_format_history_decodes_tool_payload():
     cxt = DialogueContext(session_id="s1", user_query="q")
-    cxt.add_message("user", "你好", stage="chat")
-    cxt.add_message(
-        "assistant", encode_tool_call_content("", TOOL_CALLS), stage="agent")
-    cxt.add_message("tool", "晴 22 度", stage="agent",
-                    metadata={"tool_call_id": "call_1"})
-    cxt.add_message(
+    arun(cxt.add_message("user", "你好", stage="chat"))
+    arun(cxt.add_message(
+        "assistant", encode_tool_call_content("", TOOL_CALLS), stage="agent"))
+    arun(cxt.add_message("tool", "晴 22 度", stage="agent",
+                         metadata={"tool_call_id": "call_1"}))
+    arun(cxt.add_message(
         "assistant",
         encode_tool_call_content("先查一下天气", TOOL_CALLS),
-        stage="agent")
-    cxt.add_message("assistant", "北京晴 22 度", stage="chat")
+        stage="agent"))
+    arun(cxt.add_message("assistant", "北京晴 22 度", stage="chat"))
 
     formatted = cxt.format_history()
     assert "你好" in formatted

@@ -24,12 +24,13 @@ def store(tmp_path):
     """Inject a store backed by a tmp DB into main; restore and close afterwards."""
     import host.main as main
 
-    s = SessionStore(str(tmp_path / "audit.db"))
+    from async_utils import arun
+    s = arun(SessionStore.create(str(tmp_path / "audit.db")))
     prev = main.store
     main.store = s
     yield s
     main.store = prev
-    s.close()
+    arun(s.close())
 
 
 @pytest.fixture()
@@ -92,12 +93,12 @@ def test_launch_chat_persisted(client, store, registry_guard):
     body = chat(client, "audit-1", "你好")
     assert body["status"] is True, body["message"]
 
-    rows = store.list_sessions()
+    rows = arun(store.list_sessions())
     assert [r["session_id"] for r in rows] == ["audit-1"]
     assert rows[0]["pattern_code"] == "xianyu_agent"
     assert rows[0]["message_count"] >= 2
 
-    msgs = store.get_messages("audit-1")
+    msgs = arun(store.get_messages("audit-1"))
     assert msgs[0]["role"] == "user" and msgs[0]["stage"] == "chat"
     assert msgs[-1]["role"] == "assistant"
 
@@ -108,12 +109,12 @@ def test_chat_turn_incremental_append(client, store, registry_guard):
     launch(client, "audit-2")
     _use_fake_llm("audit-2")
     chat(client, "audit-2", "你好")
-    first_count = len(store.get_messages("audit-2"))
+    first_count = len(arun(store.get_messages("audit-2")))
 
     chat(client, "audit-2", "我想买车")
-    second_count = len(store.get_messages("audit-2"))
+    second_count = len(arun(store.get_messages("audit-2")))
     assert second_count > first_count
-    msgs = store.get_messages("audit-2")
+    msgs = arun(store.get_messages("audit-2"))
     assert msgs[first_count]["role"] == "user"  # a new round starts with a user message
 
 
@@ -213,7 +214,7 @@ def test_restart_recovery_restores_and_continues(client, store, registry_guard):
     launch(client, "rs-1")
     _use_fake_llm("rs-1")
     chat(client, "rs-1", "你好")
-    count_before = len(store.get_messages("rs-1"))
+    count_before = len(arun(store.get_messages("rs-1")))
 
     # Simulate restart: wipe in-memory state
     with main.governor.lock:
@@ -233,7 +234,7 @@ def test_restart_recovery_restores_and_continues(client, store, registry_guard):
     body = chat(client, "rs-1", "我想买车")
     assert body["status"] is True, body["message"]
 
-    msgs = store.get_messages("rs-1")
+    msgs = arun(store.get_messages("rs-1"))
     assert len(msgs) == count_before + 2  # user + assistant
     assert msgs[count_before]["role"] == "user"
 
@@ -258,7 +259,7 @@ def test_mid_turn_failure_user_row_already_persisted(
     assert "对话处理异常" in body["data"]["response"]
     assert "llm down" not in body["data"]["response"]
 
-    msgs = store.get_messages("crash-mid")
+    msgs = arun(store.get_messages("crash-mid"))
     roles = [m["role"] for m in msgs]
     assert roles == ["user", "assistant"]  # user persisted immediately via the sink; the error reply is written by end_turn
 
@@ -284,7 +285,7 @@ def test_init_store_degrades_on_failure(monkeypatch):
         raise RuntimeError("no config")
 
     monkeypatch.setattr(main, "get_session_db_path", boom)
-    main._init_store()
+    arun(main._init_store())
     assert main.store is None
     main.store = prev
 
@@ -295,10 +296,10 @@ def test_restore_failure_does_not_block(client, store, registry_guard, monkeypat
     from nexus.engine.session import Session
 
     # 1) store-level failure (e.g. a DB read error): no raise, returns 0
-    def store_boom(ttl):
+    async def store_boom(ttl):
         raise RuntimeError("db read down")
 
-    monkeypatch.setattr(store, "aload_active_sessions", store_boom)
+    monkeypatch.setattr(store, "load_active_sessions", store_boom)
     assert arun(main._restore_sessions()) == 0
 
     # 2) single-session failure (e.g. any exception triggered by a corrupted row): skip that session, do not block the rest
@@ -308,7 +309,7 @@ def test_restore_failure_does_not_block(client, store, registry_guard, monkeypat
     async def fake_load(ttl):
         return [(good, main.time.time()), (bad, main.time.time())]
 
-    monkeypatch.setattr(store, "aload_active_sessions", fake_load)
+    monkeypatch.setattr(store, "load_active_sessions", fake_load)
 
     real_get = main.pattern_registry.get
     calls = []

@@ -137,7 +137,7 @@ async def compress_history(
     # (e.g. the sink once failed) never delete — replace_history re-validates inside the
     # transaction (transaction-level fallback)
     try:
-        db_history = await store.aget_history(session.session_id)
+        db_history = await store.get_history(session.session_id)
     except Exception:
         logger.exception("压缩前读 DB 失败，放弃: session=%s", session.session_id)
         return False
@@ -178,7 +178,7 @@ async def compress_history(
 
     # DB reshuffle (one transaction: alignment check → delete all rows of the current generation → summary first + reinsert retained)
     try:
-        await store.areplace_history(session, summary, keep_idx=split)
+        await store.replace_history(session, summary, keep_idx=split)
     except Exception:
         logger.exception(
             "DB 压缩重排失败，放弃（历史原样保留）: session=%s",

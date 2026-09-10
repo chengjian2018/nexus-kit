@@ -48,7 +48,7 @@ def _setup_logging() -> None:
     )
     if level >= logging.DEBUG:
         for noisy in ("httpx", "httpcore", "mcp.client", "asyncio",
-                      "urllib3", "requests"):
+                      "urllib3"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -121,7 +121,7 @@ async def _restore_sessions() -> int:
     restored = 0
     now_wall = time.time()
     try:
-        active_sessions = await store.aload_active_sessions(governor.ttl_seconds)
+        active_sessions = await store.load_active_sessions(governor.ttl_seconds)
     except Exception:
         logger.exception("加载未过期会话失败，跳过恢复")
         return 0
@@ -173,12 +173,12 @@ def _cross_check_pattern_llm(config_path: str = "") -> None:
                     pcode, ncode)
 
 
-def _init_store() -> None:
+async def _init_store() -> None:
     """Initialize the session persistence store; on failure degrade to None (dialogue works, audit/restore disabled)."""
     global store
     try:
         db_path = get_session_db_path()
-        store = SessionStore(db_path)
+        store = await SessionStore.create(db_path)
         logger.info("会话存储已启用: %s", db_path)
     except Exception:
         logger.exception("初始化会话存储失败，审计与重启恢复降级")
@@ -206,7 +206,7 @@ async def _startup_persistence() -> None:
     """Service startup: initialize the session store + restore non-expired
     sessions + cross-check pattern_llm + start MCP connections."""
     # heavy/blocking warm-ups go through to_thread so the startup loop stays responsive
-    await asyncio.to_thread(_init_store)
+    await _init_store()
     try:
         await _restore_sessions()
     except Exception:
@@ -246,7 +246,7 @@ async def _shutdown_stores() -> None:
         logger.exception("关闭知识库失败")
     if store is not None:
         try:
-            await store.aclose()
+            await store.close()
         except Exception:
             logger.exception("关闭会话存储失败")
         store = None
@@ -371,7 +371,7 @@ async def _launch_session_core(
     # lose persistence for a launch-time-broken DB than to write unreachable rows.
     if store is not None:
         try:
-            await store.acreate_session(session)
+            await store.create_session(session)
             store.attach(session)
         except Exception:
             logger.exception("会话落盘失败（本轮关闭消息持久化）: session=%s", session_id)
@@ -421,7 +421,7 @@ async def _run_chat_turn_core(
 
     if store is not None:
         try:
-            await store.asave_snapshot(session)
+            await store.save_snapshot(session)
         except Exception:
             logger.exception("会话轮末快照失败: session=%s", session.session_id)
 
@@ -571,7 +571,7 @@ async def list_sessions(
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
     try:
-        sessions = await store.alist_sessions(
+        sessions = await store.list_sessions(
             pattern_code=pattern_code or None, limit=limit, offset=offset
         )
     except Exception as e:
@@ -590,7 +590,7 @@ async def get_session_messages(session_id: str) -> SessionMessagesResponse:
         return SessionMessagesResponse(code="500", status=False, message="会话存储未启用")
 
     try:
-        messages = await store.aget_messages(session_id)
+        messages = await store.get_messages(session_id)
     except Exception as e:
         logger.exception("查询会话消息失败")
         return SessionMessagesResponse(code="500", status=False, message="查询会话消息失败，请稍后重试")

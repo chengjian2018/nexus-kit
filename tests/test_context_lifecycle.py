@@ -1,5 +1,6 @@
 """TurnLifecycle / ChatResult offline unit tests (no LLM dependency)."""
 
+from async_utils import arun
 from nexus.engine.context_lifecycle import TurnLifecycle
 from nexus.engine.response import ChatResult, build_chat_result
 from nexus.context import DialogueContext, ModuleJumpEvent
@@ -28,7 +29,7 @@ def _make_cxt() -> DialogueContext:
         "clarify": {"triggered": True, "topic": "旧主题"},
         "served_by_projection": {"module": "m1", "source": "m0"},
     }
-    cxt.add_message("user", "旧问题", stage="chat")
+    arun(cxt.add_message("user", "旧问题", stage="chat"))
     return cxt
 
 
@@ -82,7 +83,7 @@ class TestBeginTurn:
         cxt = _make_cxt()
         lc = TurnLifecycle()
         lc.begin_turn(cxt, "q1")
-        lc.end_turn(cxt, "回复1")
+        arun(lc.end_turn(cxt, "回复1"))
         lc.begin_turn(cxt, "q2")
         assert cxt.user_query == "q2"
         assert cxt.nlu_result is None
@@ -94,8 +95,8 @@ class TestBeginTurn:
         lc = TurnLifecycle()
         lc.begin_turn(cxt, "q1")
         assert cxt.turn_history_start == 1
-        cxt.add_message("user", "q1", stage="chat")
-        lc.end_turn(cxt, "回复1")
+        arun(cxt.add_message("user", "q1", stage="chat"))
+        arun(lc.end_turn(cxt, "回复1"))
         lc.begin_turn(cxt, "q2")
         assert cxt.turn_history_start == 3  # old user + q1 + reply 1
 
@@ -103,7 +104,7 @@ class TestBeginTurn:
 class TestEndTurn:
     def test_appends_assistant_message(self):
         cxt = _make_cxt()
-        TurnLifecycle().end_turn(cxt, "最终回复")
+        arun(TurnLifecycle().end_turn(cxt, "最终回复"))
         last = cxt.history[-1]
         assert last.role == "assistant"
         assert last.content == "最终回复"

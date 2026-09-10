@@ -204,7 +204,7 @@ class DefaultLoopExecutor(ModuleExecutor):
                 # context via history)
                 from nexus.context import DeferredModuleSwitch
 
-                cxt.add_message(
+                await cxt.add_message(
                     "assistant",
                     encode_tool_call_content(content or "", tool_calls),
                     stage="agent",
@@ -222,9 +222,9 @@ class DefaultLoopExecutor(ModuleExecutor):
                     else:
                         tool_result = await _execute_tool(name, _parse_args(tc))
                         result_content = tool_result
-                    cxt.add_message("tool", result_content, stage="agent",
-                                    metadata={"tool_name": name,
-                                              "tool_call_id": call_id})
+                    await cxt.add_message("tool", result_content, stage="agent",
+                                          metadata={"tool_name": name,
+                                                    "tool_call_id": call_id})
                     messages.append({"role": "tool", "tool_call_id": call_id,
                                      "content": result_content})
 

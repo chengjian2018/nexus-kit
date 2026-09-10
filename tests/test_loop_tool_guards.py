@@ -6,6 +6,7 @@ hooks behavioral suite is retired.
 """
 
 import json
+from async_utils import arun
 from unittest.mock import patch
 
 from nexus.engine.session import Session
@@ -165,7 +166,7 @@ def test_synthetic_error_row_replays_paired():
 
     s = _mk_session()
     s.cxt.user_query = "查天气"
-    s.cxt.add_message("user", "查天气", stage="chat")
+    arun(s.cxt.add_message("user", "查天气", stage="chat"))
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [
             _tool_call(name="no_such_tool", arguments="{}")]},
@@ -188,7 +189,7 @@ def test_ordinary_round_replays_paired():
 
     s = _mk_session()
     s.cxt.user_query = "查天气"
-    s.cxt.add_message("user", "查天气", stage="chat")
+    arun(s.cxt.add_message("user", "查天气", stage="chat"))
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [
             _tool_call(arguments='{"city": "北京"}')]},

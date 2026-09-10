@@ -106,16 +106,16 @@ def _mk_session_with_history(store=None, n_pairs=10, session_id="comp-1"):
     """Build a session with 2×n_pairs history entries; with a store, launch+attach (messages persisted)."""
     session = Session(session_id=session_id, pattern_code="p")
     if store is not None:
-        store.create_session(session)
+        arun(store.create_session(session))
         store.attach(session)
     for i in range(n_pairs):
-        session.cxt.add_message("user", f"问题{i}：" + "长" * 50, stage="chat")
-        session.cxt.add_message("assistant", f"回答{i}", stage="chat")
+        arun(session.cxt.add_message("user", f"问题{i}：" + "长" * 50, stage="chat"))
+        arun(session.cxt.add_message("assistant", f"回答{i}", stage="chat"))
     return session
 
 
 def test_compress_success_rebuilds_db_and_cxt(tmp_path):
-    store = SessionStore(str(tmp_path / "t.db"))
+    store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = _mk_session_with_history(store)  # history already persisted via the sink
 
     provider = _SummaryProvider()
@@ -126,7 +126,7 @@ def test_compress_success_rebuilds_db_and_cxt(tmp_path):
 
     assert ok is True
     # DB: summary first + 4 retained entries
-    history = store.get_history("comp-1")
+    history = arun(store.get_history("comp-1"))
     assert history[0].role == "summary"
     assert history[0].stage == "compress"
     assert len(history) == 5
@@ -141,15 +141,15 @@ def test_compress_success_rebuilds_db_and_cxt(tmp_path):
     assert "问题0" in provider.seen[0][1]["content"]
     # Only old messages (before the split) are summarized; questions inside the retention window are not
     assert "问题9" not in provider.seen[0][1]["content"]
-    store.close()
+    arun(store.close())
 
 
 def test_compress_llm_failure_keeps_everything(tmp_path):
     """Summary LLM failure: DB and cxt.history stay untouched (iron rule)."""
-    store = SessionStore(str(tmp_path / "t.db"))
+    store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = _mk_session_with_history(store)
     before_mem = list(session.cxt.history)
-    before_db = store.get_history("comp-1")
+    before_db = arun(store.get_history("comp-1"))
 
     provider = _SummaryProvider(fail=True)
     with patch("nexus.engine.compression.build_provider", return_value=provider):
@@ -157,14 +157,14 @@ def test_compress_llm_failure_keeps_everything(tmp_path):
                                    {"code": "f", "model": "m"}, retain_count=4))
 
     assert ok is False
-    assert store.get_history("comp-1") == before_db
+    assert arun(store.get_history("comp-1")) == before_db
     assert session.cxt.history == before_mem
-    store.close()
+    arun(store.close())
 
 
 def test_compress_aborts_when_db_memory_mismatch(tmp_path):
     """DB/memory mismatch: abort compression (never delete against a misaligned history)."""
-    store = SessionStore(str(tmp_path / "t.db"))
+    store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = _mk_session_with_history(store)
     # append one in-memory entry that is never persisted -> mismatch
     session.cxt.history.append(SessionMessage(role="user", content="幽灵"))
@@ -176,13 +176,13 @@ def test_compress_aborts_when_db_memory_mismatch(tmp_path):
 
     assert ok is False
     assert not provider.seen  # LLM not called (validation runs first)
-    assert len(store.get_history("comp-1")) == 20
-    store.close()
+    assert len(arun(store.get_history("comp-1"))) == 20
+    arun(store.close())
 
 
 def test_compress_empty_summary_aborts(tmp_path):
     """Empty summary: abort."""
-    store = SessionStore(str(tmp_path / "t.db"))
+    store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = _mk_session_with_history(store)
 
     provider = _SummaryProvider(reply="   ")
@@ -190,8 +190,8 @@ def test_compress_empty_summary_aborts(tmp_path):
         ok = arun(compress_history(session, store,
                                    {"code": "f", "model": "m"}, retain_count=4))
     assert ok is False
-    assert len(store.get_history("comp-1")) == 20
-    store.close()
+    assert len(arun(store.get_history("comp-1"))) == 20
+    arun(store.close())
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ def test_after_compress_query_appears_once(tmp_path):
     from nexus.engine.messages import default_build_messages
     from nexus.model.module import AgentModule
 
-    store = SessionStore(str(tmp_path / "t.db"))
+    store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = _mk_session_with_history(store)
     session.cxt.turn_history_start = len(session.cxt.history)
     session.cxt.user_query = "新问题"
@@ -219,7 +219,7 @@ def test_after_compress_query_appears_once(tmp_path):
     assert any("untrusted_会话摘要" in c for c in user_contents)
     # retained old turns are replayed as usual
     assert any(c.startswith("问题") for c in user_contents)
-    store.close()
+    arun(store.close())
 
 
 def test_maybe_compress_skips_without_store_or_threshold():
