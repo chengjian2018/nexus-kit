@@ -38,7 +38,7 @@ host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
 | `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 | `channel/{base,webhooks.py}` |
 | `atoms/executors/` | 三默认执行器插件（default_loop / default_fsm / default_route） | 新增（重构计划①） |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt（具名 stage codes 注册进插件中心） | `stages/` |
-| `atoms/tools/` | calculator / weather / knowledge 工具 | `tools/*_tool.py` |
+| `atoms/tools/` | knowledge / mcp 工具（MCP 经 `mcp_servers:` 配置动态注册 toolset `mcp-*`） | `tools/*_tool.py` |
 | `atoms/providers/` | OpenAICompatible Provider（原生 LLMChunk 流） | `llm/openai_provider.py` |
 | `atoms/knowledge/` | SQLite 知识库 | `database/knowledge_store.py` |
 | `apps/<name>/` | 业务 pattern（route.py，声明式 stages/executor/sub_modules）+ prompt 资产 + 渠道适配 | `dialogue/*_route.py`、`channel/xianyu.py` |

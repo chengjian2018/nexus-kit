@@ -9,6 +9,7 @@ dependencies = [
     "pyyaml>=6.0",
     "requests>=2.31",
     "jieba>=0.42",
+    "mcp>=1.9",
 ]
 
 [project.optional-dependencies]
@@ -31,8 +32,8 @@ packages = [
     "atoms", "atoms.stages", "atoms.stages.nlu", "atoms.stages.nlg", "atoms.stages.query",
     "atoms.stages.recaller", "atoms.stages.clarify", "atoms.augmentation",
     "atoms.tools", "atoms.providers", "atoms.knowledge", "atoms.channels",
-    "atoms.executors",
-    "apps", "apps.xianyu_agent", "apps.customer_agent",
+    "atoms.executors", "atoms.mcp",
+    "apps", "apps.xianyu_agent", "apps.customer_agent", "apps.deep_research_agent",
     "host", "host.config",
 ]
 

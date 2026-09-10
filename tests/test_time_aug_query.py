@@ -47,6 +47,42 @@ def test_no_time_entity_passthrough():
     assert ctx.rewritten_queries == ["这个多少钱"]
 
 
+def test_past_time_not_augmented():
+    # entirely in the past (base 2026-09-03): "上周三" = 2026-08-26
+    ctx = TimeAugQueryRewriter().execute(_ctx(query="我上周三去过"))
+    assert ctx.rewritten_queries == ["我上周三去过"]
+
+
+def test_past_time_span_not_augmented():
+    ctx = TimeAugQueryRewriter().execute(_ctx(query="昨天下午三点到五点"))
+    assert ctx.rewritten_queries == ["昨天下午三点到五点"]
+
+
+def test_beyond_two_weeks_not_augmented():
+    # badcase: "下下周" = 2026-09-14~2026-09-20, its end is 17 days past the
+    # base (2026-09-03) — beyond the 2-week window, keep the original wording
+    ctx = TimeAugQueryRewriter().execute(_ctx(query="我看下下周的"))
+    assert ctx.rewritten_queries == ["我看下下周的"]
+
+
+def test_far_future_month_not_augmented():
+    # "下个月" = 2026-10, ends ~8 weeks out — beyond the 2-week window
+    ctx = TimeAugQueryRewriter().execute(_ctx(query="下个月呢"))
+    assert ctx.rewritten_queries == ["下个月呢"]
+
+
+def test_next_week_within_window_augmented():
+    # "下周" = 2026-09-07~2026-09-13, ends within 2 weeks — still augmented
+    ctx = TimeAugQueryRewriter().execute(_ctx(query="我看下周的"))
+    assert ctx.rewritten_queries == ["我看下周(2026-09-07~2026-09-13)的"]
+
+
+def test_mixed_span_crossing_now_augmented():
+    # "上周到这周五" starts in the past but ends 2026-09-04 (future) — augmented
+    ctx = TimeAugQueryRewriter().execute(_ctx(query="上周到这周五怎么样"))
+    assert ctx.rewritten_queries == ["上周到这周五(2026-08-24~2026-09-04)怎么样"]
+
+
 def test_time_span_augmented():
     ctx = TimeAugQueryRewriter().execute(_ctx(query="明天下午3点到5点有空吗"))
     assert ctx.rewritten_queries == ["明天下午3点到5点(2026-09-04 15:00~17:00)有空吗"]

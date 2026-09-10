@@ -1,9 +1,10 @@
 """Security-hardening regression anchors — one test per fix from SECURITY_AUDIT.md.
 
 These exist so the fixes cannot be silently regressed: each test pins the
-behavior the audit required (constant-time token compare, AST-only calculator,
-session-key normalization, sanitized error/task_info surfaces, per-session
-turn lock, NaN-proof staleness input parsing).
+behavior the audit required (constant-time token compare, session-key
+normalization, sanitized error/task_info surfaces, per-session turn lock,
+NaN-proof staleness input parsing). The AST-only calculator anchors were
+retired together with atoms/tools/calculator_tool.py (demo tool removed).
 """
 
 import threading
@@ -11,56 +12,9 @@ import threading
 import pytest
 from pydantic import ValidationError
 
-from atoms.tools.calculator_tool import _safe_eval
 from apps.xianyu_agent.channel import XianyuInboundMessage, _parse_msg_time
 from nexus.engine.messages import _sanitize_task_value
 from nexus.engine.session import Session
-
-
-# ---------------------------------------------------------------------------
-# P0-2 calculator: AST whitelist, no eval
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("expr,want", [
-    ("3 + 4 * 2", 11),
-    ("sqrt(16)", 4.0),
-    ("2 ** 10", 1024),
-    ("abs(-5) + round(3.7)", 9),
-    ("min(1, 2, 3)", 1),
-    ("9 // 2", 4),
-    ("7 % 3", 1),
-    ("-5 + 3", -2),
-    ("pi * 2", pytest.approx(6.283185307, rel=1e-6)),
-])
-def test_calculator_normal_expressions(expr, want):
-    assert _safe_eval(expr) == want
-
-
-@pytest.mark.parametrize("attack", [
-    "9**9**9**9",                                  # 幂塔 CPU DoS（审计实证）
-    "2**200000000",                                # 巨幂
-    "(1).__class__",                               # 属性链逃逸面
-    "().__class__.__base__.__subclasses__()",
-    'lambda: 1',
-    '"just a string"',
-    "[x for x in range(3)]",
-    "1 if 1 else 2",                               # 条件表达式节点
-    "unknown_name",                                # 非白名单标识符
-    "open('x')",                                   # 任意函数
-    "a" * 501,                                     # 超长表达式
-    "0" + "+0" * 200,                              # AST 炸弹（节点数超限）
-])
-def test_calculator_attacks_rejected(attack):
-    with pytest.raises(ValueError):
-        _safe_eval(attack)
-
-
-def test_calculator_dos_is_instant():
-    import time
-    t0 = time.monotonic()
-    with pytest.raises(ValueError):
-        _safe_eval("9**9**9**9")
-    assert time.monotonic() - t0 < 1.0  # 拒绝必须立刻发生，不能进入计算
 
 
 # ---------------------------------------------------------------------------

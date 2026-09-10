@@ -1,6 +1,9 @@
 """Time entity augmentation: based on jionlp time parsing, appends a readable
 time annotation after time entities in the original text.
 
+Only times within the coming two weeks are augmented: ones already over stay
+as-is, and so do ones ending beyond two weeks out (e.g. "下下周").
+
 Examples:
     "I can go next Monday"      -> "I can go next Monday(2026-09-07)"
     "I'm free next Mon 7 to 9"  -> "I'm free next Mon 7 to 9(2026-09-07 07:00~09:00)"
@@ -117,12 +120,36 @@ def _reanchor_end(text: str, start: str) -> Optional[str]:
     return new_end if new_end[:19] > start[:19] else None
 
 
+_MAX_FUTURE_DAYS = 14  # augment only times ending within 2 weeks from now
+
+
+def _in_window(times: List[str], time_base: float) -> bool:
+    """A time entity is worth augmenting only when it (partly) lies in the
+    future and ends within the 2-week window: past times and far-future ones
+    (e.g. "下下周") stay in the original wording.
+
+    The end (not the start) of the interval is compared: a span starting soon
+    but running past the window ("下周到下个月") is still a distant commitment.
+    The past bound compares the exact moment; the future bound compares
+    calendar dates, so "exactly two weeks out" stays augmentable all day.
+    """
+    end = _time.mktime(_time.strptime(times[1][:19], "%Y-%m-%d %H:%M:%S"))
+    if end <= time_base:  # already over
+        return False
+    horizon = (datetime.fromtimestamp(time_base)
+               + timedelta(days=_MAX_FUTURE_DAYS)).strftime("%Y-%m-%d")
+    return times[1][:10] <= horizon
+
+
 def augment_time(
     text: str,
     time_base: Optional[float] = None,
 ) -> str:
     """Return the text with time annotations appended after time entities;
     return it unchanged when there is no time entity.
+
+    Entities entirely in the past or ending more than 2 weeks in the future
+    are left unaugmented.
 
     Args:
         text: text to augment
@@ -144,11 +171,16 @@ def augment_time(
             continue
         detail = ent.get("detail", {})
         times = detail.get("time")
-        if (isinstance(times, list) and len(times) == 2
-                and all(isinstance(t, str) for t in times) and times[1][:19] < times[0][:19]):
+        if not (isinstance(times, list) and len(times) == 2
+                and all(isinstance(t, str) for t in times)):
+            continue
+        if times[1][:19] < times[0][:19]:
             fixed = _reanchor_end(ent["text"], times[0])  # elliptical range correction
             if fixed is not None:
                 detail = {**detail, "time": [times[0], fixed]}
+                times = detail["time"]
+        if not _in_window(times, time_base):
+            continue
         note = _render(detail, today)
         if note is None:
             continue

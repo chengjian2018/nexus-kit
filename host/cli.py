@@ -25,9 +25,22 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import fire
+# 仓库是扁平顶层包布局(nexus/ atoms/ apps/ host/ 同级,pytest 靠根
+# conftest 注入 sys.path)。直接以 `python cli.py` 启动时脚本所在目录
+# (host/)成为 sys.path[0],仓库根不在路径上——这里自举补上,使 CLI 从
+# 任何 CWD、任何解释器启动都可用(与 python -m host.cli 等效)
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from nexus.engine.chat import chat as chat_turn
+import fire  # noqa: E402
+
+# 触发 host.config 的 set_config_path 副作用:裸 `python cli.py` 启动时
+# host 不作为包被 import,配置路径会退化成 CWD 探测而从非仓库根启动时
+# 找不到 local_config.yaml(MCP bootstrap / llm 解析都依赖它)
+import host.config  # noqa: E402,F401
+
+from nexus.engine.chat import chat as chat_turn  # noqa: E402
 from nexus.engine.session import Session
 from nexus.engine.store import SessionStore
 from nexus.registry.patterns import discover_builtin_patterns, registry as pattern_registry
@@ -810,6 +823,14 @@ def list_cmd(target: str = "all") -> None:
     # this function. The fire subcommand name is mapped in the fire.Fire dict.
     """List registered objects: patterns | llms | tools | all."""
     _ensure_discovery()
+    if target in ("tools", "all"):
+        # MCP 工具是 bootstrap 后台异步注册的——观测命令等待连接终态,
+        # 让列表反映真实状态(无 server 配置时立即返回)
+        try:
+            from atoms.mcp.manager import get_mcp_manager
+            get_mcp_manager().wait_ready(timeout=15.0)
+        except Exception:
+            pass
     if target in ("patterns", "all"):
         patterns = pattern_registry.list_patterns()
         print(bold(f"patterns ({len(patterns)}):"))
@@ -927,8 +948,30 @@ def pattern_load(path: str, validate_only: bool = False) -> None:
     print(green(f"已加载并注册 pattern: {p.code}（modules={len(p.module_map)}）"))
 
 
+def _setup_logging() -> None:
+    """按 NEXUS_LOG 环境变量配置根 logger(默认 WARNING)。
+
+    项目各模块只 getLogger 不配 handler——CLI 不配置时 INFO/DEBUG 全部
+    被吞。NEXUS_LOG=INFO / DEBUG 级别可见引擎轮次、MCP 连接、工具分派
+    等过程日志;NEXUS_LOG=DEBUG 再把 httpx/httpcore/mcp.client 噪声压回
+    WARNING,保持信噪比。
+    """
+    level_name = os.environ.get("NEXUS_LOG", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    if level >= logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "mcp.client", "asyncio",
+                      "urllib3", "requests"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 if __name__ == "__main__":
     sys.argv[1:] = _expand_short_verbose(sys.argv[1:])
+    _setup_logging()
     fire.Fire({
         "chat": chat,
         "ask": ask,

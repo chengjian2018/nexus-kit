@@ -190,12 +190,12 @@ def test_write_through_message_metadata_json(tmp_path):
     store.create_session(session)
     store.attach(session)
     session.cxt.add_message(
-        "tool", "tool_result", stage="agent", metadata={"tool": "calculator"}
+        "tool", "tool_result", stage="agent", metadata={"tool": "search_product_knowledge"}
     )
     store.close()
 
     row = fetch_one(db, "SELECT metadata FROM messages")
-    assert json.loads(row[0]) == {"tool": "calculator"}
+    assert json.loads(row[0]) == {"tool": "search_product_knowledge"}
 
 
 def test_snapshot_without_new_messages_only_refreshes_state(tmp_path):
@@ -405,7 +405,7 @@ def test_append_message_tool_payload_roundtrip(tmp_path):
 
     from nexus.context import SessionMessage, decode_tool_call_content, encode_tool_call_content
     tool_calls = [{"id": "call_1", "type": "function",
-                   "function": {"name": "weather", "arguments": "{}"}}]
+                   "function": {"name": "list_products", "arguments": "{}"}}]
     store.append_message(session, SessionMessage(
         role="assistant",
         content=encode_tool_call_content("查询中", tool_calls),

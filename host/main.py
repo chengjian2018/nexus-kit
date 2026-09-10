@@ -33,6 +33,26 @@ logger = logging.getLogger(__name__)
 
 
 # ----init----
+# 日志开关:项目各模块只 getLogger 不配 handler,不配置则 INFO/DEBUG 全部
+# 被吞。NEXUS_LOG=INFO / DEBUG 可见会话轮次、MCP 连接、工具分派过程;
+# DEBUG 下把 httpx/httpcore/mcp.client 噪声压回 WARNING(uvicorn 侧的
+# 访问日志不受影响)
+def _setup_logging() -> None:
+    level_name = os.environ.get("NEXUS_LOG", "WARNING").upper()
+    level = getattr(logging, level_name, logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    if level >= logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "mcp.client", "asyncio",
+                      "urllib3", "requests"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
+
 app = fastapi.FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 discover_builtin_tools()
 discover_builtin_patterns()
@@ -202,7 +222,7 @@ def _startup_persistence() -> None:
 
 @app.on_event("shutdown")
 def _shutdown_stores() -> None:
-    """Service shutdown: release the knowledge-base / session-store connections."""
+    """Service shutdown: release the knowledge-base / session-store / MCP connections."""
     global store
     try:
         from atoms.knowledge.store import close_knowledge_store
@@ -215,6 +235,13 @@ def _shutdown_stores() -> None:
         except Exception:
             logger.exception("关闭会话存储失败")
         store = None
+    # MCP manager: close server connections + stop the dedicated loop thread
+    # (no-op when no servers were configured)
+    try:
+        from atoms.mcp.manager import get_mcp_manager
+        get_mcp_manager().shutdown()
+    except Exception:
+        logger.exception("关闭 MCP 连接失败")
 
 
 class DialogueRequest(BaseModel):

@@ -60,7 +60,7 @@ def _sample_pattern():
             AgentModule(
                 module_code="helper", module_name="助手",
                 messages_builder="customer_agent_messages_builder",
-                use_tools=["calculator"],
+                use_tools=["search_product_knowledge"],
             ),
         ],
         executor_loop="default_loop",

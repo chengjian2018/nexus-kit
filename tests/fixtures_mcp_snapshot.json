@@ -1,0 +1,378 @@
+{
+ "websearch": [
+  {
+   "name": "web_search_prime",
+   "description": "Search web information, returns results including web page title, web page URL, web page summary, website name, website icon, etc.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "search_query": {
+      "type": "string",
+      "description": "Content to be searched, it is recommended that the search query not exceed 70 characters"
+     },
+     "search_domain_filter": {
+      "type": "string",
+      "description": "Used to limit the scope of search results, only return content from specified whitelist domains, such as: www.example.com."
+     },
+     "search_recency_filter": {
+      "type": "string",
+      "description": "Search for web pages within a specified time range. Default is noLimit Available values:- oneDay, within one day- oneWeek, within one week- oneMonth, within one month- oneYear, within one year- noLimit, no limit (default)"
+     },
+     "content_size": {
+      "type": "string",
+      "description": "Control the number of words in the web page summary; default value is medium - medium: balanced mode, suitable for most queries. 400-600 words.- high: maximize context to provide more comprehensive answers, but higher cost, 2500 words."
+     },
+     "location": {
+      "type": "string",
+      "description": "Guess which region the user is from based on user input. Default is cn Available values: - cn, Chinese region- us, non-Chinese region"
+     }
+    },
+    "required": [
+     "search_query"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "zread": [
+  {
+   "name": "search_doc",
+   "description": "Search documentation, issues, and commits of a GitHub repository.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "repo_name": {
+      "type": "string",
+      "description": "GitHub repository: owner/repo (e.g. \"vitejs/vite\")"
+     },
+     "query": {
+      "type": "string",
+      "description": "The search keywords or question about the repository."
+     },
+     "language": {
+      "type": "string",
+      "description": "'zh' or 'en' (choose according to context language)."
+     }
+    },
+    "required": [
+     "repo_name",
+     "query"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "read_file",
+   "description": "Read the full code content of a specific file in a GitHub repository.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "repo_name": {
+      "type": "string",
+      "description": "GitHub repository: owner/repo (e.g. \"vitejs/vite\")"
+     },
+     "file_path": {
+      "type": "string",
+      "description": "The relative path to the file (e.g. \"src/index.ts\")."
+     }
+    },
+    "required": [
+     "repo_name",
+     "file_path"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "get_repo_structure",
+   "description": "Get the directory structure and file list of a GitHub repository.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "repo_name": {
+      "type": "string",
+      "description": "GitHub repository: owner/repo (e.g. \"vitejs/vite\")"
+     },
+     "dir_path": {
+      "type": "string",
+      "description": "The directory path to inspect (default: root \"/\")"
+     }
+    },
+    "required": [
+     "repo_name"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "webreader": [
+  {
+   "name": "webReader",
+   "description": "Fetch and Convert URL to Large Model Friendly Input.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "url": {
+      "type": "string",
+      "description": "The URL of the website to fetch and read"
+     },
+     "timeout": {
+      "type": "integer",
+      "format": "int32",
+      "description": "Request timeout(unit is second), default is 20"
+     },
+     "no_cache": {
+      "type": "boolean",
+      "description": "Disable cache(true/false), default is false"
+     },
+     "return_format": {
+      "type": "string",
+      "description": "Reader response content type (markdown or text), default is markdown"
+     },
+     "retain_images": {
+      "type": "boolean",
+      "description": "Retain images (true/false), default is true"
+     },
+     "no_gfm": {
+      "type": "boolean",
+      "description": "Disable GitHub Flavored Markdown (true/false), default is false"
+     },
+     "keep_img_data_url": {
+      "type": "boolean",
+      "description": "Keep image data URL (true/false), default is false"
+     },
+     "with_images_summary": {
+      "type": "boolean",
+      "description": "Include images summary (true/false), default is false"
+     },
+     "with_links_summary": {
+      "type": "boolean",
+      "description": "Include links summary (true/false), default is false"
+     }
+    },
+    "required": [
+     "url"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "zai": [
+  {
+   "name": "ui_to_artifact",
+   "description": "Convert UI screenshots into various artifacts: code, prompts, design specifications, or descriptions.\n\nUse this tool ONLY when the user wants to:\n- Generate frontend code from UI design (output_type='code')\n- Create AI prompts for UI generation (output_type='prompt')\n- Extract design specifications (output_type='spec')\n- Get natural language description of the UI (output_type='description')\n\nDo NOT use for: screenshots containing text/code to extract, error messages, diagrams, or data visualizations.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "output_type": {
+      "type": "string",
+      "enum": [
+       "code",
+       "prompt",
+       "spec",
+       "description"
+      ],
+      "description": "Type of output to generate. Options: 'code' (generate frontend code), 'prompt' (generate AI prompt for recreating this UI), 'spec' (generate design specification document), 'description' (natural language description of the UI)."
+     },
+     "prompt": {
+      "type": "string",
+      "description": "Detailed instructions describing what to generate from this UI image. Should clearly state the desired output and any specific requirements."
+     }
+    },
+    "required": [
+     "image_source",
+     "output_type",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "extract_text_from_screenshot",
+   "description": "Extract and recognize text from screenshots using advanced OCR capabilities.\n\nUse this tool ONLY when the user has a screenshot containing text and wants to extract it.\nThis tool specializes in OCR for code, terminal output, documentation, and general text extraction.\n\nDo NOT use for: UI design conversion, error diagnosis, or diagram understanding.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "Instructions for text extraction. Specify what type of text to extract and any formatting requirements."
+     },
+     "programming_language": {
+      "type": "string",
+      "description": "Optional: specify the programming language if the screenshot contains code (e.g., 'python', 'javascript', 'java'). Leave empty for auto-detection or non-code text."
+     }
+    },
+    "required": [
+     "image_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "diagnose_error_screenshot",
+   "description": "Diagnose and analyze error messages, stack traces, and exception screenshots.\n\nUse this tool ONLY when the user has an error screenshot and needs help understanding or fixing it.\nThis tool specializes in error analysis and provides actionable solutions.\n\nDo NOT use for: code extraction, UI analysis, or diagram understanding.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "Description of what you need help with regarding this error. Include any relevant context about when it occurred."
+     },
+     "context": {
+      "type": "string",
+      "description": "Optional: additional context about when the error occurred (e.g., 'during npm install', 'when running the app', 'after deployment'). Helps with more accurate diagnosis."
+     }
+    },
+    "required": [
+     "image_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "understand_technical_diagram",
+   "description": "Analyze and explain technical diagrams including architecture diagrams, flowcharts, UML, ER diagrams, and system design diagrams.\n\nUse this tool ONLY when the user has a technical diagram and wants to understand its structure or components.\nThis tool specializes in interpreting visual technical documentation.\n\nDo NOT use for: UI screenshots, error messages, or data visualizations/charts.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "What you want to understand or extract from this diagram."
+     },
+     "diagram_type": {
+      "type": "string",
+      "description": "Optional: specify the diagram type if known (e.g., 'architecture', 'flowchart', 'uml', 'er-diagram', 'sequence'). Leave empty for auto-detection."
+     }
+    },
+    "required": [
+     "image_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "analyze_data_visualization",
+   "description": "Analyze data visualizations, charts, graphs, and dashboards to extract insights and trends.\n\nUse this tool ONLY when the user has a data visualization image and wants to understand the data patterns or metrics.\nThis tool specializes in interpreting visual data representations.\n\nDo NOT use for: UI mockups, error messages, or technical architecture diagrams.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "What insights or information you want to extract from this visualization."
+     },
+     "analysis_focus": {
+      "type": "string",
+      "description": "Optional: specify what to focus on (e.g., 'trends', 'anomalies', 'comparisons', 'performance metrics'). Leave empty for comprehensive analysis."
+     }
+    },
+    "required": [
+     "image_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "ui_diff_check",
+   "description": "Compare two UI screenshots to identify visual differences and implementation discrepancies.\n\nUse this tool ONLY when the user wants to compare an expected/reference UI with an actual implementation.\nThis tool is specialized for UI quality assurance and design-to-implementation verification.\n\nDo NOT use for: general image comparison, error diagnosis, or analyzing single UIs.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "expected_image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "actual_image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "Instructions for the comparison. Specify what aspects to focus on or what level of detail is needed."
+     }
+    },
+    "required": [
+     "expected_image_source",
+     "actual_image_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "analyze_image",
+   "description": "General-purpose image analysis for scenarios not covered by specialized tools.\n\nUse this tool as a FALLBACK when none of the other specialized tools (ui_to_artifact, extract_text_from_screenshot,\ndiagnose_error_screenshot, understand_technical_diagram, analyze_data_visualization, ui_diff_check) fit the user's need.\n\nThis tool provides flexible image understanding for any visual content.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "image_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the image"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "Detailed description of what you want to analyze, extract, or understand from the image. Be specific about your requirements."
+     }
+    },
+    "required": [
+     "image_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  },
+  {
+   "name": "analyze_video",
+   "description": "Analyze video content using advanced AI vision models.\n\nUse this tool when the user wants to:\n- Understand what happens in a video\n- Extract key moments or actions from video\n- Analyze video content, scenes, or sequences\n- Get descriptions of video footage\n- Identify objects, people, or activities in video\n\nSupports both local files and remote URL. Maximum file size: 8MB. Supports MP4, MOV, M4V formats.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "video_source": {
+      "type": "string",
+      "description": "Local file path or remote URL to the video (supports MP4, MOV, M4V)"
+     },
+     "prompt": {
+      "type": "string",
+      "description": "Detailed text prompt describing what to analyze, extract, or understand from the video"
+     }
+    },
+    "required": [
+     "video_source",
+     "prompt"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+   }
+  }
+ ]
+}

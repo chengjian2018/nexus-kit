@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pattern 可视化 · install_booking_agent</title>
+<style>
+:root { --border:#e5e7eb; --text:#1f2937; --muted:#6b7280; --bg:#f9fafb; }
+* { box-sizing: border-box; }
+body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin:0; padding:24px; background:var(--bg); color:var(--text); }
+.wrap { max-width: 1100px; margin: 0 auto; }
+header h1 { margin:0 0 4px; font-size:22px; }
+header .sub { color:var(--muted); font-size:13px; margin-bottom:12px; }
+.meta span { display:inline-block; background:#fff; border:1px solid var(--border); border-radius:6px; padding:2px 10px; font-size:12px; margin:0 8px 8px 0; }
+.legend { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0; font-size:12px; }
+.legend .chip { border-radius:999px; padding:3px 10px; border:1px solid var(--border); background:#fff; }
+.legend .c-route { background:#eff6ff; border-color:#3b82f6; }
+.legend .c-fsm { background:#f0fdf4; border-color:#16a34a; }
+.legend .c-agent { background:#fff7ed; border-color:#ea580c; }
+.legend .c-end { background:#f5f3ff; border-color:#7c3aed; }
+.legend .c-start { background:#fffbeb; border-color:#d97706; }
+.diagram { background:#fff; border:1px solid var(--border); border-radius:10px; padding:16px; overflow:auto; }
+#loading { color:var(--muted); font-size:13px; padding:8px; }
+#fallback { display:none; margin-top:16px; }
+#fallback pre { background:#0b1020; color:#e5e7eb; padding:14px; border-radius:8px; overflow:auto; font-size:12px; }
+.notice { color:#b45309; font-size:13px; }
+.card { background:#fff; border:1px solid var(--border); border-radius:10px; padding:16px 20px; margin-top:16px; }
+.card h2 { font-size:16px; margin:0 0 4px; }
+.card .desc { color:var(--muted); font-size:13px; margin:4px 0 12px; }
+.badge { font-size:11px; border-radius:4px; padding:1px 8px; margin-left:8px; vertical-align:middle; font-weight:normal; }
+.badge.route { background:#eff6ff; color:#1d4ed8; border:1px solid #3b82f6; }
+.badge.fsm { background:#f0fdf4; color:#15803d; border:1px solid #16a34a; }
+.badge.agent { background:#fff7ed; color:#c2410c; border:1px solid #ea580c; }
+table { border-collapse: collapse; width:100%; font-size:13px; }
+th, td { border:1px solid var(--border); padding:6px 10px; text-align:left; vertical-align:top; }
+th { background:#f3f4f6; white-space:nowrap; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; background:#f3f4f6; padding:1px 5px; border-radius:4px; }
+details { margin-top:10px; font-size:13px; }
+details summary { cursor:pointer; color:var(--muted); }
+dl.examples { margin:8px 0; }
+dl.examples dt { font-weight:600; margin-top:8px; }
+dl.examples dd { margin:2px 0 0; color:var(--muted); }
+ul.info { font-size:13px; margin:8px 0; padding-left:20px; }
+ul.info pre { background:#f3f4f6; padding:10px; border-radius:6px; overflow:auto; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>安装预约外呼助手（手绘FSM转写）</h1>
+<div class="sub">对话管理：FSM 统一阶段推进安装预约外呼——核对地址、确认到货、协商师傅上门时间（可约守卫 + 档期推荐/具体日期/最近三路）、最终确认与改约；通用拒绝与下次联系时间补充通道；相对时间先经时间增强改写为绝对时间</div>
+<div class="meta">
+<span><strong>code</strong>: <code>install_booking_agent</code></span>
+<span><strong>入口模块</strong>: <code>install_booking</code></span>
+<span><strong>模块</strong>: 1</span>
+<span><strong>节点</strong>: 16</span>
+</div>
+</header>
+
+<div class="legend">
+<span class="chip c-route">ROUTE 模块</span>
+<span class="chip c-fsm">FSM 模块</span>
+<span class="chip c-agent">AGENT 模块</span>
+<span class="chip c-start">⏵ 开始（入口）</span>
+<span class="chip c-end">终态节点</span>
+<span class="chip">实线 → 节点跳转 sub_nodes</span>
+<span class="chip">虚线 ⇢ jump_module 跨模块分发 / 重置回根</span>
+</div>
+
+<section class="diagram">
+<div id="loading">图表加载中（mermaid.js 通过 CDN 加载）…</div>
+<pre class="mermaid">
+flowchart TB
+    START((&quot;⏵ 开始&quot;))
+    subgraph m_install_booking [&quot;install_booking · 安装预约外呼 (FSM)&quot;]
+        n_install_greet[&quot;install_greet&lt;br/&gt;外呼开场&lt;br/&gt;slots: service_needed&quot;]
+        n_install_confirm_addr[&quot;install_confirm_addr&lt;br/&gt;地址核对&lt;br/&gt;slots: address_confirmed, address&quot;]
+        n_install_check_arrival[&quot;install_check_arrival&lt;br/&gt;到货确认&lt;br/&gt;slots: arrived&quot;]
+        n_install_ask_eta[&quot;install_ask_eta&lt;br/&gt;到货时间询问&lt;br/&gt;slots: eta_known, eta&quot;]
+        n_install_time_window[&quot;install_time_window&lt;br/&gt;时间段询问&lt;br/&gt;slots: time_window&quot;]
+        n_install_available[&quot;install_available&lt;br/&gt;上门方便确认&lt;br/&gt;slots: available&quot;]
+        n_install_ask_time[&quot;install_ask_time&lt;br/&gt;上门时间协商&lt;br/&gt;slots: visit_time&quot;]
+        n_install_recommend[&quot;install_recommend&lt;br/&gt;档期推荐&lt;br/&gt;slots: recommended_slots, chosen_slot&quot;]
+        n_install_specific_date[&quot;install_specific_date&lt;br/&gt;具体日期约定&lt;br/&gt;slots: visit_date, visit_hour&quot;]
+        n_install_nearest[&quot;install_nearest&lt;br/&gt;最近档期安排&lt;br/&gt;slots: visit_time&quot;]
+        n_install_confirm_time[&quot;install_confirm_time&lt;br/&gt;上门时间确认&lt;br/&gt;slots: visit_time, address&quot;]
+        n_install_reschedule[&quot;install_reschedule&lt;br/&gt;改约重协商&lt;br/&gt;slots: rescheduled, prev_visit_time&quot;]
+        n_install_ask_callback[&quot;install_ask_callback&lt;br/&gt;下次联系时间&lt;br/&gt;slots: callback_time, callback_source&quot;]
+        n_install_callback_default[&quot;install_callback_default&lt;br/&gt;默认改约三天&lt;br/&gt;slots: callback_time, callback_source&quot;]
+        n_install_decline[&quot;install_decline&lt;br/&gt;通用拒绝承接&lt;br/&gt;slots: decline_reason&quot;]
+        n_install_end[&quot;install_end&lt;br/&gt;通话结束语 · 终态&quot;]
+        n_install_greet --&gt; n_install_confirm_addr
+        n_install_greet --&gt; n_install_end
+        n_install_greet --&gt; n_install_decline
+        n_install_confirm_addr --&gt; n_install_check_arrival
+        n_install_confirm_addr --&gt; n_install_end
+        n_install_confirm_addr --&gt; n_install_decline
+        n_install_check_arrival --&gt; n_install_ask_time
+        n_install_check_arrival --&gt; n_install_ask_eta
+        n_install_check_arrival --&gt; n_install_decline
+        n_install_ask_eta --&gt; n_install_time_window
+        n_install_ask_eta --&gt; n_install_available
+        n_install_ask_eta --&gt; n_install_decline
+        n_install_time_window --&gt; n_install_ask_time
+        n_install_time_window --&gt; n_install_available
+        n_install_time_window --&gt; n_install_decline
+        n_install_available --&gt; n_install_ask_time
+        n_install_available --&gt; n_install_ask_callback
+        n_install_available --&gt; n_install_decline
+        n_install_ask_time --&gt; n_install_recommend
+        n_install_ask_time --&gt; n_install_specific_date
+        n_install_ask_time --&gt; n_install_nearest
+        n_install_ask_time --&gt; n_install_decline
+        n_install_recommend --&gt; n_install_specific_date
+        n_install_recommend --&gt; n_install_nearest
+        n_install_recommend --&gt; n_install_ask_time
+        n_install_recommend --&gt; n_install_decline
+        n_install_specific_date --&gt; n_install_confirm_time
+        n_install_specific_date --&gt; n_install_ask_time
+        n_install_specific_date --&gt; n_install_decline
+        n_install_nearest --&gt; n_install_confirm_time
+        n_install_nearest --&gt; n_install_ask_time
+        n_install_nearest --&gt; n_install_decline
+        n_install_confirm_time --&gt; n_install_end
+        n_install_confirm_time --&gt; n_install_reschedule
+        n_install_confirm_time --&gt; n_install_decline
+        n_install_reschedule --&gt; n_install_ask_time
+        n_install_reschedule --&gt; n_install_decline
+        n_install_ask_callback --&gt; n_install_end
+        n_install_ask_callback --&gt; n_install_callback_default
+        n_install_ask_callback --&gt; n_install_decline
+        n_install_callback_default --&gt; n_install_end
+        n_install_decline --&gt; n_install_end
+    end
+    START --&gt; n_install_greet
+    classDef nodeEnd fill:#f5f3ff,stroke:#7c3aed,stroke-width:2px
+    classDef nodeAgent fill:#ecfdf5,stroke:#059669,stroke-width:2px
+    class n_install_end nodeEnd
+    style START fill:#fffbeb,stroke:#d97706,stroke-width:2px
+    style m_install_booking fill:#f0fdf4,stroke:#16a34a,stroke-width:3px
+
+</pre>
+</section>
+
+<section id="fallback">
+<p class="notice">图表渲染失败（CDN 不可用或渲染出错）。可复制下面的 mermaid 源码到 <a href="https://mermaid.live" target="_blank" rel="noopener">mermaid.live</a> 查看：</p>
+<p id="fallback-error" class="notice"></p>
+<pre>flowchart TB
+    START((&quot;⏵ 开始&quot;))
+    subgraph m_install_booking [&quot;install_booking · 安装预约外呼 (FSM)&quot;]
+        n_install_greet[&quot;install_greet&lt;br/&gt;外呼开场&lt;br/&gt;slots: service_needed&quot;]
+        n_install_confirm_addr[&quot;install_confirm_addr&lt;br/&gt;地址核对&lt;br/&gt;slots: address_confirmed, address&quot;]
+        n_install_check_arrival[&quot;install_check_arrival&lt;br/&gt;到货确认&lt;br/&gt;slots: arrived&quot;]
+        n_install_ask_eta[&quot;install_ask_eta&lt;br/&gt;到货时间询问&lt;br/&gt;slots: eta_known, eta&quot;]
+        n_install_time_window[&quot;install_time_window&lt;br/&gt;时间段询问&lt;br/&gt;slots: time_window&quot;]
+        n_install_available[&quot;install_available&lt;br/&gt;上门方便确认&lt;br/&gt;slots: available&quot;]
+        n_install_ask_time[&quot;install_ask_time&lt;br/&gt;上门时间协商&lt;br/&gt;slots: visit_time&quot;]
+        n_install_recommend[&quot;install_recommend&lt;br/&gt;档期推荐&lt;br/&gt;slots: recommended_slots, chosen_slot&quot;]
+        n_install_specific_date[&quot;install_specific_date&lt;br/&gt;具体日期约定&lt;br/&gt;slots: visit_date, visit_hour&quot;]
+        n_install_nearest[&quot;install_nearest&lt;br/&gt;最近档期安排&lt;br/&gt;slots: visit_time&quot;]
+        n_install_confirm_time[&quot;install_confirm_time&lt;br/&gt;上门时间确认&lt;br/&gt;slots: visit_time, address&quot;]
+        n_install_reschedule[&quot;install_reschedule&lt;br/&gt;改约重协商&lt;br/&gt;slots: rescheduled, prev_visit_time&quot;]
+        n_install_ask_callback[&quot;install_ask_callback&lt;br/&gt;下次联系时间&lt;br/&gt;slots: callback_time, callback_source&quot;]
+        n_install_callback_default[&quot;install_callback_default&lt;br/&gt;默认改约三天&lt;br/&gt;slots: callback_time, callback_source&quot;]
+        n_install_decline[&quot;install_decline&lt;br/&gt;通用拒绝承接&lt;br/&gt;slots: decline_reason&quot;]
+        n_install_end[&quot;install_end&lt;br/&gt;通话结束语 · 终态&quot;]
+        n_install_greet --&gt; n_install_confirm_addr
+        n_install_greet --&gt; n_install_end
+        n_install_greet --&gt; n_install_decline
+        n_install_confirm_addr --&gt; n_install_check_arrival
+        n_install_confirm_addr --&gt; n_install_end
+        n_install_confirm_addr --&gt; n_install_decline
+        n_install_check_arrival --&gt; n_install_ask_time
+        n_install_check_arrival --&gt; n_install_ask_eta
+        n_install_check_arrival --&gt; n_install_decline
+        n_install_ask_eta --&gt; n_install_time_window
+        n_install_ask_eta --&gt; n_install_available
+        n_install_ask_eta --&gt; n_install_decline
+        n_install_time_window --&gt; n_install_ask_time
+        n_install_time_window --&gt; n_install_available
+        n_install_time_window --&gt; n_install_decline
+        n_install_available --&gt; n_install_ask_time
+        n_install_available --&gt; n_install_ask_callback
+        n_install_available --&gt; n_install_decline
+        n_install_ask_time --&gt; n_install_recommend
+        n_install_ask_time --&gt; n_install_specific_date
+        n_install_ask_time --&gt; n_install_nearest
+        n_install_ask_time --&gt; n_install_decline
+        n_install_recommend --&gt; n_install_specific_date
+        n_install_recommend --&gt; n_install_nearest
+        n_install_recommend --&gt; n_install_ask_time
+        n_install_recommend --&gt; n_install_decline
+        n_install_specific_date --&gt; n_install_confirm_time
+        n_install_specific_date --&gt; n_install_ask_time
+        n_install_specific_date --&gt; n_install_decline
+        n_install_nearest --&gt; n_install_confirm_time
+        n_install_nearest --&gt; n_install_ask_time
+        n_install_nearest --&gt; n_install_decline
+        n_install_confirm_time --&gt; n_install_end
+        n_install_confirm_time --&gt; n_install_reschedule
+        n_install_confirm_time --&gt; n_install_decline
+        n_install_reschedule --&gt; n_install_ask_time
+        n_install_reschedule --&gt; n_install_decline
+        n_install_ask_callback --&gt; n_install_end
+        n_install_ask_callback --&gt; n_install_callback_default
+        n_install_ask_callback --&gt; n_install_decline
+        n_install_callback_default --&gt; n_install_end
+        n_install_decline --&gt; n_install_end
+    end
+    START --&gt; n_install_greet
+    classDef nodeEnd fill:#f5f3ff,stroke:#7c3aed,stroke-width:2px
+    classDef nodeAgent fill:#ecfdf5,stroke:#059669,stroke-width:2px
+    class n_install_end nodeEnd
+    style START fill:#fffbeb,stroke:#d97706,stroke-width:2px
+    style m_install_booking fill:#f0fdf4,stroke:#16a34a,stroke-width:3px
+</pre>
+</section>
+
+<section class="card">
+<h2><code>install_booking</code><span class="badge fsm">FSM</span>安装预约外呼</h2>
+<p class="desc">手绘FSM模板转写（外呼语义）：家具/电器购买客户回访——外呼开场→地址核对→到货确认→上门时间协商（推荐/具体日期/最近三路，可约守卫校验）→时间确认（支持改约）→通话结束；附通用拒绝承接与下次联系时间两条补充通道</p>
+<table><thead><tr><th>节点</th><th>名称</th><th>描述</th><th>槽位</th><th>后继</th><th>跳转模块</th><th>终态</th></tr></thead><tbody>
+<tr><td><code>install_greet</code></td><td>外呼开场</td><td>电话接通后的开场：自报家门（品牌售后客服）、说明来意（客户购买的商品需要上门安装）、确认客户方便接听</td><td>service_needed</td><td>install_confirm_addr, install_end, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_confirm_addr</code></td><td>地址核对</td><td>复述订单收货地址，请客户核对是否一致（师傅按此地址上门）</td><td>address_confirmed, address</td><td>install_check_arrival, install_end, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_check_arrival</code></td><td>到货确认</td><td>确认商品是否已经送达客户地址（师傅需货到后才能上门安装）</td><td>arrived</td><td>install_ask_time, install_ask_eta, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_ask_eta</code></td><td>到货时间询问</td><td>未到货时询问客户是否知道大概的到货时间</td><td>eta_known, eta</td><td>install_time_window, install_available, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_time_window</code></td><td>时间段询问</td><td>客户知道到货时间后，请客户讲一个方便接收/安装的时间段</td><td>time_window</td><td>install_ask_time, install_available, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_available</code></td><td>上门方便确认</td><td>确认客户近期是否方便安排师傅上门安装</td><td>available</td><td>install_ask_time, install_ask_callback, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_ask_time</code></td><td>上门时间协商</td><td>核心调度节点：询问客户希望师傅什么时间上门；说不出具体时间则主动推荐档期，给出具体日期则记录，要最近的则走最近档期</td><td>visit_time</td><td>install_recommend, install_specific_date, install_nearest, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_recommend</code></td><td>档期推荐</td><td>客户说不出时间或所给时间不可约时，按师傅排班（任务信息的available_slots）主动推荐可约档期，客户选定后进入对应节点</td><td>recommended_slots, chosen_slot</td><td>install_specific_date, install_nearest, install_ask_time, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_specific_date</code></td><td>具体日期约定</td><td>客户给出具体日期/时间，复述确认并锁定师傅上门时间；所给时间是否可约由统一阶段后的可约守卫校验（不可约会被改道到档期推荐）</td><td>visit_date, visit_hour</td><td>install_confirm_time, install_ask_time, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_nearest</code></td><td>最近档期安排</td><td>客户要最近的上门时间，按最近可约档期复述确认</td><td>visit_time</td><td>install_confirm_time, install_ask_time, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_confirm_time</code></td><td>上门时间确认</td><td>最终确认节点：复述锁定的上门时间与地址，确认无误后收尾；客户此时改约则转入改约节点重新协商</td><td>visit_time, address</td><td>install_end, install_reschedule, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_reschedule</code></td><td>改约重协商</td><td>客户在时间确认后要求改期：致歉并作废原时间，重新进入上门时间协商（新时间会重新过可约守卫）</td><td>rescheduled, prev_visit_time</td><td>install_ask_time, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_ask_callback</code></td><td>下次联系时间</td><td>客户现在没空或暂时不想预约时，询问并记录下次来电时间（这是联系时间，不是上门时间，不进可约守卫）。答复三分支由统一阶段的确定性守卫裁定：时间合适（未来两周内）→直接进通话结束播报客户时间；太远（超过两周）/过去/未给出→改走「默认改约三天」节点</td><td>callback_time, callback_source</td><td>install_end, install_callback_default, install_decline</td><td>-</td><td></td></tr>
+<tr><td><code>install_callback_default</code></td><td>默认改约三天</td><td>客户给的下次联系时间太远（超过两周）、已是过去时间、或说都行/未给出时间时，改约默认 3 天后再联系：播报默认联系时间并征询客户意见，客户应答后进入通话结束（两拍收尾，与通用拒绝承接同构；分支裁定与默认时间由统一阶段的确定性守卫给出）</td><td>callback_time, callback_source</td><td>install_end</td><td>-</td><td></td></tr>
+<tr><td><code>install_decline</code></td><td>通用拒绝承接</td><td>通用退出通道：客户不想预约/已安装过/商品有质量问题/已退货/非本人等意图，按场景共情回应，然后转入通话结束</td><td>decline_reason</td><td>install_end</td><td>-</td><td></td></tr>
+<tr><td><code>install_end</code></td><td>通话结束语</td><td>通话收尾：预约完成、约好下次联系、客户拒绝、地址不符等所有终止路径的礼貌收尾（is_end 终节点，进入即结束会话）</td><td>-</td><td>-</td><td>-</td><td>✓</td></tr>
+</tbody></table>
+<details><summary>回答示例</summary><dl class="examples">
+<dt><code>install_greet</code> · 外呼开场</dt><dd>您好，请问是{user_name}先生/女士吗？我是{product_name}品牌售后客服，您购买的商品可以安排师傅上门安装，现在方便聊两句吗？</dd>
+<dt><code>install_greet</code> · 外呼开场</dt><dd>您好打扰了，这里是{product_name}售后服务中心，给您来电是想帮您预约上门安装，您这边方便吗？</dd>
+<dt><code>install_confirm_addr</code> · 地址核对</dt><dd>先跟您核对一下地址：师傅上门是到{address}，对吗？</dd>
+<dt><code>install_confirm_addr</code> · 地址核对</dt><dd>麻烦确认下，安装地址是{address}这一处吧？</dd>
+<dt><code>install_check_arrival</code> · 到货确认</dt><dd>好的～请问您的{product_name}现在已经送到{address}了吗？</dd>
+<dt><code>install_check_arrival</code> · 到货确认</dt><dd>商品这边显示近期送达，您那边签收了吗？</dd>
+<dt><code>install_ask_eta</code> · 到货时间询问</dt><dd>还没到也没关系～您知道大概什么时候能送到吗？</dd>
+<dt><code>install_ask_eta</code> · 到货时间询问</dt><dd>您那边有物流的预计送达时间吗？跟我说说就好。</dd>
+<dt><code>install_time_window</code> · 时间段询问</dt><dd>那您哪个时间段在家方便？我好帮您约师傅～</dd>
+<dt><code>install_time_window</code> · 时间段询问</dt><dd>您说个大概的时间段（比如周末白天），我来协调师傅上门。</dd>
+<dt><code>install_available</code> · 上门方便确认</dt><dd>了解～那最近方便安排师傅上门安装吗？</dd>
+<dt><code>install_available</code> · 上门方便确认</dt><dd>您这边近期方便约个时间安装吗？</dd>
+<dt><code>install_ask_time</code> · 上门时间协商</dt><dd>请问您希望师傅什么时间上门呢？方便给个大概日期或时间段吗？</dd>
+<dt><code>install_ask_time</code> · 上门时间协商</dt><dd>您哪天在家方便？我可以帮您查最近的安装档期～</dd>
+<dt><code>install_recommend</code> · 档期推荐</dt><dd>要不这样，最近可以约明天上午10点或后天下午2-4点，您看哪个合适？</dd>
+<dt><code>install_recommend</code> · 档期推荐</dt><dd>我这边推荐周末上午的档口，师傅上门安装也从容些，您觉得呢？</dd>
+<dt><code>install_specific_date</code> · 具体日期约定</dt><dd>好的，那就给您约在{visit_date}{visit_hour}，师傅到时会提前联系您～</dd>
+<dt><code>install_specific_date</code> · 具体日期约定</dt><dd>收到～{visit_date}这个时间可以安排，我帮您登记上了。</dd>
+<dt><code>install_nearest</code> · 最近档期安排</dt><dd>最快可以安排最近的档期上门，时间临近师傅会提前联系您～</dd>
+<dt><code>install_nearest</code> · 最近档期安排</dt><dd>帮您插了最近的安装档期，您留意下师傅的电话哦。</dd>
+<dt><code>install_confirm_time</code> · 上门时间确认</dt><dd>跟您最后确认下：{visit_time}师傅到{address}上门安装，没问题吧？</dd>
+<dt><code>install_confirm_time</code> · 上门时间确认</dt><dd>那就定啦——{visit_time}上门，地址{address}，辛苦您届时在家等一下～</dd>
+<dt><code>install_reschedule</code> · 改约重协商</dt><dd>没问题，改期很方便～那我们重新约一下，您什么时间方便？</dd>
+<dt><code>install_reschedule</code> · 改约重协商</dt><dd>好的好的，原来的时间帮您取消，您看约到什么时候合适？</dd>
+<dt><code>install_ask_callback</code> · 下次联系时间</dt><dd>理解理解～那您看我们什么时候再联系您方便？我记一下时间。</dd>
+<dt><code>install_ask_callback</code> · 下次联系时间</dt><dd>好的，那不打扰了，您方便的时候我们什么时候再打给您？</dd>
+<dt><code>install_callback_default</code> · 默认改约三天</dt><dd>那我们先约 3 天后左右再给您来电话确认，您看可以吗？</dd>
+<dt><code>install_callback_default</code> · 默认改约三天</dt><dd>您说的这个时间有点远呢，我们先 3 天后再联系您方便吗？</dd>
+<dt><code>install_decline</code> · 通用拒绝承接</dt><dd>好的，那就不安排上门安装了～有需要您随时联系我们，感谢接听。</dd>
+<dt><code>install_decline</code> · 通用拒绝承接</dt><dd>了解，既然已经安装好了就不打扰了，祝您使用愉快～</dd>
+<dt><code>install_decline</code> · 通用拒绝承接</dt><dd>非常抱歉给您带来困扰，质量问题我这边帮您记录反馈，稍后会有专人联系您处理，请您留意来电。</dd>
+<dt><code>install_decline</code> · 通用拒绝承接</dt><dd>好的，退货的话安装预约就帮您取消了，祝您生活愉快。</dd>
+<dt><code>install_decline</code> · 通用拒绝承接</dt><dd>不好意思打扰了，那我跟{user_name}先生/女士再确认时间，感谢您的接听。</dd>
+<dt><code>install_end</code> · 通话结束语</dt><dd>好的，那就不打扰您了～稍后有需要随时来电，祝您生活愉快，再见～</dd>
+<dt><code>install_end</code> · 通话结束语</dt><dd>感谢您的接听与配合，那我们{visit_time}见，祝您使用愉快，再见～</dd>
+<dt><code>install_end</code> · 通话结束语</dt><dd>好的，地址问题建议您联系卖家或平台核实哦，感谢接听，再见～</dd>
+</dl></details>
+</section>
+</div>
+
+<script>
+(function () {
+  var SOURCES = [
+    "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
+    "https://unpkg.com/mermaid@11/dist/mermaid.min.js",
+    "https://registry.npmmirror.com/mermaid/latest/files/dist/mermaid.min.js"
+  ];
+  function hideLoading() {
+    var el = document.getElementById("loading");
+    if (el) { el.style.display = "none"; }
+  }
+  function showFallback(msg) {
+    document.getElementById("fallback").style.display = "block";
+    hideLoading();
+    var err = document.getElementById("fallback-error");
+    if (msg && err) { err.textContent = "错误信息: " + String(msg); }
+  }
+  function init() {
+    try {
+      mermaid.initialize({ startOnLoad: false, securityLevel: "loose", theme: "default" });
+      var task;
+      if (mermaid.run) {
+        task = mermaid.run({ querySelector: ".mermaid" });
+      } else {
+        task = new Promise(function (res, rej) {
+          try { mermaid.init(undefined, ".mermaid"); res(); } catch (e) { rej(e); }
+        });
+      }
+      task.then(hideLoading).catch(function (e) { showFallback(e && e.message ? e.message : e); });
+    } catch (e) {
+      showFallback(e && e.message ? e.message : e);
+    }
+  }
+  function load(i) {
+    if (i >= SOURCES.length) { showFallback("所有 CDN 均加载失败，可能处于离线环境"); return; }
+    var s = document.createElement("script");
+    s.src = SOURCES[i];
+    s.onload = function () { init(); };
+    s.onerror = function () { load(i + 1); };
+    document.head.appendChild(s);
+  }
+  load(0);
+})();
+</script>
+</body>
+</html>

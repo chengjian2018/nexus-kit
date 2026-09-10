@@ -51,7 +51,10 @@ class OpenAICompatibleProvider(BaseLLMProvider):
     def _build_url(self) -> str:
         """Build the full chat-completions URL."""
         base = self.api_base.rstrip("/")
-        if base.endswith("/v1"):
+        # Versioned bases (…/v1 OpenAI/dashscope, …/v4 zhipu/zai api/paas)
+        # already carry the version segment — append the endpoint directly
+        import re
+        if re.search(r"/v\d+$", base):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
 

@@ -109,7 +109,15 @@ def _fsm_nlu(node_name: str, query: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _unified(node_name: str, query: str, retry: bool) -> str:
+def _detect_pattern(prompt: str) -> str:
+    """Which app's FSM the unified prompt belongs to (repair_/install_ node
+    codes appear in the valid-values / candidate sections)."""
+    if "repair_" in prompt:
+        return "repair"
+    return "install"
+
+
+def _unified(node_name: str, query: str, retry: bool, prompt: str = "") -> str:
     """Scripted result for the unified stage (single call + structured output).
 
     Output protocol: {"reply", "next_node", "slots"}; the reply embeds the
@@ -190,10 +198,355 @@ def _unified(node_name: str, query: str, retry: bool) -> str:
         node_name, ("", None, "统一回复: 未知节点")
     )
     slots = {slot_key: query} if slot_key else {}
+
+    # install_booking_agent / repair_booking_agent nodes: scripted by
+    # (node name, customer-reply keyword) pairs. The two FSMs SHARE node
+    # names (外呼开场/地址核对/上门时间协商...), so the branch is picked by
+    # the node-code prefix visible in the prompt (候选节点编码/合法取值
+    # sections), not by name alone.
+    if _detect_pattern(prompt) == "repair":
+        repair = _repair_unified(node_name, query)
+        if repair is not None:
+            return repair
+    else:
+        install = _install_unified(node_name, query)
+        if install is not None:
+            return install
+
     return json.dumps(
         {"reply": reply, "next_node": next_node, "slots": slots},
         ensure_ascii=False,
     )
+
+
+def _install_unified(node_name: str, query: str):
+    """Scripted results for the install_booking_agent FSM (outbound call,
+    hand-drawn template transcription + supplemented scenarios).
+
+    Branch selection is (current node, customer reply) driven, mirroring the
+    sketch's labeled edges (是/否、知道/不知道、方便/不方便、具体日期/最近/
+    都不知道) plus the supplemented intents (generic decline / callback /
+    reschedule); returns None when the node is not an install node.
+    """
+    install_mapping = {
+        "外呼开场": (["需要", "是的", "对", "方便"], "install_confirm_addr",
+                    "service_needed", "外呼回复: 地址核对"),
+        "地址核对": (["对", "一致", "是的"], "install_check_arrival",
+                    "address_confirmed", "外呼回复: 到货确认"),
+        "到货确认": (["到了", "到货", "收到", "签收"], "install_ask_time",
+                    "arrived", "外呼回复: 上门时间协商"),
+        "到货时间询问": (["不知道", "不清楚"], "install_available",
+                        "eta_known", "外呼回复: 上门方便确认"),
+        "时间段询问": (["上午", "下午", "点"], "install_ask_time",
+                      "time_window", "外呼回复: 上门时间协商"),  # neg first below
+        "上门方便确认": (["方便", "可以"], "install_ask_time",
+                        "available", "外呼回复: 上门时间协商"),
+        "上门时间协商": ([], None, None, ""),  # decided below (three-way)
+        "档期推荐": ([], None, None, ""),      # decided below (two-way)
+        "具体日期约定": ([], None, None, ""),  # decided below (confirm/回环)
+        "最近档期安排": ([], None, None, ""),  # decided below (confirm/回环)
+        "上门时间确认": ([], None, None, ""),  # decided below (confirm/改约)
+        "改约重协商": ([], "install_ask_time", None,
+                      "外呼回复: 上门时间协商"),
+        "下次联系时间": ([], "install_end", "callback_time",
+                        "外呼回复: 通话结束语"),
+        "默认改约三天": ([], "install_end", None,
+                        "外呼回复: 通话结束语"),
+        "通用拒绝承接": ([], "install_end", "decline_reason",
+                        "外呼回复: 通话结束语"),
+        "通话结束语": ([], "", None, "外呼回复: 通话结束语"),
+    }
+    if node_name not in install_mapping:
+        return None
+
+    # Generic decline intents (supplemented): heard at ANY node → 通用拒绝承接
+    if any(k in query for k in ("不想预约", "不需要安装", "不用安装",
+                                "已安装", "装过了", "装好了",
+                                "质量问题", "有质量问题", "有问题",
+                                "退货", "退了", "不是本人", "打错")):
+        return json.dumps(
+            {"reply": "外呼回复: 通用拒绝承接", "next_node": "install_decline",
+             "slots": {"decline_reason": query}},
+            ensure_ascii=False)
+    # Callback intent (supplemented): 现在没空/暂时不想约（没拒绝安装） → 下次联系时间
+    if any(k in query for k in ("现在没空", "现在不方便", "晚点再说",
+                                "以后再约", "改天再打", "再说吧")):
+        return json.dumps(
+            {"reply": "外呼回复: 下次联系时间", "next_node": "install_ask_callback",
+             "slots": {}},
+            ensure_ascii=False)
+    # Off-flow business questions (clarify): mid-flow FAQ-type asks trigger
+    # the clarify signal — 费用/保修/时长/自装/改地址/催物流
+    _FAQ_TOPIC_RULES = [
+        ("费用", ("收费", "要钱吗", "多少钱", "免费吗", "收钱")),
+        ("保修", ("保修", "质保", "三包")),
+        ("安装时长", ("装多久", "多长时间", "几个小时", "要几个小时")),
+        ("自装咨询", ("自己装", "自装", "不用师傅")),
+        ("改地址", ("换个地址", "换地址", "改地址", "另一个地址")),
+        ("催物流", ("物流", "还没到货吗", "什么时候发货")),
+        ("其他", ("股票", "公司信息")),  # miss-the-table probe → fallback track
+    ]
+    for topic, kws in _FAQ_TOPIC_RULES:
+        hit = next((kw for kw in kws if kw in query), None)
+        if hit:
+            return json.dumps(
+                {"reply": "外呼承接: 这个问题我说一下",
+                 "next_node": "clarify",
+                 "slots": {"topic": topic, "keywords": [hit]}},
+                ensure_ascii=False)
+
+    # 上门时间协商 three-way branch (sketch: 具体日期 / 最近 / 都不知道→推荐)
+    if node_name == "上门时间协商":
+        if "最近" in query:
+            return json.dumps(
+                {"reply": "外呼回复: 最近档期安排", "next_node": "install_nearest",
+                 "slots": {"visit_time": query}},
+                ensure_ascii=False)
+        if any(k in query for k in ("不知道", "随便", "都行", "你们定",
+                                    "看着安排", "看着办", "你推荐")):
+            return json.dumps(
+                {"reply": "外呼回复: 档期推荐", "next_node": "install_recommend",
+                 "slots": {}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 具体日期约定", "next_node": "install_specific_date",
+             "slots": {"visit_date": query}},
+            ensure_ascii=False)
+    # 档期推荐: customer picks one of the recommended slots -> 具体日期约定
+    if node_name == "档期推荐":
+        if any(k in query for k in ("第一个", "上午", "明天", "后天", "点")):
+            return json.dumps(
+                {"reply": "外呼回复: 具体日期约定",
+                 "next_node": "install_specific_date",
+                 "slots": {"visit_date": query, "visit_hour": ""}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 上门时间协商", "next_node": "install_ask_time",
+             "slots": {}},
+            ensure_ascii=False)
+    # 具体日期约定 / 最近档期安排: 可约→确认，不可约→回环再协商
+    if node_name in ("具体日期约定", "最近档期安排"):
+        if any(k in query for k in ("不行", "不可以", "没空", "换")):
+            return json.dumps(
+                {"reply": "外呼回复: 上门时间协商", "next_node": "install_ask_time",
+                 "slots": {}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 上门时间确认", "next_node": "install_confirm_time",
+             "slots": {"visit_date": query, "visit_hour": ""}},
+            ensure_ascii=False)
+    # 上门时间确认: 确认→结束语；改约（supplemented）→改约重协商
+    if node_name == "上门时间确认":
+        if any(k in query for k in ("改", "换", "不行", "再想想")):
+            return json.dumps(
+                {"reply": "外呼回复: 改约重协商", "next_node": "install_reschedule",
+                 "slots": {"rescheduled": "是"}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 通话结束语", "next_node": "install_end",
+             "slots": {"visit_time": "已约定"}},
+            ensure_ascii=False)
+
+    keywords, next_node, slot_key, reply = install_mapping[node_name]
+    # Negative-first overrides: a negative reply containing a positive
+    # keyword ("还没到货" has "到货"; "说不好时间段" has "时间")
+    negatives = {
+        "到货确认": ("还没", "没到", "没有"),
+        "时间段询问": ("说不好", "不好说", "不确定", "没有", "没啥"),
+        "地址核对": ("不对", "不对的", "错了", "不是这个"),
+        "上门方便确认": ("不方便", "没时间", "不在", "近期都"),
+        "外呼开场": ("不需要", "不用", "别打了"),
+    }
+    if node_name in negatives and any(k in query for k in negatives[node_name]):
+        hit = False
+    else:
+        hit = any(k in query for k in keywords) if keywords else True
+    if not hit:
+        # negative branch: 地址不符 → 通话结束语,
+        # except the sketch's in-flow negative edges: 到货确认-未到货 → 到货
+        # 时间询问、到货时间询问-知道 → 时间段询问、时间段询问-不提供 →
+        # 上门方便确认、上门方便确认-不方便 → 下次联系时间（supplemented）
+        in_flow_negatives = {
+            "到货确认": ("install_ask_eta", "外呼回复: 到货时间询问",
+                         {"arrived": "否"}),
+            "到货时间询问": ("install_time_window", "外呼回复: 时间段询问",
+                             {"eta": query}),
+            "时间段询问": ("install_available", "外呼回复: 上门方便确认",
+                           {}),
+            "上门方便确认": ("install_ask_callback", "外呼回复: 下次联系时间",
+                             {}),
+        }
+        if node_name in in_flow_negatives:
+            neg_node, neg_reply, neg_slots = in_flow_negatives[node_name]
+            return json.dumps(
+                {"reply": neg_reply, "next_node": neg_node, "slots": neg_slots},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 通话结束语", "next_node": "install_end",
+             "slots": {}},
+            ensure_ascii=False)
+    slots = {slot_key: query} if slot_key else {}
+    return json.dumps(
+        {"reply": reply, "next_node": next_node, "slots": slots},
+        ensure_ascii=False)
+
+
+def _repair_unified(node_name: str, query: str):
+    """Scripted results for the repair_booking_agent FSM (install variant:
+    no arrival subtree, confirm-time → fault collection → close).
+
+    Same (node name, customer-reply keyword) scripting shape as
+    _install_unified, with the repair-specific branches:
+    - decline intents drop 已安装/质量问题/退货, add 已自行修好/已找别人修过;
+    - 上门时间协商 carries the callback branch inline (no separate
+      available node in the repair FSM);
+    - 上门时间确认 → 故障信息询问 → 故障信息确认 → 通话结束.
+    Returns None when the node is not a repair node.
+    """
+    repair_mapping = {
+        "外呼开场": (["需要", "是的", "对", "方便"], "repair_confirm_addr",
+                    "service_needed", "外呼回复: 地址核对"),
+        "地址核对": (["对", "一致", "是的"], "repair_ask_time",
+                    "address_confirmed", "外呼回复: 上门时间协商"),
+        "上门时间协商": ([], None, None, ""),  # decided below (four-way)
+        "档期推荐": ([], None, None, ""),      # decided below (two-way)
+        "具体日期约定": ([], None, None, ""),  # decided below (confirm/回环)
+        "最近档期安排": ([], None, None, ""),  # decided below (confirm/回环)
+        "上门时间确认": ([], None, None, ""),  # decided below (fault/改约)
+        "故障信息询问": ([], None, None, ""),  # decided below (描述/说不清)
+        "改约重协商": ([], "repair_ask_time", None,
+                      "外呼回复: 上门时间协商"),
+        "故障信息确认": ([], "repair_end", None,
+                      "外呼回复: 通话结束语"),
+        "下次联系时间": ([], "repair_end", "callback_time",
+                      "外呼回复: 通话结束语"),
+        "默认改约三天": ([], "repair_end", None,
+                      "外呼回复: 通话结束语"),
+        "通用拒绝承接": ([], "repair_end", "decline_reason",
+                      "外呼回复: 通话结束语"),
+        "通话结束语": ([], "", None, "外呼回复: 通话结束语"),
+    }
+    if node_name not in repair_mapping:
+        return None
+
+    # Generic decline intents (repair variant): heard at ANY node → 通用拒绝承接
+    if any(k in query for k in ("不想维修", "不需要维修", "不用维修",
+                                "自己修好了", "修好了", "已经修好",
+                                "别人修", "找人修了", "修过了",
+                                "不是本人", "打错")):
+        return json.dumps(
+            {"reply": "外呼回复: 通用拒绝承接", "next_node": "repair_decline",
+             "slots": {"decline_reason": query}},
+            ensure_ascii=False)
+    # Callback intent: 现在没空/暂时不想约（没拒绝维修）→ 下次联系时间
+    if any(k in query for k in ("现在没空", "现在不方便", "晚点再说",
+                                "以后再约", "改天再打", "再说吧")):
+        return json.dumps(
+            {"reply": "外呼回复: 下次联系时间", "next_node": "repair_ask_callback",
+             "slots": {}},
+            ensure_ascii=False)
+    # Off-flow business questions (clarify): repair FAQ families
+    _FAQ_TOPIC_RULES = [
+        ("费用", ("收费", "要钱吗", "多少钱", "免费吗", "收钱", "上门费")),
+        ("保修", ("保修", "质保", "三包", "过保")),
+        ("维修时长", ("修多久", "多长时间", "几个小时", "要几个小时")),
+        ("配件", ("带配件", "带零件", "换零件", "有配件吗", "原厂件")),
+        ("自修咨询", ("自己修", "自修", "不用师傅", "指导一下怎么修")),
+        ("进度查询", ("什么时候来", "几点到", "师傅到哪了")),
+        ("其他", ("股票", "公司信息")),  # miss-the-table probe → fallback track
+    ]
+    for topic, kws in _FAQ_TOPIC_RULES:
+        hit = next((kw for kw in kws if kw in query), None)
+        if hit:
+            return json.dumps(
+                {"reply": "外呼承接: 这个问题我说一下",
+                 "next_node": "clarify",
+                 "slots": {"topic": topic, "keywords": [hit]}},
+                ensure_ascii=False)
+
+    # 上门时间协商 four-way branch (具体日期 / 最近 / 都不知道→推荐 / 没空→callback)
+    if node_name == "上门时间协商":
+        if "最近" in query:
+            return json.dumps(
+                {"reply": "外呼回复: 最近档期安排", "next_node": "repair_nearest",
+                 "slots": {"visit_time": query}},
+                ensure_ascii=False)
+        if any(k in query for k in ("不知道", "随便", "都行", "你们定",
+                                    "看着安排", "看着办", "你推荐")):
+            return json.dumps(
+                {"reply": "外呼回复: 档期推荐", "next_node": "repair_recommend",
+                 "slots": {}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 具体日期约定", "next_node": "repair_specific_date",
+             "slots": {"visit_date": query}},
+            ensure_ascii=False)
+    # 档期推荐: customer picks one of the recommended slots -> 具体日期约定
+    if node_name == "档期推荐":
+        if any(k in query for k in ("第一个", "上午", "明天", "后天", "点")):
+            return json.dumps(
+                {"reply": "外呼回复: 具体日期约定",
+                 "next_node": "repair_specific_date",
+                 "slots": {"visit_date": query, "visit_hour": ""}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 上门时间协商", "next_node": "repair_ask_time",
+             "slots": {}},
+            ensure_ascii=False)
+    # 具体日期约定 / 最近档期安排: 可约→确认，不可约→回环再协商
+    if node_name in ("具体日期约定", "最近档期安排"):
+        if any(k in query for k in ("不行", "不可以", "没空", "换")):
+            return json.dumps(
+                {"reply": "外呼回复: 上门时间协商", "next_node": "repair_ask_time",
+                 "slots": {}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 上门时间确认", "next_node": "repair_confirm_time",
+             "slots": {"visit_date": query, "visit_hour": ""}},
+            ensure_ascii=False)
+    # 上门时间确认: 确认→故障信息询问；改约→改约重协商
+    if node_name == "上门时间确认":
+        if any(k in query for k in ("改", "换", "不行", "再想想")):
+            return json.dumps(
+                {"reply": "外呼回复: 改约重协商", "next_node": "repair_reschedule",
+                 "slots": {"rescheduled": "是"}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 故障信息询问", "next_node": "repair_ask_fault",
+             "slots": {"visit_time": "已约定"}},
+            ensure_ascii=False)
+    # 故障信息询问: 说不清→留待（next_node 空，保持当前节点继续引导）
+    if node_name == "故障信息询问":
+        if any(k in query for k in ("说不清", "不知道哪", "说不出来")):
+            return json.dumps(
+                {"reply": "外呼回复: 故障信息询问", "next_node": "",
+                 "slots": {}},
+                ensure_ascii=False)
+        return json.dumps(
+            {"reply": "外呼回复: 故障信息确认",
+             "next_node": "repair_confirm_fault",
+             "slots": {"fault_description": query}},
+            ensure_ascii=False)
+
+    keywords, next_node, slot_key, reply = repair_mapping[node_name]
+    # Negative-first overrides (same reason as install's table)
+    negatives = {
+        "地址核对": ("不对", "不对的", "错了", "不是这个"),
+        "外呼开场": ("不需要", "不用", "别打了"),
+    }
+    if node_name in negatives and any(k in query for k in negatives[node_name]):
+        hit = False
+    else:
+        hit = any(k in query for k in keywords) if keywords else True
+    if not hit:
+        return json.dumps(
+            {"reply": "外呼回复: 通话结束语", "next_node": "repair_end",
+             "slots": {}},
+            ensure_ascii=False)
+    slots = {slot_key: query} if slot_key else {}
+    return json.dumps(
+        {"reply": reply, "next_node": next_node, "slots": slots},
+        ensure_ascii=False)
 
 
 def _extract_xianyu_section(prompt: str, marker: str) -> str:
@@ -242,13 +595,14 @@ def scripted_response(prompt: str) -> str:
     if "修正要求" in prompt:
         query = _extract_query(prompt).replace("解析失败重试", "")
         if '"reply"' in prompt:
-            return _unified(node_name, query, retry=True)
+            return _unified(node_name, query, retry=True, prompt=prompt)
         return _route_nlu(query, retry=True)
 
     # Unified-stage prompt: three-field JSON protocol with reply + next_node
     # (checked before the NLU branch)
     if '"reply"' in prompt and '"next_node"' in prompt:
-        return _unified(node_name, _extract_query(prompt), retry=False)
+        return _unified(node_name, _extract_query(prompt), retry=False,
+                        prompt=prompt)
 
     # NLU prompt: requires next_node JSON output
     if '"next_node"' in prompt:
@@ -263,6 +617,13 @@ def scripted_response(prompt: str) -> str:
         if "召回内容为空或无相关内容" in prompt or "（无相关知识库内容）" in prompt:
             return "承接：该问题暂无法详细解答。请问您的预算大概是多少呢？"
         return "解答：除车价外仅收取上牌费与服务费。请问您的预算大概是多少呢？"
+
+    # Install clarify prompt (custom keyword-gated stage; carries the FAQ
+    # answer section or the fallback 未命中 wording)
+    if "FAQ 答案" in prompt:
+        return "澄清解答: 收费问题已答复，咱们继续约时间。"
+    if "关键词卡控未命中" in prompt:
+        return "澄清兜底: 这个问题稍后核实，咱们继续约时间。"
 
     # NLG prompt: the reply text carries the current node name, so assertions
     # can tell which node NLG used

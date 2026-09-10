@@ -57,6 +57,87 @@ _PATTERN_LLM_SUBKEYS = {"modules", "nodes"}
 
 
 # ============================================================================
+# MCP server configuration (deep research / generic tool gateway)
+# ============================================================================
+
+# Legal transports for mcp_servers.<name>.transport
+_MCP_TRANSPORTS = {"stdio", "sse", "streamable_http"}
+
+# Fields allowed per mcp_servers.<name> entry (after normalization every entry
+# also carries a tool_name_prefix, default "")
+_MCP_SERVER_FIELDS = {
+    "transport", "command", "args", "env", "url", "headers",
+    "allowed_patterns", "tool_name_prefix",
+}
+
+
+def _validate_mcp_servers(raw: Any) -> Dict[str, Any]:
+    """Validate and normalize the ``mcp_servers:`` node (same fail-fast
+    style as _validate_llm_config — a config error surfaces at load time,
+    never silently swallowed).
+
+    Shape (see host/config/local_config.yaml for a commented example):
+
+    .. code-block:: yaml
+
+        mcp_servers:
+          websearch:                  # server name -> toolset mcp-websearch
+            transport: stdio          # stdio | sse | streamable_http
+            command: npx
+            args: ["-y", "@mcp/server-fetch"]
+            allowed_patterns: ["deep_research"]   # pattern codes; ["*"] = all
+            tool_name_prefix: ""      # optional cross-server collision guard
+
+    Returns a normalized copy (each entry gets ``tool_name_prefix`` defaulted
+    to ""). An absent / empty node returns ``{}`` — the whole MCP chain is a
+    no-op until servers are configured.
+
+    Raises:
+        ValueError: transport outside _MCP_TRANSPORTS; stdio missing
+            ``command``; sse/streamable_http missing ``url``; entry not a
+            dict; ``allowed_patterns`` not a list of strings.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"mcp_servers 应为字典（server 名 -> 配置），实际为: {type(raw).__name__}"
+        )
+
+    normalized: Dict[str, Any] = {}
+    for name, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                f"mcp_servers.{name} 应为字典，实际为: {type(cfg).__name__}"
+            )
+        transport = cfg.get("transport")
+        if transport not in _MCP_TRANSPORTS:
+            raise ValueError(
+                f"mcp_servers.{name}.transport 非法: {transport!r}，"
+                f"合法值: {sorted(_MCP_TRANSPORTS)}"
+            )
+        if transport == "stdio" and not cfg.get("command"):
+            raise ValueError(f"mcp_servers.{name} 使用 stdio 传输，缺少必填字段 command")
+        if transport in ("sse", "streamable_http") and not cfg.get("url"):
+            raise ValueError(
+                f"mcp_servers.{name} 使用 {transport} 传输，缺少必填字段 url"
+            )
+        allowed = cfg.get("allowed_patterns")
+        if allowed is not None:
+            if (not isinstance(allowed, list)
+                    or not all(isinstance(p, str) for p in allowed)
+                    or not allowed):
+                raise ValueError(
+                    f"mcp_servers.{name}.allowed_patterns 应为非空字符串列表"
+                    f"（pattern code 或 \"*\"），实际为: {allowed!r}"
+                )
+        entry = {k: v for k, v in cfg.items() if k in _MCP_SERVER_FIELDS}
+        entry["tool_name_prefix"] = str(cfg.get("tool_name_prefix", "") or "")
+        normalized[name] = entry
+    return normalized
+
+
+# ============================================================================
 # Session persistence configuration
 # ============================================================================
 
@@ -279,6 +360,10 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
         "llm_providers": llm_providers,
         "llm_default": llm_default,
         "pattern_llm": pattern_llm,
+        # MCP servers (optional; empty dict = the whole MCP chain is a no-op).
+        # Validated + normalized by _validate_mcp_servers (fail-fast on
+        # transport/required-field errors)
+        "mcp_servers": _validate_mcp_servers(raw.get("mcp_servers")),
         # Session persistence SQLite path (optional, default data/dialogue.db)
         "session_db_path": raw.get("session_db_path", DEFAULT_SESSION_DB_PATH),
         # Knowledge base SQLite path (optional, default data/knowledge.db)
@@ -381,6 +466,15 @@ def get_knowledge_db_path(config_path: str = "") -> str:
     Equivalent to ``load_config(config_path)["knowledge_db_path"]``.
     """
     return load_config(config_path)["knowledge_db_path"]
+
+
+def get_mcp_servers(config_path: str = "") -> Dict[str, Any]:
+    """Convenience method: return the validated ``mcp_servers`` config.
+
+    Equivalent to ``load_config(config_path)["mcp_servers"]`` — an empty dict
+    when no servers are configured (the MCP chain then stays a no-op).
+    """
+    return load_config(config_path)["mcp_servers"]
 
 
 def get_session_compress_config(config_path: str = "") -> tuple:

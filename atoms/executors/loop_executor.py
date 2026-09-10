@@ -74,6 +74,12 @@ class DefaultLoopExecutor(ModuleExecutor):
                             module_code=module.module_code, cxt=cxt),
         ) if hooks else []
 
+        # MCP server 是启动期后台异步注册的:首轮对话若抢在连接完成之前,
+        # 这里会解析出一个缺失 MCP 工具的集合。等待连接终态——未配置
+        # server 时零开销(mcp_tool 内部吞异常,不阻塞对话)
+        from atoms.tools.mcp_tool import ensure_mcp_ready
+        ensure_mcp_ready()
+
         own_tools = _resolve_tools(module, pattern)
         lent_schemas, lent_by = _resolve_lent_tools(module, pattern)
         # Plan-⑥: transfer_to_XX tools are gone. Projection-served adjacency

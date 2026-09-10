@@ -7,7 +7,18 @@
           <value>
             <TabSessionState>
               <option name="provider" value="claude" />
-              <option name="sessionId" value="f4636c57-9290-4afa-b580-579c477b4a2c" />
+              <option name="sessionId" value="0ba32281-d806-4ee0-9ac9-85de1dc1960a" />
+              <option name="cwd" value="$PROJECT_DIR$" />
+              <option name="model" value="claude-opus-5[1m]" />
+              <option name="permissionMode" value="bypassPermissions" />
+            </TabSessionState>
+          </value>
+        </entry>
+        <entry key="1">
+          <value>
+            <TabSessionState>
+              <option name="provider" value="claude" />
+              <option name="sessionId" value="055fca01-08a2-4e17-a888-0237f05c955c" />
               <option name="cwd" value="$PROJECT_DIR$" />
               <option name="model" value="claude-opus-5[1m]" />
               <option name="permissionMode" value="bypassPermissions" />
@@ -16,5 +27,6 @@
         </entry>
       </map>
     </option>
+    <option name="tabCount" value="2" />
   </component>
 </project>

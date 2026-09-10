@@ -1,0 +1,68 @@
+flowchart TB
+    START(("⏵ 开始"))
+    subgraph m_install_booking ["install_booking · 安装预约外呼 (FSM)"]
+        n_install_greet["install_greet<br/>外呼开场<br/>slots: service_needed"]
+        n_install_confirm_addr["install_confirm_addr<br/>地址核对<br/>slots: address_confirmed, address"]
+        n_install_check_arrival["install_check_arrival<br/>到货确认<br/>slots: arrived"]
+        n_install_ask_eta["install_ask_eta<br/>到货时间询问<br/>slots: eta_known, eta"]
+        n_install_time_window["install_time_window<br/>时间段询问<br/>slots: time_window"]
+        n_install_available["install_available<br/>上门方便确认<br/>slots: available"]
+        n_install_ask_time["install_ask_time<br/>上门时间协商<br/>slots: visit_time"]
+        n_install_recommend["install_recommend<br/>档期推荐<br/>slots: recommended_slots, chosen_slot"]
+        n_install_specific_date["install_specific_date<br/>具体日期约定<br/>slots: visit_date, visit_hour"]
+        n_install_nearest["install_nearest<br/>最近档期安排<br/>slots: visit_time"]
+        n_install_confirm_time["install_confirm_time<br/>上门时间确认<br/>slots: visit_time, address"]
+        n_install_reschedule["install_reschedule<br/>改约重协商<br/>slots: rescheduled, prev_visit_time"]
+        n_install_ask_callback["install_ask_callback<br/>下次联系时间<br/>slots: callback_time, callback_source"]
+        n_install_callback_default["install_callback_default<br/>默认改约三天<br/>slots: callback_time, callback_source"]
+        n_install_decline["install_decline<br/>通用拒绝承接<br/>slots: decline_reason"]
+        n_install_end["install_end<br/>通话结束语 · 终态"]
+        n_install_greet --> n_install_confirm_addr
+        n_install_greet --> n_install_end
+        n_install_greet --> n_install_decline
+        n_install_confirm_addr --> n_install_check_arrival
+        n_install_confirm_addr --> n_install_end
+        n_install_confirm_addr --> n_install_decline
+        n_install_check_arrival --> n_install_ask_time
+        n_install_check_arrival --> n_install_ask_eta
+        n_install_check_arrival --> n_install_decline
+        n_install_ask_eta --> n_install_time_window
+        n_install_ask_eta --> n_install_available
+        n_install_ask_eta --> n_install_decline
+        n_install_time_window --> n_install_ask_time
+        n_install_time_window --> n_install_available
+        n_install_time_window --> n_install_decline
+        n_install_available --> n_install_ask_time
+        n_install_available --> n_install_ask_callback
+        n_install_available --> n_install_decline
+        n_install_ask_time --> n_install_recommend
+        n_install_ask_time --> n_install_specific_date
+        n_install_ask_time --> n_install_nearest
+        n_install_ask_time --> n_install_decline
+        n_install_recommend --> n_install_specific_date
+        n_install_recommend --> n_install_nearest
+        n_install_recommend --> n_install_ask_time
+        n_install_recommend --> n_install_decline
+        n_install_specific_date --> n_install_confirm_time
+        n_install_specific_date --> n_install_ask_time
+        n_install_specific_date --> n_install_decline
+        n_install_nearest --> n_install_confirm_time
+        n_install_nearest --> n_install_ask_time
+        n_install_nearest --> n_install_decline
+        n_install_confirm_time --> n_install_end
+        n_install_confirm_time --> n_install_reschedule
+        n_install_confirm_time --> n_install_decline
+        n_install_reschedule --> n_install_ask_time
+        n_install_reschedule --> n_install_decline
+        n_install_ask_callback --> n_install_end
+        n_install_ask_callback --> n_install_callback_default
+        n_install_ask_callback --> n_install_decline
+        n_install_callback_default --> n_install_end
+        n_install_decline --> n_install_end
+    end
+    START --> n_install_greet
+    classDef nodeEnd fill:#f5f3ff,stroke:#7c3aed,stroke-width:2px
+    classDef nodeAgent fill:#ecfdf5,stroke:#059669,stroke-width:2px
+    class n_install_end nodeEnd
+    style START fill:#fffbeb,stroke:#d97706,stroke-width:2px
+    style m_install_booking fill:#f0fdf4,stroke:#16a34a,stroke-width:3px

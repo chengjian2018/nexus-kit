@@ -174,9 +174,10 @@ agents.py 现仅为过渡性 re-export。
 | `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 |
 | `atoms/executors/` | 三默认 executor（default_loop / default_fsm / default_route） |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt |
-| `atoms/tools/` | calculator / weather / knowledge 工具 |
+| `atoms/tools/` | knowledge / mcp 工具（MCP 动态注册 toolset `mcp-*`） |
 | `atoms/providers/` | OpenAICompatible Provider |
 | `atoms/knowledge/` | SQLite 知识库 |
+| `atoms/mcp/` | MCP 连接管理器（专职线程 + event loop，工具动态注册 toolset `mcp-<server>`） |
 | `apps/<name>/` | 业务 pattern（route.py）+ prompt 资产 + 渠道适配 |
 | `host/` | main.py / cli.py / governor.py / config/ |
 
