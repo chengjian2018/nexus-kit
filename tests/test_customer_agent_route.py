@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from async_utils import arun
 from nexus.engine.loop import _resolve_tools, run_agent
 from nexus.engine.session import Session
 from atoms.knowledge.store import KnowledgeStore
@@ -157,12 +158,11 @@ def test_run_agent_sends_migrated_messages(store):
     session.cxt.metadata["task_info"] = {
         "channel": "xianyu", "account_id": "acct_001"}
     session.cxt.user_query = "亲，有什么推荐吗"
-    session.cxt.add_message("user", "亲，有什么推荐吗", stage="chat")
+    arun(session.cxt.add_message("user", "亲，有什么推荐吗", stage="chat"))
 
     provider = _ScriptedProvider([{"content": "亲～推荐阅读器哦📖",
                                    "tool_calls": []}])
     with patch("atoms.executors.loop_executor.build_provider", return_value=provider):
-        from async_utils import arun
         result = arun(run_agent(session, customer_service,
                                 session.cxt.metadata["llm_override"]))
 

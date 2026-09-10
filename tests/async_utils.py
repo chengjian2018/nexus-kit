@@ -15,10 +15,17 @@ purely local.
 """
 
 import asyncio
+import concurrent.futures
+import os
 import threading
 
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_lock = threading.Lock()
+
+# 审查 M-25：被测协程挂起时，无超时的 .result() 会挂死整个 pytest 进程
+# 而不是失败。默认 30s（经 NEXUS_TEST_ARUN_TIMEOUT 可调）——远大于任何
+# 正常用例，只兜"永不完成"的协程。
+_DEFAULT_TIMEOUT = float(os.environ.get("NEXUS_TEST_ARUN_TIMEOUT", "30"))
 
 
 def _shared_loop() -> asyncio.AbstractEventLoop:
@@ -32,7 +39,20 @@ def _shared_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def arun(coro):
+def arun(coro, timeout: float | None = None):
     """Run a coroutine to completion on the shared background loop (sync
-    bridge for tests)."""
-    return asyncio.run_coroutine_threadsafe(coro, _shared_loop()).result()
+    bridge for tests).
+
+    Raises AssertionError on timeout (with the coroutine named for
+    diagnostics) instead of hanging the pytest process forever.
+    """
+    timeout = _DEFAULT_TIMEOUT if timeout is None else timeout
+    fut = asyncio.run_coroutine_threadsafe(coro, _shared_loop())
+    try:
+        return fut.result(timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise AssertionError(
+            f"arun timed out after {timeout}s — the coroutine likely never "
+            f"completed (hung await?): {coro}"
+        )

@@ -269,7 +269,7 @@ def test_restore_skips_unregistered_pattern(client, store, registry_guard):
     import host.main as main
     from nexus.engine.session import Session
 
-    store.create_session(Session(session_id="ghost", pattern_code="no_such_pattern"))
+    arun(store.create_session(Session(session_id="ghost", pattern_code="no_such_pattern")))
     restored = arun(main._restore_sessions())
     assert "ghost" not in main.governor.sessions
     assert restored == 0

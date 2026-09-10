@@ -18,6 +18,8 @@ Coverage:
 import json
 from unittest.mock import patch
 
+from async_utils import arun
+
 from nexus.engine.session import Session
 from nexus.context import DeferredModuleSwitch, ModuleJumpEvent
 from nexus.model.module import AgentModule
@@ -190,7 +192,7 @@ def test_defer_writes_deferred_switch_and_keeps_answering():
     a DeferredModuleSwitch lands in actions; other tool_calls of the same
     response execute for real."""
     s = _mk_session()
-    s.cxt.add_message("user", "售后流程太复杂，帮我全程处理", stage="chat")
+    arun(s.cxt.add_message("user", "售后流程太复杂，帮我全程处理", stage="chat"))
     provider = ScriptedProvider([
         {"content": "好的，先帮您查工单", "tool_calls": [
             {"id": "c1", "function": {"name": "mock_lent_tool",
@@ -256,7 +258,7 @@ def test_defer_hallucinated_target_backfills_and_continues():
     """A defer target outside the projection adjacency: error backfill, the
     loop continues, the model self-corrects to a direct reply."""
     s = _mk_session()
-    s.cxt.add_message("user", "我要办个神奇业务", stage="chat")
+    arun(s.cxt.add_message("user", "我要办个神奇业务", stage="chat"))
     provider = ScriptedProvider([
         {"content": "尝试登记切换", "tool_calls": [{
             "id": "c1", "function": {
@@ -277,7 +279,7 @@ def test_defer_rejection_backfills_all_tool_calls():
     """Same-response normal tool + invalid defer: both get tool rows (every
     tool_call_id answered — API 400 guard), the normal one executed."""
     s = _mk_session()
-    s.cxt.add_message("user", "查工单顺便办个神奇业务", stage="chat")
+    arun(s.cxt.add_message("user", "查工单顺便办个神奇业务", stage="chat"))
     provider = ScriptedProvider([
         {"content": "查询并尝试登记", "tool_calls": [
             {"id": "c1", "function": {"name": "mock_lent_tool",
@@ -300,7 +302,7 @@ def test_defer_rejection_backfills_all_tool_calls():
 def test_force_close_no_defer_tool_and_prompt():
     """force_close: no defer tool injected, the close-out suffix present."""
     s = _mk_session()
-    s.cxt.add_message("user", "帮我处理售后", stage="chat")
+    arun(s.cxt.add_message("user", "帮我处理售后", stage="chat"))
     provider = ScriptedProvider([
         {"content": "好的，我直接处理。", "tool_calls": []},
     ])
@@ -318,7 +320,7 @@ def test_force_close_no_defer_tool_and_prompt():
 def test_run_agent_direct_reply_with_lent_tool():
     """inject path: A borrows a tool and answers -> TurnResult(content) plus lent_by bookkeeping."""
     s = _mk_session()
-    s.cxt.add_message("user", "查下我的工单", stage="chat")
+    arun(s.cxt.add_message("user", "查下我的工单", stage="chat"))
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [{"id": "c1", "function": {
             "name": "mock_lent_tool", "arguments": "{}"}}]},
@@ -349,7 +351,7 @@ def test_projection_recall_scoped_to_borrower():
     s = _mk_session()
     s.cxt.metadata["served_by_projection"] = {
         "module": "reception", "source": "after_sales"}
-    s.cxt.add_message("user", "继续", stage="chat")
+    arun(s.cxt.add_message("user", "继续", stage="chat"))
     provider = ScriptedProvider([
         {"content": "好的，继续为您处理。", "tool_calls": []},
     ])
@@ -362,7 +364,7 @@ def test_tool_round_ids_paired_in_history():
     tool row metadata ids."""
     from nexus.context import decode_tool_call_content
     s = _mk_session()
-    s.cxt.add_message("user", "查下我的工单", stage="chat")
+    arun(s.cxt.add_message("user", "查下我的工单", stage="chat"))
     provider = ScriptedProvider([
         {"content": "查询中", "tool_calls": [{"id": "c1", "function": {
             "name": "mock_lent_tool", "arguments": '{}'}}]},
