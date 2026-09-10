@@ -78,7 +78,7 @@ def _validate_mcp_servers(raw: Any) -> Dict[str, Any]:
     style as _validate_llm_config — a config error surfaces at load time,
     never silently swallowed).
 
-    Shape (see host/config/local_config.yaml for a commented example):
+    Shape (see host/config/local_config.example.yaml for a commented example):
 
     .. code-block:: yaml
 

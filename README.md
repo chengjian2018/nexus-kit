@@ -5,7 +5,8 @@
 
 ```
 host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
- └─> apps (2)  组合层：业务 pattern（xianyu_agent、customer_agent）+ 各自 prompt 资产
+ └─> apps (2)  组合层：业务 pattern（apps/ 下 5 个：xianyu_agent / customer_agent /
+      │        deep_research_agent / install_booking_agent / repair_booking_agent）+ 各自 prompt 资产
       └─> atoms (1)  原子积木：executors / stages / tools / providers / knowledge / augmentation
            └─> nexus (0)  内核：context / model / pipeline / engine / registry / llm / settings
 ```
@@ -45,20 +46,59 @@ host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
 | `host/` | main.py（含 SSE 调试端点）/ cli.py（含 pattern-export/load）/ governor.py / config/ | 根目录 `main.py`、`cli.py` |
 
 
+## 安装
+
+要求 Python ≥ 3.11，推荐 [uv](https://docs.astral.sh/uv/)：
+
+```bash
+git clone <repo> && cd nexus-kit
+uv sync --extra cli --extra dev     # 或 pip install -e ".[cli,dev]"
+```
+
+可选依赖组：`cli`（fire / prompt-toolkit，CLI 与交互式 REPL 需要）、
+`dev`（pytest / import-linter）。服务端依赖（fastapi/uvicorn 等）在主依赖中。
+
+## 配置
+
+```bash
+# 1. 从模板创建本地配置（该文件含密钥，已被 .gitignore 忽略、绝不入库）
+cp host/config/local_config.example.yaml host/config/local_config.yaml
+
+# 2. 按需修改 llm_default / llm_providers（模板内有逐节注释）
+
+# 3. 导出 API key（默认 provider 经 DashScope 兼容模式调用，从该环境变量取 key）
+export DASHSCOPE_API_KEY=sk-...
+```
+
+最小可用配置 = 模板原样 + `DASHSCOPE_API_KEY`。pattern 级模型覆盖
+（`pattern_llm`）、MCP 工具网关（`mcp_servers`）、DB 路径与压缩阈值均见
+模板注释；完整 schema 见 `nexus/settings.py`。
+
+### 环境变量
+
+| 变量 | 默认 | 用途 |
+|---|---|---|
+| `DASHSCOPE_API_KEY` | — | 默认 provider（openai，DashScope 兼容模式）的 API key |
+| `NEXUS_CONFIG` | 自动探测 | local_config.yaml 路径覆盖（默认探测 `host/config/`、`config/`） |
+| `NEXUS_LOG` | `WARNING` | 根日志级别；排障时 `NEXUS_LOG=INFO` 可见轮次 / MCP / 工具分派日志 |
+| `NEXUS_API_KEY` | 未设置 | 核心 API 鉴权；**未设置时服务无认证**（启动时每分钟告警） |
+| `NEXUS_STREAM_DEBUG` | 未设置 | `=1` 挂载 SSE 流式调试端点 `POST /api/v1/chat/stream` |
+
 ## 运行
 
 ```bash
-# 测试（离线，fake provider 打桩 LLM；519 个用例，含分层契约与两个业务 pattern 验收）
-~/miniforge3/envs/hermes_nexus/bin/python -m pytest
+# 测试（离线，fake provider 打桩 LLM；含分层契约与各业务 pattern 验收）
+python -m pytest        # uv 环境：uv run python -m pytest
 
 # 服务（需要 host/config/local_config.yaml）
 uvicorn host.main:app --port 8000
 # 流式调试端点（可选）：NEXUS_STREAM_DEBUG=1 后 POST /api/v1/chat/stream（SSE）
 
-# CLI 调试（fire 子命令：chat / ask / list / sessions / pattern-export / pattern-load）
+# CLI 调试（fire 子命令：chat / ask / list / sessions / pattern-export / pattern-load / knowledge-seed）
 python -m host.cli ask --pattern xianyu_agent --query "还在吗"
 python -m host.cli pattern-export xianyu_agent --out xianyu.yml   # yml round-trip
 python -m host.cli pattern-load xianyu.yml                        # 构造+校验+注册
+python -m host.cli knowledge-seed                                 # customer_agent 演示前置：灌知识库
 ```
 
 分层契约：`tests/test_architecture.py` 在每次 pytest 时强制

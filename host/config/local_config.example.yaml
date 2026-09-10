@@ -1,0 +1,83 @@
+# ============================================================================
+# local_config.yaml 模板 — 复制为 host/config/local_config.yaml 后按需修改
+# ============================================================================
+#
+#   cp host/config/local_config.example.yaml host/config/local_config.yaml
+#
+# local_config.yaml 含密钥，已被 .gitignore 忽略、绝不入库；
+# api key 推荐经环境变量注入（api_key_env），不要把明文 key 写进本文件。
+#
+# 三个 LLM 节点的分工（spec 2026-09-02）：
+#   llm_providers  连接层：按 provider code 声明 api_base / api_key_env /
+#                  timeout / max_retries（不含模型与生成参数）
+#   llm_default    编排层：默认 LLM 选择（code + model + temperature /
+#                  max_tokens / enable_thinking），三层合并的兜底层
+#   pattern_llm    pattern 级覆盖：pattern_code -> {code/model/...}，可细化
+#                  到 modules/nodes，优先于 llm_default；空 dict = 全部回退
+
+llm_providers:
+  openai:
+    # 任何 OpenAI 兼容端点（DashScope 兼容模式 / OpenAI / 本地 vLLM …）
+    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    # 实际 key 从该环境变量读取（export DASHSCOPE_API_KEY=sk-...）
+    api_key_env: DASHSCOPE_API_KEY
+    timeout: 60
+    max_retries: 2
+
+llm_default:
+  code: openai          # 对应 llm_providers 的 key / 注册的 provider code
+  model: qwen3.8-flash  # 按 DashScope 实际可用模型修改
+  temperature: 0.7
+  max_tokens: 2048
+  enable_thinking: false
+
+pattern_llm: {}
+# 示例：某 pattern 用更强模型，其某个 module 再单独覆盖
+# pattern_llm:
+#   deep_research:
+#     code: openai
+#     model: qwen3.8-max
+#     modules:
+#       report_generator:
+#         temperature: 0.3
+
+# ============================================================================
+# MCP servers（可选；不配置则整条 MCP 链路为 no-op）
+# ============================================================================
+# 每个条目：server 名 → toolset 名 mcp-<server 名>（atoms/tools/mcp_tool.py
+# 启动时读取并注册）。字段：
+#   transport          stdio | sse | streamable_http
+#   command/args/env   stdio 传输的子进程命令（stdio 必填 command）
+#   url/headers        sse / streamable_http 传输的端点（必填 url）
+#   allowed_patterns   授权使用的 pattern code 列表；["*"] 全放行；
+#                      缺省 = 不授权任何 pattern（deny-by-default）
+#   tool_name_prefix   可选注册名前缀（防跨 server 撞名），默认保留原名
+
+mcp_servers: {}
+# 示例（stdio 子进程）：
+# mcp_servers:
+#   websearch:
+#     transport: stdio
+#     command: npx
+#     args: ["-y", "@example/mcp-server"]
+#     env:
+#       EXAMPLE_API_KEY: "<your-key>"     # 建议改为 $VAR 展开或部署时注入
+#     allowed_patterns:
+#       - deep_research
+# 示例（远程 SSE 端点）：
+#   remote_search:
+#     transport: sse
+#     url: "https://<host>/api/mcp/sse?Authorization=<your-token>"
+
+# ============================================================================
+# 存储与压缩（可选，以下即默认值）
+# ============================================================================
+
+# 会话审计 SQLite（相对服务启动目录；建议写绝对路径避免随 CWD 漂移）
+# session_db_path: data/dialogue.db
+# 知识库 SQLite（customer_agent 等使用）
+# knowledge_db_path: data/knowledge.db
+# 会话历史压缩：估算 token 超过阈值触发摘要压缩（0 = 关闭）
+# session_compress_token_threshold: 6000
+# 压缩后保留的最近消息条数（含 tool 行）
+# session_compress_retain_count: 12
