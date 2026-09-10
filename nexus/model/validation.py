@@ -24,8 +24,8 @@ import logging
 from typing import List
 
 from nexus.model.pattern import Pattern
+from nexus.model.plugins_field import PLUGIN_KINDS, plugins_slot_label
 from nexus.pipeline import normalize_skeleton
-from nexus.registry.plugins import DEFAULT_EXECUTOR_CODES
 from nexus.registry.plugins import registry as plugin_registry
 
 logger = logging.getLogger(__name__)
@@ -133,18 +133,18 @@ def validate_plugin_declarations(pattern: Pattern) -> List[str]:
     errors: List[str] = []
     pcode = getattr(pattern, "code", "?")
 
-    # Executors
-    for field, default_code in (
-        ("executor_loop", DEFAULT_EXECUTOR_CODES["agent"]),
-        ("executor_fsm", DEFAULT_EXECUTOR_CODES["fsm"]),
-        ("executor_route", DEFAULT_EXECUTOR_CODES["route"]),
-    ):
-        declared = getattr(pattern, field, None)
-        if declared and not plugin_registry.has("executor", declared):
+    # Pattern-level unified plugins dict: every declared str code resolves
+    # under its slot's kind (executor family slots report with their legacy
+    # executor_<family> label for continuity)
+    for slot, declared in (getattr(pattern, "plugins", None) or {}).items():
+        if not (isinstance(declared, str) and declared):
+            continue
+        kind = PLUGIN_KINDS.get(slot)
+        if kind and not plugin_registry.has(kind, declared):
             errors.append(
-                f"pattern {pcode!r} 的 {field}={declared!r} 未注册"
-                f"（kind=executor）")
-        del default_code
+                f"pattern {pcode!r} 的 "
+                f"plugins[{plugins_slot_label(slot)}]={declared!r} 未注册"
+                f"（kind={kind}）")
 
     skeleton_slot_names: List[str] = []
     try:
@@ -187,18 +187,18 @@ def validate_plugin_declarations(pattern: Pattern) -> List[str]:
                         f"module {mcode!r} 的 stages[{slot}]={code!r} 未注册"
                         f"（kind=stage）")
 
-        builder = getattr(module, "messages_builder", None)
-        if isinstance(builder, str) and not plugin_registry.has(
-                "messages_builder", builder):
-            errors.append(
-                f"module {mcode!r} 的 messages_builder={builder!r} 未注册"
-                f"（kind=messages_builder）")
-        hooks = getattr(module, "agent_hooks", None)
-        if isinstance(hooks, str) and not plugin_registry.has(
-                "agent_hooks", hooks):
-            errors.append(
-                f"module {mcode!r} 的 agent_hooks={hooks!r} 未注册"
-                f"（kind=agent_hooks）")
+        # Module-level unified plugins dict (covers messages_builder /
+        # agent_hooks plus the executor family slots; the legacy scalar
+        # reads route through the same dict via properties)
+        for slot, declared in (getattr(module, "plugins", None) or {}).items():
+            if not (isinstance(declared, str) and declared):
+                continue
+            kind = PLUGIN_KINDS.get(slot)
+            if kind and not plugin_registry.has(kind, declared):
+                errors.append(
+                    f"module {mcode!r} 的 "
+                    f"plugins[{plugins_slot_label(slot)}]={declared!r} 未注册"
+                    f"（kind={kind}）")
 
         for node in module.module_nodes:
             ncode = node.node_code

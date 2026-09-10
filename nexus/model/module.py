@@ -21,6 +21,8 @@ import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from nexus.model.plugins_field import normalize_plugins
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,16 +83,23 @@ class BaseModule:
             "lend_knowledge": bool, "lend_tools": [str]}]`` — the transfer-graph
             edge set and the knowledge/tool lending (projection thickness).
         executor: executor plugin code (module-level override, highest
-            priority; module.executor > pattern.executor_<family> > type
-            default).
+            priority; module.executor > module.plugins[family] >
+            pattern.plugins[family] > type default).
+        plugins: unified plugin declarations ``Dict[str, str]`` (stages-style
+            dict, see nexus/model/plugins_field.py) — legal slots:
+            loop/fsm/route (executor family) / messages_builder /
+            agent_hooks. The legacy scalar params messages_builder /
+            agent_hooks fold in (dict wins on conflict) and stay readable
+            via properties.
         enable_project: projection switch (plan-⑥, see above; default True —
             projection is the only branch with default behavior once
             transfer is gone).
-        messages_builder: messages-builder plugin code (kind=
-            "messages_builder"); module-level overrides the pattern-level
-            declaration.
-        agent_hooks: agent-hooks plugin code (kind="agent_hooks");
-            module-level wholesale-replaces the pattern-level declaration.
+        messages_builder: (property) messages-builder plugin code (kind=
+            "messages_builder"), read from plugins["messages_builder"];
+            module-level overrides the pattern-level declaration.
+        agent_hooks: (property) agent-hooks plugin code (kind="agent_hooks"),
+            read from plugins["agent_hooks"]; module-level
+            wholesale-replaces the pattern-level declaration.
     """
 
     type: ModuleType = ModuleType.AGENT
@@ -108,6 +117,7 @@ class BaseModule:
         base_nlu_prompt: Optional[str] = None,
         base_nlg_prompt: Optional[str] = None,
         stages: Optional[Dict[str, str]] = None,
+        plugins: Optional[Dict[str, Any]] = None,
         executor: Optional[str] = None,
         enable_project: bool = True,
         agent_stage: Optional[str] = None,
@@ -153,13 +163,19 @@ class BaseModule:
         # agent-stage declarations; resolved by executors that consume it
         self.agent_stage = agent_stage
 
-        # AGENT module messages-builder slot (kind="messages_builder";
-        # module-level overrides the pattern-level declaration)
-        self.messages_builder = messages_builder
-
-        # Agent loop hooks slot (kind="agent_hooks"; module-level
-        # wholesale-replaces the pattern-level declaration)
-        self.agent_hooks = agent_hooks
+        # Unified plugin declarations (stages-style dict, see
+        # nexus/model/plugins_field.py): messages_builder + agent_hooks at
+        # this layer (the executor family slots loop/fsm/route are legal
+        # here too — a module hits its own family's slot per
+        # chat._resolve_executor_code; the type-agnostic ``executor`` direct
+        # field above outranks them all). Legacy scalar params fold in (the
+        # dict value wins on conflict); read-side compat via the
+        # messages_builder / agent_hooks properties below.
+        self.plugins = normalize_plugins(
+            plugins,
+            legacy={"messages_builder": messages_builder,
+                    "agent_hooks": agent_hooks},
+        )
 
         self.is_end = is_end
 
@@ -167,6 +183,30 @@ class BaseModule:
             setattr(self, key, value)
 
         self._init_node()
+
+    # ------------------------------------------------------------------
+    # Read/write compat for the pre-merge scalar fields: they live on as
+    # properties over the plugins dict (consumers' getattr reads, yml
+    # old-shape loads, and post-construction assignments — the legacy
+    # inline dict/callable forms included — stay untouched; serialization
+    # emits the canonical plugins form)
+    # ------------------------------------------------------------------
+
+    @property
+    def messages_builder(self):
+        return self.plugins.get("messages_builder")
+
+    @messages_builder.setter
+    def messages_builder(self, value) -> None:
+        self.plugins["messages_builder"] = value
+
+    @property
+    def agent_hooks(self):
+        return self.plugins.get("agent_hooks")
+
+    @agent_hooks.setter
+    def agent_hooks(self, value) -> None:
+        self.plugins["agent_hooks"] = value
 
     def __repr__(self) -> str:
         return (

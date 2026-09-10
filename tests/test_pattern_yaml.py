@@ -64,6 +64,7 @@ def _sample_pattern():
             ),
         ],
         executor_loop="default_loop",
+        plugins={"messages_builder": "default"},
         max_hops=3,
     )
 
@@ -93,6 +94,13 @@ def test_loaded_pattern_structure_equivalent():
     assert loaded.stages == pattern.stages
     assert loaded.max_hops == pattern.max_hops
     assert loaded.executor_loop == pattern.executor_loop
+    # unified plugins dict survives（legacy executor_loop 折入 dict）
+    assert loaded.plugins == pattern.plugins
+    assert loaded.plugins == {"loop": "default_loop",
+                              "messages_builder": "default"}
+    # module-level plugins ride inside the same dict
+    assert loaded.module_map["helper"].plugins == {
+        "messages_builder": "customer_agent_messages_builder"}
     assert set(loaded.module_map) == set(pattern.module_map)
     assert set(loaded.node_map) == set(pattern.node_map)
     # module types survive

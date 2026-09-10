@@ -67,9 +67,10 @@ registry.default_executor_code(type_value)  # "agent"→"default_loop" 等
 - `TurnResult`（`nexus/engine/turn_result.py`）：`content`（固有字段，回复
   文本）/ `actions`（事件通道）/ `extra`（开放扩展袋，消费端忽略未知 key）。
 - 解析链（chat 层 `_resolve_executor_code`）：
-  `module.executor > pattern.executor_{loop|fsm|route} > 类型默认码`。
-  注意 pattern 字段后缀是 executor 家族名（loop/fsm/route），不是
-  ModuleType 值（agent/fsm/route）。
+  `module.executor（类型无关直配，最高）> module.plugins[family] >
+  pattern.plugins[family] > 类型默认码`。family 是 executor 家族名
+  （loop/fsm/route），不是 ModuleType 值（agent/fsm/route）；旧独立字段
+  `pattern.executor_<family>` 经 property 继续可读写（见 plugins 节）。
 - 默认实现：`atoms/executors/{loop,fsm,route}_executor.py`，codes
   `default_loop / default_fsm / default_route`。内核无兜底 executor——
   注册表未预热时 fail-fast，报错指引 import atoms.executors。
@@ -129,6 +130,36 @@ RouteModule(stages={"nlu": "xianyu_intent_nlu", "nlg": "xianyu_fixed_nlg"})
 `messages_builder / agent_hooks`（module 与 pattern 层）均为 `Optional[str]`
 插件 code；内核注册 `messages_builder: default`。transitional 兼容：可调用
 对象仍可直接内联使用（messages.build_agent_messages 判断 callable）。
+
+### plugins 合并声明字段（`nexus/model/plugins_field.py`）
+
+原先散落的插件声明独立字段合并为一个 **stages 同款 dict**：
+`plugins: Dict[str, str]`（槽位名 → 插件 code），Pattern 与 BaseModule
+均可配置：
+
+```python
+Pattern(plugins={"loop": "my_loop", "messages_builder": "mb_code"})
+AgentModule(plugins={"loop": "mod_loop", "agent_hooks": "my_hooks"})
+```
+
+| 槽位 | kind | 吸收的旧字段 |
+|---|---|---|
+| `loop` / `fsm` / `route` | `executor` | pattern 的 `executor_loop / executor_fsm / executor_route` |
+| `messages_builder` | `messages_builder` | pattern / module 的 `messages_builder` |
+| `agent_hooks` | `agent_hooks` | pattern / module 的 `agent_hooks` |
+
+- **构造期 fail-fast**：未知槽位名 / 非法值（executor 族只收 str/None；
+  messages_builder/agent_hooks 另收 transitional callable）
+- **解析链**（module 层压 pattern 层，与 stages 同型）：
+  executor 见上方 Executor 契约；messages_builder / agent_hooks：
+  `module.plugins[key] > pattern.plugins[key] > 内核默认`
+- **兼容**：旧独立字段仍是合法构造参数（折入 dict，同名槽位以 dict 值
+  优先），并以**读写 property** 继续可用（`pattern.executor_loop` 等，
+  含构造后动态赋值——legacy dict 内联形态照旧）；序列化只输出规范的
+  `plugins` 形态，旧形状 yml/dict 加载时由构造器折入
+- **校验**（validation.py）：pattern 与 module 两层 plugins 声明的 str
+  code 经 `has()` 可解析；executor 族槽位报错带旧字段名标签
+  （`plugins[executor_fsm]`）
 
 ### 与四个领域 registry 的关系
 

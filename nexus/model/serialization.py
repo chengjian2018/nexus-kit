@@ -18,13 +18,15 @@ from nexus.model.module import BaseModule
 from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 
-# Module fields serialized (constructor params; kwargs extras ride along)
+# Module fields serialized (constructor params; kwargs extras ride along).
+# messages_builder / agent_hooks ride inside the unified plugins dict (the
+# legacy scalar params still load — constructors fold them in).
 _MODULE_FIELDS = [
     "module_code", "module_name", "module_description",
     "module_todo_description", "use_tools", "base_prompt",
     "base_nlu_prompt", "base_nlg_prompt", "stages", "sub_modules",
-    "executor", "enable_project", "agent_stage", "messages_builder",
-    "agent_hooks", "is_end", "answer_examples",
+    "executor", "enable_project", "agent_stage", "plugins",
+    "is_end", "answer_examples",
 ]
 
 # Node fields serialized
@@ -34,10 +36,12 @@ _NODE_FIELDS = [
     "base_nlu_prompt", "base_nlg_prompt", "is_end",
 ]
 
-# Pattern scalar fields serialized (modules/stages handled structurally)
+# Pattern scalar fields serialized (modules/stages handled structurally).
+# The executor family + messages_builder + agent_hooks ride inside the
+# unified plugins dict (legacy scalar params still load — the constructor
+# folds them in).
 _PATTERN_FIELDS = [
-    "code", "name", "description", "entry_module_code", "agent_hooks",
-    "messages_builder", "executor_loop", "executor_fsm", "executor_route",
+    "code", "name", "description", "entry_module_code", "plugins",
     "max_hops",
 ]
 
@@ -74,7 +78,7 @@ def pattern_to_dict(pattern: Pattern) -> Dict[str, Any]:
     data: Dict[str, Any] = {}
     for field in _PATTERN_FIELDS:
         value = getattr(pattern, field, None)
-        if value is not None:
+        if value not in (None, [], {}):
             data[field] = value
     data["stages"] = pattern.stages or []
     data["modules"] = [module_to_dict(m) for m in (pattern.modules or [])]

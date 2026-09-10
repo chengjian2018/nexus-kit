@@ -515,19 +515,23 @@ async def _run_stages(cxt, module, pattern, force_close: bool = False
 def _resolve_executor_code(session: Session, module):
     """Resolve the executor code for a module (plugin registry kind="executor").
 
-    Fallback chain (same shape as the stage slots): module.executor >
-    pattern.executor_<type> > the type default code
-    (plugins.DEFAULT_EXECUTOR_CODES). The pattern field suffix uses the
-    executor family name (loop/fsm/route — matching pattern.executor_loop
-    & friends), not the ModuleType value (agent/fsm/route). An unset
-    module/pattern declaration keeps today's behavior (default loop / fsm /
-    route executor).
+    Fallback chain (same shape as the stage slots): module.executor (the
+    type-agnostic direct field, highest) > module.plugins[family] >
+    pattern.plugins[family] (read via the legacy executor_<family>
+    properties) > the type default code (plugins.DEFAULT_EXECUTOR_CODES).
+    The family name is loop/fsm/route — not the ModuleType value
+    (agent/fsm/route). An unset declaration at every layer keeps today's
+    behavior (default loop / fsm / route executor).
     """
     module_decl = getattr(module, "executor", None)
     if module_decl:
         return module_decl
     type_key = module.type.value
     family = {"agent": "loop", "fsm": "fsm", "route": "route"}[type_key]
+    module_plugins = getattr(module, "plugins", None) or {}
+    module_decl = module_plugins.get(family)
+    if module_decl:
+        return module_decl
     pattern_decl = getattr(session.pattern, f"executor_{family}", None)
     if pattern_decl:
         return pattern_decl

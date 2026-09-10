@@ -1,5 +1,6 @@
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
+from nexus.model.plugins_field import normalize_plugins
 from nexus.pipeline import normalize_skeleton
 
 
@@ -11,6 +12,7 @@ class Pattern:
                  entry_module_code,
                  modules: Optional[list[Any]] = None,
                  stages: Optional[list[Any]] = None,
+                 plugins: Optional[Dict[str, Any]] = None,
                  agent_hooks: Optional[str] = None,
                  messages_builder: Optional[str] = None,
                  executor_loop: Optional[str] = None,
@@ -27,20 +29,22 @@ class Pattern:
         # (empty/None → the kernel default six-slot skeleton)
         self.stages = normalize_skeleton(stages)
 
-        # Agent loop hooks (kind="agent_hooks" plugin code; the module-level
-        # agent_hooks wholesale-replaces it)
-        self.agent_hooks = agent_hooks
-
-        # AGENT all-in-one messages builder (kind="messages_builder" plugin
-        # code; the module-level messages_builder overrides it)
-        self.messages_builder = messages_builder
-
-        # Executor plugin declarations (kind="executor"; resolution order
-        # module.executor > pattern.executor_<family> > type default code —
-        # strings, resolved at runtime from the plugin registry)
-        self.executor_loop = executor_loop
-        self.executor_fsm = executor_fsm
-        self.executor_route = executor_route
+        # Unified plugin declarations (stages-style dict, see
+        # nexus/model/plugins_field.py): executor family (loop/fsm/route —
+        # the merged form of the old executor_<family> fields) +
+        # messages_builder + agent_hooks. Legacy scalar params fold in (the
+        # dict value wins on conflict); read-side compat via the
+        # executor_* / messages_builder / agent_hooks properties below.
+        self.plugins = normalize_plugins(
+            plugins,
+            legacy={
+                "loop": executor_loop,
+                "fsm": executor_fsm,
+                "route": executor_route,
+                "messages_builder": messages_builder,
+                "agent_hooks": agent_hooks,
+            },
+        )
 
         self.node_map = dict()
         self.module_map = dict()
@@ -102,3 +106,51 @@ class Pattern:
 
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+    # ------------------------------------------------------------------
+    # Read/write compat for the pre-merge scalar fields: they live on as
+    # properties over the plugins dict (consumers' getattr reads, yml
+    # old-shape loads, and post-construction assignments — the legacy
+    # inline dict/callable forms included — stay untouched; serialization
+    # emits the canonical plugins form)
+    # ------------------------------------------------------------------
+
+    @property
+    def executor_loop(self) -> Optional[str]:
+        return self.plugins.get("loop")
+
+    @executor_loop.setter
+    def executor_loop(self, value) -> None:
+        self.plugins["loop"] = value
+
+    @property
+    def executor_fsm(self) -> Optional[str]:
+        return self.plugins.get("fsm")
+
+    @executor_fsm.setter
+    def executor_fsm(self, value) -> None:
+        self.plugins["fsm"] = value
+
+    @property
+    def executor_route(self) -> Optional[str]:
+        return self.plugins.get("route")
+
+    @executor_route.setter
+    def executor_route(self, value) -> None:
+        self.plugins["route"] = value
+
+    @property
+    def messages_builder(self):
+        return self.plugins.get("messages_builder")
+
+    @messages_builder.setter
+    def messages_builder(self, value) -> None:
+        self.plugins["messages_builder"] = value
+
+    @property
+    def agent_hooks(self):
+        return self.plugins.get("agent_hooks")
+
+    @agent_hooks.setter
+    def agent_hooks(self, value) -> None:
+        self.plugins["agent_hooks"] = value
