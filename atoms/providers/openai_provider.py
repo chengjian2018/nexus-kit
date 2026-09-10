@@ -24,6 +24,15 @@ from nexus.registry.providers import registry
 
 logger = logging.getLogger(__name__)
 
+# Retryable HTTP statuses: request-timeout + rate-limit + all 5xx.
+# Other 4xx (401/403/404/400…) mean the request itself is wrong — retrying
+# with backoff just delays the inevitable failure.
+_RETRYABLE_STATUSES = frozenset({408, 429})
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in _RETRYABLE_STATUSES or status_code >= 500
+
 
 class OpenAICompatibleProvider(BaseLLMProvider):
     """LLM provider for any OpenAI-compatible chat-completion API."""
@@ -126,6 +135,12 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                     }
 
                 except httpx.HTTPError as e:
+                    # Non-retryable 4xx (auth/bad request): fail fast instead
+                    # of burning retries — HTTPStatusError carries .response,
+                    # transport-level errors don't and stay retryable.
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if status is not None and not _is_retryable_status(status):
+                        raise
                     last_exc = e
                     logger.warning(
                         "Provider '%s' attempt %d/%d failed: %s",
@@ -164,6 +179,11 @@ class OpenAICompatibleProvider(BaseLLMProvider):
           slot, arguments arrive as string fragments — passed through
           as-is; merging is the aggregator's job (llm/aggregate.py)
         - ``[DONE]`` sentinel terminates the stream
+
+        Retry policy: transport errors and retryable statuses (408/429/5xx)
+        are retried with linear backoff — but only until the first chunk is
+        yielded; a mid-stream failure propagates instead (a retry would
+        replay already-delivered content). Non-retryable 4xx fails fast.
         """
         url = self._build_url()
 
@@ -179,44 +199,76 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             **kwargs,
         }
 
+        # Retry shares the non-streaming policy (transport errors + 408/429/5xx
+        # with linear backoff), but ONLY until the first chunk is yielded —
+        # past that point a retry would replay already-delivered content.
+        streamed_any = False
+        last_exc = None
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST", url, headers=self._build_headers(), json=payload,
-            ) as response:
-                response.raise_for_status()
+            for attempt in range(self.max_retries + 1):
+                try:
+                    async with client.stream(
+                        "POST", url, headers=self._build_headers(), json=payload,
+                    ) as response:
+                        response.raise_for_status()
 
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    # SSE format: "data: {...}"
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                        async for line in response.aiter_lines():
+                            if not line:
+                                continue
+                            # SSE format: "data: {...}"
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
 
-                    usage = data.get("usage") or {}
-                    choices = data.get("choices", [])
-                    if not choices:
-                        # usage-only tail chunk (include_usage): choices == []
-                        if usage:
-                            yield LLMChunk(usage=usage)
-                        continue
+                            usage = data.get("usage") or {}
+                            choices = data.get("choices", [])
+                            if not choices:
+                                # usage-only tail chunk (include_usage): choices == []
+                                if usage:
+                                    streamed_any = True
+                                    yield LLMChunk(usage=usage)
+                                continue
 
-                    choice = choices[0]
-                    delta = choice.get("delta", {}) or {}
-                    text = delta.get("content", "") or ""
-                    tool_calls = delta.get("tool_calls", []) or []
-                    finish_reason = choice.get("finish_reason", "") or ""
-                    if text or tool_calls or finish_reason:
-                        yield LLMChunk(text=text, tool_calls=tool_calls,
-                                       finish_reason=finish_reason)
-                    elif usage:
-                        yield LLMChunk(usage=usage)
+                            choice = choices[0]
+                            delta = choice.get("delta", {}) or {}
+                            text = delta.get("content", "") or ""
+                            tool_calls = delta.get("tool_calls", []) or []
+                            finish_reason = choice.get("finish_reason", "") or ""
+                            if text or tool_calls or finish_reason:
+                                streamed_any = True
+                                yield LLMChunk(text=text, tool_calls=tool_calls,
+                                               finish_reason=finish_reason)
+                            elif usage:
+                                streamed_any = True
+                                yield LLMChunk(usage=usage)
+                    return
+
+                except httpx.HTTPError as e:
+                    if streamed_any:
+                        raise  # mid-stream failure: retry would duplicate content
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if status is not None and not _is_retryable_status(status):
+                        raise  # non-retryable 4xx: fail fast
+                    last_exc = e
+                    logger.warning(
+                        "Provider '%s' stream attempt %d/%d failed: %s",
+                        self.code,
+                        attempt + 1,
+                        self.max_retries + 1,
+                        e,
+                    )
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(1 * (attempt + 1))  # linear backoff
+
+        raise RuntimeError(
+            f"Provider '{self.code}' failed after {self.max_retries + 1} attempts: {last_exc}"
+        )
 
 
 # ---------------------------------------------------------------------------
