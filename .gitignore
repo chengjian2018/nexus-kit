@@ -4,6 +4,12 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# IDE / 编辑器 / 操作系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
 # 运行时数据与本机配置（不入库）
 data/
 host/config/local_config.yaml
