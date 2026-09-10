@@ -161,6 +161,23 @@ AgentModule(plugins={"loop": "mod_loop", "agent_hooks": "my_hooks"})
   code 经 `has()` 可解析；executor 族槽位报错带旧字段名标签
   （`plugins[executor_fsm]`）
 
+### pattern → module(s) 转换（`nexus/model/convert.py`）
+
+把一个已有 pattern 收敛为可直接嵌入其它 pattern 的 Module 集（声明式纯
+数据变换，`pattern_to_modules` 返回**头模块居首**的模块列表；单模块便捷
+入口 `pattern_to_module` 只取头模块）：
+
+- **整组随行**：全部模块都转换（deepcopy 零共享引用），模块间
+  `sub_modules` 邻接边与节点 `jump_module` 跳转目标都在组内——拓扑不丢，
+  宿主以 `modules=result, entry_module_code=result[0].module_code` 接入
+- **头模块 = 入口模块**：承接 pattern 身份（code/name/description，入参
+  可覆盖）；头模块 code 变化时组内指向旧 code 的边与跳转一并改写
+- **pattern 属性分发给全部模块**：pattern 层 plugins 声明折入**每个**
+  模块的空槽（模块已声明的槽位优先，与运行时解析链同序——转换后在无
+  同级声明的宿主里行为不变）；模块的 `executor` 直配字段原样随行
+- 不随行（无 module 对应物，宿主自行声明）：`stages` 槽位骨架（module
+  的 `stages` 覆盖表已随行）、`max_hops`
+
 ### 与四个领域 registry 的关系
 
 patterns / tools / providers / channels 四个领域注册中心**保持独立**（载荷
