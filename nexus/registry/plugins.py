@@ -57,6 +57,10 @@ class PluginRegistry:
         self._factories: Dict[tuple, Factory] = {}
         self._instances: Dict[tuple, Any] = {}
         self._lock = threading.RLock()
+        # 热重载窗口开关（host.reload._ReplaceMode 持有）：True 时同名不同
+        # factory 的注册变为"替换 + 清实例缓存"而不是拒绝。默认 False——
+        # 严格模式拦截真正的同名冲突。
+        self.replace_on_conflict = False
 
     # ------------------------------------------------------------------
     # Registration
@@ -67,7 +71,9 @@ class PluginRegistry:
 
         Raises ValueError when the slot is already taken by a different
         factory (same-name conflict); re-registering the identical factory is
-        an idempotent no-op.
+        an idempotent no-op. With ``replace_on_conflict`` set (hot-reload
+        window), a different factory replaces the entry and drops its cached
+        instance instead — re-imported classes are never the same object.
         """
         if not kind or not code:
             raise ValueError(f"plugin kind/code 不能为空: kind={kind!r}, code={code!r}")
@@ -77,10 +83,15 @@ class PluginRegistry:
         with self._lock:
             existing = self._factories.get(key)
             if existing is not None and existing is not factory:
-                raise ValueError(
-                    f"插件冲突: ({kind!r}, {code!r}) 已被其它 factory 注册"
-                    f"（同名插件不允许，请更换 code）"
-                )
+                if not self.replace_on_conflict:
+                    raise ValueError(
+                        f"插件冲突: ({kind!r}, {code!r}) 已被其它 factory 注册"
+                        f"（同名插件不允许，请更换 code）"
+                    )
+                self._factories[key] = factory
+                self._instances.pop(key, None)
+                logger.info("Replaced plugin (reload): kind=%s, code=%s", kind, code)
+                return
             if existing is factory:
                 return  # idempotent re-registration (module re-import)
             self._factories[key] = factory

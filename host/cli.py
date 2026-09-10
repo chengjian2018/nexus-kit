@@ -171,7 +171,7 @@ def parse_slash_command(line: str) -> Optional[Dict[str, Any]]:
     return {"name": name, "arg": arg}
 
 
-_SLASH_COMMANDS = ("help", "exit", "reset", "slots", "new", "llm")
+_SLASH_COMMANDS = ("help", "exit", "reset", "slots", "new", "llm", "reload")
 
 # Fixed "维持 config 配置" entry of the provider/model menus (spec §4.1: an
 # empty override = resolve entirely via the yaml three-tier orchestration)
@@ -582,7 +582,8 @@ HELP_TEXT = """\
   /reset           重置当前会话（同 pattern 重新开始）
   /slots           显示当前 slots / node / module 状态
   /new [pattern]   换 pattern 新会话（无参数出选择菜单）
-  /llm [code]      切换 LLM（无参数出选择菜单，只影响后续轮次）\
+  /llm [code]      切换 LLM（无参数出选择菜单，只影响后续轮次）
+  /reload          热重载：llm config + 变更的 pattern/plugin/channel 代码\
 """
 
 
@@ -662,6 +663,8 @@ async def repl_loop(pattern_code: str, session_id: str,
                 continue
         elif name == "llm":
             _do_llm(session, arg)
+        elif name == "reload":
+            session = _do_reload(session, sessions)
 
     try:
         from atoms.mcp.manager import get_mcp_manager
@@ -708,6 +711,21 @@ async def _do_new(arg: str, sessions: Dict[str, Session], store, llm_overrides, 
         store.attach(new_session)
     print(green(f"新会话: {new_id} ({code})"))
     return new_session
+
+
+def _do_reload(session: Session, sessions: Dict[str, Session]) -> Session:
+    """/reload: hot-reload llm config + changed pattern/plugin/channel modules,
+    then rebind the in-memory sessions to the fresh pattern objects."""
+    from host.reload import reload_all, rebind_sessions
+
+    result = reload_all()
+    changed = result.get("changed") or []
+    failed = result.get("failed") or []
+    rebound = rebind_sessions(sessions, pattern_registry)
+    if failed:
+        print(yellow(f"重载失败（保持旧注册）: {failed}"))
+    print(green(f"热重载完成：变更 {len(changed)} 个模块，会话重绑 {rebound} 个"))
+    return sessions.get(session.session_id, session)
 
 
 def _do_llm(session: Session, arg: str) -> None:

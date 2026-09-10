@@ -100,6 +100,10 @@ class ChannelRegistry:
     def __init__(self):
         self._channels: dict = {}
         self._lock = threading.RLock()
+        # 热重载窗口开关（host.reload._ReplaceMode 持有）：True 时同名
+        # 注册变为替换而不是拒绝（re-import 的 spec 类必然是新对象）。
+        # router handler 每请求从 registry 活取 spec，替换后下一请求生效。
+        self.replace_on_conflict = False
 
     def register(self, spec: Any) -> Any:
         """Register a channel spec; raises ValueError on an invalid/duplicate name or non-callable hooks."""
@@ -110,8 +114,15 @@ class ChannelRegistry:
             if not callable(getattr(spec, hook, None)):
                 raise ValueError(f"channel '{name}' 的 {hook} 不可调用")
         with self._lock:
-            if name in self._channels:
-                raise ValueError(f"channel '{name}' 已注册（防同名冲突）")
+            existing = self._channels.get(name)
+            if existing is not None and existing is not spec:
+                if not self.replace_on_conflict:
+                    raise ValueError(f"channel '{name}' 已注册（防同名冲突）")
+                self._channels[name] = spec
+                logger.info("Replaced channel (reload): %s", name)
+                return spec
+            if existing is spec:
+                return spec
             self._channels[name] = spec
         logger.info("Registered channel: %s", name)
         return spec

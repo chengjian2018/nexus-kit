@@ -321,6 +321,51 @@ class DelegateExecutor(ModuleExecutor):
   `_apply_deferred_switch`）
 - 声明方式：`module.executor="my_delegate"`（插件中心 kind="executor"）
 
+## 热重载（2026-09-10）
+
+不改代码结构的前提下，四类东西的运行时重载机制（`host/reload.py` 是
+代码侧的装配点，`nexus/settings.py` 是数据侧的）：
+
+### llm config — mtime 指纹缓存（`nexus/settings.py`）
+
+`load_config` 按 resolved path 记 `(mtime_ns, size)` 指纹：每轮对话的
+R1 刷新（`get_llm_config`）只 **stat** 不读文件；指纹变了才重新
+读→校验→规范化。**无需任何显式 reload**——改 yaml 下一轮自动生效。
+返回深拷贝（pattern_llm 校验会原地清非法键，不能污染缓存）；解析失败
+缓存不落盘（上次的合法结果继续可用）。编程入口：
+`reload_config()`（强制重读）/ `invalidate_config_cache()`。
+
+### pattern / plugin / channel — mtime re-import（`host/reload.py`）
+
+注册发生在模块 import 时，"重载"= 按依赖序重新执行：
+
+- **追踪**：扫描域 = sys.modules 里 `apps.<pkg>.<mod>` 与
+  `atoms.executors.<mod>` 名下的模块（含 prompts 等非注册支撑模块）；
+  mtime 对比找变更。不做 AST 注册谓词过滤——编辑中途的语法错文件恰
+  恰最需要重载反馈（重放失败 → 告警 + 保持旧注册）。
+- **重放序**：AST import 边（含相对 import）的拓扑序。不能用
+  sys.modules 插入序——import 机制在模块 body 执行**前**插入
+  sys.modules，消费者反而排在依赖前面。
+- **注册表收编**：plugin/channel 注册表有 `replace_on_conflict` 开关
+  （重放窗口内临时打开：替换条目 + 清实例缓存；默认 False 保持"同名
+  冲突拒绝"的严格模式）。pattern 注册本就覆盖同名。
+- **channel router 不重建**：webhooks handler 每请求从 registry 活取
+  spec（`_live_spec`），replace 后下一请求生效。
+
+各注册表的重载语义：**pattern** 覆盖同名，运行中会话持旧引用跑完在途
+轮次（`rebind_sessions` 显式重绑内存会话）；**plugin** 新类替换 +
+实例缓存清空；**channel** spec 替换。**不在范围**：tools / MCP /
+providers（重启进程）。
+
+### 宿主挂点
+
+- `POST /api/v1/reload`（host/main.py）：config 缓存失效 + 代码重载 +
+  会话重绑；startup 时 `init_baseline()` 建基线，首个 reload 即可检测
+  开机以来的变更
+- CLI `/reload` slash 命令（同语义）
+- `NEXUS_RELOAD_WATCH=1`：后台线程轮询 mtime 自动 reload（开发期便利，
+  默认关）
+
 ## 变更记录
 
 - 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
@@ -335,3 +380,12 @@ class DelegateExecutor(ModuleExecutor):
   `docs/refactor-notes/plan-5.md`。
 - 计划⑥（2026-09-09）：跳转/投影重构（transfer 删除 + enable_project +
   DeferredModuleSwitch）。详见 `docs/refactor-notes/plan-6.md`。
+- 热重载（2026-09-10）：llm config mtime 指纹缓存 + pattern/plugin/
+  channel 的 mtime re-import（`POST /api/v1/reload` / CLI `/reload` /
+  `NEXUS_RELOAD_WATCH`）。详见上文"热重载"节。
+- plugins 合并字段 + pattern→module 转换（2026-09-10）：executor 族 /
+  messages_builder / agent_hooks 合并为 stages 同款 `plugins` dict
+  （pattern 与 module 两层，旧字段经 property 兼容读写）；
+  `pattern_to_module` 声明式转换（入口模块为基底 + pattern 身份 +
+  plugins 折入）。详见上文"plugins 合并声明字段"与"pattern → module
+  转换"节。

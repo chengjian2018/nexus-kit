@@ -7,10 +7,12 @@ in ``nexus/llm/provider.py`` plus ``OpenAICompatibleProvider`` in
 ``atoms/providers/openai_provider.py``.
 """
 
+import copy
 import logging
 import os
+import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -197,6 +199,17 @@ def _get_config_path() -> Path:
     )
 
 
+# ============================================================================
+# Config cache — (mtime_ns, size) fingerprint per resolved path
+# ============================================================================
+
+# resolved path -> ((mtime_ns, size), parsed config dict); guarded by a lock
+# (chat turns resolve llm_config on the event loop, CLI/test threads may load
+# concurrently — parse happens outside the lock, only the dict swap is atomic)
+_CONFIG_CACHE: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+_CONFIG_CACHE_LOCK = threading.Lock()
+
+
 def _validate_llm_config(llm_config: Dict[str, Any]) -> None:
     """Validate the completeness and legality of the LLM config.
 
@@ -288,6 +301,13 @@ def _validate_llm_providers(providers: Dict[str, Any]) -> None:
 def load_config(config_path: str = "") -> Dict[str, Any]:
     """Read the local configuration from local_config.yaml and return it.
 
+    mtime 缓存（本函数是每轮对话 R1 刷新的热路径）：文件 stat 指纹
+    (mtime_ns, size) 未变时直接返回上次解析结果的深拷贝——不重读、不
+    重新校验；变了（或缓存被 invalidate）才走完整 读文件→校验→规范化
+    流程。编辑器原子写（写临时文件再 rename）会换 inode，指纹必然变
+    化，天然兼容。解析失败时缓存不落盘（上次的有效结果继续可用，直到
+    文件改回合法内容）。
+
     Args:
         config_path: optional; explicit config file path. When empty, looks up
                      ``config/local_config.yaml`` automatically.
@@ -296,7 +316,8 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
         Config dict containing the ``llm_providers`` / ``llm_default`` /
         ``pattern_llm`` / ``session_db_path`` keys. A legacy ``llm:`` node is
         converted automatically at load time into ``llm_providers`` +
-        ``llm_default``.
+        ``llm_default``. **返回深拷贝**：调用方改写（如 pattern_llm 校
+        验原地清空非法键）不会污染缓存。
 
     Raises:
         FileNotFoundError: when the config file does not exist.
@@ -313,6 +334,49 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
     else:
         path = _get_config_path()
 
+    resolved = str(path.resolve())
+    stat = path.stat()  # FileNotFoundError 按原语义上抛
+    fingerprint = (stat.st_mtime_ns, stat.st_size)
+
+    with _CONFIG_CACHE_LOCK:
+        cached = _CONFIG_CACHE.get(resolved)
+        if cached is not None and cached[0] == fingerprint:
+            return copy.deepcopy(cached[1])
+
+    cfg = _parse_config_file(path)
+
+    with _CONFIG_CACHE_LOCK:
+        _CONFIG_CACHE[resolved] = (fingerprint, copy.deepcopy(cfg))
+    return cfg
+
+
+def reload_config(config_path: str = "") -> Dict[str, Any]:
+    """强制重载配置（编程入口）：丢弃缓存后走一次完整 load_config。
+
+    mtime 缓存正常情况下无需手动调用（指纹变化自动重载）；供改了系统
+    时钟、或想拿到"确定重读了文件"的确定性的调用方使用。
+    """
+    invalidate_config_cache(config_path)
+    return load_config(config_path)
+
+
+def invalidate_config_cache(config_path: str = "") -> None:
+    """丢弃配置缓存（全部，或指定路径的一条）。
+
+    Tests use this between writes to the same path with an unchanged fingerprint
+    (same mtime_ns + size within filesystem resolution); production rarely
+    needs it — the fingerprint check in load_config handles real edits.
+    """
+    with _CONFIG_CACHE_LOCK:
+        if config_path:
+            resolved = str(Path(config_path).resolve())
+            _CONFIG_CACHE.pop(resolved, None)
+        else:
+            _CONFIG_CACHE.clear()
+
+
+def _parse_config_file(path: Path) -> Dict[str, Any]:
+    """读文件 + 校验 + 规范化（load_config 的无缓存内核）。"""
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
 

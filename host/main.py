@@ -550,7 +550,9 @@ if os.getenv("NEXUS_STREAM_DEBUG", "") == "1":
 # AST-discovers the declarative channels in atoms/channels/*.py and apps/*/
 # (token / default pattern come from each channel's declared env vars,
 # re-read on every request and thus hot-reloadable); a generic handler
-# generates the routers
+# generates the routers. The handler resolves the spec from the registry
+# per request, so a hot-reloaded channel spec takes effect without a router
+# rebuild (see nexus/channels/webhooks.py).
 discover_builtin_channels()
 for _router in build_channel_routers(EngineOps(
     get_session=_get_session,
@@ -558,6 +560,53 @@ for _router in build_channel_routers(EngineOps(
     run_chat_turn=_run_chat_turn_core,
 )):
     app.include_router(_router)
+
+
+# ---------------------------------------------------------------------------
+# Hot reload — llm config 缓存失效 + pattern/plugin/channel 代码模块重载。
+# 覆盖面与边界见 host/reload.py 模块注释（tools/MCP/providers 不在其中，
+# 需要时重启进程）。NEXUS_API_KEY 未设置时本端点与核心 API 一样处于无认
+# 证状态（同样的每分钟告警）。
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/reload")
+async def reload_modules() -> DialogueResponse:
+    """重载变更的 pattern / plugin / channel 模块 + 失效 llm config 缓存。
+
+    重载后把内存会话重绑到注册表里的最新 pattern 对象（在途轮次持有旧
+    引用的按旧拓扑跑完，不受影响）。
+    """
+    from host.reload import reload_all, rebind_sessions
+
+    result = reload_all()
+    rebound = rebind_sessions(governor.sessions, pattern_registry)
+    changed = result.get("changed") or []
+    failed = result.get("failed") or []
+    if failed:
+        message = (f"重载完成：变更 {len(changed)} 个，失败 {len(failed)} 个"
+                   f"（保持旧注册）: {failed}；会话重绑 {rebound} 个")
+    else:
+        message = (f"重载完成：变更 {len(changed)} 个模块"
+                   f"{'（无变更）' if not changed else ''}；会话重绑 {rebound} 个")
+    logger.info("[reload] %s", message)
+    return DialogueResponse(code="0", status=True, message=message)
+
+
+@app.on_event("startup")
+async def _startup_reload_watcher():
+    """建立热重载 mtime 基线（首个 /reload 即可检测开机以来的变更）；
+    NEXUS_RELOAD_WATCH=1 时启动后台 watcher（开发期便利，默认关）。"""
+    from host.reload import init_baseline, start_watcher
+
+    init_baseline()
+    if os.getenv("NEXUS_RELOAD_WATCH", "") == "1":
+        start_watcher()
+
+
+@app.on_event("shutdown")
+async def _shutdown_reload_watcher():
+    from host.reload import stop_watcher
+    stop_watcher()
 
 
 # func3 (read-only audit)
