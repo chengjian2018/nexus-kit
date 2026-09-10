@@ -115,7 +115,7 @@ class DeepResearchExecutor(ModuleExecutor):
             # 触发"不在本轮可用集合"拦截(模型经 mcp_list_tools 能看到工
             # 具名)。这里在解析工具前等待 MCP 连接终态——未配置 server
             # 时零开销,已就绪时立即返回
-            ensure_mcp_ready()
+            await ensure_mcp_ready()
             tools = _resolve_tools(module, pattern)
             allowed_names = {t.get("function", {}).get("name", "")
                              for t in tools}

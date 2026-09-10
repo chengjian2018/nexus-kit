@@ -105,7 +105,7 @@ governor = SessionGovernor()
 store: Optional[SessionStore] = None
 
 
-def _restore_sessions() -> int:
+async def _restore_sessions() -> int:
     """Restore non-expired sessions from the store back into memory (restart
     restore).
 
@@ -121,7 +121,7 @@ def _restore_sessions() -> int:
     restored = 0
     now_wall = time.time()
     try:
-        active_sessions = store.load_active_sessions(governor.ttl_seconds)
+        active_sessions = await store.aload_active_sessions(governor.ttl_seconds)
     except Exception:
         logger.exception("加载未过期会话失败，跳过恢复")
         return 0
@@ -202,45 +202,59 @@ def _validate_registered_patterns() -> None:
 
 
 @app.on_event("startup")
-def _startup_persistence() -> None:
-    """Service startup: initialize the session store + restore non-expired sessions + cross-check pattern_llm."""
-    _init_store()
+async def _startup_persistence() -> None:
+    """Service startup: initialize the session store + restore non-expired
+    sessions + cross-check pattern_llm + start MCP connections."""
+    # heavy/blocking warm-ups go through to_thread so the startup loop stays responsive
+    await asyncio.to_thread(_init_store)
     try:
-        _restore_sessions()
+        await _restore_sessions()
     except Exception:
         logger.exception("重启恢复失败，跳过恢复")
     # Warm up the knowledge-base connection (moves the tools' lazy-init
-    # fallback to startup); failure does not block the service.
+    # fallback to startup); jieba first-load (~1s) off the loop.
+    # Failure does not block the service.
     try:
         from atoms.knowledge.store import get_knowledge_store
-        kb = get_knowledge_store()
-        logger.info("知识库已启用: %s", kb._conn and "ok")
+
+        def _warm_kb():
+            kb = get_knowledge_store()
+            return kb._conn and "ok"
+        logger.info("知识库已启用: %s",
+                    await asyncio.to_thread(_warm_kb))
     except Exception:
         logger.exception("初始化知识库失败，知识工具将在首次调用时重试")
-    _cross_check_pattern_llm()
-    _validate_registered_patterns()
+    await asyncio.to_thread(_cross_check_pattern_llm)
+    await asyncio.to_thread(_validate_registered_patterns)
+    # MCP: spawn server connections on the main loop (registered lazily by
+    # ensure_mcp_ready too — this just front-loads the startup race)
+    try:
+        from atoms.mcp.manager import get_mcp_manager
+        await get_mcp_manager().ensure_started()
+    except Exception:
+        logger.exception("MCP 连接启动失败（首轮对话会重试）")
 
 
 @app.on_event("shutdown")
-def _shutdown_stores() -> None:
+async def _shutdown_stores() -> None:
     """Service shutdown: release the knowledge-base / session-store / MCP connections."""
     global store
     try:
         from atoms.knowledge.store import close_knowledge_store
-        close_knowledge_store()
+        await asyncio.to_thread(close_knowledge_store)
     except Exception:
         logger.exception("关闭知识库失败")
     if store is not None:
         try:
-            store.close()
+            await store.aclose()
         except Exception:
             logger.exception("关闭会话存储失败")
         store = None
-    # MCP manager: close server connections + stop the dedicated loop thread
-    # (no-op when no servers were configured)
+    # MCP manager: close server connections (no-op when none configured;
+    # the loop itself belongs to the host and is not stopped here)
     try:
         from atoms.mcp.manager import get_mcp_manager
-        get_mcp_manager().shutdown()
+        await get_mcp_manager().shutdown()
     except Exception:
         logger.exception("关闭 MCP 连接失败")
 
@@ -307,7 +321,7 @@ class SessionMessagesResponse(BaseModel):
 
 # ----Engine-op core (shared by endpoints and channels; main injects these functions into channels)----
 
-def _launch_session_core(
+async def _launch_session_core(
     pattern_code: str,
     session_id: str,
     task_info: Dict[str, str],
@@ -357,7 +371,7 @@ def _launch_session_core(
     # lose persistence for a launch-time-broken DB than to write unreachable rows.
     if store is not None:
         try:
-            store.create_session(session)
+            await store.acreate_session(session)
             store.attach(session)
         except Exception:
             logger.exception("会话落盘失败（本轮关闭消息持久化）: session=%s", session_id)
@@ -370,7 +384,7 @@ def _get_session(session_id: str) -> Optional[Session]:
     return governor.get(session_id)
 
 
-def _run_chat_turn_core(
+async def _run_chat_turn_core(
     session: Session, query: str
 ) -> Tuple[Optional[str], Optional[Exception]]:
     """Single chat-turn core: run chat + end-of-turn audit persistence.
@@ -386,31 +400,28 @@ def _run_chat_turn_core(
     Returns:
         (reply, error): error is None on success; reply is None only on the
         exception path.
-
-    TODO(phase4): temporary asyncio.run bridge — the engine core is async
-    since phase-2 while the FastAPI endpoints stay sync until phase-4. Safe
-    today: sync endpoints run on the threadpool, never inside a loop.
     """
     error: Optional[Exception] = None
     try:
         # Per-session serialization: concurrent turns on the same session_id
         # (buyer retries / channel replays) would otherwise interleave
         # begin_turn resets and history appends. Cross-session parallelism is
-        # unaffected — each session holds only its own lock.
-        with session.turn_lock:
-            response_text = asyncio.run(chat(
+        # unaffected — each session holds only its own lock (asyncio.Lock:
+        # waiters queue as tasks, the loop keeps serving other sessions).
+        async with session.turn_lock:
+            response_text = await chat(
                 query=query,
                 session_id=session.session_id,
                 all_sessions=governor.sessions,
                 store=store,
-            ))
+            )
     except Exception as e:
         logger.exception("对话处理异常")
         error = e
 
     if store is not None:
         try:
-            store.save_snapshot(session)
+            await store.asave_snapshot(session)
         except Exception:
             logger.exception("会话轮末快照失败: session=%s", session.session_id)
 
@@ -421,8 +432,8 @@ def _run_chat_turn_core(
 
 # func1
 @app.post("/api/v1/launch")
-def launch_dialogue(dialogue_request: DialogueRequest) -> DialogueResponse:
-    _session, code, message = _launch_session_core(
+async def launch_dialogue(dialogue_request: DialogueRequest) -> DialogueResponse:
+    _session, code, message = await _launch_session_core(
         pattern_code=dialogue_request.pattern_code,
         session_id=dialogue_request.session_id,
         task_info=dialogue_request.task_info,
@@ -433,7 +444,7 @@ def launch_dialogue(dialogue_request: DialogueRequest) -> DialogueResponse:
 
 # func2
 @app.post("/api/v1/chat")
-def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
+async def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
     session = _get_session(chat_request.session_id)
     if session is None:
         return ChatResponse(
@@ -442,7 +453,7 @@ def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
             message=f"session_id '{chat_request.session_id}' 不存在或已过期，请先发起对话任务",
         )
 
-    response_text, error = _run_chat_turn_core(session, chat_request.query)
+    response_text, error = await _run_chat_turn_core(session, chat_request.query)
 
     if error is not None:
         # 对外脱敏：异常细节可能含路径/配置/SQL 信息，只回统一话术（细节已进日志）
@@ -465,13 +476,14 @@ def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
 
 
 # func2b (debug-only, env-gated): streaming chat via SSE
-def _chat_dialogue_stream(chat_request: ChatRequest):
-    """SSE debug endpoint for the plan-⑤ streaming protocol.
+async def _chat_dialogue_stream(chat_request: ChatRequest):
+    """SSE debug endpoint for the plan-⑤ streaming protocol (async since
+    the asyncio rewrite — an async generator driving the async engine core;
+    the per-session turn_lock is held across yields by design: same-session
+    requests queue as tasks while the loop keeps serving other sessions).
 
     Mounted only when NEXUS_STREAM_DEBUG=1 — a debugging/observability tool,
-    not a production API (the sync generator holds the request thread for
-    the whole turn; production front-ends should aggregate server-side
-    until an async provider path exists).
+    not a production API.
 
     Event stream (text/event-stream, one JSON payload per line):
         data: {"kind": "delta", "text": "..."}
@@ -490,17 +502,17 @@ def _chat_dialogue_stream(chat_request: ChatRequest):
                      "message": f"session_id '{chat_request.session_id}' 不存在或已过期"},
         )
 
-    def _gen():
+    async def _gen():
         try:
-            with session.turn_lock:
-                gen = chat_turn_stream(
+            async with session.turn_lock:
+                agen = chat_turn_stream(
                     query=chat_request.query,
                     session_id=chat_request.session_id,
                     all_sessions=governor.sessions,
                     store=store,
                 )
                 result = None
-                for event in gen:
+                async for event in agen:
                     if event.kind == "done":
                         result = event.result
                         yield "data: " + _json.dumps({
@@ -528,15 +540,9 @@ def _chat_dialogue_stream(chat_request: ChatRequest):
         _gen(), media_type="text/event-stream")
 
 
-if os.getenv("NEXUS_STREAM_DEBUG", "") == "1" and os.getenv("NEXUS_STREAM_DEBUG", "") != "1-broken":
+if os.getenv("NEXUS_STREAM_DEBUG", "") == "1":
     # Env-gated mount: the SSE debug endpoint exists only when explicitly
     # requested (keep the production surface minimal)
-    #
-    # TODO(phase4): disabled during the phase-2..3 migration window —
-    # chat_turn_stream is now an async generator while this endpoint's sync
-    # generator bridge cannot drive it mid-yield. Phase-4 restores true SSE
-    # via an async endpoint. The guard's second clause is never true; it
-    # exists to make the disabled state grep-able.
     app.post("/api/v1/chat/stream")(_chat_dialogue_stream)
 
 
@@ -556,7 +562,7 @@ for _router in build_channel_routers(EngineOps(
 
 # func3 (read-only audit)
 @app.get("/api/v1/sessions")
-def list_sessions(
+async def list_sessions(
     pattern_code: str = "", limit: int = 50, offset: int = 0
 ) -> SessionListResponse:
     if store is None:
@@ -565,7 +571,7 @@ def list_sessions(
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
     try:
-        sessions = store.list_sessions(
+        sessions = await store.alist_sessions(
             pattern_code=pattern_code or None, limit=limit, offset=offset
         )
     except Exception as e:
@@ -579,12 +585,12 @@ def list_sessions(
 
 # func4 (read-only audit)
 @app.get("/api/v1/sessions/{session_id}/messages")
-def get_session_messages(session_id: str) -> SessionMessagesResponse:
+async def get_session_messages(session_id: str) -> SessionMessagesResponse:
     if store is None:
         return SessionMessagesResponse(code="500", status=False, message="会话存储未启用")
 
     try:
-        messages = store.get_messages(session_id)
+        messages = await store.aget_messages(session_id)
     except Exception as e:
         logger.exception("查询会话消息失败")
         return SessionMessagesResponse(code="500", status=False, message="查询会话消息失败，请稍后重试")

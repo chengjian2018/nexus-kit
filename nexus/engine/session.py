@@ -1,4 +1,4 @@
-import threading
+import asyncio
 
 from nexus.context import DialogueContext
 
@@ -24,7 +24,7 @@ class Session:
         # Per-session turn lock: serializes concurrent chat turns on the SAME
         # session (begin_turn/history writes are not otherwise synchronized);
         # different sessions stay fully parallel — LLM-slow turns only block
-        # their own session's re-entry, not the global thread pool.
-        self.turn_lock = threading.Lock()
-
-
+        # their own session's re-entry, not the event loop. asyncio.Lock
+        # since the asyncio rewrite: waiters are queued as tasks on the host
+        # loop instead of blocking threads.
+        self.turn_lock = asyncio.Lock()

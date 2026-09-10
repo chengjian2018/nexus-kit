@@ -367,7 +367,7 @@ class SessionStore:
 
     # ------------------------------------------------------------------
     # Async twins (asyncio rewrite migration): the sync sqlite3 core is kept
-    # during the phase-2..4 window; async callers go through asyncio.to_thread
+    # during the phase-2..5 window; async callers go through asyncio.to_thread
     # so the blocking core never runs on the event loop. Phase-⑤ replaces the
     # core with aiosqlite and merges the twins into one async method family.
     # ------------------------------------------------------------------
@@ -379,3 +379,24 @@ class SessionStore:
                                keep_idx: int) -> None:
         await asyncio.to_thread(self.replace_history, session,
                                 summary_text, keep_idx)
+
+    async def acreate_session(self, session: Session) -> None:
+        await asyncio.to_thread(self.create_session, session)
+
+    async def asave_snapshot(self, session: Session) -> None:
+        await asyncio.to_thread(self.save_snapshot, session)
+
+    async def aload_active_sessions(
+            self, ttl_seconds: float) -> List[Tuple[Session, float]]:
+        return await asyncio.to_thread(self.load_active_sessions, ttl_seconds)
+
+    async def alist_sessions(self, pattern_code=None, limit=50, offset=0
+                             ) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_sessions, pattern_code,
+                                       limit, offset)
+
+    async def aget_messages(self, session_id: str) -> Optional[List[Dict[str, Any]]]:
+        return await asyncio.to_thread(self.get_messages, session_id)
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self.close)

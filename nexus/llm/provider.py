@@ -121,44 +121,6 @@ class ProviderEntry:
         provider = self.instantiate()
         return await provider.acheck_connection(model=model, **kwargs)
 
-    def chat_completion(
-        self,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        stream: bool = False,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Sync bridge (TODO(phase3): delete once all callers are async)."""
-        return asyncio.run(self.achat_completion(
-            messages=messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, stream=stream, **kwargs))
-
-    def chat_completion_stream(
-        self,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        **kwargs,
-    ) -> Generator["LLMChunk", None, None]:
-        """Sync bridge (TODO(phase3): delete once all callers are async)."""
-        async def _collect():
-            return [c async for c in self.achat_completion_stream(
-                messages=messages, model=model, temperature=temperature,
-                max_tokens=max_tokens, **kwargs)]
-        yield from asyncio.run(_collect())
-
-    def check_connection(
-        self,
-        model: Optional[str] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Sync bridge (TODO(phase3): delete once all callers are async)."""
-        return asyncio.run(self.acheck_connection(model=model, **kwargs))
-
-
 class BaseLLMProvider(ABC):
     """Abstract base for all LLM providers.
 
@@ -346,64 +308,6 @@ class BaseLLMProvider(ABC):
         )
 
     # ------------------------------------------------------------------
-    # Sync bridges (TODO(phase3): delete once all callers are async)
-    # ------------------------------------------------------------------
-
-    def chat_completion(
-        self,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        stream: bool = False,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        return asyncio.run(self.achat_completion(
-            messages=messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, stream=stream, **kwargs))
-
-    def chat_completion_stream(
-        self,
-        messages: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        **kwargs,
-    ) -> Generator["LLMChunk", None, None]:
-        async def _collect():
-            return [c async for c in self.achat_completion_stream(
-                messages=messages, model=model, temperature=temperature,
-                max_tokens=max_tokens, **kwargs)]
-        yield from asyncio.run(_collect())
-
-    def _chat_completion_impl(
-        self,
-        messages: List[Dict[str, Any]],
-        model: str,
-        temperature: float,
-        max_tokens: int,
-        stream: bool,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        return asyncio.run(self._achat_completion_impl(
-            messages=messages, model=model, temperature=temperature,
-            max_tokens=max_tokens, stream=stream, **kwargs))
-
-    def _chat_completion_stream_impl(
-        self,
-        messages: List[Dict[str, Any]],
-        model: str,
-        temperature: float,
-        max_tokens: int,
-        **kwargs,
-    ) -> Generator["LLMChunk", None, None]:
-        async def _collect():
-            return [c async for c in self._achat_completion_stream_impl(
-                messages=messages, model=model, temperature=temperature,
-                max_tokens=max_tokens, **kwargs)]
-        yield from asyncio.run(_collect())
-
-    # ------------------------------------------------------------------
     # Connectivity
     # ------------------------------------------------------------------
 
@@ -465,21 +369,6 @@ class BaseLLMProvider(ABC):
     async def ais_available(self, model: Optional[str] = None, **kwargs) -> bool:
         """Return True when the provider answers a minimal probe request."""
         return (await self.acheck_connection(model=model, **kwargs))["ok"]
-
-    def check_connection(
-        self,
-        model: Optional[str] = None,
-        prompt: str = "ping",
-        max_tokens: int = 16,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Sync bridge (TODO(phase3): delete once all callers are async)."""
-        return asyncio.run(self.acheck_connection(
-            model=model, prompt=prompt, max_tokens=max_tokens, **kwargs))
-
-    def is_available(self, model: Optional[str] = None, **kwargs) -> bool:
-        """Sync bridge (TODO(phase3): delete once all callers are async)."""
-        return self.check_connection(model=model, **kwargs)["ok"]
 
     # ------------------------------------------------------------------
     # Helpers

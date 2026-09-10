@@ -20,6 +20,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -156,19 +157,22 @@ def test_call_failure_marks_not_ready_and_returns_tool_error():
     """调用超时/连接异常后:返回 tool_error JSON(永不 raise)、conn 置
     not-ready(后续调用 fast-fail 而非傻等满超时)、后台重连被调度。"""
     from atoms.mcp.manager import McpManager, _ServerConn
+    from async_utils import arun
     from unittest.mock import patch
+
+    async def _boom_call(tool, arguments):
+        raise TimeoutError(" ConnectTimeout ")
 
     mgr = McpManager()
     conn = _ServerConn("fake", {"transport": "bogus"})  # 重连会失败但零网络
     conn.ready = True
-    conn.session = object()  # 假 session
+    conn.session = SimpleNamespace(call_tool=_boom_call)
     mgr._servers["fake"] = conn
 
     scheduled = []
-    with patch.object(mgr, "_submit", side_effect=TimeoutError(" ConnectTimeout ")), \
-         patch.object(mgr, "_schedule_reconnect",
+    with patch.object(mgr, "_schedule_reconnect",
                       side_effect=lambda c: scheduled.append(c.name)):
-        result = mgr.call_tool_sync("fake", "web_search_prime", {})
+        result = arun(mgr.call_tool("fake", "web_search_prime", {}))
 
     payload = json.loads(result)
     assert payload["error"] == "mcp_call_exception"
@@ -177,23 +181,13 @@ def test_call_failure_marks_not_ready_and_returns_tool_error():
 
 
 def test_reconnect_dedup_prevents_storm():
-    """同一 conn 的重连去重:进行中不重复调度(reconnecting 标志防线);
-    且重连启动失败时标志必须释放(否则一次失败永久卡死自愈)。"""
+    """同一 conn 的重连去重:进行中不重复调度(reconnecting 标志防线)。"""
     from atoms.mcp.manager import McpManager, _ServerConn
-    from unittest.mock import patch
 
     mgr = McpManager()
 
-    # 分支一:重连已在途 → 立即返回,不碰 loop 线程
+    # 重连已在途 → 立即返回,不 spawn 新任务
     conn = _ServerConn("fake", {"transport": "bogus"})
     conn.reconnecting = True
     mgr._schedule_reconnect(conn)
     assert conn.reconnecting is True  # 未被覆盖(去重生效)
-
-    # 分支二:_ensure_loop 启动失败 → reconnecting 必须被释放
-    conn2 = _ServerConn("fake2", {"transport": "bogus"})
-    conn2.ready = True
-    with patch.object(mgr, "_ensure_loop", side_effect=RuntimeError("no loop")):
-        mgr._schedule_reconnect(conn2)
-    assert conn2.reconnecting is False  # 启动失败已释放
-    assert conn2.ready is False

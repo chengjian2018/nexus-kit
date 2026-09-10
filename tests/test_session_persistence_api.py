@@ -5,6 +5,7 @@ into a tmp DB explicitly by fixture; registry_guard clears/restores the global
 session table to prevent pollution.
 """
 
+from async_utils import arun
 import pytest
 from fastapi.testclient import TestClient
 
@@ -219,7 +220,7 @@ def test_restart_recovery_restores_and_continues(client, store, registry_guard):
         main.governor.sessions.clear()
         main.governor.last_active.clear()
 
-    restored = main._restore_sessions()
+    restored = arun(main._restore_sessions())
     assert restored >= 1
     session = main.governor.sessions["rs-1"]
     assert session.pattern is not None  # pattern re-resolved from the registry
@@ -268,7 +269,7 @@ def test_restore_skips_unregistered_pattern(client, store, registry_guard):
     from nexus.engine.session import Session
 
     store.create_session(Session(session_id="ghost", pattern_code="no_such_pattern"))
-    restored = main._restore_sessions()
+    restored = arun(main._restore_sessions())
     assert "ghost" not in main.governor.sessions
     assert restored == 0
 
@@ -297,17 +298,17 @@ def test_restore_failure_does_not_block(client, store, registry_guard, monkeypat
     def store_boom(ttl):
         raise RuntimeError("db read down")
 
-    monkeypatch.setattr(store, "load_active_sessions", store_boom)
-    assert main._restore_sessions() == 0
+    monkeypatch.setattr(store, "aload_active_sessions", store_boom)
+    assert arun(main._restore_sessions()) == 0
 
     # 2) single-session failure (e.g. any exception triggered by a corrupted row): skip that session, do not block the rest
     good = Session(session_id="rs-good", pattern_code="xianyu_agent")
     bad = Session(session_id="rs-bad", pattern_code="xianyu_agent")
 
-    def fake_load(ttl):
+    async def fake_load(ttl):
         return [(good, main.time.time()), (bad, main.time.time())]
 
-    monkeypatch.setattr(store, "load_active_sessions", fake_load)
+    monkeypatch.setattr(store, "aload_active_sessions", fake_load)
 
     real_get = main.pattern_registry.get
     calls = []
@@ -320,7 +321,7 @@ def test_restore_failure_does_not_block(client, store, registry_guard, monkeypat
 
     monkeypatch.setattr(main.pattern_registry, "get", get_or_raise)
 
-    restored = main._restore_sessions()
+    restored = arun(main._restore_sessions())
     assert restored == 1
     assert "rs-good" in main.governor.sessions
     assert "rs-bad" not in main.governor.sessions

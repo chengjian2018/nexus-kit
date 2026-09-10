@@ -279,37 +279,7 @@ class LLMProviderRegistry:
         async for chunk in agen:
             yield chunk
 
-    # -- sync bridges (TODO(phase3): delete once all callers are async) ----
 
-    def chat_completion(
-        self,
-        messages: List[Dict[str, Any]],
-        code: Optional[str] = None,
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        stream: bool = False,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        return asyncio.run(self.achat_completion(
-            messages=messages, code=code, model=model,
-            temperature=temperature, max_tokens=max_tokens,
-            stream=stream, **kwargs))
-
-    def chat_completion_stream(
-        self,
-        messages: List[Dict[str, Any]],
-        code: Optional[str] = None,
-        model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        **kwargs,
-    ) -> Generator[str, None, None]:
-        async def _collect():
-            return [c async for c in self.achat_completion_stream(
-                messages=messages, code=code, model=model,
-                temperature=temperature, max_tokens=max_tokens, **kwargs)]
-        yield from asyncio.run(_collect())
 
 
 # Module-level singleton

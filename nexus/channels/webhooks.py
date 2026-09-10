@@ -32,7 +32,7 @@ def build_channel_router(spec: Any, ops: EngineOps) -> APIRouter:
     payload_model = spec.payload_model
 
     @router.post(f"/api/v1/channel/{spec.name}")
-    def handle(
+    async def handle(
         payload: payload_model,  # type: ignore[valid-type]
         token: str = Query(default=""),
     ) -> Dict[str, Any]:
@@ -79,7 +79,7 @@ def build_channel_router(spec: Any, ops: EngineOps) -> APIRouter:
                     ),
                 )
             request_id = f"{spec.name}-{uuid.uuid4().hex[:12]}"
-            session, _code, message = ops.launch_session(
+            session, _code, message = await ops.launch_session(
                 pattern_code, session_id, msg.task_info, request_id, exist_ok=True,
             )
             if session is None:
@@ -88,7 +88,7 @@ def build_channel_router(spec: Any, ops: EngineOps) -> APIRouter:
                         spec.name, session_id, pattern_code)
 
         # 5. One chat turn + channel difference point (2): success response contract
-        reply, error = ops.run_chat_turn(session, msg.text)
+        reply, error = await ops.run_chat_turn(session, msg.text)
         if error is not None:
             raise HTTPException(status_code=500, detail=f"对话处理异常: {error}")
 

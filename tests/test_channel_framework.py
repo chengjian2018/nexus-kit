@@ -47,11 +47,18 @@ def test_inbound_message_defaults():
 
 def test_engine_ops_holds_callables():
     """EngineOps is a pure data bundle: the three operation fields are stored and read back verbatim."""
+    async def _launch(*a, **k):
+        return None, "0", ""
+
+    async def _run(s, q):
+        return "ok", None
+
     ops = EngineOps(get_session=lambda _sid: None,
-                    launch_session=lambda *a, **k: (None, "0", ""),
-                    run_chat_turn=lambda s, q: ("ok", None))
+                    launch_session=_launch,
+                    run_chat_turn=_run)
     assert ops.get_session("any") is None
-    assert ops.run_chat_turn(None, "q")[0] == "ok"
+    from async_utils import arun
+    assert arun(ops.run_chat_turn(None, "q"))[0] == "ok"
 
 
 def test_fake_spec_satisfies_protocol():
@@ -202,7 +209,7 @@ class HandlerHarness:
         self.launch_error = None
         self.run_error = None
 
-        def launch_session(pattern_code, session_id, task_info, request_id, exist_ok=False):
+        async def launch_session(pattern_code, session_id, task_info, request_id, exist_ok=False):
             self.launch_calls.append(
                 {"pattern_code": pattern_code, "session_id": session_id,
                  "task_info": task_info, "exist_ok": exist_ok}
@@ -218,7 +225,7 @@ class HandlerHarness:
         def get_session(session_id):
             return self.sessions.get(session_id)
 
-        def run_chat_turn(session, query):
+        async def run_chat_turn(session, query):
             self.run_calls.append((session.session_id, query))
             if self.run_error is not None:
                 return None, self.run_error

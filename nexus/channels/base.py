@@ -8,7 +8,7 @@ protocol with no IO; it imports neither the engine nor main.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Type, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, Tuple, Type, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -37,12 +37,14 @@ class EngineOps:
     """Engine operations bundle injected by main.py — the three core functions shared by endpoints and channels.
 
     Channel modules depend only on this bundle, never importing main
-    (offline unit-testable).
+    (offline unit-testable). Since the asyncio rewrite: get_session stays
+    sync (pure in-memory governor lookup); launch_session / run_chat_turn
+    are coroutines (store writes + the engine core are async).
     """
 
     get_session: Callable[[str], Optional[Session]]
-    launch_session: Callable[..., Tuple[Optional[Session], str, str]]
-    run_chat_turn: Callable[[Session, str], Tuple[Optional[str], Optional[Exception]]]
+    launch_session: Callable[..., Awaitable[Tuple[Optional[Session], str, str]]]
+    run_chat_turn: Callable[[Session, str], Awaitable[Tuple[Optional[str], Optional[Exception]]]]
 
 
 @runtime_checkable

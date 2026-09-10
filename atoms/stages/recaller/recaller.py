@@ -833,7 +833,7 @@ class BaseReranker(ABC):
         self.name = name or self.__class__.__name__
 
     @abstractmethod
-    def rerank(
+    async def rerank(
         self,
         results: List[Dict[str, Any]],
         query: str,
@@ -873,7 +873,7 @@ class ScoreBasedReranker(BaseReranker):
         super().__init__(name=name)
         self.path_weights = path_weights or {}
 
-    def rerank(
+    async def rerank(
         self,
         results: List[Dict[str, Any]],
         query: str,
@@ -913,7 +913,7 @@ class DiversityReranker(BaseReranker):
         super().__init__(name=name)
         self.lambda_param = lambda_param
 
-    def rerank(
+    async def rerank(
         self,
         results: List[Dict[str, Any]],
         query: str,
@@ -991,7 +991,7 @@ class LLMReranker(BaseReranker):
         self._call_llm = call_llm
         self._prompt_template = prompt_template or RECALL_RERANK_LLM_PROMPT
 
-    def rerank(
+    async def rerank(
         self,
         results: List[Dict[str, Any]],
         query: str,
@@ -1018,11 +1018,7 @@ class LLMReranker(BaseReranker):
 
         raw_response = self._call_llm(prompt)
         if inspect.iscoroutine(raw_response):
-            # async callback: bridge on a private loop (rerank stays a sync
-            # hook inside MultiPathRecaller.execute; the injected default is
-            # sync — this branch only serves exotic async rerankers)
-            import asyncio as _asyncio
-            raw_response = _asyncio.run(raw_response)
+            raw_response = await raw_response
 
         try:
             reranked_data = self._parse_rerank_response(raw_response)
@@ -1155,7 +1151,7 @@ class MultiPathRecaller(PipelineStage):
     # LLM client (reuses the NLU/NLG pattern)
     # ------------------------------------------------------------------
 
-    def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
+    async def _call_llm(self, prompt: str, llm_config: Optional[Dict[str, Any]] = None) -> str:
         """Call the LLM and return the response text.
 
         When *llm_config* is None, the config is auto-loaded from
@@ -1169,7 +1165,7 @@ class MultiPathRecaller(PipelineStage):
         provider = build_provider(llm_config)
 
         messages = [{"role": "user", "content": prompt}]
-        result = provider.chat_completion(
+        result = await provider.achat_completion(
             messages=messages,
             model=llm_config["model"],
             temperature=llm_config.get("temperature", 0.7),
@@ -1184,12 +1180,14 @@ class MultiPathRecaller(PipelineStage):
         """Inject LLM callbacks into components that need the LLM.
 
         For LLMRecallPath and LLMReranker without an explicit call_llm, auto-bind
-        to self._call_llm for unified LLM management.
+        to self._call_llm for unified LLM management (async since the asyncio
+        rewrite; consumers duck-type the return via inspect.iscoroutine).
 
         Called on every ``execute``: auto-injected components are rebound to the
         current ``ctx.llm_config``; components with an explicit call_llm are untouched.
         """
-        callback = lambda prompt: self._call_llm(prompt, llm_config)
+        async def callback(prompt: str) -> str:
+            return await self._call_llm(prompt, llm_config)
 
         for path in self.recall_paths:
             if not isinstance(path, LLMRecallPath):
@@ -1304,7 +1302,7 @@ class MultiPathRecaller(PipelineStage):
 
         # 4. Run reranking
         try:
-            final = self._reranker.rerank(fused, query, ctx)
+            final = await self._reranker.rerank(fused, query, ctx)
         except Exception as e:
             logger.error("重排序器 '%s' 执行异常: %s", self._reranker.name, e, exc_info=True)
             final = fused

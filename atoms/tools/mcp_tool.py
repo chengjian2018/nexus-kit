@@ -96,20 +96,23 @@ def bootstrap_mcp() -> None:
         logger.error("[mcp] bootstrap 失败(忽略): %s", e)
 
 
-def ensure_mcp_ready(timeout: float = 15.0) -> None:
+async def ensure_mcp_ready(timeout: float = 15.0) -> None:
     """等待已配置的 MCP server 到达连接终态(消费者侧时序闸)。
 
-    背景:bootstrap 只 spawn 后台连接任务,工具注册完成时刻不定;首个
-    对话轮若抢在注册完成之前解析工具(如 deep_research 的
-    _resolve_tools),allowed_names 会被冻结成不含 MCP 工具的集合,模型
-    后续引用即触发"不在本轮可用集合"拦截。agent executor 在解析工具前
-    调用本函数——未配置 server 时立即返回,全部就绪时也立即返回,只有
-    启动竞态窗口内的首轮会真正等待(上限 timeout)。
+    背景:bootstrap 只登记配置,连接由 ensure_started spawn 的 task 异步
+    完成,工具注册完成时刻不定;首个对话轮若抢在注册完成之前解析工具
+    (如 deep_research 的 _resolve_tools),allowed_names 会被冻结成不含
+    MCP 工具的集合,模型后续引用即触发"不在本轮可用集合"拦截。agent
+    executor 在解析工具前调用本函数——未配置 server 时立即返回,全部
+    就绪时也立即返回,只有启动竞态窗口内的首轮会真正等待(上限 timeout)。
+
+    兜底自愈:宿主忘记在 startup 挂 ensure_started 时,这里的 wait_ready
+    内部会先 spawn 连接(见 manager.wait_ready)。
     """
     try:
         from atoms.mcp.manager import get_mcp_manager
 
-        get_mcp_manager().wait_ready(timeout=timeout)
+        await get_mcp_manager().wait_ready(timeout=timeout)
     except Exception as e:  # noqa: BLE001 -- 时序闸绝不能阻塞对话
         logger.warning("[mcp] 等待就绪失败(忽略,继续解析工具): %s", e)
 

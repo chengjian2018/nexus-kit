@@ -226,6 +226,18 @@ def test_executor_plugin_registered():
     assert plugins.has("executor", "deep_research")
 
 
+class _AsyncSpy:
+    """Await-able spy (async-def stand-in) recording kwargs of each call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *a, **kw):
+        import asyncio
+        self.calls.append(kw)
+        return asyncio.sleep(0)
+
+
 def test_ensure_mcp_ready_is_noop_without_servers():
     """时序闸回归锚:未配置 MCP server 时 ensure_mcp_ready 立即返回、
     绝不阻塞对话(启动竞态修复的守卫;真实竞态窗口的行为已在线下用
@@ -236,10 +248,10 @@ def test_ensure_mcp_ready_is_noop_without_servers():
     from atoms.tools.mcp_tool import ensure_mcp_ready
 
     with _patch("atoms.mcp.manager.get_mcp_manager") as gm:
-        gm.return_value.wait_ready.return_value = None
-        ensure_mcp_ready(timeout=0.1)
+        gm.return_value.wait_ready = _AsyncSpy()
+        arun(ensure_mcp_ready(timeout=0.1))
         gm.assert_called_once()
-        gm.return_value.wait_ready.assert_called_once_with(timeout=0.1)
+        gm.return_value.wait_ready.calls == [dict(timeout=0.1)]
 
     # 异常吞没契约:manager 抛错也绝不向对话层传播
     with _patch("atoms.mcp.manager.get_mcp_manager") as gm:

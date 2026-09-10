@@ -1,18 +1,21 @@
 """MCP 连接管理器 — toolset ``mcp-<server>`` 背后的客户端层。
 
-架构约束(为什么不用 ToolRegistry._run_async 桥):
+asyncio 改造后的架构(原「专职后台线程 + 专职 event loop」已拆除):
 
-- ``ClientSession`` 绑定创建它的 event loop,不能跨 loop 复用;而
-  ``ToolRegistry.dispatch`` 对 async handler 走的 ``_run_async`` 每次起一个
-  新 loop——两者不兼容。因此本管理器自持「专职后台线程 + 专职 event
-  loop」,所有 MCP 操作经 ``asyncio.run_coroutine_threadsafe`` 提交,工具
-  handler 用 sync 签名(``is_async=False``)内部桥接。
-- 连接生命周期:bootstrap 只 spawn 后台连接任务(不阻塞 import / host
-  启动);长连接复用(stdio 子进程 / HTTP session);断线标记 not-ready,
-  ``refresh()`` 走 deregister nuke-and-repave(命中 ToolRegistry 的 mcp-
-  豁免)后重连重注册。
-- ``notifications/tools/list_changed`` V1 不订阅:刷新由显式 ``refresh()``
-  触发(运维 / 定时任务的挂点)。
+- 连接直接活在**调用方 event loop**(uvicorn 主 loop / CLI 的单一
+  asyncio.run loop)。``ClientSession`` 本就绑定创建它的 loop——现在整
+  个框架 async-only,不再需要跨线程桥。
+- ``bootstrap`` 只做纯记录(import 期不可 await):解析配置 + 建
+  ``_ServerConn``;真正的连接由 ``ensure_started()`` spawn(asyncio
+  task,不等待——保持「启动不阻塞」语义)。
+- 挂载点三处:①FastAPI startup;②CLI repl 开头;③``ensure_mcp_ready``
+  兜底自愈(即使宿主忘记挂载,首个对话轮也会懒起连接)。
+- ``wait_ready`` 用每个 conn 的 ``asyncio.Event``(终态 set),不再忙
+  轮询。
+- 工具 handler 注册为 async(``is_async=True``),直接 await
+  ``call_tool``——``ToolRegistry._run_async`` 桥退役。
+- ``notifications/tools/list_changed`` V1 不订阅:刷新由显式
+  ``arefresh()`` 触发(运维 / 定时任务的挂点)。
 
 mcp sdk 延迟 import(连接时才 import):未装 sdk 且未配置 server 时,本
 模块的 import / no-op bootstrap 都不报错——优雅降级。
@@ -31,7 +34,7 @@ logger = logging.getLogger(__name__)
 # 单条 MCP 工具结果的最大字符数(超长截断,防单次搜索结果撑爆 LLM 上下文)
 _MAX_TOOL_RESULT_CHARS = 8000
 
-# call_tool_sync 的默认等待秒数
+# call_tool 的默认等待秒数
 _DEFAULT_CALL_TIMEOUT = 120.0
 
 
@@ -71,7 +74,8 @@ class _ServerConn:
 
     ``stack`` 持有 transport + ClientSession 的 AsyncExitStack,生命周期
     即连接生命周期;``registered_tools`` 记录本 server 注册进 ToolRegistry
-    的工具名(refresh 时 nuke-and-repave 的拆除清单)。
+    的工具名(refresh 时 nuke-and-repave 的拆除清单)。``done_event`` 在
+    连接到达终态(成功或失败)时 set——``wait_ready`` 的等待锚点。
     """
 
     def __init__(self, name: str, cfg: Dict[str, Any]):
@@ -82,8 +86,10 @@ class _ServerConn:
         self.registered_tools: List[str] = []
         self.ready = False
         self.error: Optional[str] = None
-        # 重连去重标记:调用侧故障触发的后台重连进行中(防重连风暴)
+        # 重连去重标志:调用侧故障触发的后台重连进行中(防重连风暴)
         self.reconnecting = False
+        # 终态事件(None = 尚未在本 loop 上 spawn 过连接任务)
+        self.done_event: Optional[asyncio.Event] = None
 
     @property
     def toolset(self) -> str:
@@ -91,65 +97,34 @@ class _ServerConn:
 
 
 class McpManager:
-    """MCP 连接管理器:专职后台线程 + 专职 event loop。
+    """MCP 连接管理器:asyncio 原生(连接活在调用方 loop)。
 
-    线程模型:``_loop_thread`` 跑 ``_loop``(专职 asyncio loop),
-    ``_ready_event`` 标记 loop 就绪;所有 async 工作以 coroutine 函数经
-    ``_submit`` 从任意线程投递。连接任务之间不互相等待(一个 server 失败
-    不影响其它),``wait_ready`` 供需要确定性的调用方同步终态。
+    生命周期:``bootstrap``(sync,import 期纯记录)→ ``ensure_started``
+    (async,幂等 spawn 连接 task,不等待)→ ``wait_ready``(async,等
+    全部终态)→ ``call_tool``(await)→ ``shutdown``(async,拆除全部)。
     """
 
     def __init__(self):
         self._servers: Dict[str, _ServerConn] = {}
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._loop_thread: Optional[threading.Thread] = None
-        self._loop_ready = threading.Event()
         self._bootstrapped = False
+        self._started = False
+        # bootstrap 可能在无 loop 的 import 期执行(纯记录,不需要 loop);
+        # 懒单例本身也是跨线程可达的——保留 threading 锁保护 dict 写入
         self._lock = threading.RLock()
-
-    # ------------------------------------------------------------------
-    # 后台 loop 线程
-    # ------------------------------------------------------------------
-
-    def _run_loop(self) -> None:
-        asyncio.run(self._loop_main())
-
-    async def _loop_main(self) -> None:
-        self._loop = asyncio.get_running_loop()
-        self._loop_ready.set()
-        # loop 存活直至 shutdown 投递哨兵
-        await asyncio.Event().wait()
-
-    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        """启动专职线程并等 loop 就绪(幂等)。"""
-        with self._lock:
-            if self._loop_thread is not None and self._loop_thread.is_alive():
-                return self._loop
-            self._loop_thread = threading.Thread(
-                target=self._run_loop, name="mcp-manager-loop", daemon=True)
-            self._loop_thread.start()
-        self._loop_ready.wait(timeout=10.0)
-        if self._loop is None:
-            raise RuntimeError("MCP 专职 event loop 启动失败")
-        return self._loop
-
-    def _submit(self, coro_fn, *args, timeout: float = _DEFAULT_CALL_TIMEOUT):
-        """把 coroutine 工厂投递到专职 loop,阻塞等待结果(异常原样抛)。"""
-        loop = self._ensure_loop()
-        future = asyncio.run_coroutine_threadsafe(coro_fn(*args), loop)
-        return future.result(timeout=timeout)
+        # ensure_started spawn 的 task 引用(防 GC 中途回收)
+        self._tasks: List[asyncio.Task] = []
 
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
 
     def bootstrap(self, servers_cfg: Dict[str, Any]) -> None:
-        """启动入口(import 副作用调用):解析配置 + spawn 后台连接任务。
+        """启动入口(import 副作用调用):纯记录——解析配置 + 建 conn。
 
         幂等:已 bootstrap 过则忽略后续调用(含不同配置——改配置请走
-        refresh / 重启进程)。同步部分绝不阻塞——stdio 子进程启动 / HTTP
-        握手都在后台 loop 里完成,注册完成的工具在之后的 _resolve_tools
-        中自然可见(ToolRegistry 的线程安全为 MCP 动态刷新而设计)。
+        arefresh / 重启进程)。连接不在此时发生(import 期不可 await);
+        真正的 spawn 在 ``ensure_started``(startup / CLI / ensure_mcp_ready
+        三挂点)。
         """
         with self._lock:
             if self._bootstrapped:
@@ -172,26 +147,56 @@ class McpManager:
                 "(pip install mcp): %s", len(servers_cfg), e)
             return
 
-        loop = self._ensure_loop()
-        for name, cfg in servers_cfg.items():
-            conn = _ServerConn(str(name), dict(cfg))
-            self._servers[conn.name] = conn
-            asyncio.run_coroutine_threadsafe(
-                self._connect_and_register(conn), loop)
-        logger.info("[mcp] bootstrap: %d 个 server 后台连接中 %s",
+        with self._lock:
+            for name, cfg in servers_cfg.items():
+                conn = _ServerConn(str(name), dict(cfg))
+                self._servers[conn.name] = conn
+        logger.info("[mcp] bootstrap: %d 个 server 已登记(连接待 ensure_started) %s",
                     len(servers_cfg), sorted(servers_cfg))
 
-    def wait_ready(self, timeout: float = 30.0) -> None:
-        """等待全部已配置 server 到达终态(连接成功或失败;测试 / 运维用)。"""
-        import time
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            with self._lock:
-                if all(c.ready or c.error for c in self._servers.values()):
-                    return
-            time.sleep(0.05)
+    async def ensure_started(self) -> None:
+        """幂等启动:对已配置未连接的 conn spawn 连接 task(不等待完成)。
 
-    def refresh(self, server_name: Optional[str] = None) -> None:
+        必须在 event loop 内调用。挂载点:FastAPI startup / CLI repl 开头 /
+        ``ensure_mcp_ready`` 兜底——即使宿主忘记挂载,首个对话轮也会懒起。
+        """
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+            pending = [c for c in self._servers.values()
+                       if c.done_event is None or not c.done_event.is_set()]
+
+        for conn in pending:
+            if conn.done_event is None:
+                conn.done_event = asyncio.Event()
+            elif conn.done_event.is_set() and conn.error is None:
+                continue  # 已成功连接
+            task = asyncio.create_task(self._connect_and_register(conn))
+            self._tasks.append(task)
+        if pending:
+            logger.info("[mcp] ensure_started: %d 个 server 连接任务已 spawn",
+                        len(pending))
+
+    async def wait_ready(self, timeout: float = 30.0) -> None:
+        """等待全部已配置 server 到达终态(连接成功或失败;测试 / 运维用)。
+
+        兼容懒宿主:若 ensure_started 尚未被调用,先 spawn 再等(自愈)。
+        """
+        await self.ensure_started()
+        with self._lock:
+            events = [c.done_event for c in self._servers.values()
+                      if c.done_event is not None]
+        if not events:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(e.wait() for e in events)), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[mcp] wait_ready 超时 %.0fs(继续,工具面按现状解析)",
+                           timeout)
+
+    async def arefresh(self, server_name: Optional[str] = None) -> None:
         """nuke-and-repave 刷新:deregister 该 server toolset(前缀 mcp-,
         命中 ToolRegistry.deregister 的 MCP 豁免)→ 重连 → 重注册。
 
@@ -201,31 +206,28 @@ class McpManager:
         with self._lock:
             targets = ([self._servers[server_name]] if server_name in self._servers
                        else list(self._servers.values()))
-        loop = self._ensure_loop()
         for conn in targets:
-            asyncio.run_coroutine_threadsafe(
-                self._teardown_and_reconnect(conn), loop)
+            if conn.done_event is None:
+                conn.done_event = asyncio.Event()
+            asyncio.create_task(self._teardown_and_reconnect(conn))
 
-    def shutdown(self) -> None:
-        """关闭全部连接并停 loop(host shutdown 钩子调用;幂等)。"""
+    async def shutdown(self) -> None:
+        """关闭全部连接(host shutdown 钩子调用;幂等)。
+
+        不停任何 loop——loop 属于调用方(uvicorn 主 loop / CLI 的
+        asyncio.run);这里只拆除连接 + 复位状态,允许同进程再次起。
+        """
         with self._lock:
             conns = list(self._servers.values())
-            loop, thread = self._loop, self._loop_thread
-            self._loop, self._loop_thread = None, None
-            self._bootstrapped = False
+            self._started = False
             self._servers.clear()
-        if loop is None or thread is None or not thread.is_alive():
-            return
-
-        async def _close_all():
-            for conn in conns:
+            self._bootstrapped = False
+        for conn in conns:
+            try:
                 await self._teardown(conn)
-            loop.stop()
-
-        try:
-            asyncio.run_coroutine_threadsafe(_close_all(), loop).result(timeout=10.0)
-        except Exception as e:  # noqa: BLE001 -- shutdown 尽力而为
-            logger.warning("[mcp] shutdown 清理异常(忽略): %s", e)
+            except Exception as e:  # noqa: BLE001 -- shutdown 尽力而为
+                logger.warning("[mcp] shutdown 清理 '%s' 异常(忽略): %s",
+                               conn.name, e)
 
     def list_servers(self) -> List[Dict[str, Any]]:
         """观测数据:[{server, ready, error, tools}](``mcp_list_tools`` 的数据源)。"""
@@ -235,13 +237,13 @@ class McpManager:
                     for c in self._servers.values()]
 
     # ------------------------------------------------------------------
-    # 工具调用桥(handler 契约:sync 签名,永不 raise)
+    # 工具调用(handler 契约:async handler,永不 raise)
     # ------------------------------------------------------------------
 
-    def call_tool_sync(self, server_name: str, tool_name: str,
-                       args: Dict[str, Any],
-                       timeout: float = _DEFAULT_CALL_TIMEOUT) -> str:
-        """同步桥:提交 call_tool 到专职 loop,阻塞等结果。
+    async def call_tool(self, server_name: str, tool_name: str,
+                        args: Dict[str, Any],
+                        timeout: float = _DEFAULT_CALL_TIMEOUT) -> str:
+        """在本 loop 上直接调用 server 工具。
 
         任何异常(未连接 / 超时 / server 报错)都返回 tool_error JSON 字符串
         ——符合 ToolRegistry handler 契约,错误信息经 _sanitize_tool_error
@@ -255,12 +257,11 @@ class McpManager:
             return tool_error(
                 "mcp_server_not_ready",
                 server=server_name,
-                hint="MCP server 未连接或已断开;可尝试 refresh 恢复")
+                hint="MCP server 未连接或已断开;可尝试 arefresh 恢复")
         try:
-            async def _call():
-                return await conn.session.call_tool(tool_name, arguments=args)
-
-            result = self._submit(lambda: _call(), timeout=timeout)
+            result = await asyncio.wait_for(
+                conn.session.call_tool(tool_name, arguments=args),
+                timeout=timeout)
             return _content_to_text(result)
         except Exception as e:  # noqa: BLE001 -- handler 契约:永不 raise
             logger.warning("[mcp] call_tool %s/%s 失败: %s",
@@ -275,7 +276,7 @@ class McpManager:
                               hint="连接故障,已触发重连;模型可稍后重试该工具")
 
     # ------------------------------------------------------------------
-    # 连接 / 注册(loop 线程内执行)
+    # 连接 / 注册(调用方 loop 内执行)
     # ------------------------------------------------------------------
 
     def _schedule_reconnect(self, conn: _ServerConn) -> None:
@@ -284,24 +285,18 @@ class McpManager:
         立即置 not-ready(后续调用走 fast-fail 错误而不是傻等超时),
         重连完成后由 _connect_and_register 恢复 ready。重连风暴防线:
         ``reconnecting`` 标志在任务终态时释放。"""
-        with self._lock:
-            if conn.reconnecting:
-                return
-            conn.reconnecting = True
-            conn.ready = False
-        try:
-            loop = self._ensure_loop()
-        except Exception as e:  # noqa: BLE001 -- 自愈失败不向调用方传播
-            conn.reconnecting = False
-            logger.warning("[mcp] server '%s' 重连启动失败: %s", conn.name, e)
+        if conn.reconnecting:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._teardown_and_reconnect(conn), loop)
+        conn.reconnecting = True
+        conn.ready = False
 
-        def _release(_fut):
-            conn.reconnecting = False
+        async def _run():
+            try:
+                await self._teardown_and_reconnect(conn)
+            finally:
+                conn.reconnecting = False
 
-        future.add_done_callback(_release)
+        asyncio.create_task(_run())
         logger.info("[mcp] server '%s' 连接故障,后台重连已启动", conn.name)
 
     async def _connect_and_register(self, conn: _ServerConn) -> None:
@@ -329,9 +324,12 @@ class McpManager:
         except Exception as e:  # noqa: BLE001 -- 单 server 失败不拖垮整体
             conn.ready, conn.error = False, str(e)
             logger.error("[mcp] server '%s' 连接失败: %s", conn.name, e)
+        finally:
+            if conn.done_event is not None:
+                conn.done_event.set()
 
     async def _teardown_and_reconnect(self, conn: _ServerConn) -> None:
-        """refresh 用:先拆连接(连带 deregister 工具)再重连。"""
+        """arefresh 用:先拆连接(连带 deregister 工具)再重连。"""
         await self._teardown(conn)
         await self._connect_and_register(conn)
 
@@ -377,7 +375,7 @@ class McpManager:
         if transport == "streamable_http":
             # mcp 2.2+: headers 经预配置的 httpx.AsyncClient 传入(客户端
             # 工厂不再收 headers kwarg);headers 为空时仍传 client 以保
-            # 证超时行为一致
+            # 证超时行为一致。AsyncClient 现在自然活在调用方 loop 上。
             import httpx as _httpx
             from mcp.client.streamable_http import streamable_http_client
             client = _httpx.AsyncClient(
@@ -394,6 +392,8 @@ class McpManager:
           ToolRegistry 的 mcp-→mcp- 覆盖豁免兜底)
         - allowed_patterns 从 server 配置转 ACL 形状;缺省 None = deny
           (与 ToolRegistry 的 deny-by-default 一致)
+        - handler 为 async(直接 await call_tool——asyncio 改造后
+          dispatch 与连接同 loop,不再需要专职线程桥)
         """
         registry = _tool_registry()
         prefix = str(conn.cfg.get("tool_name_prefix", "") or "")
@@ -422,7 +422,7 @@ class McpManager:
                 toolset=conn.toolset,
                 schema=schema,
                 handler=_make_handler(conn.name, t.name),
-                is_async=False,  # sync 桥:run_coroutine_threadsafe 进专职 loop
+                is_async=True,  # asyncio 改造后:dispatch 同 loop 直接 await
                 description=t.description or "",
                 emoji="🔌",
                 max_result_size_chars=_MAX_TOOL_RESULT_CHARS,
@@ -443,10 +443,10 @@ def _tool_registry():
 
 
 def _make_handler(server_name: str, tool_name: str):
-    """闭包工厂:绑定 (server, tool) 的 sync handler,桥到管理器。"""
-    def _handler(args: Dict[str, Any]) -> str:
-        return get_mcp_manager().call_tool_sync(server_name, tool_name,
-                                                dict(args or {}))
+    """闭包工厂:绑定 (server, tool) 的 async handler,直接 await 管理器。"""
+    async def _handler(args: Dict[str, Any]) -> str:
+        return await get_mcp_manager().call_tool(server_name, tool_name,
+                                                 dict(args or {}))
     return _handler
 
 

@@ -78,7 +78,7 @@ class DefaultLoopExecutor(ModuleExecutor):
         # 这里会解析出一个缺失 MCP 工具的集合。等待连接终态——未配置
         # server 时零开销(mcp_tool 内部吞异常,不阻塞对话)
         from atoms.tools.mcp_tool import ensure_mcp_ready
-        ensure_mcp_ready()
+        await ensure_mcp_ready()
 
         own_tools = _resolve_tools(module, pattern)
         lent_schemas, lent_by = _resolve_lent_tools(module, pattern)

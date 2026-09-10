@@ -159,12 +159,7 @@ def test_fallback_without_stream_method_still_works():
 # ============================================================================
 # SSE debug endpoint (env-gated)
 # ============================================================================
-# TODO(phase4): the streaming-endpoint test is disabled during the phase-2..3
-# migration window — chat_turn_stream is now an async generator while the
-# endpoint still mounts a sync generator. Phase-4 restores the endpoint as
-# async and this test with it.
 
-@pytest.mark.skip(reason="SSE debug endpoint disabled until phase-4 async host")
 def test_sse_endpoint_streams_events(_stream_debug_env, monkeypatch):
     from fastapi.testclient import TestClient
 

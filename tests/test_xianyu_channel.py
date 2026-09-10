@@ -46,7 +46,7 @@ class ChannelHarness:
         self.launch_error = None  # (code, message): simulates launch failure
         self.run_error = None
 
-        def launch_session(pattern_code, session_id, task_info, request_id, exist_ok=False):
+        async def launch_session(pattern_code, session_id, task_info, request_id, exist_ok=False):
             self.launch_calls.append(
                 {
                     "pattern_code": pattern_code,
@@ -66,7 +66,7 @@ class ChannelHarness:
         def get_session(session_id):
             return self.sessions.get(session_id)
 
-        def run_chat_turn(session, query):
+        async def run_chat_turn(session, query):
             self.run_calls.append((session.session_id, query))
             if self.run_error is not None:
                 return None, self.run_error

@@ -2,14 +2,12 @@
 
 Each tool atom calls ``registry.register()`` at module level to declare its
 schema, handler, toolset membership, and availability check; the AST scan
-under ``atoms/tools/`` auto-discovers them. The async bridge
-(``_run_async``) and the tool-error sanitizer (``_sanitize_tool_error``)
-live here — they were inlined from the old hermes-agent ``model_tools.py``
-stub, which no longer exists.
+under ``atoms/tools/`` auto-discovers them. The tool-error sanitizer
+(``_sanitize_tool_error``) lives here — it was inlined from the old
+hermes-agent ``model_tools.py`` stub, which no longer exists.
 """
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import re
@@ -28,23 +26,6 @@ logger = logging.getLogger(__name__)
 # Async bridge + tool-error sanitizer (inlined from the old hermes-agent
 # model_tools.py stub — that module no longer exists)
 # =========================================================================
-
-def _run_async(coro):
-    """Run an async coroutine and return its result synchronously.
-
-    Handles the case where an event loop is already running (e.g. inside a
-    FastAPI request handler) by delegating to a separate thread.
-    """
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
-
 
 # Tool exceptions can carry arbitrary text into the model's context as the
 # `tool` message content. json.dumps() handles quote/backslash escaping so a

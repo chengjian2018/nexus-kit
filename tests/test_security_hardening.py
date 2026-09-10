@@ -67,5 +67,9 @@ def test_sanitize_task_value_fullwidths_and_truncates():
 # ---------------------------------------------------------------------------
 
 def test_session_has_turn_lock():
+    import asyncio
+
     s = Session("sid", "pattern")
-    assert isinstance(s.turn_lock, type(threading.Lock()))
+    # asyncio.Lock since the asyncio rewrite — same security property: each
+    # session serializes its turns (waiters queue as tasks on the host loop)
+    assert isinstance(s.turn_lock, asyncio.Lock)

@@ -149,32 +149,34 @@ def test_chat_refreshes_ttl(client, registry_guard):
 def test_concurrent_duplicate_launch(registry_guard):
     """Concurrent launches of the same session_id: exactly one succeeds, the rest get 409.
 
-    Calls the sync endpoint function directly (FastAPI's thread pool runs it
-    multi-threaded the same way), verifying that the duplicate check plus
-    registration are atomic under the lock.
+    Calls the async endpoint concurrently on one loop (the asyncio-rewrite
+    equivalent of the old multi-threaded race: tasks yield at the same await
+    points threads used to interleave at), verifying that the duplicate
+    check plus registration are atomic under the governor lock.
     """
+    import asyncio
+
     import host.main as main
     from host.main import DialogueRequest
+    from async_utils import arun
 
-    barrier = threading.Barrier(8)
-    results = []
-
-    def worker():
+    async def worker(results):
         request = DialogueRequest(
             request_id="req-gov-race",
             session_id="gov-race",
             pattern_code="xianyu_agent",
             task_info={"caller": "pytest"},
         )
-        barrier.wait()
-        response = main.launch_dialogue(request)
+        # gather = all tasks run "concurrently" before any completes
+        response = await main.launch_dialogue(request)
         results.append(response.code)
 
-    threads = [threading.Thread(target=worker) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    async def race():
+        results = []
+        await asyncio.gather(*(worker(results) for _ in range(8)))
+        return results
+
+    results = arun(race())
 
     assert results.count("0") == 1
     assert results.count("409") == 7
