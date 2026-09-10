@@ -479,7 +479,7 @@ def test_replace_history_summary_first_and_retained_kept(tmp_path):
 
 
 def test_replace_history_mismatch_leaves_db_untouched(tmp_path):
-    """DB/memory row-count mismatch: raises RuntimeError, the transaction rolls back, and the DB is left untouched."""
+    """DB/memory row-count mismatch: raises RuntimeError before anything is written, and the DB is left untouched."""
     import pytest
     store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = make_session()
@@ -494,4 +494,42 @@ def test_replace_history_mismatch_leaves_db_untouched(tmp_path):
 
     history = arun(store.get_history("s1"))
     assert len(history) == 1 and history[0].content == "DB 里的消息"
+    arun(store.close())
+
+
+def test_replace_history_midway_failure_rolls_back_delete(tmp_path, monkeypatch):
+    """审查 M-2：delete+insert 中途失败必须整体回滚——悬挂的未提交 DELETE
+    若留给下一个 commit（如 append_message 的），旧消息会被静默删除。"""
+    import pytest
+    from nexus.context import SessionMessage
+    store = arun(SessionStore.create(str(tmp_path / "t.db")))
+    session = make_session()
+    arun(store.create_session(session))
+    session.cxt.history = [
+        SessionMessage(role="user", content="旧问题", stage="chat"),
+        SessionMessage(role="assistant", content="旧回答", stage="chat"),
+        SessionMessage(role="user", content="新问题", stage="chat"),
+        SessionMessage(role="assistant", content="新回答", stage="chat"),
+    ]
+    for msg in session.cxt.history:
+        arun(store.append_message(session, msg))
+
+    async def failing_executemany(sql, params):
+        raise RuntimeError("disk I/O error mid-transaction")
+    monkeypatch.setattr(store._conn, "executemany", failing_executemany)
+
+    with pytest.raises(RuntimeError, match="disk I/O"):
+        arun(store.replace_history(session, "摘要", keep_idx=2))
+    monkeypatch.undo()
+
+    # DELETE 已回滚：4 条旧消息仍在
+    history = arun(store.get_history("s1"))
+    assert [m.content for m in history] == ["旧问题", "旧回答", "新问题", "新回答"]
+
+    # 回归关键点：下一次写路径的 commit 不得把悬挂 DELETE 一并提交
+    arun(store.append_message(session, SessionMessage(
+        role="user", content="又一条", stage="chat")))
+    history = arun(store.get_history("s1"))
+    assert [m.content for m in history] == [
+        "旧问题", "旧回答", "新问题", "新回答", "又一条"]
     arun(store.close())

@@ -14,6 +14,7 @@ public methods are coroutines. Construction is ``await SessionStore.create(
 path)`` (open + WAL + schema); there is no sync constructor.
 """
 
+import contextlib
 import json
 import logging
 import time
@@ -247,12 +248,16 @@ class SessionStore:
         """Compression rewrite: delete all rows of the current epoch → insert
         the summary row → re-insert ``history[keep_idx:]``.
 
-        Single transaction; first checks the DB row count against
-        ``len(cxt.history)`` and raises ``RuntimeError`` on mismatch (the
-        transaction rolls back, DB untouched); the caller catches it and
+        First checks the DB row count against ``len(cxt.history)`` and raises
+        ``RuntimeError`` on mismatch (nothing has been written at that point,
+        so a plain raise leaves the DB untouched); the caller catches it and
         abandons compression — out-of-sync history is never deleted.
-        Retained rows get renumbered ids (AUTOINCREMENT cannot insert before
-        existing rows); the summary naturally sorts first.
+        The delete+insert pair runs as one explicit transaction: a mid-way
+        failure (or cancellation) rolls the DELETE back, so it can never
+        dangle uncommitted and get silently committed by the next
+        append_message. Retained rows get renumbered ids
+        (AUTOINCREMENT cannot insert before existing rows); the summary
+        naturally sorts first.
         """
         now = time.time()
         epoch = await self._current_epoch(session.session_id)
@@ -262,15 +267,10 @@ class SessionStore:
             (session.session_id, epoch),
         )
         if count_rows[0]["n"] != len(session.cxt.history):
-            await self._conn.rollback()
             raise RuntimeError(
                 f"DB/内存消息数不齐，放弃压缩: session={session.session_id}"
                 f" db={count_rows[0]['n']} mem={len(session.cxt.history)}"
             )
-        await self._conn.execute(
-            "DELETE FROM messages WHERE session_id = ? AND launch_epoch = ?",
-            (session.session_id, epoch),
-        )
         rows = [(
             session.session_id, epoch, "summary", summary_text, "compress",
             "{}", now,
@@ -281,12 +281,24 @@ class SessionStore:
                 json.dumps(msg.metadata or {}, ensure_ascii=False),
                 now,
             ))
-        await self._conn.executemany(
-            """INSERT INTO messages
-               (session_id, launch_epoch, role, content, stage, metadata, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            rows,
-        )
+        # 显式事务（不能用 `async with self._conn`：aiosqlite 的 __aenter__
+        # 会重新 await 连接、二次启动 worker 线程）。DELETE/INSERT 隐式开启
+        # 事务；中途失败（含取消）回滚整体，成功才 commit。
+        try:
+            await self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND launch_epoch = ?",
+                (session.session_id, epoch),
+            )
+            await self._conn.executemany(
+                """INSERT INTO messages
+                   (session_id, launch_epoch, role, content, stage, metadata, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self._conn.rollback()
+            raise
         await self._conn.commit()
 
     # ------------------------------------------------------------------

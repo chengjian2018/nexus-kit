@@ -143,8 +143,10 @@ async def compress_history(
         return False
     if len(db_history) != len(cxt.history):
         logger.warning(
-            "DB/内存消息数不齐，放弃压缩: session=%s db=%d mem=%d",
+            "DB/内存消息数不齐，放弃压缩: session=%s db=%d mem=%d "
+            "本进程内 sink 写入失败计数=%d（DB 缺行后无回填路径，该会话压缩将持续放弃）",
             session.session_id, len(db_history), len(cxt.history),
+            cxt.sink_failure_count,
         )
         return False
 

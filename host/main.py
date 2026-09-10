@@ -424,6 +424,14 @@ async def _run_chat_turn_core(
             await store.save_snapshot(session)
         except Exception:
             logger.exception("会话轮末快照失败: session=%s", session.session_id)
+        # 审查 M-1：sink 失败不阻塞对话，但静默降级必须可见——已知缺行的会话
+        # 每轮提示一次（压缩也会因数量不齐而对它放弃）
+        if session.cxt.sink_failure_count > 0:
+            logger.warning(
+                "session=%s 存在未落库消息（本进程内 sink 失败 %d 次，"
+                "重启后该段对话将丢失）",
+                session.session_id, session.cxt.sink_failure_count,
+            )
 
     if error is not None:
         return None, error

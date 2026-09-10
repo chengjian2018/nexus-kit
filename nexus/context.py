@@ -220,6 +220,13 @@ class DialogueContext:
     # side — they must never block the dialogue.
     message_sink: Optional[Any] = None
 
+    # Cumulative count of message_sink write failures (per process lifetime).
+    # A missed row makes DB < memory permanently (no backfill path exists);
+    # compression checks this counter when it abandons on DB/memory mismatch,
+    # and the turn-end snapshot logs it — the silent-degradation path must
+    # stay observable (审查 M-1).
+    sink_failure_count: int = 0
+
     # Recall results before query rewrite
     pre_recall_results: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -297,9 +304,12 @@ class DialogueContext:
                 if inspect.iscoroutine(result):
                     await result
             except Exception:
+                self.sink_failure_count += 1
                 logger.exception(
-                    "message_sink 写入失败（不影响对话）: session=%s role=%s stage=%s",
+                    "message_sink 写入失败（不影响对话；DB 将落后于内存，压缩会因"
+                    "数量不齐而放弃）: session=%s role=%s stage=%s 累计失败=%d",
                     self.session_id, msg.role, msg.stage,
+                    self.sink_failure_count,
                 )
 
     def format_history(self, max_turns: int = 10) -> str:
