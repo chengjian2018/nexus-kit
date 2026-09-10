@@ -390,6 +390,17 @@ class DelegateExecutor(ModuleExecutor):
   `_apply_deferred_switch`）
 - 声明方式：`module.executor="my_delegate"`（插件中心 kind="executor"）
 
+**In-repo 实例：`deep_research_multi`**（`apps/deep_research_agent/
+route_multi.py` + `executor_multi.py`）——「相位即模块」的多模块研究
+流水线。单模块版 `deep_research`（一个 executor 内跑 PREPLAN→PLAN→
+SEARCH→SYNTHESIZE）的四个相位各拆成一个 AGENT 模块，executor 写
+`ModuleJumpEvent` 同轮接力（`max_hops=4` = 3 跳 + 最终模块）；相位间
+状态走 `cxt.metadata["deep_research_state"]`（轮内瞬态，综合模块收尾
+弹出，`TurnLifecycle.begin_turn` 兜底出清），终态 trace 仍写
+`deep_research` 键（与单模块版同键同构）；末站收尾把底座复位到
+entry，下一轮从首站重跑。相位实现两版共用（executor_multi 继承
+DeepResearchExecutor 复用其无状态相位方法）。
+
 ## 热重载（2026-09-10）
 
 不改代码结构的前提下，四类东西的运行时重载机制（`host/reload.py` 是

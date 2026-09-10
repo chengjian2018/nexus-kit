@@ -71,6 +71,10 @@ class TurnLifecycle:
     )
     PER_TURN_METADATA_KEYS = (
         "unified",
+        # deep_research_multi 的轮内瞬态研究状态(工作区/findings/计划):
+        # dr_synthesize 收尾即弹出,这里兜底出清——研究中途异常(相位抛错
+        # 被对话层兜住)留下的陈旧状态绝不能泄进下一轮
+        "deep_research_state",
     )
 
     # -- Stage self-managed: reset at turn start -----------------------------

@@ -138,7 +138,7 @@ class DeepResearchExecutor(ModuleExecutor):
 
             # ---- PLAN ----
             plan = await self._plan_phase(
-                provider, plan_base, llm_config, hooks, trace)
+                provider, plan_base, llm_config, ec, hooks, trace)
 
             # ---- SEARCH(含反思状态板;预检索 findings 并入)----
             findings, search_stats = await self._search_phase(
@@ -243,7 +243,8 @@ class DeepResearchExecutor(ModuleExecutor):
     # ------------------------------------------------------------------
 
     async def _plan_phase(self, provider, messages: List[Dict[str, Any]],
-                          llm_config: Dict[str, Any], hooks,
+                          llm_config: Dict[str, Any],
+                          ec: "ExecutionContext", hooks,
                           trace: Dict[str, Any]) -> Dict[str, Any]:
         """一次无工具 LLM 调用产研究计划(messages 含预检索上下文,若有)。
 
@@ -252,7 +253,13 @@ class DeepResearchExecutor(ModuleExecutor):
         自己的错误自纠重试 _PLAN_RETRIES 次,仍失败降级为
         ``{"sub_questions": [原问题]}`` 并标记 degraded——PLAN 失败绝不
         阻塞研究本身。不转发 delta(计划 JSON 不是回复)。
+
+        (ec 参数是多模块版 route_multi 引入的:相位方法要发 round 事件
+        / hooks 事件就需要 emitter 与真实 session/module 码,单模块版
+        同步受益——此前 plan round 事件因拿不到 emitter 从未发出。)
         """
+        cxt = ec.cxt
+        module = ec.module
         model = llm_config["model"]
         temperature = llm_config.get("temperature", 0.7)
         max_tokens = llm_config.get("max_tokens", 2048)
@@ -264,8 +271,8 @@ class DeepResearchExecutor(ModuleExecutor):
         for attempt in range(1 + _PLAN_RETRIES):
             if hooks:
                 fire(hooks, "on_llm_call", LLMCallEvent(
-                    session_id=trace.get("session_id", ""),
-                    module_code=trace.get("module_code", ""),
+                    session_id=cxt.session_id,
+                    module_code=module.module_code,
                     round_idx=0, messages=plan_messages, model=model))
             result = await _stream_round(
                 provider, plan_messages, model, temperature, max_tokens,
@@ -273,8 +280,8 @@ class DeepResearchExecutor(ModuleExecutor):
             content = result.get("content", "") or ""
             if hooks:
                 fire(hooks, "on_llm_response", LLMResponseEvent(
-                    session_id=trace.get("session_id", ""),
-                    module_code=trace.get("module_code", ""),
+                    session_id=cxt.session_id,
+                    module_code=module.module_code,
                     round_idx=0, content=content, tool_calls=[]))
             plan, err = _extract_plan_json(content)
             if plan:
@@ -296,7 +303,7 @@ class DeepResearchExecutor(ModuleExecutor):
 
         trace["phases"].append("plan")
         trace["plan"] = plan
-        _emit_round(None, "plan", 0)
+        _emit_round(ec.stream, "plan", 0)
         return plan
 
     # ------------------------------------------------------------------
