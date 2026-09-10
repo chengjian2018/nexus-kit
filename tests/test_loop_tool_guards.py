@@ -204,3 +204,30 @@ def test_ordinary_round_replays_paired():
         asst[0]["tool_calls"][0]["function"]["arguments"]) == {"city": "北京"}
     assert len([m for m in msgs if m["role"] == "tool"]) == 1
     assert not any("untrusted" in (m.get("content") or "") for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Max-rounds forced termination (审查 M-3：唯一硬终止防线的行为回归)
+# ---------------------------------------------------------------------------
+
+def test_max_tool_rounds_forced_termination():
+    """模型每轮都要求调工具（永不直接回答）时：恰在第 _MAX_TOOL_ROUNDS 轮
+    强制终止，回复兜底文案，不再多发一次 LLM 请求，工具行协议配对完整。"""
+    from atoms.executors.loop_executor import _MAX_TOOL_ROUNDS
+
+    s = _mk_session()
+    s.cxt.user_query = "无限循环"
+    arun(s.cxt.add_message("user", "无限循环", stage="chat"))
+    provider = ScriptedProvider([
+        {"content": None, "tool_calls": [
+            _tool_call(cid=f"c{i}", arguments='{"city": "北京"}')]}
+        for i in range(_MAX_TOOL_ROUNDS)
+    ])
+    result = _run(s, provider)
+
+    assert result.content == "抱歉，处理超时，请稍后重试。"
+    assert len(provider.seen) == _MAX_TOOL_ROUNDS   # 恰好 10 轮，不多不少
+    rows = _tool_rows(s.cxt)
+    assert len(rows) == _MAX_TOOL_ROUNDS            # 每轮工具行都落了
+    assert [m.metadata.get("tool_call_id") for m in rows] == [
+        f"c{i}" for i in range(_MAX_TOOL_ROUNDS)]   # id 逐轮配对
