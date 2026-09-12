@@ -3,12 +3,12 @@ isolated, jieba-tokenized LIKE search).
 
 Ported from Customer-Agent's database/knowledge_service.py, rewritten in the
 hermes-nexus idiom: native sqlite3 single connection + lock + WAL (mirroring
-chat/store.py); the Shop FK hierarchy flattened into a ``scope`` column
-(``{channel}:{account_id}``).
+nexus/engine/store.py); the Shop FK hierarchy flattened into a ``scope``
+column (``{channel}:{account_id}``).
 
-Storage definitions live under ``database/`` (table DDL / future ES schemas
-all belong here); the tool layer (tools/knowledge_tool.py) only consumes this
-module and defines no storage.
+Storage definitions live under ``atoms/knowledge/`` (table DDL / future ES
+schemas all belong here); the tool layer (atoms/tools/knowledge_tool.py)
+only consumes this module and defines no storage.
 
 Output sanitization (_clean_untrusted + untrusted wrapping) is the security
 boundary: knowledge base content is untrusted data, and retrieval results
@@ -141,16 +141,17 @@ class KnowledgeStore:
         content: str,
         tags: Optional[str] = None,
         enabled: bool = True,
-    ) -> None:
-        """Append one customer-service knowledge entry."""
+    ) -> int:
+        """Append one customer-service knowledge entry; returns the new row id."""
         now = time.time()
         with self._lock, self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 """INSERT INTO customer_service_knowledge
                    (scope, title, content, tags, enabled, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (scope, title, content, tags, 1 if enabled else 0, now, now),
             )
+        return int(cur.lastrowid)
 
     def seed(self, scope: str) -> None:
         """Idempotent seed data: Xianyu second-hand customer-service style demo set."""
@@ -273,6 +274,155 @@ class KnowledgeStore:
             return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Console management CRUD (ops-console P0, PRD §7.2 / gap G-2)
+    # Read side reuses search_*; this section adds update / delete / enabled
+    # toggles / scope aggregation. Update semantics differ from upsert's
+    # COALESCE: only keys **present in** fields are updated (a None value =
+    # explicit clear), absent keys are untouched — the console's edit form
+    # relies on this to distinguish "clear this field" from "don't modify".
+    # ------------------------------------------------------------------
+
+    def list_scopes(self) -> List[Dict[str, Any]]:
+        """Per-scope aggregation over both tables: entry counts + latest
+        update time (the console's scope picker)."""
+        with self._lock:
+            product_rows = self._conn.execute(
+                """SELECT scope, COUNT(*) AS n, MAX(updated_at) AS updated_at
+                   FROM product_knowledge GROUP BY scope"""
+            ).fetchall()
+            cs_rows = self._conn.execute(
+                """SELECT scope, COUNT(*) AS n, MAX(updated_at) AS updated_at
+                   FROM customer_service_knowledge GROUP BY scope"""
+            ).fetchall()
+        products = {r["scope"]: dict(r) for r in product_rows}
+        cs = {r["scope"]: dict(r) for r in cs_rows}
+        return [
+            {
+                "scope": s,
+                "product_count": products.get(s, {}).get("n", 0),
+                "cs_count": cs.get(s, {}).get("n", 0),
+                "updated_at": max(
+                    products.get(s, {}).get("updated_at") or 0,
+                    cs.get(s, {}).get("updated_at") or 0,
+                ),
+            }
+            for s in sorted(set(products) | set(cs))
+        ]
+
+    def get_product(
+        self, scope: str, goods_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Exact single-row read (fills the console's edit form)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM product_knowledge WHERE scope = ? AND goods_id = ?",
+                (scope, goods_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_product(
+        self, scope: str, goods_id: int, fields: Dict[str, Any]
+    ) -> bool:
+        """Partial update: only present keys are updated (None = clear that
+        column). Returns whether the row exists."""
+        allowed = {"goods_name", "price", "sold_quantity",
+                   "specifications", "extracted_content"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"未知字段: {sorted(unknown)}（合法: {sorted(allowed)}）")
+        if not fields:
+            return self.get_product(scope, goods_id) is not None
+        sets = ", ".join(f"{key} = ?" for key in fields)
+        params = list(fields.values()) + [time.time(), scope, goods_id]
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE product_knowledge SET {sets}, updated_at = ? "
+                "WHERE scope = ? AND goods_id = ?",
+                params,
+            )
+        return cur.rowcount > 0
+
+    def delete_product(self, scope: str, goods_id: int) -> bool:
+        """Delete one product knowledge row. Returns whether a row was deleted."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM product_knowledge WHERE scope = ? AND goods_id = ?",
+                (scope, goods_id),
+            )
+        return cur.rowcount > 0
+
+    def list_cs(
+        self,
+        scope: str,
+        include_disabled: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """CS-knowledge management list (disabled entries included;
+        search_cs returns only enabled=1 — that is the retrieval view)."""
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        cond = "scope = ?" + ("" if include_disabled else " AND enabled = 1")
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT * FROM customer_service_knowledge
+                    WHERE {cond}
+                    ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (scope, limit, offset),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_cs(self, entry_id: int) -> Optional[Dict[str, Any]]:
+        """Read one CS entry by primary key (cross-scope; entry_id is globally unique)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM customer_service_knowledge WHERE id = ?",
+                (entry_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_cs(self, entry_id: int, fields: Dict[str, Any]) -> bool:
+        """Partial-update a CS entry (title/content/tags/enabled; None = clear tags)."""
+        allowed = {"title", "content", "tags", "enabled"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"未知字段: {sorted(unknown)}（合法: {sorted(allowed)}）")
+        if "enabled" in fields:
+            fields["enabled"] = 1 if fields["enabled"] else 0
+        if not fields:
+            return self.get_cs(entry_id) is not None
+        sets = ", ".join(f"{key} = ?" for key in fields)
+        params = list(fields.values()) + [time.time(), entry_id]
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE customer_service_knowledge SET {sets}, updated_at = ? "
+                "WHERE id = ?",
+                params,
+            )
+        return cur.rowcount > 0
+
+    def delete_cs(self, entry_id: int) -> bool:
+        """Delete one CS entry. Returns whether a row was deleted."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM customer_service_knowledge WHERE id = ?",
+                (entry_id,),
+            )
+        return cur.rowcount > 0
+
+    def clear_scope(self, scope: str) -> Dict[str, int]:
+        """Clear everything in one scope (both tables; backs the console's
+        delete-scope action)."""
+        with self._lock, self._conn:
+            p = self._conn.execute(
+                "DELETE FROM product_knowledge WHERE scope = ?", (scope,)
+            ).rowcount
+            c = self._conn.execute(
+                "DELETE FROM customer_service_knowledge WHERE scope = ?", (scope,)
+            ).rowcount
+        return {"products_deleted": p, "cs_deleted": c}
+
+    # ------------------------------------------------------------------
     # Output formatting (security boundary)
     # ------------------------------------------------------------------
 
@@ -345,7 +495,7 @@ class KnowledgeStore:
 
 
 # ---------------------------------------------------------------------------
-# Module-level lazy holder — owns the connection; main.py lifespan closes it
+# Module-level lazy holder — owns the connection; host/main.py lifespan closes it
 # ---------------------------------------------------------------------------
 
 _store: Optional[KnowledgeStore] = None

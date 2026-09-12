@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nexus-console · 运营配置台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">nexus</span>
+      <span class="brand-sub">运营配置台</span>
+    </div>
+    <nav id="nav">
+      <a href="#/" data-nav="dashboard">总览</a>
+      <a href="#/patterns" data-nav="patterns">应用（Pattern）</a>
+      <a href="#/knowledge" data-nav="knowledge">知识库</a>
+      <a href="#/rag" data-nav="rag">RAG 检索配置</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="foot-line">P0 · 只读台 + 知识库管理</div>
+      <div class="foot-line">编辑与发布流（P1）未开放</div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-title" id="page-title">总览</div>
+      <div class="auth-box">
+        <span class="status-dot" id="api-status" title="API 连接状态"></span>
+        <input type="password" id="api-key" placeholder="NEXUS_API_KEY（服务未设密钥时留空）" autocomplete="off">
+        <button class="btn btn-ghost btn-sm" id="api-key-save">保存</button>
+      </div>
+    </header>
+
+    <main id="main">
+      <div class="panel loading">加载中…</div>
+    </main>
+  </div>
+</div>
+
+<div class="modal-mask" id="modal-mask" hidden>
+  <div class="modal" id="modal"></div>
+</div>
+
+<div id="toast-root"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
