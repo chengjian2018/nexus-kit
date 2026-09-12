@@ -7,26 +7,24 @@ Importing this package does two registrations:
    implementations, so this warm-up is what makes the default skeleton
    runnable; host bootstrap and tests/conftest.py do it automatically);
 2. the named stages into the plugin registry (kind="stage") — the string
-   codes that pattern/module/node ``stages`` declarations reference:
+   codes that pattern/node ``stages`` declarations reference (FSM patterns
+   only — plan-⑧: AGENT nodes run via their loop executors):
 
    - ``fsm_nlu`` / ``fsm_nlg``       : FSM two-stage defaults
-   - ``route_nlu`` / ``route_nlg``   : ROUTE two-stage defaults
-   - ``fsm_unified`` / ``route_unified``: single-call unified stages
+   - ``fsm_unified``                 : single-call unified stage
    - ``nlg_pass_through``            : no-op NLG companion for unified
    - ``time_aug_query``              : time-augmentation query rewrite
    - ``clarify_default``             : default ClarifyStage assembly
 """
 
-from nexus.model.module import ModuleType
 from nexus.pipeline import register_default_clarify, register_default_generate
 from nexus.registry.plugins import registry
 
-from atoms.stages.nlu import FSMNLU, RouteNLU
-from atoms.stages.nlg import FSMNLG, RouteNLG
+from atoms.stages.nlu import FSMNLU
+from atoms.stages.nlg import FSMNLG
 from atoms.stages.unified import (
     FSMUnifiedNLU,
     PassThroughNLG,
-    RouteUnifiedNLU,
 )
 from atoms.stages.clarify import ClarifyRouteRule, ClarifyStage
 from atoms.stages.recaller import (
@@ -41,9 +39,9 @@ from atoms.stages.query.time_aug import TimeAugQueryRewriter
 def _default_clarify_stage():
     """Build the default ClarifyStage: in-memory keyword recall + default gating.
 
-    Production should configure the clarify slot explicitly on the module (the
+    Production should configure the clarify slot explicitly on the node (the
     ES-backed recall path); the default instance guarantees out-of-the-box
-    usability. (Moved in from the old stage_slots.default_clarify_stage.)
+    usability.
     """
     return ClarifyStage(
         recaller=MultiPathRecaller(
@@ -55,8 +53,7 @@ def _default_clarify_stage():
     )
 
 
-register_default_generate(ModuleType.FSM, lambda: (FSMNLU(), FSMNLG()))
-register_default_generate(ModuleType.ROUTE, lambda: (RouteNLU(), RouteNLG()))
+register_default_generate("fsm", lambda: (FSMNLU(), FSMNLG()))
 register_default_clarify(_default_clarify_stage)
 
 # ---------------------------------------------------------------------------
@@ -65,10 +62,7 @@ register_default_clarify(_default_clarify_stage)
 
 registry.register("stage", "fsm_nlu", FSMNLU)
 registry.register("stage", "fsm_nlg", FSMNLG)
-registry.register("stage", "route_nlu", RouteNLU)
-registry.register("stage", "route_nlg", RouteNLG)
 registry.register("stage", "fsm_unified", FSMUnifiedNLU)
-registry.register("stage", "route_unified", RouteUnifiedNLU)
 registry.register("stage", "nlg_pass_through", PassThroughNLG)
 registry.register("stage", "time_aug_query", TimeAugQueryRewriter)
 registry.register("stage", "clarify_default", _default_clarify_stage)

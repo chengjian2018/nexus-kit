@@ -71,16 +71,20 @@ class ChatStreamEvent:
 
 
 # Canonical trace event names (all optional fields default to ""/{} —
-# consumers render what is present; unknown names pass through untouched)
+# consumers render what is present; unknown names pass through untouched).
+# plan-⑧: the module-jump family (module_jump / route_hit / route_root /
+# defer_switch / module_start) is gone with the module layer; the graph
+# runtime emits the node_* / graph_* family.
 TRACE_EVENT_NAMES = (
-    "module_start",   # a module's turn execution begins (module/node entered)
-    "module_jump",    # same-turn module reroute via ModuleJumpEvent
-    "node_jump",      # FSM end-of-turn node transition
-    "route_hit",      # ROUTE landed on a menu node (this turn's routing pick)
-    "route_root",     # ROUTE end-of-turn reset back to root
-    "tool_call",      # agent loop: one tool invocation issued
-    "tool_result",    # agent loop: one tool invocation returned
-    "defer_switch",   # end-of-turn DeferredModuleSwitch applied
+    "node_start",        # an AGENT graph node's execution begins
+    "node_end",          # an AGENT graph node's execution finished
+    "node_jump",         # FSM end-of-turn node transition
+    "graph_wait",        # AGENT graph suspended (wait_human)
+    "graph_resume",      # AGENT graph resumed from suspension
+    "graph_done",        # AGENT graph run terminated (reason: terminal /
+                         # is_end / max_steps / undeclared_edge)
+    "tool_call",         # agent loop: one tool invocation issued
+    "tool_result",       # agent loop: one tool invocation returned
     "conversation_end",  # FSM reached a terminal node (is_end)
 )
 

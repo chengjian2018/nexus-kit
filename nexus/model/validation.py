@@ -1,23 +1,25 @@
 """Pattern validation — base-info completeness + plugin-declaration
-resolvability, collecting ALL errors before raising one numbered
-ValueError (fail-fast timing stays at assembly/registration time; the report
-upgrades from one-error-per-run to a full list).
+resolvability + toolset authorization, collecting ALL errors before raising
+one numbered ValueError (fail-fast timing: assembly/registration time, after
+the tool/plugin registries are warmed).
 
-Two entry points:
+Entry points:
 
-- validate_base_info(pattern): code/name/entry non-empty & resolvable,
-  module_code uniqueness (today's module_map assignment silently
-  overwrites), FSM/ROUTE modules have ≥1 node, node_code unique within its
-  module. Missing display names are warnings (soft), everything else raises.
+- validate_base_info(pattern): code/name/entry non-empty, node codes unique
+  (constructor already raised on the hard ones — this catches the soft
+  remainder), unreachable-node warning, AGENT nodes must not declare stages
+  (constructor raised on pattern-level stages; node-level stages are an
+  AGENT declaration error caught here).
 - validate_plugin_declarations(pattern): executor / stages / skeleton /
-  messages_builder / agent_hooks string codes resolve in the plugin
-  registry (checked via has() — no instantiation).
+    messages_builder / agent_hooks codes resolve in the plugin registry
+    (``llm`` resolves via settings at refresh time — not checked here).
+- validate_tools(pattern): every node.use_tools name is registered AND its
+  toolset ∈ pattern.allow_toolset (deny-by-default 三层收口, plan-⑧ §4).
 
-Callers: host/cli assembly (after discover_builtin_plugins warms the
-registry) validate every registered pattern; yml loading (plan-③) validates
-after construction. The graph checks (dangling edges / self-loops /
-lend-tools authorization) already run in Pattern.__init__ and are not
-duplicated here.
+Callers: host/cli assembly validates every registered pattern; yml loading
+validates after construction. The structural graph checks (dangling
+sub_nodes edges / duplicate node codes / entry resolvability / slots on
+AGENT nodes) already run in Pattern.__init__ and are not duplicated here.
 """
 
 import logging
@@ -29,11 +31,6 @@ from nexus.pipeline import normalize_skeleton
 from nexus.registry.plugins import registry as plugin_registry
 
 logger = logging.getLogger(__name__)
-
-# Slots that carry builtin defaults (nlu/nlg per module type) — a None value
-# there is fine even without any declaration; other slots with None are
-# optional by the universal skip rule, so None is never an error either.
-# Resolution errors are only about *declared* codes that cannot resolve.
 
 
 def _slot_codes_declared(stages) -> List[str]:
@@ -60,70 +57,45 @@ def validate_base_info(pattern: Pattern) -> List[str]:
         errors.append("pattern.code 为空")
     if not getattr(pattern, "name", None):
         warnings.append(f"pattern {pattern.code!r} 缺少 name")
-    if not getattr(pattern, "entry_module_code", None):
-        errors.append(f"pattern {pattern.code!r} 缺少 entry_module_code")
-    elif pattern.entry_module_code not in pattern.module_map:
-        errors.append(
-            f"pattern {pattern.code!r} 的 entry_module_code "
-            f"{pattern.entry_module_code!r} 不在 modules 中"
-        )
 
-    seen_module_codes = set()
-    for module in pattern.modules or []:
-        code = module.module_code
-        if not code:
-            errors.append(f"存在 module_code 为空的模块（name="
-                          f"{module.module_name!r}）")
+    if not getattr(pattern, "nodes", None):
+        errors.append(f"pattern {pattern.code!r} 没有任何节点")
+        return _finish(errors, warnings)
+
+    if pattern.pattern_type == "agent":
+        for node in pattern.nodes:
+            if getattr(node, "stages", None):
+                errors.append(
+                    f"AGENT pattern 的节点 {node.code!r} 声明了 stages"
+                    f"（stages 管线仅 FSM pattern 可用）")
+
+    # Reachability from entry (warning only — a disconnected node is an
+    # authoring smell, not a hard structural error)
+    reachable = set()
+    frontier = [pattern.entry_node_code]
+    while frontier:
+        cur = frontier.pop()
+        if cur in reachable:
             continue
-        if code in seen_module_codes:
-            errors.append(f"module_code 重复: {code!r}（后者覆盖前者）")
-        seen_module_codes.add(code)
+        reachable.add(cur)
+        node = pattern.node_map.get(cur)
+        if node is not None:
+            frontier.extend(node.sub_nodes)
+    for node in pattern.nodes:
+        if node.code not in reachable:
+            warnings.append(
+                f"节点 {node.code!r} 从 entry 不可达（悬空声明？）")
 
-        if not getattr(module, "module_name", None):
-            warnings.append(f"module {code!r} 缺少 module_name")
+    for node in pattern.nodes:
+        if not getattr(node, "name", None):
+            warnings.append(f"node {node.code!r} 缺少 name")
 
-        # FSM/ROUTE need at least one node
-        from nexus.model.module import ModuleType
-        if module.type in (ModuleType.FSM, ModuleType.ROUTE):
-            if not module.module_nodes:
-                errors.append(
-                    f"module {code!r}（{module.type.value}）没有任何节点")
+    return _finish(errors, warnings)
 
-        # node_code unique within the module
-        seen_node_codes = set()
-        for node in module.module_nodes:
-            node_code = node.node_code
-            if not node_code:
-                errors.append(f"module {code!r} 存在 node_code 为空的节点")
-                continue
-            if node_code in seen_node_codes:
-                errors.append(
-                    f"module {code!r} 内 node_code 重复: {node_code!r}")
-            seen_node_codes.add(node_code)
 
+def _finish(errors: List[str], warnings: List[str]) -> List[str]:
     for w in warnings:
         logger.warning("[validation] %s（软警告）", w)
-    return errors
-
-
-    # Projection-edge consistency (plan-⑥): an enable_project=True edge that
-    # lends no knowledge would give the parent nothing to answer with — a
-    # declaration error (lend_tools-only edges belong on jump targets,
-    # enable_project=False)
-    for module in pattern.modules or []:
-        for link in getattr(module, "sub_modules", None) or []:
-            target = pattern.module_map.get(link.get("target"))
-            if target is None:
-                continue  # dangling edge: Pattern.__init__ already raised
-            if (getattr(target, "enable_project", True)
-                    and not link.get("lend_knowledge")
-                    and not (link.get("lend_tools") or [])):
-                errors.append(
-                    f"module {module.module_code!r} 的投影边 "
-                    f"{link.get('target')!r}（enable_project=True）既不 "
-                    f"lend_knowledge 也不 lend_tools——父模块无从代答，"
-                    f"请补 lend_knowledge 或改 enable_project=False 走跳转")
-
     return errors
 
 
@@ -133,9 +105,8 @@ def validate_plugin_declarations(pattern: Pattern) -> List[str]:
     errors: List[str] = []
     pcode = getattr(pattern, "code", "?")
 
-    # Pattern-level unified plugins dict: every declared str code resolves
-    # under its slot's kind (executor family slots report with their legacy
-    # executor_<family> label for continuity)
+    # Pattern-level plugins dict (executor family slots report with their
+    # executor_<family> label; "llm" resolves via settings — skipped here)
     for slot, declared in (getattr(pattern, "plugins", None) or {}).items():
         if not (isinstance(declared, str) and declared):
             continue
@@ -146,108 +117,136 @@ def validate_plugin_declarations(pattern: Pattern) -> List[str]:
                 f"plugins[{plugins_slot_label(slot)}]={declared!r} 未注册"
                 f"（kind={kind}）")
 
-    skeleton_slot_names: List[str] = []
-    try:
-        skeleton = normalize_skeleton(getattr(pattern, "stages", None))
-        skeleton_slot_names = [slot for entry in skeleton
-                               for slot in entry.keys()]
-    except ValueError as e:
-        errors.append(f"pattern {pcode!r} 骨架声明非法: {e}")
-        skeleton = []
-
-    # Skeleton + per-module/node stages codes resolve & slots belong to the
-    # skeleton; the unified pair (nlu/nlg sharing a code) is the only legal
-    # duplicate
-    for entry in skeleton:
-        for slot, code in entry.items():
-            if code and not plugin_registry.has("stage", code):
-                errors.append(
-                    f"pattern {pcode!r} 骨架槽位 {slot} 声明的 {code!r} "
-                    f"未注册（kind=stage）")
-
-    for module in pattern.modules or []:
-        mcode = module.module_code
-        declared = getattr(module, "executor", None)
-        if declared and not plugin_registry.has("executor", declared):
-            errors.append(
-                f"module {mcode!r} 的 executor={declared!r} 未注册"
-                f"（kind=executor）")
-
-        stages = getattr(module, "stages", None) or {}
-        if not isinstance(stages, dict):
-            errors.append(f"module {mcode!r} 的 stages 必须是 dict: {stages!r}")
-        else:
-            for slot, code in stages.items():
-                if skeleton_slot_names and slot not in skeleton_slot_names:
-                    errors.append(
-                        f"module {mcode!r} 的 stages 声明了骨架不存在的槽位 "
-                        f"{slot!r}（骨架: {skeleton_slot_names}）")
-                if code and not plugin_registry.has("stage", code):
-                    errors.append(
-                        f"module {mcode!r} 的 stages[{slot}]={code!r} 未注册"
-                        f"（kind=stage）")
-
-        # Module-level unified plugins dict (covers messages_builder /
-        # agent_hooks plus the executor family slots; the legacy scalar
-        # reads route through the same dict via properties)
-        for slot, declared in (getattr(module, "plugins", None) or {}).items():
+    # Node-level plugins dict (node layer over pattern layer)
+    for node in pattern.nodes:
+        for slot, declared in (getattr(node, "plugins", None) or {}).items():
             if not (isinstance(declared, str) and declared):
                 continue
             kind = PLUGIN_KINDS.get(slot)
             if kind and not plugin_registry.has(kind, declared):
                 errors.append(
-                    f"module {mcode!r} 的 "
+                    f"node {node.code!r} 的 "
                     f"plugins[{plugins_slot_label(slot)}]={declared!r} 未注册"
                     f"（kind={kind}）")
 
-        for node in module.module_nodes:
-            ncode = node.node_code
-            nstages = getattr(node, "stages", None) or {}
-            if not isinstance(nstages, dict):
-                errors.append(
-                    f"node {ncode!r} 的 stages 必须是 dict: {nstages!r}")
-            else:
-                for slot, code in nstages.items():
-                    if skeleton_slot_names and slot not in skeleton_slot_names:
-                        errors.append(
-                            f"node {ncode!r} 的 stages 声明了骨架不存在的"
-                            f"槽位 {slot!r}")
-                    if code and not plugin_registry.has("stage", code):
-                        errors.append(
-                            f"node {ncode!r} 的 stages[{slot}]={code!r} "
-                            f"未注册（kind=stage）")
+    # FSM skeleton + per-node stages codes resolve & slots belong to the
+    # skeleton; the unified pair (nlu/nlg sharing a code) is the only legal
+    # duplicate
+    if pattern.pattern_type == "fsm":
+        skeleton_slot_names: List[str] = []
+        try:
+            skeleton = normalize_skeleton(getattr(pattern, "stages", None))
+            skeleton_slot_names = [slot for entry in skeleton
+                                   for slot in entry.keys()]
+        except ValueError as e:
+            errors.append(f"pattern {pcode!r} 骨架声明非法: {e}")
+            skeleton = []
 
-    # Plugin-code uniqueness across the resolved slots (the nlu/nlg pair
-    # sharing one code — the unified form — is the only legal duplicate)
-    slots_by_code: dict = {}
-    stages_root = getattr(pattern, "stages", None)
-    if isinstance(stages_root, list):
-        for entry in stages_root:
+        for entry in skeleton:
+            for slot, code in entry.items():
+                if code and not plugin_registry.has("stage", code):
+                    errors.append(
+                        f"pattern {pcode!r} 骨架槽位 {slot} 声明的 {code!r} "
+                        f"未注册（kind=stage）")
+
+        for node in pattern.nodes:
+            stages = getattr(node, "stages", None) or {}
+            if not isinstance(stages, dict):
+                errors.append(
+                    f"node {node.code!r} 的 stages 必须是 dict: {stages!r}")
+                continue
+            for slot, code in stages.items():
+                if skeleton_slot_names and slot not in skeleton_slot_names:
+                    errors.append(
+                        f"node {node.code!r} 的 stages 声明了骨架不存在的"
+                        f"槽位 {slot!r}")
+                if code and not plugin_registry.has("stage", code):
+                    errors.append(
+                        f"node {node.code!r} 的 stages[{slot}]={code!r} 未注册"
+                        f"（kind=stage）")
+
+        # Plugin-code uniqueness across the resolved slots (the nlu/nlg pair
+        # sharing one code — the unified form — is the only legal duplicate)
+        slots_by_code: dict = {}
+        for entry in skeleton:
             for slot, code in entry.items():
                 if code:
                     slots_by_code.setdefault(code, []).append(slot)
-    for module in pattern.modules or []:
-        for slot, code in (getattr(module, "stages", None) or {}).items():
-            if code:
-                slots_by_code.setdefault(code, []).append(slot)
-        for node in module.module_nodes:
+        for node in pattern.nodes:
             for slot, code in (getattr(node, "stages", None) or {}).items():
                 if code:
                     slots_by_code.setdefault(code, []).append(slot)
-    for code, slots in slots_by_code.items():
-        if len(slots) > 1 and set(slots) - {"nlu", "nlg"}:
-            errors.append(
-                f"stage code {code!r} 在多个槽位声明（{sorted(set(slots))}；"
-                f"仅 nlu/nlg 同 code 的 unified 形态允许，其余为声明错误）")
+        for code, slots in slots_by_code.items():
+            # Repetition of one code within a SINGLE slot (the skeleton
+            # value + node overrides of the same slot, e.g. the same
+            # clarify stage declared on every node) is layering, not a
+            # duplicate — runtime resolution handles it without warnings;
+            # the error is one code serving several DISTINCT slots
+            # (nlu/nlg sharing a code — the unified form — is exempt).
+            if len(set(slots)) > 1 and set(slots) - {"nlu", "nlg"}:
+                errors.append(
+                    f"stage code {code!r} 在多个槽位声明（{sorted(set(slots))}；"
+                    f"仅 nlu/nlg 同 code 的 unified 形态允许，其余为声明错误）")
+
+    return errors
+
+
+def validate_tools(pattern: Pattern) -> List[str]:
+    """Validate the toolset authorization (plan-⑧ §4): every node's
+    use_tools names must be registered and belong to an allowed toolset.
+
+    Runs at registration time (tools discovered before patterns); patterns
+    validated in unit tests without registered tools get their use_tools
+    flagged — the intended deny-by-default fail-fast.
+
+    MCP timing exception: MCP-server tools register **asynchronously** (the
+    connections complete after startup validation — host/main.py validates
+    before ensure_started), so a declared name matching no registered tool
+    cannot be statically verified while the pattern allows ``mcp-*``
+    toolsets. Such names downgrade to a warning and defer to the runtime
+    checks (``_resolve_tools`` intersection + the "not in this round's
+    available set" hallucination guard), keeping the designed
+    ``allow_toolset=["mcp-<server>"]`` + ``use_tools=[MCP tool name]``
+    usage bootable.
+    """
+    from nexus.registry.tools import registry as tool_registry
+
+    errors: List[str] = []
+    pcode = getattr(pattern, "code", "?")
+    allowed_toolsets = set(getattr(pattern, "allow_toolset", None) or [])
+    allows_mcp = any(ts.startswith("mcp-") for ts in allowed_toolsets)
+
+    for node in pattern.nodes:
+        for name in (getattr(node, "use_tools", None) or []):
+            entry = tool_registry.get_entry(name) if name else None
+            if entry is None:
+                if allows_mcp:
+                    logger.warning(
+                        "[validation] pattern %r 节点 %r 的 use_tools 声明了"
+                        "未注册的工具 %r（pattern 允许 mcp-* 工具集，MCP 工具"
+                        "启动后异步注册，留待运行期解析）",
+                        pcode, node.code, name)
+                    continue
+                errors.append(
+                    f"pattern {pcode!r} 节点 {node.code!r} 的 use_tools 声明了"
+                    f"未注册的工具 {name!r}")
+                continue
+            if entry.toolset not in allowed_toolsets:
+                errors.append(
+                    f"pattern {pcode!r} 节点 {node.code!r} 的 use_tools 越集: "
+                    f"{name!r}（toolset={entry.toolset!r}，"
+                    f"allow_toolset={sorted(allowed_toolsets) or '空'}）")
 
     return errors
 
 
 def validate_pattern(pattern: Pattern) -> None:
-    """Full validation: base info + plugin declarations; collects ALL errors
-    then raises one numbered ValueError (empty list = valid, silent return).
-    """
-    errors = validate_base_info(pattern) + validate_plugin_declarations(pattern)
+    """Full validation: base info + plugin declarations + toolset
+    authorization; collects ALL errors then raises one numbered ValueError
+    (empty list = valid, silent return)."""
+    errors = (validate_base_info(pattern)
+              + validate_plugin_declarations(pattern)
+              + validate_tools(pattern))
     if errors:
         numbered = "\n".join(f"  [{i + 1}] {e}" for i, e in enumerate(errors))
         raise ValueError(

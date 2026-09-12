@@ -16,9 +16,11 @@ Differences from the original (degradation notes):
   goods_id must exist in the current scope's knowledge base, preventing LLM
   fabrication
 
-Permissions: ``allowed_patterns={"customer_agent": True}`` — precise domain-tool
+Permissions (plan-⑧ §4): toolset="knowledge" — the pattern grants via
+allow_toolset=["knowledge"], the node narrows via use_tools (both
+deny-by-default).
 authorization (customer_agent is the wholesale migration of Customer-Agent, see
-dialogue/customer_agent_route.py; the original knowledge_agent demo pattern was
+apps/customer_agent/route.py; the original knowledge_agent demo pattern was
 removed).
 """
 
@@ -251,5 +253,4 @@ for _schema, _handler, _desc, _emoji in _KNOWLEDGE_TOOLS:
         handler=_handler,
         description=_desc,
         emoji=_emoji,
-        allowed_patterns={"customer_agent": True},
     )

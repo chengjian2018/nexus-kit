@@ -72,11 +72,10 @@ class PatternRegistry:
         code_or_pattern: Any,
         name: str = "",
         description: str = "",
-        modules: Optional[Dict[str, Any]] = None,
-        nodes: Optional[Dict[str, Any]] = None,
+        pattern_type: Optional[str] = None,
+        nodes: Optional[List[Any]] = None,
         stages: Optional[List[Any]] = None,
-        entry_module_code: str = "",
-        llm_provider_code: str = "",
+        entry_node_code: str = "",
         **kwargs,
     ) -> Pattern:
         """Register a Pattern.
@@ -85,11 +84,11 @@ class PatternRegistry:
             code_or_pattern: a Pattern object, or the pattern's code string.
             name: pattern name (used when the first arg is a string).
             description: pattern description.
-            modules: module dict.
-            nodes: node dict.
-            stages: Pipeline stage list.
-            entry_module_code: entry module code.
-            llm_provider_code: LLM provider code.
+            pattern_type: "fsm" | "agent" (used when the first arg is a
+                string; default agent).
+            nodes: node list (BaseNode objects / inline dicts).
+            stages: FSM pipeline skeleton.
+            entry_node_code: entry node code (default nodes[0]).
             **kwargs: extra args passed to the Pattern constructor.
 
         Returns:
@@ -103,9 +102,10 @@ class PatternRegistry:
                     code=code_or_pattern,
                     name=name,
                     description=description,
-                    modules=modules,
+                    pattern_type=pattern_type,
+                    nodes=nodes,
                     stages=stages,
-                    entry_module_code=entry_module_code,
+                    entry_node_code=entry_node_code or None,
                     **kwargs
                 )
 

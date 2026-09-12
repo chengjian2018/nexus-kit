@@ -38,22 +38,23 @@ class TurnLifecycle:
     # this is the session state itself; deleting it by mistake loses state.
     PERSISTENT_FIELDS = (
         "history",              # appended incrementally (end_turn); never cleared wholesale
-        "current_module_code",  # maintained by jump consumption (chat layer _apply_jump)
-        "current_node_code",    # maintained by jump consumption / node transition
+        "current_node_code",    # maintained by node transition (FSM) / the graph
+                                # runtime's position mirror (AGENT)
         "filled_slots",         # merged incrementally (merge_slots)
         "task_basic_info",      # injected at launch; read-only throughout
         "session_id",
         "node_map",             # topology map injected at launch
-        "module_map",
+        # AGENT graph state board: survives turns WHILE the graph is
+        # suspended (the paused cursor IS the cross-turn state); the graph
+        # runtime itself clears it on termination and re-initializes on a
+        # fresh run — begin_turn never touches it
+        "graph_state",
     )
     PERSISTENT_METADATA_KEYS = (
         "bargain_settings",
         "task_info",
         "llm_override",
         "pattern_code",
-        # plan-⑥: modules recorded as force-projected (jumped away / deferred)
-        # stay projected for the rest of the session (anti-ping-pong)
-        "forced_projection",
     )
 
     # -- Per-turn reset: zeroed at turn start --------------------------------
@@ -65,23 +66,17 @@ class TurnLifecycle:
         "pre_recall_results",
         "rewritten_queries",
         "post_recall_results",
-        "actions",              # jump event/action channel rebuilt every turn (chat layer snapshots
-                                # it into ChatResult at turn end; ModuleJumpEvent is consumed and
-                                # removed by the hop loop; non-jump actions remain until turn end)
+        "actions",              # action channel rebuilt every turn (chat layer snapshots
+                                # it into ChatResult at turn end)
     )
     PER_TURN_METADATA_KEYS = (
         "unified",
-        # deep_research_multi 的轮内瞬态研究状态(工作区/findings/计划):
-        # dr_synthesize 收尾即弹出,这里兜底出清——研究中途异常(相位抛错
-        # 被对话层兜住)留下的陈旧状态绝不能泄进下一轮
-        "deep_research_state",
     )
 
     # -- Stage self-managed: reset at turn start -----------------------------
-    # served_by_projection is written by agent tool receipts (bookkeeping for rounds answered via
-    # a lent projection); clarify is set by ClarifyStage each turn — neither should leak across
-    # turns, so both are cleared at turn start.
-    STAGE_MANAGED_METADATA_KEYS = ("clarify", "served_by_projection")
+    # clarify is set by ClarifyStage each turn — it should never leak across
+    # turns, so it is cleared at turn start.
+    STAGE_MANAGED_METADATA_KEYS = ("clarify",)
 
     # ------------------------------------------------------------------
     # Turn boundary

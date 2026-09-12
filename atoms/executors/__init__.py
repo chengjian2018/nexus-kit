@@ -1,18 +1,18 @@
-"""Executor atoms: the default module executors (agent loop / FSM / ROUTE).
+"""Executor atoms: the default node/pattern executors (agent loop / FSM).
 
 Importing this package registers the kernel's builtin executors into the
-plugin registry (kind="executor"): default_loop / default_fsm /
-default_route. The kernel never imports atom implementations — this warm-up
-(at host bootstrap and tests/conftest.py) is what makes the chat layer's
-plugin dispatch runnable, mirroring atoms.stages' registration of default
-stage factories.
+plugin registry (kind="executor"): default_loop / default_fsm. The kernel
+never imports atom implementations — this warm-up (at host bootstrap and
+tests/conftest.py) is what makes the chat layer's plugin dispatch runnable,
+mirroring atoms.stages' registration of default stage factories.
+
+plan-⑧: default_route is gone (the ROUTE module type is gone; routing apps
+declare an AGENT graph with routing node executors).
 """
 
 from atoms.executors.loop_executor import DefaultLoopExecutor
 from atoms.executors.fsm_executor import DefaultFSMExecutor
-from atoms.executors.route_executor import DefaultRouteExecutor
 from nexus.registry.plugins import registry
 
 registry.register("executor", "default_loop", DefaultLoopExecutor)
 registry.register("executor", "default_fsm", DefaultFSMExecutor)
-registry.register("executor", "default_route", DefaultRouteExecutor)

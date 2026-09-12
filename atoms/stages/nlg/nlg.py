@@ -20,7 +20,7 @@ from nexus.context import (
     resolve_prompt_template,
 )
 from nexus.llm.resolve import build_provider
-from atoms.stages._prompts import FSM_NLG_DEFAULT_PROMPT, ROUTE_NLG_DEFAULT_PROMPT
+from atoms.stages._prompts import FSM_NLG_DEFAULT_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -176,33 +176,3 @@ class FSMNLG(BaseNLG):
 
 
 # ============================================================================
-# Route module NLG
-# ============================================================================
-
-class RouteNLG(BaseNLG):
-    """NLG implementation for Route modules — reply generation for top-level route modules.
-
-    Uses ``ROUTE_NLG_DEFAULT_PROMPT`` as the default template; node/module level override supported.
-    """
-
-    stage_name = "route_nlg"
-
-    def _default_prompt_template(self) -> str:
-        return ROUTE_NLG_DEFAULT_PROMPT
-
-    def prompt_build(self, cxt: DialogueContext) -> str:
-        prompt_template = self._resolve_prompt_template(cxt)
-        kwargs = self._build_template_kwargs(cxt)
-
-        return self._fill_template(prompt_template, kwargs)
-
-    async def execute(self, ctx: DialogueContext) -> DialogueContext:
-        prompt = self.prompt_build(ctx)
-        raw = await self._call_llm(prompt, ctx.llm_config)
-        ctx.nlg_result = {"content": raw.strip()}
-        logger.info(
-            "Route NLG 完成: session=%s, content_len=%d",
-            ctx.session_id,
-            len(raw),
-        )
-        return ctx

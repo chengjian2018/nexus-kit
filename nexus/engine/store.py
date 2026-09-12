@@ -1,8 +1,8 @@
 """SQLite session persistence — source of truth for messages (per-message
 write-through) + state snapshots + audit.
 
-Governance (TTL/eviction/existence checks) happens in main.py's in-memory
-state. Messages are persisted one by one, as they are added, through the
+Governance (TTL/eviction/existence checks) happens in host/governor.py's
+in-memory state (wired by host/main.py). Messages are persisted one by one, as they are added, through the
 message_sink wired up by ``attach`` (``append_message``; the DB is the source
 of truth — a mid-turn crash loses no messages); end of turn ``save_snapshot``
 only writes back the sessions state snapshot; startup restores via
@@ -35,8 +35,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     launch_epoch        INTEGER NOT NULL DEFAULT 0,
     request_id          TEXT,
     task_info           TEXT NOT NULL DEFAULT '{}',
-    current_module_code TEXT,
     current_node_code   TEXT,
+    graph_state         TEXT NOT NULL DEFAULT '{}',
     filled_slots        TEXT NOT NULL DEFAULT '{}',
     created_at          REAL NOT NULL,
     last_active_at      REAL NOT NULL
@@ -88,9 +88,33 @@ class SessionStore:
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.executescript(_SCHEMA)
+        await cls._migrate(conn)
         await conn.commit()
         self._conn = conn
         return self
+
+    @staticmethod
+    async def _migrate(conn) -> None:
+        """One-shot schema migration for pre-plan-⑧ databases: drop the
+        module-layer column, add the graph_state column. Fresh databases
+        already match _SCHEMA (both steps no-op)."""
+        rows = await conn.execute_fetchall(
+            "PRAGMA table_info(sessions)")
+        cols = {r["name"] for r in rows}
+        if "current_module_code" in cols:
+            # plan-⑧: the module cursor has no successor — dropped (the
+            # FSM node cursor lives on in current_node_code)
+            try:
+                await conn.execute(
+                    "ALTER TABLE sessions DROP COLUMN current_module_code")
+            except Exception:
+                # ancient sqlite without DROP COLUMN: leave the orphan
+                # column in place (harmless — nothing reads it)
+                pass
+        if "graph_state" not in cols:
+            await conn.execute(
+                "ALTER TABLE sessions ADD COLUMN graph_state TEXT"
+                " NOT NULL DEFAULT '{}'")
 
     async def close(self) -> None:
         await self._conn.close()
@@ -115,10 +139,12 @@ class SessionStore:
             (session.session_id,),
         )
         epoch = (rows[0]["launch_epoch"] + 1) if rows else 0
+        graph_state = json.dumps(session.cxt.graph_state or {},
+                                 ensure_ascii=False)
         await self._conn.execute(
             """INSERT OR REPLACE INTO sessions
                (session_id, pattern_code, launch_epoch, request_id, task_info,
-                current_module_code, current_node_code, filled_slots,
+                current_node_code, graph_state, filled_slots,
                 created_at, last_active_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
@@ -127,8 +153,8 @@ class SessionStore:
                 epoch,
                 request_id,
                 task_info,
-                session.cxt.current_module_code,
                 session.cxt.current_node_code,
+                graph_state,
                 filled_slots,
                 now,
                 now,
@@ -165,14 +191,16 @@ class SessionStore:
         """
         now = time.time()
         filled_slots = json.dumps(session.cxt.filled_slots or {}, ensure_ascii=False)
+        graph_state = json.dumps(session.cxt.graph_state or {},
+                                 ensure_ascii=False)
         await self._conn.execute(
             """UPDATE sessions
-               SET current_module_code = ?, current_node_code = ?,
+               SET current_node_code = ?, graph_state = ?,
                    filled_slots = ?, last_active_at = ?
                WHERE session_id = ?""",
             (
-                session.cxt.current_module_code,
                 session.cxt.current_node_code,
+                graph_state,
                 filled_slots,
                 now,
                 session.session_id,
@@ -196,7 +224,7 @@ class SessionStore:
         """Persist a single message immediately (write side of message_sink,
         triggered per add_message).
 
-        The epoch is looked up at write time (same idiom as save_turn): an
+        The epoch is looked up at write time (same idiom as save_snapshot): an
         in-flight turn of a session evicted from memory and re-launched lands
         in the new generation — same kind of deviation as the existing batch
         write, not introduced here.
@@ -281,9 +309,11 @@ class SessionStore:
                 json.dumps(msg.metadata or {}, ensure_ascii=False),
                 now,
             ))
-        # 显式事务（不能用 `async with self._conn`：aiosqlite 的 __aenter__
-        # 会重新 await 连接、二次启动 worker 线程）。DELETE/INSERT 隐式开启
-        # 事务；中途失败（含取消）回滚整体，成功才 commit。
+        # Explicit transaction (`async with self._conn` cannot be used:
+        # aiosqlite's __aenter__ would re-await the connection and start
+        # the worker thread a second time). DELETE/INSERT implicitly open
+        # a transaction; a mid-way failure (cancellation included) rolls
+        # everything back, only success commits.
         try:
             await self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ? AND launch_epoch = ?",
@@ -336,8 +366,8 @@ class SessionStore:
             session.task_info = json.loads(row["task_info"] or "{}")
             session.cxt.metadata["task_info"] = session.task_info
             session.cxt.metadata["request_id"] = row["request_id"]
-            session.cxt.current_module_code = row["current_module_code"]
             session.cxt.current_node_code = row["current_node_code"]
+            session.cxt.graph_state = json.loads(row["graph_state"] or "{}")
             session.cxt.filled_slots = json.loads(row["filled_slots"] or "{}")
             session.cxt.history = [
                 SessionMessage(
@@ -364,8 +394,8 @@ class SessionStore:
         """Session list (descending by last_active_at), with message counts."""
         sql = """
             SELECT s.session_id, s.pattern_code, s.launch_epoch,
-                   s.current_module_code,
-                   s.current_node_code, s.created_at, s.last_active_at,
+                   s.current_node_code, s.graph_state,
+                   s.created_at, s.last_active_at,
                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id)
                        AS message_count
             FROM sessions s

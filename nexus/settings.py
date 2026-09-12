@@ -1,10 +1,10 @@
 """Kernel runtime settings — schema + resolution for local_config.yaml.
 
-The kernel owns the settings *schema* (LLM 三级编排、压缩、DB 路径); only the
-host knows where the yaml file lives: host/config calls ``set_config_path()``
-at boot. LLM config fields come from ``ProviderEntry`` / ``BaseLLMProvider``
-in ``nexus/llm/provider.py`` plus ``OpenAICompatibleProvider`` in
-``atoms/providers/openai_provider.py``.
+The kernel owns the settings *schema* (three-tier LLM orchestration,
+compression, DB paths); only the host knows where the yaml file lives:
+host/config calls ``set_config_path()`` at boot. LLM config fields come from
+``ProviderEntry`` / ``BaseLLMProvider`` in ``nexus/llm/provider.py`` plus
+``OpenAICompatibleProvider`` in ``atoms/providers/openai_provider.py``.
 """
 
 import copy
@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 
 # ============================================================================
-# Required and optional LLM config fields (from ProviderEntry in llm/provider.py)
+# Required and optional LLM config fields (from ProviderEntry in nexus/llm/provider.py)
 # ============================================================================
 
 _LLM_REQUIRED_FIELDS = {
@@ -55,7 +55,7 @@ _CONNECTION_FIELDS = {
     "api_base", "api_key", "api_key_env", "timeout", "max_retries",
 }
 
-_PATTERN_LLM_SUBKEYS = {"modules", "nodes"}
+_PATTERN_LLM_SUBKEYS = {"nodes"}  # plan-⑧: the modules sub-key is gone
 
 
 # ============================================================================
@@ -301,12 +301,14 @@ def _validate_llm_providers(providers: Dict[str, Any]) -> None:
 def load_config(config_path: str = "") -> Dict[str, Any]:
     """Read the local configuration from local_config.yaml and return it.
 
-    mtime 缓存（本函数是每轮对话 R1 刷新的热路径）：文件 stat 指纹
-    (mtime_ns, size) 未变时直接返回上次解析结果的深拷贝——不重读、不
-    重新校验；变了（或缓存被 invalidate）才走完整 读文件→校验→规范化
-    流程。编辑器原子写（写临时文件再 rename）会换 inode，指纹必然变
-    化，天然兼容。解析失败时缓存不落盘（上次的有效结果继续可用，直到
-    文件改回合法内容）。
+    mtime cache (this function is the hot path of the per-turn R1 refresh):
+    when the file's stat fingerprint (mtime_ns, size) is unchanged, return a
+    deep copy of the last parsed result — no re-read, no re-validation; only
+    when it changed (or the cache was invalidated) run the full
+    read→validate→normalize pipeline. Editor atomic writes (temp file +
+    rename) change the inode, so the fingerprint necessarily changes —
+    naturally compatible. A parse failure does not populate the cache (the
+    last valid result stays usable until the file is fixed).
 
     Args:
         config_path: optional; explicit config file path. When empty, looks up
@@ -316,8 +318,9 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
         Config dict containing the ``llm_providers`` / ``llm_default`` /
         ``pattern_llm`` / ``session_db_path`` keys. A legacy ``llm:`` node is
         converted automatically at load time into ``llm_providers`` +
-        ``llm_default``. **返回深拷贝**：调用方改写（如 pattern_llm 校
-        验原地清空非法键）不会污染缓存。
+        ``llm_default``. **Returns a deep copy**: caller-side rewrites (e.g.
+        pattern_llm validation stripping illegal keys in place) cannot
+        pollute the cache.
 
     Raises:
         FileNotFoundError: when the config file does not exist.
@@ -335,7 +338,7 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
         path = _get_config_path()
 
     resolved = str(path.resolve())
-    stat = path.stat()  # FileNotFoundError 按原语义上抛
+    stat = path.stat()  # FileNotFoundError propagates with its original semantics
     fingerprint = (stat.st_mtime_ns, stat.st_size)
 
     with _CONFIG_CACHE_LOCK:
@@ -351,17 +354,19 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
 
 
 def reload_config(config_path: str = "") -> Dict[str, Any]:
-    """强制重载配置（编程入口）：丢弃缓存后走一次完整 load_config。
+    """Force-reload the config (programmatic entry): drop the cache, then run
+    a full load_config.
 
-    mtime 缓存正常情况下无需手动调用（指纹变化自动重载）；供改了系统
-    时钟、或想拿到"确定重读了文件"的确定性的调用方使用。
+    With the mtime cache this normally needs no manual call (a fingerprint
+    change reloads automatically); it exists for callers that changed the
+    system clock, or want the certainty of "the file was definitely re-read".
     """
     invalidate_config_cache(config_path)
     return load_config(config_path)
 
 
 def invalidate_config_cache(config_path: str = "") -> None:
-    """丢弃配置缓存（全部，或指定路径的一条）。
+    """Drop the config cache (all of it, or one resolved path's entry).
 
     Tests use this between writes to the same path with an unchanged fingerprint
     (same mtime_ns + size within filesystem resolution); production rarely
@@ -376,7 +381,7 @@ def invalidate_config_cache(config_path: str = "") -> None:
 
 
 def _parse_config_file(path: Path) -> Dict[str, Any]:
-    """读文件 + 校验 + 规范化（load_config 的无缓存内核）。"""
+    """Read the file + validate + normalize (the cache-free core of load_config)."""
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
 
@@ -450,8 +455,9 @@ def _merge_connection(orch: Dict[str, Any], providers: Dict[str, Any]) -> Dict[s
 
 
 def _resolve_layered(cfg: Dict[str, Any], pattern_code: str,
-                     module_code: str, node_code: str) -> Dict[str, Any]:
-    """llm_default ⊕ pattern ⊕ module ⊕ node shallow-merged layer by layer (spec §3.2).
+                     node_code: str) -> Dict[str, Any]:
+    """llm_default ⊕ pattern ⊕ node shallow-merged layer by layer (spec §3.2;
+    plan-⑧: the module sub-layer is gone with the module layer).
 
     Unconfigured/unknown codes silently fall back to the shallower layer with a warning.
     """
@@ -463,7 +469,6 @@ def _resolve_layered(cfg: Dict[str, Any], pattern_code: str,
     if pcfg:
         merged.update({k: v for k, v in pcfg.items() if k not in _PATTERN_LLM_SUBKEYS})
         for sub_key, code, label in (
-            ("modules", module_code, "module"),
             ("nodes", node_code, "node"),
         ):
             if not code:
@@ -477,16 +482,18 @@ def _resolve_layered(cfg: Dict[str, Any], pattern_code: str,
     return merged
 
 
-def get_llm_config(pattern_code: str = "", module_code: str = "",
-                   node_code: str = "", override: Optional[Dict[str, Any]] = None,
+def get_llm_config(pattern_code: str = "", node_code: str = "",
+                   override: Optional[Dict[str, Any]] = None,
                    config_path: str = "") -> Dict[str, Any]:
     """Resolve the LLM config for the current position (spec §3.3 / §4.1).
 
-    override not None: skip the three-tier resolution and only try to merge in
-    the llm_providers[override.code] connection section; a yaml load failure
-    silently degrades to an empty connection section (keeps offline tests sealed).
-    Otherwise: merge the three tiers, then merge in the connection layer; a yaml
-    load failure raises as usual.
+    override not None (the plugins["llm"] declaration resolves as
+    ``{"code": ...}`` here; the CLI's explicit pick wins): skip the layered
+    resolution and only try to merge in the llm_providers[override.code]
+    connection section; a yaml load failure silently degrades to an empty
+    connection section (keeps offline tests sealed). Otherwise: merge the
+    layers, then merge in the connection layer; a yaml load failure raises
+    as usual.
     """
     if override is not None:
         # override carries only user-explicit fields (code/model may each be
@@ -505,13 +512,13 @@ def get_llm_config(pattern_code: str = "", module_code: str = "",
             merged["code"] = default["code"]
         if not merged.get("model") and default.get("model"):
             # When the CLI picks "维持 config 配置", override carries only code;
-            # a missing model would make run_agent raise KeyError on
+            # a missing model would make the loop executor raise KeyError on
             # llm_config["model"], so backfill it just like code
             merged["model"] = default["model"]
         return _merge_connection(merged, cfg.get("llm_providers", {}))
     cfg = load_config(config_path)
     return _merge_connection(
-        _resolve_layered(cfg, pattern_code, module_code, node_code),
+        _resolve_layered(cfg, pattern_code, node_code),
         cfg.get("llm_providers", {}),
     )
 

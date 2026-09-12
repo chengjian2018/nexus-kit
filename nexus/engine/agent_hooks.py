@@ -21,8 +21,8 @@ P3    on_llm_response  observe: after each LLM response
 P4    on_tool_call     mutate: returns Optional[RewriteToolCall]
                         (name/args rewrite, guarded by allowed_names)
 P5    on_tool_result   mutate: returns Optional[str] (result rewrite)
-P6    on_transfer      observe: transfer hit writes a jump event
-P7    on_agent_end     observe: exits (reply / transfer / max_rounds)
+P6    (removed)        plan-⑧: the defer/transfer machinery is gone
+P7    on_agent_end     observe: exits (reply / max_rounds)
 ===== ================ =====================================================
 
 Declaration (pattern level; a module-level declaration replaces it
@@ -60,15 +60,14 @@ HOOK_POINTS = (
     "on_llm_response",   # P3: after each turn's LLM response (observe)
     "on_tool_call",      # P4: before a single tool execution (mutate: name/args)
     "on_tool_result",    # P5: after a single tool execution, before writing history (mutate: result string)
-    "on_transfer",       # P6: when a transfer hit writes a jump event (observe)
-    "on_agent_end",      # P7: exits: reply / transfer / max_rounds (observe)
+    "on_agent_end",      # P7: exits: reply / max_rounds (observe)
 )
 
 HookMap = Dict[str, List[Callable[..., Any]]]
 
 
 # ============================================================================
-# Event types (one per hook point; all carry session_id / module_code)
+# Event types (one per hook point; all carry session_id / node_code)
 # ============================================================================
 
 @dataclass
@@ -81,7 +80,7 @@ class AgentStartEvent:
     """
 
     session_id: str
-    module_code: str
+    node_code: str
     cxt: Any
 
 
@@ -90,7 +89,7 @@ class LLMCallEvent:
     """P2: before each turn's LLM call. Observation (return value ignored). messages is a reference (read-only discipline)."""
 
     session_id: str
-    module_code: str
+    node_code: str
     round_idx: int
     messages: List[Dict[str, Any]]
     model: str
@@ -101,7 +100,7 @@ class LLMResponseEvent:
     """P3: after each turn's LLM response (content/tool_calls already parsed). Observation."""
 
     session_id: str
-    module_code: str
+    node_code: str
     round_idx: int
     content: str
     tool_calls: List[Dict[str, Any]]
@@ -113,7 +112,7 @@ class ToolCallEvent:
     hook's rewrite is reflected into this event before it is fed to the next hook)."""
 
     session_id: str
-    module_code: str
+    node_code: str
     round_idx: int
     tool_name: str
     args: Dict[str, Any]
@@ -133,7 +132,7 @@ class ToolResultEvent:
     result (chained like P4; the rewritten result goes to both the LLM backfill and the store — no fork)."""
 
     session_id: str
-    module_code: str
+    node_code: str
     round_idx: int
     tool_name: str
     tool_call_id: str
@@ -141,38 +140,28 @@ class ToolResultEvent:
 
 
 @dataclass
-class TransferEvent:
-    """P6: when a transfer hit writes a jump event. Observation."""
-
-    session_id: str
-    module_code: str
-    round_idx: int
-    target: str
-    reason: str
-
-
-@dataclass
 class AgentEndEvent:
-    """P7: the three run_agent exits. Observation.
+    """P7: the loop exits. Observation.
 
-    outcome: "reply" (direct answer, reply is the exit text) / "transfer" (silent transfer,
-    transfer_target is the target module) / "max_rounds" (round limit exceeded, reply is the fallback text).
+    outcome: "reply" (direct answer, reply is the exit text) /
+    "max_rounds" (round limit exceeded, reply is the fallback text).
     """
 
     session_id: str
-    module_code: str
+    node_code: str
     rounds: int
     outcome: str
     reply: Optional[str] = None
-    transfer_target: str = ""
 
 
 # ============================================================================
-# Declaration parsing (module replaces pattern wholesale; invalid config degrades to skip)
+# Declaration parsing (node replaces pattern wholesale; invalid config degrades to skip)
 # ============================================================================
 
-def resolve_agent_hooks(module: Any, pattern: Any = None) -> HookMap:
-    """Resolve the effective hooks: a non-empty module.agent_hooks replaces wholesale, else the pattern level.
+def resolve_agent_hooks(node: Any, pattern: Any = None) -> HookMap:
+    """Resolve the effective hooks: a non-empty node-level declaration
+    (node.plugins["agent_hooks"]) replaces wholesale, else the pattern level
+    (pattern.plugins["agent_hooks"]).
 
     Since plan-② the declaration is a **string code** (plugin registry
     kind="agent_hooks") resolving to a hooks package (a callable returning
@@ -182,9 +171,10 @@ def resolve_agent_hooks(module: Any, pattern: Any = None) -> HookMap:
     non-dict package / unknown point name / non-callable entry → warning
     and skip, no raise.
     """
-    raw = getattr(module, "agent_hooks", None)
-    if not raw:
-        raw = getattr(pattern, "agent_hooks", None)
+    raw = ((getattr(node, "plugins", None) or {}).get("agent_hooks")
+           if node is not None else None)
+    if not raw and pattern is not None:
+        raw = (getattr(pattern, "plugins", None) or {}).get("agent_hooks")
     if not raw:
         return {}
 
@@ -276,16 +266,16 @@ def _normalize_rewrite(rw: Any) -> Optional[RewriteToolCall]:
 
 def rewrite_tool_call(
     hooks: HookMap, event: ToolCallEvent, allowed_names: set,
-    reserved_prefix: str = "",
 ) -> Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]:
     """P4 dispatch: chained rewrite of name/args (hook₁'s rewrite is reflected into the event before feeding hook₂).
 
-    Guards (rule 2 at the dispatcher layer): a rewritten name not in allowed_names (this turn's
-    own+lent) or carrying reserved_prefix (transfer_to_) → reject that rename + warning; the legal
-    parts of the same return value are applied as usual (name rejected, args applied). The dispatcher
-    only guarantees "a rewrite cannot make things worse" — if the name fallen back to after rejection
-    is still illegal (the original call was a hallucinated name to begin with), the loop main flow's
-    final validation catches it as the fallback.
+    Guard (rule 2 at the dispatcher layer): a rewritten name not in
+    allowed_names (this execution's resolved set) → reject that rename +
+    warning; the legal parts of the same return value are applied as usual
+    (name rejected, args applied). The dispatcher only guarantees "a rewrite
+    cannot make things worse" — if the name fallen back to after rejection
+    is still illegal (the original call was a hallucinated name to begin
+    with), the loop main flow's final validation catches it as the fallback.
 
     Returns:
         (final_name, final_args, original): original is
@@ -307,12 +297,7 @@ def rewrite_tool_call(
         if rw.args is not None:
             event.args = rw.args
         if rw.name is not None and rw.name != event.tool_name:
-            if reserved_prefix and rw.name.startswith(reserved_prefix):
-                logger.warning(
-                    "[agent_hooks] 改写 name '%s' 带 reserved 前缀，拒绝改名"
-                    "（保留 '%s'）", rw.name, event.tool_name,
-                )
-            elif rw.name not in allowed_names:
+            if rw.name not in allowed_names:
                 logger.warning(
                     "[agent_hooks] 改写 name '%s' 不在本轮可用工具中，拒绝改名"
                     "（保留 '%s'）", rw.name, event.tool_name,

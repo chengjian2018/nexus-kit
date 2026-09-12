@@ -1,61 +1,44 @@
-"""Pattern serialization — to_dict/from_dict + to_yaml/from_yaml round-trip.
+"""Pattern serialization — to_dict/from_dict + to_yaml/from_yaml round-trip
+(plan-⑧ two-layer shape).
 
-The plan-② declarative model (all fields are str/bool/list/dict) makes a
-pattern fully serializable. The dict/yml shape mirrors the constructor
-kwargs; from_dict goes through the same construction path (normalization +
-graph fail-fast), then validation (model/validation.py) is the caller's
-duty — the host assembly and CLI wiring call validate_pattern after
-loading, mirroring the python-declared patterns' registration-time checks.
+The declarative model (all fields are str/bool/list/dict) makes a pattern
+fully serializable. The dict/yml shape mirrors the constructor kwargs;
+``from_dict`` goes through the same construction path (normalization +
+compile fail-fast), then validation (model/validation.py) is the caller's
+duty — the host assembly and CLI wiring call validate_pattern after loading.
 
-Non-goals: hot reload / file watching (explicitly out of plan-③ scope).
+Nodes serialize inline (the complete field list per node dict); the YAML
+form is exactly this dict shape. No node registry — cross-file node reuse
+waits for a real consumer.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import yaml
 
-from nexus.model.module import BaseModule
 from nexus.model.node import BaseNode
-from nexus.model.pattern import Pattern
+from nexus.model.pattern import DEFAULT_MAX_STEPS, Pattern
 
-# Module fields serialized (constructor params; kwargs extras ride along).
-# messages_builder / agent_hooks ride inside the unified plugins dict (the
-# legacy scalar params still load — constructors fold them in).
-_MODULE_FIELDS = [
-    "module_code", "module_name", "module_description",
-    "module_todo_description", "use_tools", "base_prompt",
-    "base_nlu_prompt", "base_nlg_prompt", "stages", "sub_modules",
-    "executor", "enable_project", "agent_stage", "plugins",
-    "is_end", "answer_examples",
-]
-
-# Node fields serialized
+# Node fields serialized (constructor params; config/kwargs ride as one dict)
 _NODE_FIELDS = [
-    "node_code", "node_name", "node_description", "node_todo_description",
-    "sub_nodes", "node_slots", "answer_examples", "stages",
-    "base_nlu_prompt", "base_nlg_prompt", "is_end",
+    "code", "name", "description", "task_description",
+    "sub_nodes", "answer_examples", "stages", "slots",
+    "use_tools", "is_end", "plugins",
 ]
 
-# Pattern scalar fields serialized (modules/stages handled structurally).
-# The executor family + messages_builder + agent_hooks ride inside the
-# unified plugins dict (legacy scalar params still load — the constructor
-# folds them in).
+# Pattern scalar fields serialized (nodes/stages/plugins handled
+# structurally; everything else lives inside config)
 _PATTERN_FIELDS = [
-    "code", "name", "description", "entry_module_code", "plugins",
-    "max_hops",
+    "code", "name", "description", "pattern_type",
+    "entry_node_code", "allow_toolset",
 ]
 
-
-def module_to_dict(module: BaseModule) -> Dict[str, Any]:
-    """Serialize a module (with its nodes) into a declarative dict."""
-    data: Dict[str, Any] = {"type": module.type.value}
-    for field in _MODULE_FIELDS:
-        value = getattr(module, field, None)
-        if value not in (None, [], {}):
-            data[field] = value
-    if module.module_nodes:
-        data["nodes"] = [node_to_dict(n) for n in module.module_nodes]
-    return data
+# config keys already emitted as top-level structural fields — excluded from
+# the config snapshot to avoid double emission
+_CFG_DEDUP_KEYS = {
+    "pattern_type", "entry_node_code", "stages", "plugins",
+    "allow_toolset", "max_steps",
+}
 
 
 def node_to_dict(node: BaseNode) -> Dict[str, Any]:
@@ -63,51 +46,47 @@ def node_to_dict(node: BaseNode) -> Dict[str, Any]:
     data: Dict[str, Any] = {}
     for field in _NODE_FIELDS:
         value = getattr(node, field, None)
-        if value not in (None, [], {}):
+        if value not in (None, [], {}, False):
             data[field] = value
-    # jump_module is an optional extra attribute (not a constructor param of
-    # BaseNode — it rides kwargs); serialize when present
-    jump = getattr(node, "jump_module", None)
-    if jump:
-        data["jump_module"] = jump
+    if node.config:
+        data["config"] = node.config
     return data
+
+
+def node_from_dict(data: Dict[str, Any]) -> BaseNode:
+    """Build a node from a declarative dict (full construction path)."""
+    return BaseNode(**dict(data))
 
 
 def pattern_to_dict(pattern: Pattern) -> Dict[str, Any]:
-    """Serialize a whole pattern (modules + nodes tree) into a dict."""
+    """Serialize a whole pattern (nodes inline) into a dict."""
     data: Dict[str, Any] = {}
     for field in _PATTERN_FIELDS:
         value = getattr(pattern, field, None)
-        if value not in (None, [], {}):
+        if value not in (None, [], {}, False):
             data[field] = value
-    data["stages"] = pattern.stages or []
-    data["modules"] = [module_to_dict(m) for m in (pattern.modules or [])]
+    if pattern.stages:
+        data["stages"] = pattern.stages
+    if pattern.plugins:
+        data["plugins"] = pattern.plugins
+    if pattern.max_steps != DEFAULT_MAX_STEPS:
+        data["max_steps"] = pattern.max_steps
+    config = {k: v for k, v in (pattern.config or {}).items()
+              if k not in _CFG_DEDUP_KEYS}
+    if config:
+        data["config"] = config
+    data["nodes"] = [node_to_dict(n) for n in pattern.nodes]
     return data
 
 
-def _module_from_dict(data: Dict[str, Any]) -> BaseModule:
-    """Build a module (with nodes) from a declarative dict."""
-    from nexus.model.module import AgentModule, FSMModule, RouteModule
-
-    type_value = data.pop("type", "agent")
-    classes = {"agent": AgentModule, "fsm": FSMModule, "route": RouteModule}
-    cls = classes.get(type_value)
-    if cls is None:
-        raise ValueError(f"未知 module type: {type_value!r}（合法: agent/fsm/route）")
-
-    node_data = data.pop("nodes", None) or []
-    nodes = [BaseNode(**{k: v for k, v in nd.items()})
-             for nd in node_data]
-    data["module_nodes"] = nodes
-    return cls(**data)
-
-
 def pattern_from_dict(data: Dict[str, Any]) -> Pattern:
-    """Build a Pattern from a declarative dict (full construction path —
-    normalization + graph fail-fast run in the constructor)."""
+    """Build a Pattern from a declarative dict (nodes inline dicts →
+    BaseNode objects; full construction path — normalization + compile
+    fail-fast run in the constructor)."""
     data = dict(data)  # never mutate the caller's dict
-    module_data = data.pop("modules", None) or []
-    data["modules"] = [_module_from_dict(dict(md)) for md in module_data]
+    node_data = data.pop("nodes", None) or []
+    data["nodes"] = [n if isinstance(n, BaseNode) else node_from_dict(dict(n))
+                     for n in node_data]
     return Pattern(**data)
 
 

@@ -2,10 +2,9 @@
 
 Exports:
     - ``BaseNLU``: abstract base class for NLU atoms.stages.
-    - ``FSMNLU``: intent recognition and state transition for FSM modules.
-    - ``RouteNLU``: intent classification and dispatch for the top-level routing module.
+    - ``FSMNLU``: intent recognition and state transition for FSM patterns.
 """
 
-from atoms.stages.nlu.nlu import BaseNLU, FSMNLU, RouteNLU
+from atoms.stages.nlu.nlu import BaseNLU, FSMNLU
 
-__all__ = ["BaseNLU", "FSMNLU", "RouteNLU"]
+__all__ = ["BaseNLU", "FSMNLU"]

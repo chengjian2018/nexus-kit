@@ -1,52 +1,47 @@
 """
-Dialogue processing — the turn orchestrator.
+Dialogue processing — the turn orchestrator (plan-⑧: node+pattern 二层模型).
 
 Responsibility is narrowed to "orchestrating one turn": locate the session →
-cxt turn lifecycle → same-turn hop loop → produce a ChatResult. Per-module
-handling is dispatched to executor plugins (registry kind="executor";
-resolution module.executor > pattern.executor_<type> > type default code):
+cxt turn lifecycle → **dispatch by pattern_type** → produce a ChatResult.
 
-- AGENT → default_loop (atoms/executors/loop_executor.py — inject answers
-  directly / transfer writes a ModuleJumpEvent and returns)
-- FSM   → default_fsm (atoms/executors/fsm_executor.py — stages execution +
-  next_node jump)
-- ROUTE → default_route (atoms/executors/route_executor.py — stages
-  execution + end-of-turn reset to root)
+- ``pattern_type == "fsm"``   : the FSM pipeline executor (plugins["fsm"] >
+  default_fsm) runs the stages sequence (two-layer resolution node > pattern
+  skeleton) and advances ONE node per turn via next_node (clarify turns
+  skip; the terminal node writes conversation_end). No budget — cycles are
+  natural semantics.
+- ``pattern_type == "agent"`` : the graph runtime runs the WHOLE graph per
+  user message from entry (a fresh run), or resumes from the suspended node
+  when ``cxt.graph_state`` carries a wait_human cursor:
+    - conditional edges = the node executor's routing output
+      (``TurnResult.next``, mapped back onto the node's sub_nodes);
+    - node executor resolution: node.plugins["loop"] >
+      pattern.plugins["loop"] > default_loop (the ReAct tool loop);
+    - step budget ``pattern.max_steps`` (one node execution per step; on
+      exhaustion a force-close reply ends the run);
+    - suspension: ``TurnResult.wait_human`` persists the cursor + step into
+      cxt.graph_state (sessions-table graph_state column — process-restart
+      safe) and ends the turn; the NEXT user message re-executes the paused
+      node with the message as ``ec.resume_input`` (langgraph-interrupt
+      style; side-effect idempotency is the executor's documented duty).
+      A graph that never suspends completes within the single turn —
+      "full re-run per message" and "cross-turn resumable workflow" are the
+      same engine's emergent behaviors, no config switch.
 
-This module keeps the kernel toolbox the executors import: the R1-R4
+This module keeps the kernel toolbox the executors import: the R1/R3/R4
 _refresh_llm_config, _resolve_entry_node, _run_stages, and
 _fsm_node_transition (patch anchors — tests patch
 "nexus.engine.chat.get_llm_config").
-
-Module jumps all go through ModuleJumpEvent (written to cxt.actions,
-defined in dialogue/base.py). Events originate from only two entry points:
-
-- ROUTE jumping to a new module: _run_stages detects after each stage
-  execution (ROUTE modules only) — the jump_module field output by NLU, or
-  the jump_module configured on the menu node after advancement. On a hit:
-  merge slots, write the event, abort the remaining stages (the source
-  module is suppressed and generates no reply).
-- AGENT transfer tool call: the loop executor writes the event directly and
-  returns.
-- FSM produces no events: clarify is handled inside the loop by
-  ClarifyStage (overwrites nlg_result without leaving the loop), and node
-  jumps are handled by the end-of-turn _fsm_node_transition.
-- Consumption: chat_turn's hop loop _jumps.pop → _jumps.reroute (writes
-  current_module_code, clears current_node_code) → the target module
-  continues the reply in the same turn; exceeding the hop budget forces a
-  force_close close-out.
-- No adjacency validation / bounce rejection / dispatch accounting — the
-  target existing in module_map is legal; boundaries are deliberately thin,
-  and agent and route jumps are isomorphic.
 
 The cxt field lifecycle (per-turn reset / cross-turn retention / incremental
 update) is managed exclusively by context_lifecycle.TurnLifecycle; this
 module only calls it at the right timing points.
 
 Entries:
-- chat_turn() : full entry, returns ChatResult (text + reserved actions)
-- chat()      : compat entry (main.py / cli.py / existing tests),
-  equivalent to chat_turn().text
+- chat_turn_stream() : async generator (protocol entry), yields
+  ChatStreamEvent and terminates on done
+- chat_turn() : aggregate of chat_turn_stream, returns ChatResult
+- chat()      : compat entry (main.py / cli.py), equivalent to
+  chat_turn().text
 """
 
 import logging
@@ -56,330 +51,89 @@ from nexus.settings import get_llm_config
 from nexus.engine.compression import maybe_compress
 from nexus.engine.context_lifecycle import TurnLifecycle
 from nexus.engine.execution import ExecutionContext
-from nexus.engine.loop import TurnResult, run_agent  # noqa: F401 (compat re-export)
+from nexus.engine.loop import TurnResult  # noqa: F401 (compat re-export)
 from nexus.engine.response import ChatResult, build_chat_result
 from nexus.engine.session import Session
-from nexus.context import ModuleJumpEvent
-from nexus.model.module import ModuleType
 from nexus.registry.plugins import registry as plugin_registry
+from nexus.pipeline import resolve_execution_sequence
 
 if TYPE_CHECKING:
     from nexus.engine.store import SessionStore
-from nexus.pipeline import (
-    default_skeleton,
-    resolve_execution_sequence,
-)
 
 logger = logging.getLogger(__name__)
 
 # Sole manager of the cxt field lifecycle (stateless, shared module-level instance)
 _lifecycle = TurnLifecycle()
 
-
-# ============================================================================
-# ModuleJumpEvent channel (cxt.actions is the sole carrier of jump events)
-# ============================================================================
-
-class ModuleJumpChannel:
-    """Jump event channel operations — the single entry for channel
-    read/write, production detection, and consumption rerouting.
-
-    Stateless (all state lives on cxt.actions), reused at module level in
-    the same pattern as TurnLifecycle. This class must stay in the chat
-    module: the R4 refresh resolves ``get_llm_config`` in this namespace
-    (tests/test_llm_refresh.py anchors on
-    patch("nexus.engine.chat.get_llm_config")).
-
-    Division of duties: producers (detect_after_stage / stages writing
-    events themselves / run_agent) only append and never remove;
-    cxt.actions is the cross-function carrier. Consumption (pop + reroute)
-    happens only in chat_turn's hop loop — if a producer popped, the
-    consumer would find nothing and treat it as no jump, yielding an empty
-    reply.
-    """
-
-    # ------------------------------------------------------------------
-    # Channel read/write
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def peek(cxt) -> Optional[ModuleJumpEvent]:
-        """Check whether cxt.actions already holds a jump event (without removing it)."""
-        for item in cxt.actions:
-            if isinstance(item, ModuleJumpEvent):
-                return item
-        return None
-
-    @staticmethod
-    def pop(cxt) -> Optional[ModuleJumpEvent]:
-        """Take the first jump event out of cxt.actions (consumption removes it).
-
-        Non-jump actions (dict-shaped, e.g. conversation_end) stay in
-        actions untouched and are snapshotted into ChatResult by the
-        end-of-turn build_chat_result.
-        """
-        for i, item in enumerate(cxt.actions):
-            if isinstance(item, ModuleJumpEvent):
-                return cxt.actions.pop(i)
-        return None
-
-    # ------------------------------------------------------------------
-    # Consumption: reroute
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def reroute(cxt, event: ModuleJumpEvent) -> None:
-        """Consume a jump event: reroute to the target module (deliberately
-        thin boundary, only existence is validated).
-
-        If the target does not exist, stay in place (the pattern already
-        fail-fasts on jump_module configuration at registration time; this
-        guards against hallucinated NLU output). Plan-⑥: the handing-off
-        module is recorded as force-projected (anti-ping-pong).
-        """
-        if event.target_module_code not in cxt.module_map:
-            logger.warning(
-                "[jump] 目标模块 '%s' 不存在，保持原模块: %s",
-                event.target_module_code, cxt.current_module_code,
-            )
-            return
-        logger.info(
-            "[jump] %s → %s (source=%s)",
-            cxt.current_module_code, event.target_module_code, event.source,
-        )
-        if cxt.current_module_code:
-            _record_forced_projection(cxt, cxt.current_module_code)
-        cxt.current_module_code = event.target_module_code
-        # Node cleared: the target module's _resolve_entry_node picks its own first node
-        cxt.current_node_code = None
-
-    @staticmethod
-    def detect_after_stage(cxt, module, before_nlu) -> Optional[ModuleJumpEvent]:
-        """Jump detection after each stage execution for ROUTE modules;
-        FSM/AGENT always return None.
-
-        Events are produced by ROUTE only: FSM's clarify is handled inside
-        the loop by ClarifyStage (overwrites nlg_result without leaving the
-        loop) and node jumps are handled by the end-of-turn
-        _fsm_node_transition; AGENT transfers go through the transfer tool
-        (run_agent writes the event).
-
-        Before detecting, ROUTE first advances the menu node (the former
-        _RouteNodeAdvance duty was merged in here): next_node hitting one
-        of this module's nodes → switch the current node + R4 node-level
-        LLM config takes effect this turn, so the subsequent NLG part
-        generates per the menu node's configuration.
-
-        Module jump sources (in priority order):
-        1. ``nlu_result.jump_module``: the module-level jump field output
-           directly by NLU
-        2. the advanced node's ``jump_module`` configuration: the module
-           the menu node itself declares to jump to (advancement already
-           happened above, so just read the current node)
-
-        Detection runs only when nlu_result was (over)written during this
-        stage's execution — prevents false detection on a stale nlu_result
-        during the hop continuation phase. Targets missing from module_map
-        / self-jumps are ignored and the remaining stages keep executing
-        (LLM hallucination tolerance).
-        """
-        if module.type != ModuleType.ROUTE:
-            return None
-        if cxt.nlu_result is None or cxt.nlu_result is before_nlu:
-            return None
-
-        nlu_result = cxt.nlu_result
-        target = ""
-        source = ""
-
-        # Menu node advancement
-        next_node_code = nlu_result.get("next_node", "")
-        module_node_codes = {n.node_code for n in module.module_nodes}
-        if next_node_code and next_node_code in module_node_codes:
-            logger.info(
-                "ROUTE 命中菜单节点: %s → %s",
-                cxt.current_node_code, next_node_code,
-            )
-            cxt.current_node_code = next_node_code
-            # R4: the menu node's node-level LLM config takes effect this
-            # turn (spec §4; pattern_code comes from the metadata R1 wrote —
-            # ROUTE departs from root every turn and never dwells on a menu
-            # node)
-            cxt.llm_config = get_llm_config(
-                pattern_code=cxt.metadata.get("pattern_code", ""),
-                module_code=cxt.current_module_code or "",
-                node_code=next_node_code,
-                override=cxt.metadata.get("llm_override"),
-            )
-
-        # 1) NLU directly outputs the module-level jump field
-        jump_field = nlu_result.get("jump_module", "")
-        if isinstance(jump_field, str) and jump_field:
-            target, source = jump_field, "nlu_jump"
-
-        # 2) the advanced (or current) node has jump_module configured (menu dispatch)
-        if not target:
-            cur_node = cxt.node_map.get(cxt.current_node_code)
-            node_jump = getattr(cur_node, "jump_module", None) if cur_node else None
-            if node_jump:
-                target, source = node_jump, "route_menu"
-
-        if not target or target == cxt.current_module_code:
-            return None
-        if target not in cxt.module_map:
-            logger.warning(
-                "[jump] NLU 指示跳转目标 '%s' 不在 module_map 中，忽略", target,
-            )
-            return None
-
-        return ModuleJumpEvent(
-            target_module_code=target,
-            reason=str(nlu_result.get("reason", "") or ""),
-            source=source,
-        )
-
-
-
-# Sole manager of the jump event channel (stateless, shared module-level instance)
-_jumps = ModuleJumpChannel()
+# graph_state reserved keys (engine-managed; everything else is free for
+# node executors' workflow data)
+PAUSED_NODE_KEY = "__paused_node__"
+STEP_KEY = "__step__"
 
 
 # ============================================================================
-# Projection / deferred-switch helpers (plan-⑥)
+# LLM config refresh (R1 turn-level / R3 FSM-node-level / R4 AGENT-node-level)
 # ============================================================================
 
-_FORCED_PROJECTION_KEY = "forced_projection"
-
-
-def _effective_enable_project(module, cxt) -> bool:
-    """Whether an adjacency target serves its parent via projection.
-
-    True when the module declares enable_project OR it has been force-
-    projected this session (a module that handed off / deferred was recorded
-    in cxt.metadata["forced_projection"] — the anti-ping-pong rule: never
-    mutate the shared Pattern/Module singletons, the override lives on the
-    session's context).
-    """
-    forced = cxt.metadata.get(_FORCED_PROJECTION_KEY) or set()
-    if module.module_code in forced:
-        return True
-    return bool(getattr(module, "enable_project", True))
-
-
-def _record_forced_projection(cxt, module_code: str) -> None:
-    """Record a module as force-projected for this session (idempotent).
-
-    Called when a module hands off (jump) or defers — afterwards any OTHER
-    module enumerating it as an adjacency serves it via projection only,
-    preventing A↔B ping-pong.
-    """
-    forced = set(cxt.metadata.get(_FORCED_PROJECTION_KEY) or set())
-    forced.add(module_code)
-    cxt.metadata[_FORCED_PROJECTION_KEY] = sorted(forced)
-
-
-def _pop_deferred_switch(cxt) -> Optional["DeferredModuleSwitch"]:
-    """Take the first DeferredModuleSwitch out of cxt.actions (consumption
-    removes it); None when the turn produced none."""
-    from nexus.context import DeferredModuleSwitch
-
-    for i, item in enumerate(cxt.actions):
-        if isinstance(item, DeferredModuleSwitch):
-            return cxt.actions.pop(i)
-    return None
-
-
-def _apply_deferred_switch(session: Session, pattern, stream=None) -> None:
-    """End-of-turn consumption of a DeferredModuleSwitch (plan-⑥).
-
-    Runs AFTER the hop loop and BEFORE end_turn (so the end-of-turn history
-    append and the store snapshot see the applied base). Rewrites
-    current_module_code to the target (existence-checked; a hallucinated
-    target warns and keeps the current base) and records the SOURCE module
-    as force-projected (anti-ping-pong). The event stays observable: it is
-    re-appended to actions after application so build_chat_result
-    snapshots it into ChatResult.actions.
-
-    stream: optional StreamEmitter — a successful switch is forwarded as a
-    defer_switch trace event for real-time consumers.
-    """
-    from nexus.context import DeferredModuleSwitch
-
-    cxt = session.cxt
-    switch = _pop_deferred_switch(cxt)
-    if switch is None:
-        return
-
-    source_module = cxt.current_module_code
-    target = switch.target_module_code
-    if target not in (pattern.module_map if pattern else {}):
-        logger.warning(
-            "[defer_switch] 目标模块 '%s' 不存在，保持当前底座: %s",
-            target, source_module,
-        )
-        return
-
-    logger.info(
-        "[defer_switch] %s → %s（轮末切换底座，下一轮生效, source=%s）",
-        source_module, target, switch.source,
-    )
-    cxt.current_module_code = target
-    cxt.current_node_code = None  # the target resolves its own entry node
-    if source_module:
-        _record_forced_projection(cxt, source_module)
-    if stream is not None:
-        stream.emit_trace(
-            "defer_switch", module_code=target,
-            from_module=source_module or "", to_module=target,
-            source=switch.source, reason=switch.reason)
-    # re-append for observability (ChatResult.actions snapshot)
-    cxt.actions.append(switch)
-
-
-# ============================================================================
-# Pipeline execution
-# ============================================================================
-
-def _default_skeleton(module) -> list:
-    """Default pipeline skeleton (kept as a patch/test anchor).
-
-    The declarative skeleton now lives in pattern.stages (normalized at
-    construction); this returns the kernel default six-slot form — kept
-    because tests reference it and visualize/consumers may import it.
-    """
-    return default_skeleton()
-
-
-def _refresh_llm_config(session: Session, module_code: str = "",
-                        node_code: str = "") -> None:
+def _refresh_llm_config(session: Session, node_code: str = "") -> None:
     """Resolve the LLM config for the current position and write it to
-    cxt.llm_config (spec §4, shared by R1-R4).
+    cxt.llm_config (R1-R4 shared).
 
-    This function must stay in the chat module: R1-R3 resolve
-    get_llm_config through this namespace (tests/test_llm_refresh.py et al.
-    anchor on patch("nexus.engine.chat.get_llm_config")), avoiding a handlers
-    self-import.
+    Resolution: the explicit plugins["llm"] declaration (node layer over
+    pattern layer — the value is an llm_providers code, resolved as an
+    override) > the settings layered lookup (llm_default ⊕ pattern_llm ⊕
+    pattern_llm.nodes[node_code]) > the session's llm_override metadata
+    (CLI-side explicit pick, highest).
+
+    This function must stay in the chat module: R1-R4 resolve
+    get_llm_config through this namespace (tests anchor on
+    patch("nexus.engine.chat.get_llm_config")).
     """
     cxt = session.cxt
+    pattern = session.pattern
+    override = cxt.metadata.get("llm_override")
+
+    llm_code = None
+    if pattern is not None:
+        node = pattern.node_map.get(node_code) if node_code else None
+        if node is not None:
+            llm_code = (node.plugins or {}).get("llm")
+        if not llm_code:
+            llm_code = (pattern.plugins or {}).get("llm")
+    if llm_code and override is None:
+        override = {"code": llm_code}
+
     cxt.llm_config = get_llm_config(
         pattern_code=session.pattern_code or cxt.metadata.get("pattern_code", ""),
-        module_code=module_code or cxt.current_module_code or "",
         node_code=node_code or cxt.current_node_code or "",
-        override=cxt.metadata.get("llm_override"),
+        override=override,
     )
 
 
-def _fsm_node_transition(cxt, module) -> None:
+# ============================================================================
+# FSM kernel toolbox (imported by the FSM executor atom)
+# ============================================================================
+
+def _resolve_entry_node(cxt, pattern) -> None:
+    """Determine the current node (pattern entry on first entry), written to
+    cxt.current_node_code."""
+    if cxt.current_node_code is None:
+        cxt.current_node_code = pattern.entry_node_code
+        logger.info("首次进入 FSM，使用入口节点: %s", pattern.entry_node_code)
+
+    if cxt.current_node_code not in pattern.node_map:
+        raise ValueError(
+            f"节点 '{cxt.current_node_code}' 不存在于 node_map 中"
+        )
+
+
+def _fsm_node_transition(cxt, pattern) -> None:
     """FSM end-of-turn node transition.
 
     Jumps per next_node from the NLU result; clarify turns skip slot
     merging and jumping (topic/keywords stay out of filled_slots, node
     unchanged). Also merges the slots extracted by NLU incrementally into
     filled_slots.
-
-    Args:
-        cxt: dialogue context
-        module: current module object
     """
     # Clarify turn: skip slot merging (topic/keywords stay out of filled_slots), node unchanged
     if (cxt.metadata.get("clarify") or {}).get("triggered"):
@@ -392,7 +146,7 @@ def _fsm_node_transition(cxt, module) -> None:
     # Merge slots (incremental: via the lifecycle entry point)
     _lifecycle.merge_slots(cxt, slots)
 
-    # FSM type: jump according to next_node in the NLU result
+    # Jump according to next_node in the NLU result
     next_node_code = nlu_result.get("next_node", "")
 
     if not next_node_code:
@@ -415,70 +169,35 @@ def _fsm_node_transition(cxt, module) -> None:
     cxt.current_node_code = next_node_code
 
 
-def _resolve_entry_node(cxt, module) -> None:
-    """Determine the current node (first node of the module on first entry), written to cxt.current_node_code."""
-    if cxt.current_node_code is None:
-        if module.module_nodes:
-            first_node = module.module_nodes[0]
-            cxt.current_node_code = first_node.node_code
-            logger.info(
-                "首次进入模块 %s，使用首节点: %s",
-                module.module_code,
-                first_node.node_code,
-            )
-        else:
-            raise ValueError(f"模块 '{module.module_code}' 无可用节点")
+async def _run_stages(cxt, node, pattern, force_close: bool = False) -> None:
+    """Execute the FSM pipeline stages in order (slots resolved lazily as
+    node > pattern skeleton — the two-layer successor of the pre-merge
+    node > module > skeleton).
 
-    cur_node = cxt.node_map.get(cxt.current_node_code)
-    if cur_node is None:
-        raise ValueError(
-            f"节点 '{cxt.current_node_code}' 不存在于 node_map 中"
-        )
-
-
-async def _run_stages(cxt, module, pattern, force_close: bool = False
-                      ) -> Optional[ModuleJumpEvent]:
-    """Execute the pipeline stages in order (slots resolved lazily as
-    node > module > pattern).
-
-    After each stage executes, run jump detection (ROUTE only:
-    _jumps.detect_after_stage + events written by stages themselves): on a
-    hit, merge slots, write the ModuleJumpEvent to cxt.actions, and abort
-    the remaining stages — the source module is suppressed this turn (NLG
-    does not run) and the chat layer's hop loop reroutes to the target
-    module to continue the reply in the same turn. FSM produces no events
-    (clarify is handled inside the loop by ClarifyStage without leaving it;
-    node jumps are handled by the end-of-turn transition). force_close
-    (max-hops close-out) skips detection and lets the stages run through;
-    events written by stages during that window do not participate in
-    control flow (they do not trigger suppression) and stay in actions for
-    observation only.
+    force_close (budget close-out — kept for the FSM executor's terminal
+    guard parity) simply runs the stages through.
 
     Returns:
-        The jump event awaiting consumption (already written to
-        cxt.actions, popped by chat_turn's hop loop); None means no jump.
+        None (FSM produces no control-flow events; clarify is handled
+        inside the loop by ClarifyStage, node jumps by the end-of-turn
+        transition).
     """
     from nexus.engine.streaming import reset_streamed_reply
 
-    # Zero the stage-streaming marker per module execution (a hop into the
-    # next module must not inherit the previous module's streamed text)
+    # Zero the stage-streaming marker per execution
     reset_streamed_reply()
 
-    sequence = resolve_execution_sequence(cxt, module, pattern)
+    sequence = resolve_execution_sequence(cxt, node, pattern)
 
     logger.info(
-        "Pipeline 开始: session=%s, module=%s, node=%s, stages=%s",
+        "Pipeline 开始: session=%s, node=%s, stages=%s",
         cxt.session_id,
-        module.module_code,
         cxt.current_node_code,
         [f"{slot}:{getattr(stage, 'stage_name', type(stage).__name__)}"
          for slot, stage in sequence],
     )
 
-    # Execute each (slot, stage) in skeleton order; the sequence was resolved
-    # against the *current* node (unified dedup already applied)
     for slot, concrete in sequence:
-        before_nlu = cxt.nlu_result
         try:
             cxt = await concrete.execute(cxt)
             logger.debug("Stage '%s'（slot=%s）执行完成",
@@ -490,92 +209,201 @@ async def _run_stages(cxt, module, pattern, force_close: bool = False
             )
             raise
 
-        if force_close:
-            continue
 
-        # Detection 1: the stage itself wrote a jump event (custom stage channel)
-        direct = _jumps.peek(cxt)
-        if direct is not None:
-            logger.info(
-                "Stage '%s' 写入跳转事件: → %s",
-                concrete.stage_name, direct.target_module_code,
-            )
-            return direct
+# ============================================================================
+# Executor resolution
+# ============================================================================
 
-        # Detection 2: nlu_result was updated and indicates a jump (NLU
-        # jump_module field / advanced node's jump_module config)
-        event = _jumps.detect_after_stage(cxt, module, before_nlu)
-        if event is not None:
-            # Incremental slot merge travels with the jump (the target module inherits the context)
-            _lifecycle.merge_slots(
-                cxt, (cxt.nlu_result or {}).get("slots", {}))
-            cxt.actions.append(event)
-            logger.info(
-                "Stage '%s' 后检测到模块跳转: %s → %s (source=%s)",
-                concrete.stage_name, module.module_code,
-                event.target_module_code, event.source,
-            )
-            return event
+def _resolve_node_executor_code(pattern, node) -> str:
+    """Resolve the AGENT node's executor code (plugin kind="executor").
 
-    # Stages running through naturally means no jump: events written
-    # directly by a stage were already caught by detection 1 right after
-    # that stage and returned early; under force_close detection is skipped,
-    # so events written in the meantime stay in actions for observation
-    # only (end-of-turn snapshot) and do not trigger source-module
-    # suppression
-    return None
-
-
-def _resolve_executor_code(session: Session, module):
-    """Resolve the executor code for a module (plugin registry kind="executor").
-
-    Fallback chain (same shape as the stage slots): module.executor (the
-    type-agnostic direct field, highest) > module.plugins[family] >
-    pattern.plugins[family] (read via the legacy executor_<family>
-    properties) > the type default code (plugins.DEFAULT_EXECUTOR_CODES).
-    The family name is loop/fsm/route — not the ModuleType value
-    (agent/fsm/route). An unset declaration at every layer keeps today's
-    behavior (default loop / fsm / route executor).
+    node.plugins["loop"] > pattern.plugins["loop"] > default_loop.
     """
-    module_decl = getattr(module, "executor", None)
-    if module_decl:
-        return module_decl
-    type_key = module.type.value
-    family = {"agent": "loop", "fsm": "fsm", "route": "route"}[type_key]
-    module_plugins = getattr(module, "plugins", None) or {}
-    module_decl = module_plugins.get(family)
-    if module_decl:
-        return module_decl
-    pattern_decl = getattr(session.pattern, f"executor_{family}", None)
+    node_decl = (getattr(node, "plugins", None) or {}).get("loop")
+    if node_decl:
+        return node_decl
+    pattern_decl = (getattr(pattern, "plugins", None) or {}).get("loop")
     if pattern_decl:
         return pattern_decl
-    return plugin_registry.default_executor_code(type_key)
+    return plugin_registry.default_executor_code("agent")
 
 
-async def _handle_module(session: Session, module, force_close: bool = False,
-                         stream=None,
-                         ) -> TurnResult:
-    """Dispatch single-module single-turn handling via the executor plugin.
-
-    The ModuleType hard-coded dispatch is gone: the executor is resolved
-    from the plugin registry (module.executor > pattern.executor_<type> >
-    type default), and each executor receives an ExecutionContext (cxt /
-    pattern / module / force_close / stream). The default implementations
-    live in atoms/executors/ — the kernel holds no default executor, so an
-    un-warmed registry fails fast with a pointer to atoms.executors (same
-    kernel-purity pattern as pipeline.register_default_generate).
-    """
+async def _handle_node(session: Session, node, force_close: bool = False,
+                       stream=None, resume_input: Optional[str] = None,
+                       step: int = 0,
+                       ) -> TurnResult:
+    """Dispatch one node execution via the executor plugin."""
     ec = ExecutionContext(
         cxt=session.cxt,
         pattern=session.pattern,
-        module=module,
+        node=node,
         force_close=force_close,
         stream=stream,
+        resume_input=resume_input,
+        step=step,
     )
     executor = plugin_registry.resolve(
-        "executor", _resolve_executor_code(session, module))
+        "executor", _resolve_node_executor_code(session.pattern, node))
     return await executor.execute(ec)
 
+
+# ============================================================================
+# AGENT graph runtime (whole-graph run per message + suspension/resumption)
+# ============================================================================
+
+async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult:
+    """Run the AGENT graph for this turn.
+
+    Fresh turn: start from entry, clear the state board. Resumed turn
+    (graph_state carries a paused cursor): re-execute the paused node with
+    the user message as resume_input, then continue to the terminal node.
+
+    Termination: a node returns no routing output (and has no declared
+    successors / is_end), or the max_steps budget is exhausted (force-close
+    reply). Suspension: a node returns wait_human — persist the cursor and
+    end the turn with that node's content as the reply.
+    """
+    cxt = session.cxt
+    graph_state = cxt.graph_state
+    max_steps = pattern.max_steps
+    _emit = getattr(stream, "emit_trace", None)
+
+    paused = graph_state.get(PAUSED_NODE_KEY)
+    resume_input: Optional[str] = None
+    if paused is not None and paused in pattern.node_map:
+        current = pattern.node_map[paused]
+        step = int(graph_state.get(STEP_KEY, 0))
+        resume_input = cxt.user_query
+        graph_state.pop(PAUSED_NODE_KEY, None)
+        logger.info("[graph] 恢复挂起图: node=%s, step=%d", paused, step)
+        if _emit is not None:
+            _emit("graph_resume", node_code=current.code, step=step)
+    else:
+        if paused is not None:
+            logger.warning(
+                "[graph] 挂起节点 %r 不在 node_map 中，丢弃游标从 entry 重跑", paused,
+            )
+            graph_state.clear()
+        current = pattern.node_map[pattern.entry_node_code]
+        step = 0
+        graph_state.clear()
+
+    content = ""
+    while True:
+        if step >= max_steps:
+            logger.warning(
+                "[graph] 达到 max_steps=%d，强制收尾: session=%s",
+                max_steps, cxt.session_id,
+            )
+            if _emit is not None:
+                _emit("graph_done", reason="max_steps", step=step)
+            graph_state.clear()
+            if not content:
+                content = "抱歉，处理超时，请稍后重试。"
+            return TurnResult(content=content)
+
+        node = current
+        # Observability: cxt.current_node_code mirrors the graph position
+        # (store snapshot / trace consumers read it)
+        cxt.current_node_code = node.code
+
+        # R4: node-level LLM config (plugins["llm"] node layer over pattern)
+        _refresh_llm_config(session, node_code=node.code)
+
+        if _emit is not None:
+            _emit("node_start", node_code=node.code, step=step)
+
+        result = await _handle_node(
+            session, node, stream=stream,
+            resume_input=resume_input, step=step)
+        resume_input = None  # only the resumed turn's first execution
+
+        if _emit is not None:
+            _emit("node_end", node_code=node.code, step=step)
+
+        if result.content:
+            content = result.content
+
+        # ---- Suspension (wait_human) --------------------------------
+        if result.wait_human:
+            graph_state[PAUSED_NODE_KEY] = node.code
+            graph_state[STEP_KEY] = step + 1
+            cxt.actions.append({"graph_wait": {
+                "node": node.code, "step": step,
+                "message": (result.extra or {}).get("wait_message", ""),
+            }})
+            logger.info("[graph] 节点 %s 等待人工输入，图挂起（step=%d）",
+                        node.code, step)
+            if _emit is not None:
+                _emit("graph_wait", node_code=node.code, step=step)
+            return result
+
+        # ---- Terminal markers ---------------------------------------
+        if getattr(node, "is_end", False):
+            if _emit is not None:
+                _emit("graph_done", reason="is_end", step=step)
+            graph_state.clear()
+            return TurnResult(content=content, extra=result.extra)
+
+        # ---- Routing (conditional edge via TurnResult.next) ---------
+        nxt = result.next
+        if isinstance(nxt, (list, tuple)):
+            if not nxt:
+                nxt = None
+            else:
+                if len(nxt) > 1:
+                    logger.warning(
+                        "[graph] 运行时扇出未实现，仅消费首个目标: %r", nxt)
+                nxt = nxt[0]
+
+        if nxt is None:
+            if node.sub_nodes:
+                logger.warning(
+                    "[graph] 节点 %s 声明了后继 %s 但执行器未返回 next，图终止",
+                    node.code, node.sub_nodes,
+                )
+            if _emit is not None:
+                _emit("graph_done", reason="terminal", step=step)
+            graph_state.clear()
+            return TurnResult(content=content, extra=result.extra)
+
+        if nxt not in node.sub_nodes:
+            # Hallucination tolerance: an undeclared edge terminates the
+            # run (the declared sub_nodes graph is authoritative)
+            logger.warning(
+                "[graph] 节点 %s 的路由输出 %r 不在其 sub_nodes %s 中"
+                "（未声明边），图终止",
+                node.code, nxt, node.sub_nodes,
+            )
+            if _emit is not None:
+                _emit("graph_done", reason="undeclared_edge", step=step)
+            graph_state.clear()
+            return TurnResult(content=content, extra=result.extra)
+
+        step += 1
+        current = pattern.node_map[nxt]
+
+
+# ============================================================================
+# FSM turn (single executor dispatch; the atom owns stages + transition)
+# ============================================================================
+
+async def _run_fsm_turn(session: Session, pattern, stream=None) -> TurnResult:
+    """Dispatch the FSM pattern's executor (pattern.plugins["fsm"] >
+    default_fsm). The executor atom owns entry resolution / R3 / stages /
+    end-of-turn transition."""
+    cxt = session.cxt
+    code = (pattern.plugins or {}).get("fsm") or \
+        plugin_registry.default_executor_code("fsm")
+    executor = plugin_registry.resolve("executor", code)
+    ec = ExecutionContext(
+        cxt=cxt, pattern=pattern, node=None, stream=stream)
+    return await executor.execute(ec)
+
+
+# ============================================================================
+# Turn entries
+# ============================================================================
 
 async def chat_turn_stream(
         query: str,
@@ -583,23 +411,20 @@ async def chat_turn_stream(
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
 ):
-    """Async generator form of chat_turn (plan-⑤): yields ChatStreamEvent
-    objects (delta / round / trace / done), the final done event carrying
-    the complete ChatResult. See nexus/engine/streaming.py for the protocol
-    and the optimistic-forwarding caveat.
+    """Async generator form of chat_turn: yields ChatStreamEvent objects
+    (delta / round / trace / done), the final done event carrying the
+    complete ChatResult. See nexus/engine/streaming.py for the protocol.
 
     REAL-TIME bridge (not step-drained): the whole turn orchestration runs
-    in a background task; every emit (deltas as LLM chunks arrive, traces
-    at transition time) is pushed onto an asyncio.Queue and re-yielded
-    here the moment it happens — consumers see events live while the turn
-    is still executing, not in a burst after each module finishes. The
-    turn's last push is always the done event; if the task dies early the
-    bridge pushes an error done so the consumer never hangs.
+    in a background task; every emit is pushed onto an asyncio.Queue and
+    re-yielded here the moment it happens. The turn's last push is always
+    the done event; if the task dies early the bridge pushes an error done
+    so the consumer never hangs.
 
-    The turn steps are unchanged from the pre-streaming chat_turn:
-    1. locate session → begin_turn; 2. locate entry module → R1 refresh →
-    compression → record user; 3. hop loop (jump events reroute same-turn,
-    max_hops force-close); 4. deferred base switch → end_turn → snapshot.
+    The turn steps:
+    1. locate session → begin_turn; 2. R1 refresh → compression → record
+    user; 3. dispatch by pattern_type (FSM pipeline / AGENT graph runtime,
+    resuming a suspended graph when present); 4. end_turn → done.
     """
     import asyncio
 
@@ -632,8 +457,7 @@ async def chat_turn_stream(
             return build_chat_result(text, session.cxt)
 
         # ----------------------------------------------------------------
-        # 1. Locate the session; start-of-turn reset (user_query overwrite
-        #    + per-turn fields zeroed — exactly once, before hopping)
+        # 1. Locate the session; start-of-turn reset
         # ----------------------------------------------------------------
         session = all_sessions.get(session_id)
         if session is None:
@@ -651,32 +475,10 @@ async def chat_turn_stream(
                 kind="done", result=await _finish("对话模板未配置")))
             return
 
-        # ----------------------------------------------------------------
-        # 2. Locate the entry module (cxt.current_module_code first, fall
-        #    back to the entry)
-        # ----------------------------------------------------------------
-        current_module_code = session.cxt.current_module_code or pattern.entry_module_code
-        if not current_module_code:
-            logger.warning("会话 %s 未找到入口模块", session_id)
-            queue.put_nowait(ChatStreamEvent(
-                kind="done", result=await _finish("入口模块未配置")))
-            return
-
-        # Write back to cxt: stages and transitions (jump detection /
-        # _fsm_node_transition) both read the current position from cxt
-        session.cxt.current_module_code = current_module_code
-
-        current_module = pattern.module_map.get(current_module_code)
-        if current_module is None:
-            logger.warning("模块不存在: %s", current_module_code)
-            queue.put_nowait(ChatStreamEvent(
-                kind="done",
-                result=await _finish(f"模块 '{current_module_code}' 不存在")))
-            return
-
         session.cxt.metadata["pattern_code"] = session.pattern_code
 
-        # R1: resolve the LLM config by current position each turn, override takes precedence (spec §4)
+        # R1: resolve the LLM config for the turn (plugins["llm"] /
+        # settings layered lookup; override takes precedence)
         try:
             _refresh_llm_config(session)
         except Exception as e:
@@ -686,8 +488,7 @@ async def chat_turn_stream(
             return
 
         # History compression (silently skipped when the store is disabled /
-        # threshold is 0 / too few messages; summarizes with the llm_config
-        # R1 just refreshed; failure never blocks the dialogue). Must run
+        # threshold is 0 / too few messages; failure never blocks). Must run
         # before add user — compression rebuilds history and fixes
         # turn_history_start
         await maybe_compress(session, store)
@@ -696,64 +497,21 @@ async def chat_turn_stream(
         await session.cxt.add_message("user", query, stage="chat")
 
         # ----------------------------------------------------------------
-        # 3. Reentry loop: consume same-turn jump events (cxt.actions
-        #    channel). Emissions flow straight to the queue (sink mode).
+        # 2. Dispatch by pattern_type
         # ----------------------------------------------------------------
-        max_hops = getattr(pattern, "max_hops", 2)
         try:
-            for hop in range(max_hops):
-                current_module = pattern.module_map[
-                    session.cxt.current_module_code or pattern.entry_module_code
-                ]
-                result = await _handle_module(session, current_module,
-                                              stream=emitter)
-
-                event = _jumps.pop(session.cxt)
-                if event is None:
-                    response = result.content or ""
-                    break
-                logger.info(
-                    "same-turn jump 第 %d 跳: → %s (source=%s)",
-                    hop + 1, event.target_module_code, event.source,
-                )
-                # Emitted before reroute so from_module still reads the source
-                emitter.emit_trace(
-                    "module_jump",
-                    module_code=event.target_module_code,
-                    from_module=session.cxt.current_module_code or "",
-                    to_module=event.target_module_code,
-                    source=event.source, reason=event.reason, hop=hop + 1)
-                _jumps.reroute(session.cxt, event)
+            if pattern.pattern_type == "fsm":
+                result = await _run_fsm_turn(session, pattern, stream=emitter)
             else:
-                # Max hops exceeded: first consume the leftover event to land
-                # on the final target, then force-close with that module
-                logger.warning("达到 max_hops=%d，强制收尾", max_hops)
-                pending = _jumps.pop(session.cxt)
-                if pending is not None:
-                    emitter.emit_trace(
-                        "module_jump",
-                        module_code=pending.target_module_code,
-                        from_module=session.cxt.current_module_code or "",
-                        to_module=pending.target_module_code,
-                        source=pending.source, reason=pending.reason,
-                        hop=max_hops)
-                    _jumps.reroute(session.cxt, pending)
-                current_module = pattern.module_map[
-                    session.cxt.current_module_code or pattern.entry_module_code
-                ]
-                result = await _handle_module(session, current_module,
-                                              force_close=True, stream=emitter)
-                response = result.content or ""
+                result = await _run_agent_graph(session, pattern,
+                                                stream=emitter)
+            response = result.content or ""
         except Exception:
             logger.exception("对话处理异常: session=%s", session_id)
-            # 对外脱敏：异常细节可能含路径/配置信息，只回统一话术（细节已进日志）
+            # External sanitization: exception details may carry
+            # path/config information — return a uniform message only
             response = "对话处理异常，请稍后重试"
 
-        # ----------------------------------------------------------------
-        # 4. End of turn: apply the deferred base switch (plan-⑥,
-        #    projection), append the assistant message to history, snapshot
-        # ----------------------------------------------------------------
-        _apply_deferred_switch(session, pattern, stream=emitter)
         queue.put_nowait(ChatStreamEvent(kind="done",
                                          result=await _finish(response)))
 
@@ -781,20 +539,12 @@ async def chat_turn(
         store: Optional["SessionStore"] = None,
 ) -> ChatResult:
     """Process one user dialogue turn, returning the full output (text +
-    reserved actions). Aggregates chat_turn_stream (plan-⑤) — behavior
-    identical to the pre-streaming implementation; see that generator's
-    docstring for the turn steps.
-    """
+    reserved actions). Aggregates chat_turn_stream — behavior identical to
+    the pre-streaming implementation; see that generator's docstring for
+    the turn steps."""
     from nexus.engine.streaming import aggregate_turn
     return await aggregate_turn(chat_turn_stream(query, session_id, all_sessions,
                                                  store=store))
-
-
-# ---------------------------------------------------------------------------
-# Compat re-exports (test anchors, signatures unchanged)
-# ---------------------------------------------------------------------------
-
-_handle_node_transition = _fsm_node_transition  # noqa: F401 (clarify test anchor)
 
 
 async def chat(

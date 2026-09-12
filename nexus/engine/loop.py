@@ -1,24 +1,28 @@
-"""Agent loop kernel module — TurnResult, the shared tool toolbox, and the
-run_agent compat facade.
+"""Engine loop kernel — TurnResult, the shared tool toolbox.
 
-The loop's orchestration body moved to the executor atom
+The ReAct loop body lives in the executor atom
 (atoms/executors/loop_executor.py::DefaultLoopExecutor, plugin code
-"default_loop"); this kernel module keeps:
+"default_loop" — the AGENT graph's default node executor); this kernel
+module keeps:
 
-- TurnResult — the executor return contract (content/actions/extra)
-- run_agent — compat facade (test anchor): builds an ExecutionContext and
-  delegates to the plugin-resolved executor
+- TurnResult — the executor return contract (content/next/wait_human/
+  actions/extra; re-exported from turn_result)
 - the tool-resolution / dispatch toolbox (_resolve_tools /
-  _resolve_lent_tools / _dispatch_tool_calls / _parse_args / _execute_tool)
-  shared by the default executor and custom loops — kept in the kernel so
-  the layering stays one-directional (atoms → nexus) and existing import
-  anchors hold
+  _dispatch_tool_calls / _parse_args / _execute_tool) shared by the default
+  executor and custom loops — kept in the kernel so the layering stays
+  one-directional (atoms → nexus) and existing import anchors hold
 - framework-enforced prompt items (force-close suffix, prompt-length warning)
 
-Plan-⑥: the transfer_to_XX tool family is gone (projection adjacency uses
-the generic defer_to_module tool — see loop_executor); _dispatch_tool_calls'
-error-backfill branch keys on the defer tool name. See
-atoms/executors/loop_executor.py for the loop.
+Tool authorization (plan-⑧ §4, deny-by-default 三层收口):
+
+1. toolset 标签 — every registered tool carries one (builtin: knowledge /
+   mcp; MCP servers register under ``mcp-<server>``)
+2. ``pattern.allow_toolset`` — the toolset-level grant (empty = nothing)
+3. ``node.use_tools`` — the concrete tool-name grant (**empty = no tools**)
+
+Effective set = use_tools ∩ tools-of-allowed-toolsets; declared-but-
+unavailable names log a warning at resolution (registration-time
+validation already failed fast on dangling/cross-toolset declarations).
 """
 
 import json
@@ -31,55 +35,14 @@ from nexus.engine.agent_hooks import (
     rewrite_tool_call,
     rewrite_tool_result,
 )
-from nexus.engine.execution import ExecutionContext
-from nexus.engine.session import Session
 from nexus.engine.turn_result import TurnResult  # noqa: F401 -- compat re-export (import anchor)
 from nexus.context import encode_tool_call_content
-from nexus.registry.plugins import registry as plugin_registry
 from nexus.registry.tools import registry as tool_registry
 
 logger = logging.getLogger(__name__)
 
-# The plan-⑥ generic defer tool name (error-backfill branch key in
-# _dispatch_tool_calls; the tool itself is built by the loop executor)
-_DEFER_TOOL_NAME = "defer_to_module"
-
-# Warn when the system prompt exceeds this length (projection bloat observability)
+# Warn when the system prompt exceeds this length (prompt bloat observability)
 _PROMPT_LENGTH_WARN = 4000
-
-
-async def conversation(
-    session: Session,
-    module,
-    llm_config: Dict[str, Any],
-) -> str:
-    """Compatibility wrapper: calls run_agent and returns the reply text (the chat layer continues transfer turns)."""
-    result = await run_agent(session, module, llm_config)
-    return result.content or ""
-
-
-async def run_agent(
-    session: Session,
-    module,
-    llm_config: Dict[str, Any],
-    force_close: bool = False,
-) -> TurnResult:
-    """Compat facade (test anchor): run one turn of a single AGENT module.
-
-    Builds an ExecutionContext (llm_config written back to cxt.llm_config)
-    and delegates to the plugin-resolved default_loop executor — identical
-    behavior to the pre-pluginization function body.
-    """
-    from nexus.model.module import ModuleType  # local: avoid import cycle at module import time
-
-    ec = ExecutionContext(
-        cxt=session.cxt, pattern=session.pattern, module=module,
-        force_close=force_close,
-    )
-    session.cxt.llm_config = llm_config
-    executor = plugin_registry.resolve(
-        "executor", plugin_registry.default_executor_code(ModuleType.AGENT.value))
-    return await executor.execute(ec)
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +50,8 @@ async def run_agent(
 # ---------------------------------------------------------------------------
 
 async def _dispatch_tool_calls(
-    cxt, module, messages, content, tool_calls, hooks, allowed_names,
-    lent_by, round_idx, transfer_error=None, stream=None,
+    cxt, node, messages, content, tool_calls, hooks, allowed_names,
+    round_idx, stream=None,
 ) -> None:
     """Unified dispatch of a tool round: P4 rewrite -> validate -> append
     assistant payload -> execute -> P5 -> append tool rows.
@@ -103,16 +66,9 @@ async def _dispatch_tool_calls(
     Main-flow final validation (rule 2, the authoritative checkpoint): any
     final name not in allowed_names is **not executed**; the tool row is
     backfilled with an error listing the available tools (the model
-    self-corrects next round; this also seals the bypass where dispatch only
-    checks registration and not ACL). Metadata follows the synthetic-row
+    self-corrects next round). Metadata follows the synthetic-row
     convention ``{"synthetic": True}``. P5 only fires on a real
     ``_execute_tool`` result, never on synthetic/backfilled strings.
-
-    Non-empty transfer_error = the error-backfill branch for an illegal
-    transfer target: the transfer entry (prefix determined earlier; rule 1 —
-    not rewritten, not executed) is backfilled with that error string, while
-    ordinary entries still go through the full P4 / validation / execution /
-    P5 flow.
 
     Audit metadata: when a rewrite happens, ``rewritten=True`` plus
     ``original_call`` (P4, original name/args) / ``original_result``
@@ -120,27 +76,23 @@ async def _dispatch_tool_calls(
 
     stream: optional StreamEmitter — each issued / returned call is
     forwarded as trace events (tool_call / tool_result) for real-time
-    consumers; None = no emission (pre-streaming callers unchanged).
+    consumers; None = no emission.
     """
     session_id = cxt.session_id
-    module_code = module.module_code
+    node_code = node.code
     _emit = getattr(stream, "emit_trace", None)
 
-    # 1. P4 chained rewrite -> applied back to tc (transfer entries skipped:
-    #    their determination happened earlier)
+    # 1. P4 chained rewrite -> applied back to tc
     rewrite_audits = {}
     for idx, tc in enumerate(tool_calls):
         name = tc.get("function", {}).get("name", "")
-        if transfer_error is not None and name == _DEFER_TOOL_NAME:
-            continue
         parsed_args = _parse_args(tc)
         if hooks:
             event = ToolCallEvent(
-                session_id=session_id, module_code=module_code,
+                session_id=session_id, node_code=node_code,
                 round_idx=round_idx, tool_name=name, args=parsed_args)
             final_name, final_args, original = rewrite_tool_call(
-                hooks, event, allowed_names,
-                reserved_prefix=_DEFER_TOOL_NAME)
+                hooks, event, allowed_names)
         else:
             final_name, final_args, original = name, parsed_args, None
         if final_name != name:
@@ -165,20 +117,18 @@ async def _dispatch_tool_calls(
         stage="agent",
     )
 
-    # 3. Per tc: validate -> execute (valid) / error backfill (invalid,
-    #    transfer entries) -> P5 -> append row
+    # 3. Per tc: validate -> execute (valid) / error backfill (invalid) ->
+    #    P5 -> append row
     for idx, tc in enumerate(tool_calls):
         name = tc.get("function", {}).get("name", "")
         call_id = tc.get("id", "")
         metadata = {"tool_name": name, "tool_call_id": call_id}
 
         if _emit is not None:
-            _emit("tool_call", module_code=module_code, call_id=call_id,
+            _emit("tool_call", node_code=node_code, call_id=call_id,
                   tool_name=name, args=_parse_args(tc), round_idx=round_idx)
 
-        if transfer_error is not None and name == _DEFER_TOOL_NAME:
-            result_content = transfer_error
-        elif name not in allowed_names:
+        if name not in allowed_names:
             logger.warning(
                 "[tools] 工具 '%s' 不在本轮可用集合中，拦截不执行"
                 "（幻觉/越权调用，错误回填供模型自纠）", name,
@@ -196,18 +146,11 @@ async def _dispatch_tool_calls(
             result_original = None
             if hooks:
                 event = ToolResultEvent(
-                    session_id=session_id, module_code=module_code,
+                    session_id=session_id, node_code=node_code,
                     round_idx=round_idx, tool_name=name,
                     tool_call_id=call_id, result=tool_result)
                 tool_result, result_original = rewrite_tool_result(hooks, event)
             result_content = tool_result
-
-            source = lent_by.get(name)
-            if source:
-                cxt.metadata["served_by_projection"] = {
-                    "module": module_code, "source": source,
-                }
-                metadata["lent_by"] = source
             if result_original is not None:
                 metadata["rewritten"] = True
                 metadata["original_result"] = result_original
@@ -217,7 +160,7 @@ async def _dispatch_tool_calls(
             metadata["original_call"] = rewrite_audits[idx]
 
         if _emit is not None:
-            _emit("tool_result", module_code=module_code, call_id=call_id,
+            _emit("tool_result", node_code=node_code, call_id=call_id,
                   tool_name=name, result=result_content, round_idx=round_idx,
                   synthetic=bool(metadata.get("synthetic")))
 
@@ -232,8 +175,9 @@ async def _dispatch_tool_calls(
 # ---------------------------------------------------------------------------
 
 # force_close close-out suffix (control-flow semantics that prevents infinite
-# loops when hops are exhausted; no messages_builder may break it — the loop
-# executor enforces it via append_force_close_suffix after the builder returns)
+# loops when the step budget is exhausted; no messages_builder may break it —
+# the loop executor enforces it via append_force_close_suffix after the
+# builder returns)
 _FORCE_CLOSE_SUFFIX = "\n请直接回应用户，勿再移交。"
 
 
@@ -247,8 +191,8 @@ def _append_force_close_suffix(messages: List[Dict[str, Any]]) -> None:
                         "content": _FORCE_CLOSE_SUFFIX.strip()})
 
 
-def _warn_prompt_length(messages, cxt, module) -> None:
-    """Warn on system row length (projection bloat observability; measures the
+def _warn_prompt_length(messages, cxt, node) -> None:
+    """Warn on system row length (prompt bloat observability; measures the
     real length after hooks injection and the suffix)."""
     system_row = next(
         (m for m in messages if m.get("role") == "system"), None)
@@ -257,8 +201,8 @@ def _warn_prompt_length(messages, cxt, module) -> None:
     length = len(system_row.get("content") or "")
     if length > _PROMPT_LENGTH_WARN:
         logger.warning(
-            "Agent system_prompt 过长 (%d 字符): session=%s, module=%s（投影膨胀观测）",
-            length, cxt.session_id, module.module_code,
+            "Agent system_prompt 过长 (%d 字符): session=%s, node=%s（prompt 膨胀观测）",
+            length, cxt.session_id, node.code,
         )
 
 
@@ -269,94 +213,52 @@ warn_prompt_length = _warn_prompt_length
 
 
 # ---------------------------------------------------------------------------
-# Tool resolution and filtering
+# Tool resolution and filtering (plan-⑧ §4 deny-by-default)
 # ---------------------------------------------------------------------------
 
-def _resolve_tools(module, pattern=None) -> List[Dict[str, Any]]:
-    """Filter tool definitions by pattern permissions + module.use_tools.
+def _resolve_tools(node, pattern=None) -> List[Dict[str, Any]]:
+    """Filter tool definitions by the three-layer authorization.
 
-    Two-layer filtering:
-    1. **Pattern layer**: get the tool set allowed for the current pattern +
-       module via :meth:`ToolRegistry.get_allowed_tools_for_pattern`.
-    2. **Module layer**: if ``module.use_tools`` is non-empty, take the
-       intersection; if empty, use all tools allowed by the pattern layer.
+    1. **Pattern layer**: ``pattern.allow_toolset`` — only tools whose
+       toolset is listed are candidates (empty allowlist = nothing).
+    2. **Node layer**: ``node.use_tools`` — **empty = NO tools**
+       (deny-by-default); non-empty intersects with layer 1's candidates.
     """
-    pattern_code = pattern.code if pattern is not None else ""
-    module_code = module.module_code or ""
+    node_code = node.code if node is not None else ""
+    use_tools = set(getattr(node, "use_tools", None) or [])
+    if not use_tools:
+        logger.info("节点 '%s' 未声明 use_tools（deny-by-default，无工具）",
+                    node_code)
+        return []
 
-    if pattern_code:
-        allowed_tool_names = tool_registry.get_allowed_tools_for_pattern(
-            pattern_code, module_code
+    allowed_toolsets = set(getattr(pattern, "allow_toolset", None) or []) \
+        if pattern is not None else set()
+    if not allowed_toolsets:
+        logger.info(
+            "节点 '%s' 声明了工具但 pattern.allow_toolset 为空（无可用工具集）",
+            node_code)
+        return []
+
+    tool_names = tool_registry.names_in_toolsets(allowed_toolsets) & use_tools
+
+    missing = use_tools - tool_names
+    if missing:
+        logger.warning(
+            "节点 '%s' 声明的工具不可用（未授权 toolset 或未注册）: %s",
+            node_code, sorted(missing),
         )
-    else:
-        allowed_tool_names = tool_registry.get_allowed_tools_for_pattern(
-            "*", module_code
-        )
-
-    use_tools = module.use_tools or []
-    if use_tools:
-        tool_names_from_module = set(use_tools)
-
-        missing = tool_names_from_module - allowed_tool_names
-        if missing:
-            logger.warning(
-                "模块 '%s' 声明的工具不可用: %s (未授权或未注册)",
-                module_code, missing,
-            )
-
-        tool_names = allowed_tool_names & tool_names_from_module
-    else:
-        tool_names = allowed_tool_names
 
     if not tool_names:
-        logger.info(
-            "模块 '%s' (pattern='%s') 无可用工具",
-            module_code, pattern_code,
-        )
         return []
 
     tool_schemas = tool_registry.get_definitions(tool_names)
 
     logger.info(
-        "模块 '%s' (pattern='%s') 可用工具: %s",
-        module_code,
-        pattern_code,
+        "节点 '%s' 可用工具: %s",
+        node_code,
         [t.get("function", {}).get("name", "?") for t in tool_schemas],
     )
     return tool_schemas
-
-
-def _resolve_lent_tools(module, pattern):
-    """Resolve borrowed tool schemas and the name -> source-domain mapping
-    (spec §3.3 permissions).
-
-    Returns:
-        (schemas, lent_by): schemas is a list in OpenAI format; lent_by is
-        {tool_name: source module_code}.
-    """
-    schemas, lent_by = [], {}
-    for link in module.sub_modules:
-        if not link.get("lend_tools"):
-            continue
-        target = (pattern.module_map if pattern else {}).get(link["target"])
-        if target is None:
-            continue
-        allowed = set(target.use_tools or []) & set(link.get("lend_tools") or [])
-        # Second-pass filter: the lending path is bound by the same pattern-level
-        # tool ACL (deny-by-default), with the borrower (target module) as the
-        # ACL subject — this must not bypass get_allowed_tools_for_pattern
-        if not allowed:
-            continue
-        if pattern is not None:
-            allowed &= tool_registry.get_allowed_tools_for_pattern(
-                pattern.code, link["target"])
-        else:
-            allowed = set()
-        for schema in tool_registry.get_definitions(allowed):
-            name = schema["function"]["name"]
-            schemas.append(schema)
-            lent_by[name] = link["target"]
-    return schemas, lent_by
 
 
 # ---------------------------------------------------------------------------
@@ -381,5 +283,3 @@ async def _execute_tool(tool_name: str, tool_args: Dict[str, Any]) -> str:
     except Exception as e:
         logger.exception("工具执行异常: %s", tool_name)
         return json.dumps({"error": f"工具执行失败: {e}"}, ensure_ascii=False)
-
-

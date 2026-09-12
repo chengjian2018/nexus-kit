@@ -12,8 +12,14 @@ registry API changes):
 - ``stage_factory`` : builtin default-stage factories (internal storage
                        behind pipeline.register_default_generate/_clarify;
                        the public pipeline API stays unchanged).
-- future kinds (``stage``, ``messages_builder``, ``agent_hooks``, ...) are
-  added by later refactor plans without touching this registry.
+- ``stage``           : named stages (the string codes referenced by
+                       stages declarations); registered by
+                       atoms/stages/__init__ and app-owned stages.
+- ``messages_builder``: AGENT messages builders (the kernel registers the
+                       "default" builder; apps may register their own).
+- ``agent_hooks``     : hooks packages (no in-repo package today; the
+                       machinery in nexus/engine/agent_hooks.py stays
+                       no-op until one is registered).
 
 Registration idiom (same as the four domain registries, discovered by the
 shared AST scanner in nexus/registry/discovery.py):
@@ -41,12 +47,11 @@ logger = logging.getLogger(__name__)
 # (kind, code) and reuses it across sessions.
 Factory = Callable[[], Any]
 
-# Default executor codes per module type (fallback chain tail:
-# module.executor > pattern.executor_<type> > these codes)
+# Default executor codes per pattern type (fallback chain tail:
+# node.plugins[slot] > pattern.plugins[slot] > these codes)
 DEFAULT_EXECUTOR_CODES: Dict[str, str] = {
     "agent": "default_loop",
     "fsm": "default_fsm",
-    "route": "default_route",
 }
 
 
@@ -57,9 +62,10 @@ class PluginRegistry:
         self._factories: Dict[tuple, Factory] = {}
         self._instances: Dict[tuple, Any] = {}
         self._lock = threading.RLock()
-        # 热重载窗口开关（host.reload._ReplaceMode 持有）：True 时同名不同
-        # factory 的注册变为"替换 + 清实例缓存"而不是拒绝。默认 False——
-        # 严格模式拦截真正的同名冲突。
+        # Hot-reload window switch (held by host.reload._ReplaceMode): when
+        # True, registering a same-name/different-factory plugin becomes
+        # "replace + drop instance cache" instead of rejection. Default
+        # False — strict mode intercepts genuine same-name conflicts.
         self.replace_on_conflict = False
 
     # ------------------------------------------------------------------
@@ -139,12 +145,12 @@ class PluginRegistry:
         with self._lock:
             return sorted(code for (k, code) in self._factories if k == kind)
 
-    def default_executor_code(self, module_type_value: str) -> str:
-        """The default executor code for a module type value (ModuleType.X.value)."""
-        code = DEFAULT_EXECUTOR_CODES.get(module_type_value)
+    def default_executor_code(self, pattern_type_value: str) -> str:
+        """The default executor code for a pattern type ("fsm"/"agent")."""
+        code = DEFAULT_EXECUTOR_CODES.get(pattern_type_value)
         if code is None:
             raise ValueError(
-                f"module type {module_type_value!r} 没有默认 executor code"
+                f"pattern type {pattern_type_value!r} 没有默认 executor code"
             )
         return code
 

@@ -19,81 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Module jump event (same-turn reroute primitive)
-# ============================================================================
-
-@dataclass
-class ModuleJumpEvent:
-    """A module jump intent — produced inside a stage / agent turn, consumed
-    uniformly by the chat layer.
-
-    Producers (write to ``cxt.actions``):
-    - NLU in-turn detection: ``nlu_result.jump_module`` points at another module
-    - ROUTE menu node config: ``node.jump_module`` (after next_node hits)
-    - custom executor plugins (agent-as-tool / delegate recipes — see
-      ARCHITECTURE.md's module-movement section)
-
-    Consumer (chat layer hop loop): reroutes as long as the target exists in
-    module_map (writes current_module_code, clears current_node_code) —
-    adjacency boundaries are deliberately blurred.
-
-    Also keeps compatibility with dict-form actions (e.g.
-    ``{"conversation_end": True}``): elements of other types in the actions
-    list are snapshotted verbatim into ChatResult.actions.
-    """
-
-    target_module_code: str
-    reason: str = ""      # Transfer context: picked up by the target module (injected into its prompt)
-    source: str = ""      # nlu_jump / route_menu / handoff_tool
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Observation form: snapshotted into ChatResult.actions / rendered by the cli."""
-        return {
-            "module_jump": {
-                "target": self.target_module_code,
-                "reason": self.reason,
-                "source": self.source,
-            }
-        }
-
-
-# ============================================================================
-# Deferred module switch (end-of-turn base switch primitive, plan-⑥)
-# ============================================================================
-
-@dataclass
-class DeferredModuleSwitch:
-    """A deferred base switch — projection-served turn's exit signal.
-
-    Semantics (mutually exclusive with the same-turn ModuleJumpEvent): the
-    current module answered this turn using the target's projected knowledge
-    (enable_project=True adjacency); the LLM flagged via the defer_to_module
-    tool that deeper flow belongs to the target. Consumption happens at END
-    of turn (after the hop loop, before end_turn): current_module_code is
-    rewritten to the target, so the NEXT turn runs on the target as its
-    base. The event also snapshots into ChatResult.actions for observability.
-
-    Producers: the default loop executor's defer_to_module tool (and custom
-    executors writing this event).
-    Consumer: chat_turn_stream's end-of-turn apply (existence-checked; a
-    hallucinated target warns and keeps the current base).
-    """
-
-    target_module_code: str
-    reason: str = ""
-    source: str = "projection"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "module_switch": {
-                "target": self.target_module_code,
-                "reason": self.reason,
-                "source": self.source,
-            }
-        }
-
-
-# ============================================================================
 # Pipeline stage base class
 # ============================================================================
 
@@ -126,7 +51,7 @@ class SessionMessage:
     All messages produced by stages use this format to keep session storage consistent.
 
     tool-trace conventions (replayed to the LLM in full across turns; see the
-    replay guard in chat/messages.py) — no new fields/table columns added;
+    replay guard in nexus/engine/messages.py) — no new fields/table columns added;
     everything rides on the existing JSON channels:
     - assistant tool round: content is the ``{"content": str, "tool_calls": [...]}``
       JSON payload (encoded by ``encode_tool_call_content`` / parsed by ``decode``)
@@ -224,7 +149,7 @@ class DialogueContext:
     # A missed row makes DB < memory permanently (no backfill path exists);
     # compression checks this counter when it abandons on DB/memory mismatch,
     # and the turn-end snapshot logs it — the silent-degradation path must
-    # stay observable (审查 M-1).
+    # stay observable (audit finding M-1).
     sink_failure_count: int = 0
 
     # Recall results before query rewrite
@@ -246,7 +171,6 @@ class DialogueContext:
     agent_result: Optional[Dict[str, Any]] = None
 
     # Current state
-    current_module_code: Optional[str] = None
     current_node_code: Optional[str] = None
     filled_slots: Dict[str, Any] = field(default_factory=dict)
 
@@ -260,15 +184,24 @@ class DialogueContext:
     # Pipeline infrastructure (injected by the pipeline runner; stages need not store it)
     # ------------------------------------------------------------------
     node_map: Dict[str, Any] = field(default_factory=dict)
-    module_map: Dict[str, Any] = field(default_factory=dict)
     llm_config: Optional[Dict[str, Any]] = None
+
+    # AGENT graph state board (plan-⑧): turn-scoped workflow data + the
+    # suspension cursor. Reserved keys (engine-managed):
+    #   "__paused_node__" : code of the node whose executor returned
+    #                       wait_human — the next user message resumes there
+    #   "__step__"        : step counter surviving a suspension (max_steps
+    #                       budget accounting across turns)
+    # Everything else is free for node executors to stash workflow data
+    # (subtask lists, intermediate findings, approval records). The board is
+    # cleared when the graph terminates; while paused it persists (sessions
+    # table graph_state column — process-restart safe).
+    graph_state: Dict[str, Any] = field(default_factory=dict)
 
     # Actions reserved for this turn (e.g. sends / transitions / external calls the reply should
     # trigger besides the text). Stages/handlers may append; the chat layer snapshots per turn
-    # (see TurnLifecycle in chat/context_lifecycle.py — per-turn reset).
-    # Module jumps are carried as ModuleJumpEvent instances (consumed by the chat
-    # layer's hop loop, which then reroutes); other dict-form actions are
-    # snapshotted verbatim into ChatResult.actions.
+    # (see TurnLifecycle in nexus/engine/context_lifecycle.py — per-turn reset).
+    # Dict-form actions are snapshotted verbatim into ChatResult.actions.
     actions: List[Any] = field(default_factory=list)
 
     # ------------------------------------------------------------------
@@ -377,12 +310,6 @@ class DialogueContext:
             return None
         return self.node_map.get(self.current_node_code)
 
-    def get_current_module(self) -> Optional[Any]:
-        """Return the current module instance from module_map (None when unset)."""
-        if not self.current_module_code:
-            return None
-        return self.module_map.get(self.current_module_code)
-
     # ------------------------------------------------------------------
     # Node / module slot formatting — delegation to the data layer
     # (node.py / module.py own the formatting; ctx only resolves "which node/module")
@@ -440,26 +367,6 @@ class DialogueContext:
             if node is not None
             else "暂无后续节点信息"
         )
-
-    def format_jump_modules(self) -> str:
-        """Format the jumpable module list as prompt-ready text (slot: jump_modules).
-
-        Lists all modules in module_map except the current one (code + name +
-        description) for the NLU prompt to reference when emitting the
-        jump_module field. Boundaries are deliberately blurred: no adjacency
-        graph is consulted — any target in module_map is a legal jump.
-        """
-        parts = []
-        for code, module in self.module_map.items():
-            if code == self.current_module_code:
-                continue
-            name = getattr(module, "module_name", "") or code
-            desc = getattr(module, "module_description", "") or ""
-            seg = f"- {code}（{name}）"
-            if desc:
-                seg += f"：{desc}"
-            parts.append(seg)
-        return "\n".join(parts) if parts else "暂无可跳转模块"
 
     def format_answer_pattern(self) -> str:
         """Format the current node's answer examples as prompt-ready text (slot: answer_pattern)."""
@@ -520,24 +427,19 @@ def resolve_prompt_template(
 ) -> Optional[str|None]:
     """Resolve a stage's prompt template by priority.
 
-    Priority: node level > module level > *default_template*.
+    Priority: node.config[prompt_attr] > *default_template* (the pre-merge
+    node/module attribute layers collapsed into the node's config bag).
 
     Args:
         ctx: current dialogue context.
-        prompt_attr: override attribute name on node/module (e.g. ``base_nlu_prompt``).
+        prompt_attr: prompt key in the node's config (e.g. ``base_nlu_prompt``).
         default_template: fallback template (may be None to keep each consumer's built-in).
     """
     node = ctx.get_current_node()
     if node is not None:
-        node_prompt = getattr(node, prompt_attr, None)
+        node_prompt = node.get_prompt(prompt_attr)
         if node_prompt:
             return node_prompt
-
-    module = ctx.get_current_module()
-    if module is not None:
-        module_prompt = getattr(module, prompt_attr, None)
-        if module_prompt:
-            return module_prompt
 
     return default_template
 

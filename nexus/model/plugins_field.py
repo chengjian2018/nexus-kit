@@ -1,77 +1,78 @@
-"""plugins 合并声明字段 — Pattern 与 BaseModule 共用的插件声明 dict。
+"""plugins declaration field — the plugin declaration dict shared by
+Pattern and BaseNode (plan-⑧ node/module merge).
 
-把原先散落的独立字段合并为一个 ``plugins: Dict[str, str]``（pattern 层的
-executor_loop / executor_fsm / executor_route / messages_builder /
-agent_hooks，module 层的 messages_builder / agent_hooks）——与 stages 的
-dict 形态同款：槽位名 → 插件 code，纯声明式、可序列化、构造期 fail-fast。
+One ``plugins: Dict[str, str]`` per layer (pattern / node), the same dict
+shape as stages: slot name → plugin code, purely declarative, serializable,
+fail-fast at construction time. Values are **str/None only** — the
+transitional inline-callable window is over (unregistered str codes raise at
+validation time, never silently).
 
-槽位表（槽位名 → 插件中心 kind）：
+Slot table (slot name → resolution target):
 
 =================  ===================  =================================
-槽位               kind                 说明
+slot               target               meaning
 =================  ===================  =================================
-loop               executor             AGENT 族 executor（旧 executor_loop）
-fsm                executor             FSM 族 executor（旧 executor_fsm）
-route              executor             ROUTE 族 executor（旧 executor_route）
-messages_builder   messages_builder     AGENT 消息构建器
-agent_hooks        agent_hooks          agent loop hooks 包
+loop               executor            AGENT 节点执行器（ReAct 工具循环 /
+                                        自定义 / 规则 executor）
+fsm                executor            FSM 执行器（pattern_type="fsm"）
+messages_builder   messages_builder    AGENT 消息构建器
+agent_hooks        agent_hooks         agent 循环 hooks 包
+llm                llm_providers code  LLM provider code（settings 解析，
+                                        声明式只存 code，不内联密钥）
 =================  ===================  =================================
 
-解析链（与 stages 的三层同型，module 层压 pattern 层）：
+Resolution chains (node over pattern, the two-layer successor of the old
+module > pattern):
 
-- executor：``module.executor``（类型无关直配，最高）>
-  ``module.plugins[family]`` > ``pattern.plugins[family]`` > 类型默认码
-  （family = loop/fsm/route，由模块类型映射；见 chat 层
-  ``_resolve_executor_code``）
-- messages_builder / agent_hooks：``module.plugins[key]`` >
-  ``pattern.plugins[key]`` > 内核默认（messages_builder 注册码
-  "default"）/ 空直通（agent_hooks）
-
-兼容：旧独立字段仍是合法构造参数（折入 dict，同名槽位以 dict 值优先），
-并以只读 property 继续可读（``pattern.executor_loop`` 等）——存量声明、
-消费端 getattr、yml 旧形状全部无感；序列化只输出规范的 plugins 形态。
+- executor（AGENT 节点）: ``node.plugins["loop"]`` >
+  ``pattern.plugins["loop"]`` > default_loop
+- executor（FSM pattern）: ``pattern.plugins["fsm"]`` > default_fsm
+- messages_builder / agent_hooks: ``node.plugins[key]`` >
+  ``pattern.plugins[key]`` > kernel default / empty passthrough
+- llm: ``node.plugins["llm"]`` > ``pattern.plugins["llm"]`` > settings 的
+  pattern_llm 分层解析（见 nexus.settings.get_llm_config）
 """
 
 from typing import Any, Dict, Optional
 
-# 槽位名 → 插件中心 kind（新扩展点加一行即可）
+# slot name → plugin-registry kind (a new extension point is one line here).
+# "llm" has no registry kind — its value is an llm_providers code resolved
+# by nexus.settings at refresh time (R1/R3/R4), not a plugin instance.
 PLUGIN_KINDS: Dict[str, str] = {
     "loop": "executor",
     "fsm": "executor",
-    "route": "executor",
     "messages_builder": "messages_builder",
     "agent_hooks": "agent_hooks",
+    "llm": "",  # settings-resolved (llm_providers code)
 }
 
-# executor 族槽位（pattern 层旧字段名 executor_<family> 的 family 部分）
-EXECUTOR_FAMILY_SLOTS = ("loop", "fsm", "route")
-
-# 允许 transitional 内联 callable 的槽位（messages.build_agent_messages /
-# agent_hooks.resolve_agent_hooks 判断 callable 直调——与旧独立字段时代的
-# transitional 语义一致；executor 族只收 str code）
-_CALLABLE_OK = {"messages_builder", "agent_hooks"}
+# executor-family slots (mirror the pattern_type dispatch: loop drives AGENT
+# graph nodes, fsm drives the FSM pipeline)
+EXECUTOR_FAMILY_SLOTS = ("loop", "fsm")
 
 
 def plugins_slot_label(slot: str) -> str:
-    """槽位名的报错标签：executor 族带旧字段前缀（executor_fsm 等），
-    其余用槽位名本身。"""
+    """Error label for a slot name: the executor family carries the legacy
+    executor_<family> prefix, others use the slot name itself."""
     return f"executor_{slot}" if slot in EXECUTOR_FAMILY_SLOTS else slot
 
 
 def normalize_plugins(plugins: Optional[Dict[str, Any]],
                       legacy: Optional[Dict[str, Any]] = None,
                       ) -> Dict[str, Any]:
-    """规范化 plugins 声明：合并 legacy 独立字段 + 结构 fail-fast。
+    """Normalize a plugins declaration: merge legacy scalar params +
+    structural fail-fast.
 
     Args:
-        plugins: dict 形声明（槽位名 → str code / None / transitional
-          callable）。同名槽位以 dict 值为准（dict 是新范式的权威载体）。
-        legacy: 旧独立字段的名值对（构造参数收进来后传入）；仅填补 dict
-          中缺失的槽位（值为 None 的跳过）。
+        plugins: dict-form declaration (slot name → str code / None). On the
+          same slot the dict value wins (the dict is the authoritative
+          carrier).
+        legacy: name-value pairs of the old scalar params (e.g. the Pattern
+          constructor's agent_hooks); they only fill slots missing from the
+          dict (None values are skipped).
 
     Raises:
-        ValueError: 未知槽位名，或值类型非法（executor 族只收 str/None；
-            messages_builder/agent_hooks 额外收 callable）。
+        ValueError: unknown slot name, or a value that is not str/None.
     """
     merged: Dict[str, Any] = dict(plugins or {})
     for slot, value in (legacy or {}).items():
@@ -87,10 +88,7 @@ def normalize_plugins(plugins: Optional[Dict[str, Any]],
             )
         if value is None or isinstance(value, str):
             continue
-        if callable(value) and slot in _CALLABLE_OK:
-            continue  # transitional 内联 callable（同旧独立字段语义）
         raise ValueError(
-            f"plugins[{slot!r}] 的值必须是 str/None"
-            f"（{slot!r} 另收 transitional callable）: {value!r}"
+            f"plugins[{slot!r}] 的值必须是 str/None: {value!r}"
         )
     return merged

@@ -1,13 +1,17 @@
-"""MCP tool bootstrap — import 副作用:读 ``mcp_servers`` 配置,后台连接
-各 server 并把工具动态注册进 ToolRegistry(toolset=``mcp-<server>``)。
+"""MCP tool bootstrap — import side effect: read the ``mcp_servers``
+config, connect each server in the background, and dynamically register
+the tools into ToolRegistry (toolset=``mcp-<server>``).
 
-本文件顶层的 ``registry.register(mcp_list_tools)`` 是 AST 发现锚点
-(discover_builtin_tools 只 import 带顶层 registry.register 调用的模块);
-紧随其后的 ``bootstrap_mcp()`` 全程 try/except 包裹——配置缺失 / sdk 未装
-/ 配置文件损坏都降级为 warning + no-op,绝不阻塞 import 或 host 启动。
+The module-level ``registry.register(mcp_list_tools)`` at the top of this
+file is the AST discovery anchor (discover_builtin_tools only imports
+modules carrying a top-level registry.register call); the
+``bootstrap_mcp()`` right after it is fully wrapped in try/except — a
+missing config / missing sdk / broken config file all degrade to a
+warning + no-op, never blocking import or host startup.
 
-真实 server 配置示例见 host/config/local_config.yaml 的 ``mcp_servers:``
-注释块(transport 支持 stdio / sse / streamable_http)。
+See the ``mcp_servers:`` comment block in
+host/config/local_config.yaml for a real server config example
+(transport supports stdio / sse / streamable_http).
 """
 
 import logging
@@ -19,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 观测工具:列出各 MCP server 连接状态与已注册工具
+# Observation tool: list each MCP server's connection state and tools
 # ============================================================================
 
 MCP_LIST_TOOLS_SCHEMA = {
@@ -54,22 +58,24 @@ registry.register(
     handler=_handle_mcp_list_tools,
     description=MCP_LIST_TOOLS_SCHEMA["description"],
     emoji="🔌",
-    allowed_patterns={"*": True},
 )
 
 
 # ============================================================================
-# bootstrap — import 副作用:配置非空时启动后台连接
+# bootstrap — import side effect: start background connections when configured
 # ============================================================================
 
 def bootstrap_mcp() -> None:
-    """读 ``mcp_servers`` 配置并启动 MCP 管理器的后台连接。
+    """Read the ``mcp_servers`` config and start the MCP manager's
+    background connections.
 
-    全链路 no-op 条件:``NEXUS_MCP_DISABLED`` 置位(测试隔离——pytest 从
-    仓库根运行时 CWD 探测会命中真实 local_config.yaml,不关掉则每个
-    测试进程都真连 server)/ 未配置 server(返回前)/ 配置文件加载失败
-    (warning)/ mcp sdk 未装(manager 内部报错)。永不 raise——这个函数
-    在 ``discover_builtin_tools`` 的 import 路径上执行,失败不能拖垮启动。
+    No-op across the whole chain when: ``NEXUS_MCP_DISABLED`` is set (test
+    isolation — pytest run from the repo root would probe CWD into the
+    real local_config.yaml, and every test process would genuinely connect
+    to servers otherwise) / no server configured (returns early) / config
+    file load fails (warning) / mcp sdk not installed (errors inside the
+    manager). Never raises — this function runs on the import path of
+    ``discover_builtin_tools``; a failure must not sink startup.
     """
     import os
 
@@ -81,7 +87,7 @@ def bootstrap_mcp() -> None:
         from nexus.settings import get_mcp_servers
 
         servers_cfg = get_mcp_servers()
-    except Exception as e:  # noqa: BLE001 -- import 路径上的防御性容错
+    except Exception as e:  # noqa: BLE001 -- defensive tolerance on the import path
         logger.warning("[mcp] 读取 mcp_servers 配置失败,MCP 工具不启用: %s", e)
         return
 
@@ -92,28 +98,34 @@ def bootstrap_mcp() -> None:
         from atoms.mcp.manager import get_mcp_manager
 
         get_mcp_manager().bootstrap(servers_cfg)
-    except Exception as e:  # noqa: BLE001 -- 同上,启动不被 MCP 拖垮
+    except Exception as e:  # noqa: BLE001 -- same as above: startup must not be dragged down by MCP
         logger.error("[mcp] bootstrap 失败(忽略): %s", e)
 
 
 async def ensure_mcp_ready(timeout: float = 15.0) -> None:
-    """等待已配置的 MCP server 到达连接终态(消费者侧时序闸)。
+    """Wait for the configured MCP servers to reach a connection final
+    state (consumer-side timing gate).
 
-    背景:bootstrap 只登记配置,连接由 ensure_started spawn 的 task 异步
-    完成,工具注册完成时刻不定;首个对话轮若抢在注册完成之前解析工具
-    (如 deep_research 的 _resolve_tools),allowed_names 会被冻结成不含
-    MCP 工具的集合,模型后续引用即触发"不在本轮可用集合"拦截。agent
-    executor 在解析工具前调用本函数——未配置 server 时立即返回,全部
-    就绪时也立即返回,只有启动竞态窗口内的首轮会真正等待(上限 timeout)。
+    Background: bootstrap only records the config; connections complete
+    asynchronously via tasks spawned by ensure_started, so the moment tool
+    registration finishes is undefined. If the first dialogue turn resolves
+    tools before registration completes (e.g. deep_research's
+    _resolve_tools), allowed_names gets frozen without the MCP tools, and
+    any later model reference trips the "not in this turn's available set"
+    guard. The agent executor calls this before resolving tools — with no
+    server configured it returns immediately, with everything ready it
+    also returns immediately; only the first turn inside the startup race
+    window truly waits (capped at timeout).
 
-    兜底自愈:宿主忘记在 startup 挂 ensure_started 时,这里的 wait_ready
-    内部会先 spawn 连接(见 manager.wait_ready)。
+    Fallback self-healing: if the host forgot to mount ensure_started at
+    startup, wait_ready here spawns the connections first (see
+    manager.wait_ready).
     """
     try:
         from atoms.mcp.manager import get_mcp_manager
 
         await get_mcp_manager().wait_ready(timeout=timeout)
-    except Exception as e:  # noqa: BLE001 -- 时序闸绝不能阻塞对话
+    except Exception as e:  # noqa: BLE001 -- a timing gate must never block the dialogue
         logger.warning("[mcp] 等待就绪失败(忽略,继续解析工具): %s", e)
 
 

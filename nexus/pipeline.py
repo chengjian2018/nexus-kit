@@ -1,34 +1,33 @@
-"""Pipeline stages — the ordered slot skeleton + three-layer lazy resolution
-(node > module > pattern) at execution time.
+"""Pipeline stages — the ordered slot skeleton + two-layer lazy resolution
+(node > pattern) at execution time. FSM patterns only (plan-⑧: AGENT nodes
+run via their loop executors, no stages pipeline).
 
-Declarative shape (plan-② refactor):
+Declarative shape:
 
 - ``pattern.stages: List[Dict[str, Optional[str]]]`` — the ordered skeleton,
   each entry a single-key dict {slot_name: code-or-None}. None means "fill
-  at runtime from the three layers"; a string is the pattern-level default
-  for that slot. Default skeleton (kernel builtin):
+  at runtime from the layers"; a string is the pattern-level default for
+  that slot. Default skeleton (kernel builtin):
       [{"pre_recall": None}, {"query": None}, {"post_recall": None},
        {"nlu": None}, {"clarify": None}, {"nlg": None}]
-- ``module.stages / node.stages: Dict[str, str]`` — per-layer slot config
-  (slot_name -> plugin code). The old explicit slot fields
-  (generate/pre_recall/query/post_recall/clarify_stage) are gone; node's
-  base_nlu/base_nlg_prompt stay (prompt assets, not slots).
-- Resolution per slot: node.stages > module.stages > pattern skeleton value >
-  builtin default code. A slot that resolves to None is **skipped** (the
-  universal rule — pre_recall / post_recall / clarify are optional by
-  nature; nlu/nlg default to the unified builtin).
+- ``node.stages: Dict[str, str]`` — the node-layer slot config (slot_name ->
+  plugin code).
+- Resolution per slot: node.stages > pattern skeleton value > builtin
+  default code. A slot that resolves to None is **skipped** (the universal
+  rule — pre_recall / post_recall / clarify are optional by nature; nlu/nlg
+  default to the unified builtin).
 - Stage codes are strings resolved from the plugin registry (kind="stage");
   registration lives in atoms (module-level ``registry.register(...)`` +
   AST discovery).
 - Unified dedup: nlu/nlg may share one code (the unified stage writes both
   nlu_result and nlg_result); the resolved execution sequence executes any
   code at most once. Any other repetition is a declaration error caught by
-  validation (plan-③).
+  validation.
 - enable_clarify is gone: declaring ``clarify`` in stages IS the switch.
 
-Compatibility: the builtin default factories are still registered by
-``atoms.stages`` via register_default_generate/_clarify (public API
-unchanged); their storage sits in the plugin registry (kind="stage_factory").
+The module layer of the pre-merge three-layer resolution is gone with the
+module layer itself; the ROUTE-era deferred-NLG wrapper is gone too (no
+same-turn node switch outside NLU advancement anymore).
 """
 
 from __future__ import annotations
@@ -59,7 +58,7 @@ def default_skeleton() -> List[Dict[str, Optional[str]]]:
     """The kernel default skeleton: six ordered slots, all None values.
 
     A fresh list per call (callers may mutate); values are filled at
-    resolution time by the three-layer lookup / builtin defaults.
+    resolution time by the two-layer lookup / builtin defaults.
     """
     return [{slot: None} for slot in DEFAULT_SKELETON_SLOTS]
 
@@ -101,14 +100,14 @@ def normalize_skeleton(stages: Optional[List[Any]]) -> List[Dict[str, Optional[s
 # clarify fallbacks are registered at import time by ``atoms.stages`` (the
 # host and tests/conftest warm it up), keeping the layering one-directional.
 # Storage goes through the plugin registry (kind="stage_factory", keyed by
-# module type / "clarify") — the public register_default_* API is unchanged.
+# pattern type / "clarify") — the public register_default_* API is unchanged.
 
 
-def register_default_generate(module_type: Any,
+def register_default_generate(pattern_type: Any,
                               factory: Callable[[], Tuple[Any, Any]]) -> None:
-    """Register the builtin ``(nlu, nlg)`` fallback pair for a module type."""
+    """Register the builtin ``(nlu, nlg)`` fallback pair for a pattern type."""
     plugin_registry.register(
-        "stage_factory", f"generate:{module_type}", factory)
+        "stage_factory", f"generate:{pattern_type}", factory)
 
 
 def register_default_clarify(factory: Callable[[], Any]) -> None:
@@ -116,8 +115,8 @@ def register_default_clarify(factory: Callable[[], Any]) -> None:
     plugin_registry.register("stage_factory", "clarify", factory)
 
 
-def builtin_generate_default(module_type: Any) -> Optional[Dict[str, str]]:
-    """The builtin nlu/nlg default codes for a module type, if registered.
+def builtin_generate_default(pattern_type: Any) -> Optional[Dict[str, str]]:
+    """The builtin nlu/nlg default codes for a pattern type, if registered.
 
     Returns e.g. {"nlu": "builtin:generate:X#0", "nlg": "builtin:generate:X#1"}
     where X is the stage_factory code and #0/#1 select the pair element (the
@@ -125,7 +124,7 @@ def builtin_generate_default(module_type: Any) -> Optional[Dict[str, str]]:
     registers one stage reached via both element markers). None when
     atoms.stages has not registered the pair.
     """
-    code = f"generate:{module_type}"
+    code = f"generate:{pattern_type}"
     if not plugin_registry.has("stage_factory", code):
         return None
     return {"nlu": f"builtin:{code}#0", "nlg": f"builtin:{code}#1"}
@@ -153,25 +152,21 @@ def builtin_clarify_default() -> Optional[str]:
 
 
 # ============================================================================
-# Slot resolution (three layers + builtin defaults)
+# Slot resolution (two layers + builtin defaults)
 # ============================================================================
 
-def resolve_stage_code(slot: str, cxt: DialogueContext, module: Any,
+def resolve_stage_code(slot: str, cxt: DialogueContext, node: Any,
                        pattern: Any, skeleton_value: Optional[str] = None,
                        ) -> Optional[str]:
-    """Resolve a slot's code: node.stages > module.stages > skeleton value.
+    """Resolve a slot's code: node.stages > skeleton value.
 
-    The builtin-default tail (nlu/nlg/clarify per module type) is applied by
+    The builtin-default tail (nlu/nlg/clarify) is applied by
     resolve_execution_sequence, which knows the whole skeleton; this
-    function covers only the declarative three layers.
+    function covers only the declarative layers.
     """
-    node = cxt.get_current_node() if cxt is not None else None
     node_stages = getattr(node, "stages", None) or {}
     if slot in node_stages:
         return node_stages[slot]
-    module_stages = getattr(module, "stages", None) or {}
-    if slot in module_stages:
-        return module_stages[slot]
     return skeleton_value
 
 
@@ -202,17 +197,17 @@ def _resolve_code_to_stage(code: Optional[str]) -> Optional[Any]:
     return plugin_registry.resolve("stage", code)
 
 
-def resolve_execution_sequence(cxt: DialogueContext, module: Any,
+def resolve_execution_sequence(cxt: DialogueContext, node: Any,
                                pattern: Any) -> List[Tuple[str, Any]]:
     """Resolve the pattern skeleton into the concrete (slot, stage) sequence.
 
     Rules:
-    - Per slot: node.stages > module.stages > skeleton value > builtin default
+    - Per slot: node.stages > skeleton value > builtin default
     - None after all layers → slot skipped (not in the sequence)
     - Unified dedup: when nlu and nlg resolve to the same code, the nlg entry
       is dropped (the unified stage already wrote nlg_result); any other
       duplicate code across slots logs a warning and keeps only the first
-      occurrence — a declaration error surfaced by validation (plan-③)
+      occurrence — a declaration error surfaced by validation
     """
     raw_stages = getattr(pattern, "stages", None) if pattern is not None else None
     skeleton = normalize_skeleton(raw_stages)
@@ -225,24 +220,22 @@ def resolve_execution_sequence(cxt: DialogueContext, module: Any,
 
     for entry in skeleton:
         (slot, _skeleton_code), = entry.items()
-        code = resolve_stage_code(slot, cxt, module, pattern,
+        code = resolve_stage_code(slot, cxt, node, pattern,
                                   skeleton_value=skeleton_values.get(slot))
         resolved_codes[slot] = code
 
     # Builtin defaults tail (nlu/nlg only), and only for slots the skeleton
     # actually carries. The clarify slot is opt-in by declaration — no
-    # builtin tail (a module that does not declare clarify never gets one;
+    # builtin tail (a pattern that does not declare clarify never gets one;
     # the builtin factory backs the *declared* clarify slot's code only via
     # "builtin:clarify", which resolve_stage_code never produces).
-    module_type = getattr(module, "type", None)
     if resolved_codes.get("nlu") is None or resolved_codes.get("nlg") is None:
-        builtin_pair = builtin_generate_default(module_type)
+        builtin_pair = builtin_generate_default("fsm")
         if builtin_pair:
             for slot in ("nlu", "nlg"):
                 if resolved_codes.get(slot) is None:
                     resolved_codes[slot] = builtin_pair[slot]
 
-    deferred_nlg = False
     for entry in skeleton:
         (slot, _), = entry.items()
         code = resolved_codes.get(slot)
@@ -263,56 +256,16 @@ def resolve_execution_sequence(cxt: DialogueContext, module: Any,
             continue
         seen_codes[code] = slot
 
-        if slot == "nlg":
-            # Timing fix (inherited from the old GenerateSlot split): the
-            # nlg stage resolves at its execution moment — under ROUTE the
-            # jump detection between the nlu and nlg slots may have advanced
-            # the current node, and the menu-node-level nlg takes effect the
-            # same turn. Deferred via a lazy resolver entry.
-            deferred_nlg = True
-            continue
-
         stage = _resolve_code_to_stage(code)
         if stage is None:
             continue
         sequence.append((slot, stage))
 
-    if deferred_nlg:
-        sequence.append(("nlg", _DeferredNLG(resolved_codes.get("nlg"),
-                                              module, pattern)))
-
     return sequence
 
 
-class _DeferredNLG:
-    """Lazy nlg-slot wrapper: resolves the stage at execution time against
-    the *current* node (see resolve_execution_sequence's timing note).
-
-    Duck-types PipelineStage (stage_name resolved late).
-    """
-
-    stage_name = "nlg(deferred)"
-
-    def __init__(self, fallback_code: Optional[str], module: Any,
-                 pattern: Any):
-        self.fallback_code = fallback_code
-        self.module = module
-        self.pattern = pattern
-
-    async def execute(self, ctx: DialogueContext) -> DialogueContext:
-        code = resolve_stage_code("nlg", ctx, self.module, self.pattern,
-                                  skeleton_value=self.fallback_code)
-        if code is None:
-            return ctx  # nothing declared at any layer: skip
-        stage = _resolve_code_to_stage(code)
-        if stage is None:
-            return ctx
-        return await stage.execute(ctx)
-
-
 # ============================================================================
-# Compat: old three-layer attribute lookup (kept for transitional callers;
-# slot fields are gone from the models — this reads the stages dicts)
+# Compat: stage duck-typing validation
 # ============================================================================
 
 def is_valid_stage(obj: Any) -> bool:

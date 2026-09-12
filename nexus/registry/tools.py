@@ -85,13 +85,11 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
-        "allowed_patterns",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None,
-                 allowed_patterns=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -110,19 +108,6 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
-        # Pattern-based access control.  ``None`` (default) means the tool is
-        # NOT available to any pattern — strict deny-by-default.  To grant
-        # access, set a dict mapping pattern codes to allowed module codes:
-        #
-        #     {"*": True}                    → all patterns, all modules
-        #     {"pattern_a": True}            → all modules in pattern_a
-        #     {"pattern_a": ["mod_1"]}       → specific modules in pattern_a
-        #     {"pattern_a": ["m1"], "p_b": True}  → mixed
-        #
-        # General-purpose tools (calculator, web search) should use
-        # ``{"*": True}``.  Domain-specific tools should list only the
-        # patterns and modules that need them.
-        self.allowed_patterns = allowed_patterns
 
 
 # ---------------------------------------------------------------------------
@@ -371,39 +356,6 @@ class ToolRegistry:
         except Exception:
             return ""
 
-    @staticmethod
-    def _validate_allowed_patterns(allowed_patterns) -> None:
-        """Validate the *allowed_patterns* dict at registration time.
-
-        Raises ``ValueError`` for malformed values so the mistake is caught
-        early (at import time) rather than silently ignored at query time.
-        """
-        if allowed_patterns is None:
-            return
-        if not isinstance(allowed_patterns, dict):
-            raise ValueError(
-                f"allowed_patterns must be a dict or None, got {type(allowed_patterns).__name__}"
-            )
-        for pattern_code, module_spec in allowed_patterns.items():
-            if not isinstance(pattern_code, str) or not pattern_code.strip():
-                raise ValueError(
-                    f"allowed_patterns keys must be non-empty strings, got {pattern_code!r}"
-                )
-            if module_spec is True:
-                continue
-            if isinstance(module_spec, list):
-                for item in module_spec:
-                    if not isinstance(item, str) or not item.strip():
-                        raise ValueError(
-                            f"allowed_patterns['{pattern_code}'] list items must be "
-                            f"non-empty strings, got {item!r}"
-                        )
-                continue
-            raise ValueError(
-                f"allowed_patterns['{pattern_code}'] must be True or a list of "
-                f"module codes, got {type(module_spec).__name__}: {module_spec!r}"
-            )
-
     def register(
         self,
         name: str,
@@ -418,7 +370,6 @@ class ToolRegistry:
         max_result_size_chars: Optional[int] = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
-        allowed_patterns: Optional[dict] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -428,14 +379,11 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
 
-        ``allowed_patterns`` controls which dialogue patterns (and which
-        modules within those patterns) can use this tool.  The default
-        ``None`` means the tool is NOT available to any pattern — strict
-        deny-by-default.  To grant access:
-
-        - ``{"*": True}`` — all patterns, all modules (general-purpose tool)
-        - ``{"pattern_code": True}`` — all modules in that pattern
-        - ``{"pattern_code": ["mod_a", "mod_b"]}`` — specific modules only
+        Tool authorization is toolset-based (plan-⑧ §4): every tool
+        carries its ``toolset`` tag here; the pattern-level
+        ``allow_toolset`` list plus the node-level ``use_tools`` list (both
+        deny-by-default) decide availability at resolution time — see
+        nexus/engine/loop.py::_resolve_tools.
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -485,7 +433,6 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            self._validate_allowed_patterns(allowed_patterns)
             self._tools[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
@@ -498,7 +445,6 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
-                allowed_patterns=allowed_patterns,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -638,84 +584,15 @@ class ToolRegistry:
         """Return a snapshot of all registered tool entries."""
         return self._snapshot_entries()
 
-    def get_allowed_tools_for_pattern(
-        self,
-        pattern_code: str,
-        module_code: str = "",
-    ) -> Set[str]:
-        """Return the set of tool names allowed for a given pattern + module.
-
-        Resolves each tool's ``allowed_patterns`` against the requested
-        *pattern_code* and *module_code*:
-
-        - ``allowed_patterns is None`` → tool is denied (strict default)
-        - ``"*"`` key → all patterns; value ``True`` or ``["*"]`` means all
-          modules; a list of module codes means only those modules
-        - specific pattern code key → same value resolution as above
-
-        Returns an empty set when no tools match.
-        """
-        allowed: Set[str] = set()
-        for entry in self._snapshot_entries():
-            ap = entry.allowed_patterns
-            if ap is None:
-                continue  # deny by default
-
-            if not isinstance(ap, dict):
-                logger.warning(
-                    "Tool '%s' has invalid allowed_patterns type %s; skipping",
-                    entry.name, type(ap).__name__,
-                )
-                continue
-
-            module_codes = self._resolve_pattern_modules(ap, pattern_code)
-            if module_codes is None:
-                continue  # pattern not granted access
-
-            # module_codes is True → all modules allowed
-            if module_codes is True:
-                allowed.add(entry.name)
-            elif isinstance(module_codes, list):
-                if "*" in module_codes or module_code in module_codes:
-                    allowed.add(entry.name)
-
-        return allowed
-
-    @staticmethod
-    def _resolve_pattern_modules(
-        allowed_patterns: dict,
-        pattern_code: str,
-    ):
-        """Resolve the module access value for a given pattern.
-
-        Returns:
-            - ``True`` if all modules in the pattern are allowed
-            - ``list[str]`` if specific modules are listed
-            - ``None`` if the pattern is not granted access
-        """
-        # Check for wildcard (all patterns)
-        if "*" in allowed_patterns:
-            value = allowed_patterns["*"]
-            if value is True or (isinstance(value, list) and value):
-                return value
-            logger.warning(
-                "allowed_patterns['*'] value must be True or a non-empty list, "
-                "got %r; treating as denied",
-                value,
-            )
-            return None
-        # Check for specific pattern
-        if pattern_code in allowed_patterns:
-            value = allowed_patterns[pattern_code]
-            if value is True or (isinstance(value, list) and value):
-                return value
-            logger.warning(
-                "allowed_patterns['%s'] value must be True or a non-empty list, "
-                "got %r; treating as denied",
-                pattern_code, value,
-            )
-            return None
-        return None
+    def names_in_toolsets(self, toolsets) -> Set[str]:
+        """Return the set of tool names belonging to any of the given
+        toolsets (the pattern-level allow_toolset gate's candidate pool —
+        plan-⑧ §4; the node-level use_tools intersects on top)."""
+        wanted = set(toolsets or [])
+        if not wanted:
+            return set()
+        return {entry.name for entry in self._snapshot_entries()
+                if entry.toolset in wanted}
 
     # ------------------------------------------------------------------
     # Dispatch

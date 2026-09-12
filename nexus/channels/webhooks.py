@@ -49,13 +49,15 @@ def build_channel_router(spec: Any, ops: EngineOps) -> APIRouter:
         if live.token_env:
             expected = os.getenv(live.token_env)
             if not expected:
-                # 无 token = 无认证公开端点：每次请求告警一次（部署侧应尽快配置）
+                # no token = unauthenticated public endpoint: warn once per
+                # request (deployment side should configure it ASAP)
                 logger.warning(
                     "[%s] 环境变量 %s 未设置，渠道处于无认证状态（请尽快配置）",
                     live.name, live.token_env,
                 )
             elif not hmac.compare_digest(token, expected):
-                # 恒定时间比较，防计时侧信道逐字节猜测
+                # constant-time compare, defeating timing side-channel
+                # byte-by-byte guessing
                 raise HTTPException(status_code=403, detail="channel token 校验失败")
 
         # 2. Channel difference point (1): payload -> normalized message

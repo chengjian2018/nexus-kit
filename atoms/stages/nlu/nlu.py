@@ -20,7 +20,7 @@ from nexus.context import (
     resolve_prompt_template,
 )
 from nexus.llm.resolve import build_provider
-from atoms.stages._prompts import FSM_NLU_DEFAULT_PROMPT, ROUTE_NLU_DEFAULT_PROMPT
+from atoms.stages._prompts import FSM_NLU_DEFAULT_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +212,6 @@ class BaseNLU(PipelineStage, ABC):
         return {
             "cur_node": cxt.format_cur_node(stage="nlu"),
             "next_node": cxt.format_next_nodes(),
-            "jump_modules": cxt.format_jump_modules(),
             "query": cxt.user_query,
             "query_rewrite": cxt.format_rewritten_queries(),
             "recall_info": cxt.format_recall_info(),
@@ -269,32 +268,3 @@ class FSMNLU(BaseNLU):
 
 
 # ============================================================================
-# Route module NLU
-# ============================================================================
-
-class RouteNLU(BaseNLU):
-    """NLU implementation for Route modules — top-level route intent classification and dispatch.
-
-    Uses ``ROUTE_NLU_DEFAULT_PROMPT`` as the default template; node/module level override supported.
-    """
-
-    stage_name = "route_nlu"
-
-    def _default_prompt_template(self) -> str:
-        return ROUTE_NLU_DEFAULT_PROMPT
-
-    def prompt_build(self, cxt: DialogueContext) -> str:
-        prompt_template = self._resolve_prompt_template(cxt)
-        kwargs = self._build_template_kwargs(cxt)
-
-        return self._fill_template(prompt_template, kwargs)
-
-    async def execute(self, ctx: DialogueContext) -> DialogueContext:
-        prompt = self.prompt_build(ctx)
-        ctx.nlu_result = await self._execute_with_retry(prompt, ctx.llm_config)
-        logger.info(
-            "Route NLU 完成: session=%s, next_node=%s",
-            ctx.session_id,
-            ctx.nlu_result.get("next_node", ""),
-        )
-        return ctx

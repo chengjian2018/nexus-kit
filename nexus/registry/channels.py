@@ -100,9 +100,11 @@ class ChannelRegistry:
     def __init__(self):
         self._channels: dict = {}
         self._lock = threading.RLock()
-        # 热重载窗口开关（host.reload._ReplaceMode 持有）：True 时同名
-        # 注册变为替换而不是拒绝（re-import 的 spec 类必然是新对象）。
-        # router handler 每请求从 registry 活取 spec，替换后下一请求生效。
+        # Hot-reload window switch (held by host.reload._ReplaceMode): when
+        # True, a same-name registration becomes a replace instead of a
+        # rejection (a re-imported spec class is necessarily a new object).
+        # The router handler fetches the spec live from the registry per
+        # request, so a replacement takes effect on the next request.
         self.replace_on_conflict = False
 
     def register(self, spec: Any) -> Any:

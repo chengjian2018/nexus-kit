@@ -51,10 +51,7 @@ from nexus.context import (
     fill_prompt_template,
 )
 from atoms.stages.nlu.nlu import BaseNLU
-from atoms.stages._prompts import (
-    FSM_UNIFIED_DEFAULT_PROMPT,
-    ROUTE_UNIFIED_DEFAULT_PROMPT,
-)
+from atoms.stages._prompts import FSM_UNIFIED_DEFAULT_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -157,15 +154,15 @@ class _UnifiedBaseNLU(BaseNLU):
     def _valid_next_values(self, cxt: DialogueContext) -> set:
         """Legal values for next_node: candidate node codes + empty string (stay on current node).
 
-        When the module declares the clarify slot (a non-None ``clarify`` in
-        module.stages — the plan-② replacement of enable_clarify), "clarify" is
+        When the node declares the clarify slot (a non-None ``clarify`` in
+        node.stages — the plan-② replacement of enable_clarify), "clarify" is
         additionally admitted: once triggered, ClarifyStage overwrites nlg_result to
         generate the clarify reply, and the node transition guard skips via
         metadata["clarify"], so it never actually jumps to a nonexistent node.
         """
         valid = set(self._candidate_node_codes(cxt)) | {""}
-        module = cxt.get_current_module()
-        if module is not None and (getattr(module, "stages", None) or {}).get("clarify"):
+        node = cxt.get_current_node()
+        if node is not None and (getattr(node, "stages", None) or {}).get("clarify"):
             valid.add("clarify")
         return valid
 
@@ -194,14 +191,14 @@ class _UnifiedBaseNLU(BaseNLU):
                 continue
 
             seg = [f"- 节点编码: {code}"]
-            if sub_node.node_name:
-                seg.append(f"  节点名称: {sub_node.node_name}")
-            if sub_node.node_description:
-                seg.append(f"  节点描述: {sub_node.node_description}")
-            if sub_node.node_slots:
+            if sub_node.name:
+                seg.append(f"  节点名称: {sub_node.name}")
+            if sub_node.description:
+                seg.append(f"  节点描述: {sub_node.description}")
+            if sub_node.slots:
                 seg.append(
                     "  槽位定义: "
-                    + json.dumps(sub_node.node_slots, ensure_ascii=False)
+                    + json.dumps(sub_node.slots, ensure_ascii=False)
                 )
             if sub_node.answer_examples:
                 for example in sub_node.answer_examples:
@@ -326,39 +323,6 @@ class FSMUnifiedNLU(_UnifiedBaseNLU):
         await self._execute_unified(ctx)
         logger.info(
             "FSM 统一阶段完成: session=%s, next_node=%s, reply_len=%d",
-            ctx.session_id,
-            ctx.nlu_result.get("next_node", ""),
-            len(ctx.nlg_result.get("content", "")),
-        )
-        return ctx
-
-
-# ============================================================================
-# ROUTE module unified stage
-# ============================================================================
-
-class RouteUnifiedNLU(_UnifiedBaseNLU):
-    """ROUTE module unified stage: one structured call completes intent classification and menu-node reply generation.
-
-    Candidates are the routing root's menu nodes (each with its answer style); the
-    pipeline's subsequent route_advance switches the current node to the chosen menu,
-    and jump_module dispatch is unaffected.
-    """
-
-    stage_name = "route_unified"
-
-    def _default_prompt_template(self) -> str:
-        return ROUTE_UNIFIED_DEFAULT_PROMPT
-
-    def prompt_build(self, cxt: DialogueContext) -> str:
-        prompt_template = self._resolve_prompt_template(cxt)
-        kwargs = self._build_template_kwargs(cxt)
-        return self._fill_template(prompt_template, kwargs)
-
-    async def execute(self, ctx: DialogueContext) -> DialogueContext:
-        await self._execute_unified(ctx)
-        logger.info(
-            "Route 统一阶段完成: session=%s, next_node=%s, reply_len=%d",
             ctx.session_id,
             ctx.nlu_result.get("next_node", ""),
             len(ctx.nlg_result.get("content", "")),
