@@ -11,38 +11,41 @@ host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
            └─> nexus (0)  内核：context / model / pipeline / engine / registry / llm / settings
 ```
 
-架构详情（插件中心 / 声明式模型 / 流式协议 / 模块间移动模型）见
+架构详情（插件中心 / 声明式模型 / AGENT 图运行时 / 流式协议）见
 **[ARCHITECTURE.md](ARCHITECTURE.md)**；各重构计划的改动清单与避坑记录见
-`docs/refactor-notes/plan-{1..6}.md`。
+`docs/refactor-notes/plan-{1..8}.md`。
 
 ## 核心机制一览
 
 | 机制 | 入口 | 说明 |
 |---|---|---|
-| **插件中心** | `nexus/registry/plugins.py` | 引擎扩展点统一注册：executor（loop/FSM/ROUTE 三默认执行器 + 自定义）、stage、messages_builder、agent_hooks。字符串 (kind, code)，同名冲突 fail-fast，AST 自动发现（`atoms/executors/` 等） |
-| **声明式模型** | `nexus/model/` | node/module/pattern 全字段 str/bool/list/dict 无对象引用。stages 六槽有序骨架（pre_recall/query/post_recall/nlu/clarify/nlg），三层解析 node>module>骨架值，clarify 声明即启用；ModuleLink→dict；yml round-trip（`pattern_to_yaml` / CLI `pattern-export`/`pattern-load`）+ 收集式校验（`nexus/model/validation.py`） |
+| **插件中心** | `nexus/registry/plugins.py` | 引擎扩展点统一注册：executor（default_loop/default_fsm + app 自定义执行器）、stage、messages_builder、agent_hooks。字符串 (kind, code)，同名冲突 fail-fast，AST 自动发现（`atoms/executors/` 等） |
+| **二层声明式模型** | `nexus/model/` | Pattern → Node 两层（module 层已删），全字段 str/bool/list/dict。`pattern_type`（fsm/agent）是引擎分流键；stages 六槽骨架（FSM 专属，两层解析 node>骨架值）；`plugins` 槽位表（loop/fsm/messages_builder/agent_hooks/llm）；yml round-trip + 构造期编译校验 + 注册期收集式校验 |
+| **AGENT 图运行时** | `nexus/engine/chat.py` | 每条消息从 entry 跑全图（或从挂起节点恢复）：条件边 = `TurnResult.next` 路由输出；`max_steps` 预算防环；`wait_human` 挂起/恢复（graph_state 落盘，借鉴 langgraph interrupt/checkpointer）；FSM 则每轮推进一个节点（next_node） |
 | **默认流式** | `nexus/llm/` + `nexus/engine/streaming.py` | provider 层 LLMChunk 结构化流（非流式=聚合流式，双向桥兼容旧 provider）；引擎层 `chat_turn_stream` generator（delta/round/done 事件，乐观转发，done 权威）；SSE 调试端点 `POST /api/v1/chat/stream`（`NEXUS_STREAM_DEBUG=1`） |
-| **模块间移动** | `enable_project` + 两类事件 | 投影代答 + `defer_to_module` 延迟切换（轮末换底座，防乒乓 forced_projection）；ROUTE 侧同轮跳转（`ModuleJumpEvent`）。transfer_to_XX 已删除；自定义 executor 可按配方写两类事件实现 agent-as-tool / delegate |
-| **hooks（保留待实现）** | `nexus/engine/agent_hooks.py` | 7 点位机制完整，默认 no-op 直通（受测契约）；恢复实现只需注册 kind="agent_hooks" 插件包 |
+| **工具三层收口** | toolset → `allow_toolset` → `use_tools` | deny-by-default：工具注册带 toolset（knowledge / mcp-\<server\>）；pattern 授权工具集（空=无）；节点列具体工具（空=无）；注册期悬空/越集 fail-fast |
+| **hooks（保留待实现）** | `nexus/engine/agent_hooks.py` | 6 点位机制完整，默认 no-op 直通（受测契约）；恢复实现只需注册 kind="agent_hooks" 插件包 |
 
 ## 布局
 
 | 包 | 职责 | 来源（旧路径） |
 |---|---|---|
-| `nexus/context.py` | DialogueContext / SessionMessage / ModuleJumpEvent / DeferredModuleSwitch / PipelineStage | `dialogue/base.py` |
-| `nexus/model/` | Pattern→Module→Node 三级声明式模型 + serialization（yml round-trip）+ validation（收集式校验）+ 注册期 fail-fast 图校验 | `dialogue/{module,node,pattern}.py` |
-| `nexus/pipeline.py` | stages 有序骨架 + 三层延迟解析 + unified 去重 + nlg 延迟解析；兜底 stage 经插件中心注入 | `dialogue/stage_slots.py` |
-| `nexus/engine/` | chat（轮次编排 + 流式 generator）/ execution（Executor 契约）/ turn_result / loop（工具箱）/ streaming（ChatStreamEvent）/ agents / hooks / messages / 压缩 / 持久化 | `chat/*` |
+| `nexus/context.py` | DialogueContext（current_node_code + graph_state）/ SessionMessage / PipelineStage | `dialogue/base.py` |
+| `nexus/model/` | Pattern + BaseNode 二层声明式模型 + plugins 字段 + serialization（yml round-trip）+ validation（构造期编译 + 注册期收集式校验） | `dialogue/{module,node,pattern}.py` |
+| `nexus/pipeline.py` | stages 有序骨架 + 两层延迟解析 + unified 去重（FSM 专属）；兜底 stage 经插件中心注入 | `dialogue/stage_slots.py` |
+| `nexus/engine/` | chat（pattern_type 分流 + 图运行时 + 流式 generator）/ execution（NodeExecutor 契约）/ turn_result / loop（工具箱）/ streaming / hooks / messages / 压缩 / 持久化 | `chat/*` |
 | `nexus/registry/` | discovery（共享 AST 扫描）/ plugins（插件中心）/ patterns / tools / providers / channels | `dialogue|tools|llm|channel /register.py` |
 | `nexus/llm/` | Provider 抽象 + 聚合流式 + LLMChunk 协议 + 解析 | `llm/{provider,resolve}.py` |
-| `nexus/settings.py` | 运行时设置（LLM 三级配置、压缩、DB 路径） | `config/config.py` |
+| `nexus/settings.py` | 运行时设置（LLM 分层配置 llm_default ⊕ pattern_llm ⊕ nodes、压缩、DB 路径） | `config/config.py` |
 | `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 | `channel/{base,webhooks.py}` |
-| `atoms/executors/` | 三默认执行器插件（default_loop / default_fsm / default_route） | 新增（重构计划①） |
+| `atoms/executors/` | 两默认执行器插件（default_loop / default_fsm） | 新增（重构计划①） |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt（具名 stage codes 注册进插件中心） | `stages/` |
-| `atoms/tools/` | knowledge / mcp 工具（MCP 经 `mcp_servers:` 配置动态注册 toolset `mcp-*`） | `tools/*_tool.py` |
+| `atoms/tools/` | knowledge / mcp 工具（MCP 经 `mcp_servers:` 配置动态注册 toolset `mcp-*`，toolset 即授权单元） | `tools/*_tool.py` |
 | `atoms/providers/` | OpenAICompatible Provider（原生 LLMChunk 流） | `llm/openai_provider.py` |
 | `atoms/knowledge/` | SQLite 知识库 | `database/knowledge_store.py` |
-| `apps/<name>/` | 业务 pattern（route.py，声明式 stages/executor/sub_modules）+ prompt 资产 + 渠道适配 | `dialogue/*_route.py`、`channel/xianyu.py` |
+| `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器/prompt 资产）+ 渠道适配 | `dialogue/*_route.py`、`channel/xianyu.py` |
+| `ui/` | 运营配置台（ops-console，见 `docs/design/ops-console-prd.md`）：`api.py` 挂 `/api/v1/console/*`（P0 只读 pattern 视图 + 知识库 CRUD/试搜 + RAG 检索配置），`static/` 无构建前端挂 `/console` | 新增 |
+| `atoms/stages/rag_config.py` | RAG 声明式配置：yml → 召回管线装配（kb 通路接知识库）+ 重注册生效 + 离线试跑 | 新增 |
 | `host/` | main.py（含 SSE 调试端点）/ cli.py（含 pattern-export/load）/ governor.py / config/ | 根目录 `main.py`、`cli.py` |
 
 
@@ -83,6 +86,7 @@ export DASHSCOPE_API_KEY=sk-...
 | `NEXUS_LOG` | `WARNING` | 根日志级别；排障时 `NEXUS_LOG=INFO` 可见轮次 / MCP / 工具分派日志 |
 | `NEXUS_API_KEY` | 未设置 | 核心 API 鉴权；**未设置时服务无认证**（启动时每分钟告警） |
 | `NEXUS_STREAM_DEBUG` | 未设置 | `=1` 挂载 SSE 流式调试端点 `POST /api/v1/chat/stream` |
+| `NEXUS_RAG_CONFIG` | `host/config/rag.yaml` | RAG 检索配置（clarify 召回管线声明式装配）路径；文件存在则启动时应用并在控制台保存后热生效 |
 
 ## 运行
 
@@ -92,6 +96,9 @@ python -m pytest        # uv 环境：uv run python -m pytest
 
 # 服务（需要 host/config/local_config.yaml）
 uvicorn host.main:app --port 8000
+# 运营配置台（随服务挂载）：浏览器打开 http://localhost:8000/console/
+#   —— pattern 结构图/声明树/YAML（只读）、知识库管理与试搜台；
+#      设置 NEXUS_API_KEY 后在页面右上角填入同一密钥
 # 流式调试端点（可选）：NEXUS_STREAM_DEBUG=1 后 POST /api/v1/chat/stream（SSE）
 
 # CLI 调试（fire 子命令：chat / ask / list / sessions / pattern-export / pattern-load / knowledge-seed）

@@ -34,10 +34,11 @@ logger = logging.getLogger(__name__)
 
 
 # ----init----
-# 日志开关:项目各模块只 getLogger 不配 handler,不配置则 INFO/DEBUG 全部
-# 被吞。NEXUS_LOG=INFO / DEBUG 可见会话轮次、MCP 连接、工具分派过程;
-# DEBUG 下把 httpx/httpcore/mcp.client 噪声压回 WARNING(uvicorn 侧的
-# 访问日志不受影响)
+# Logging switch: every module in the project only calls getLogger without
+# configuring a handler — unconfigured, all INFO/DEBUG would be swallowed.
+# NEXUS_LOG=INFO / DEBUG exposes session turns, MCP connections, tool
+# dispatch; under DEBUG the httpx/httpcore/mcp.client noise is pushed back
+# to WARNING (uvicorn's access logs are unaffected)
 def _setup_logging() -> None:
     level_name = os.environ.get("NEXUS_LOG", "WARNING").upper()
     level = getattr(logging, level_name, logging.WARNING)
@@ -58,6 +59,15 @@ app = fastapi.FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 discover_builtin_tools()
 discover_builtin_patterns()
 discover_builtin_plugins()
+
+# RAG retrieval config (ops-console): applied when host/config/rag.yaml
+# exists (declarative assembly of the clarify recall pipeline); a missing
+# file = builtin defaults, zero behavior change. A broken file only logs
+# ERROR and never drags down the dialogue service (see
+# atoms/stages/rag_config.py).
+from atoms.stages.rag_config import load_and_apply_rag_config  # noqa: E402
+
+load_and_apply_rag_config()
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +120,7 @@ async def _restore_sessions() -> int:
     restore).
 
     Patterns are re-resolved from the registry by pattern_code and injected
-    into node_map/module_map; unregistered patterns are skipped with a
+    into node_map; unregistered patterns are skipped with a
     warning. DB wall-clock times are converted onto the monotonic base.
 
     Returns:
@@ -136,7 +146,6 @@ async def _restore_sessions() -> int:
                 )
                 continue
             session.pattern = pattern
-            session.cxt.module_map = pattern.module_map
             session.cxt.node_map = pattern.node_map
             store.attach(session)  # re-attach write-through for the restored session (before it enters memory)
             governor.adopt_restored(session, idle_seconds=now_wall - last_active_wall)
@@ -161,11 +170,6 @@ def _cross_check_pattern_llm(config_path: str = "") -> None:
         if pattern is None:
             logger.warning("pattern_llm 配置了未注册的 pattern '%s'", pcode)
             continue
-        for mcode in (pcfg.get("modules") or {}):
-            if mcode not in pattern.module_map:
-                logger.warning(
-                    "pattern '%s' 的 pattern_llm.modules 配置了未注册 module '%s'",
-                    pcode, mcode)
         for ncode in (pcfg.get("nodes") or {}):
             if ncode not in pattern.node_map:
                 logger.warning(
@@ -288,8 +292,8 @@ class ChatResponse(BaseModel):
 class SessionSummary(BaseModel):
     session_id: str
     pattern_code: str
-    current_module_code: Optional[str] = None
     current_node_code: Optional[str] = None
+    graph_state: Dict[str, Any] = {}
     message_count: int
     created_at: float
     last_active_at: float
@@ -350,7 +354,6 @@ async def _launch_session_core(
     session = Session(session_id=session_id, pattern_code=pattern_code)
     session.pattern = pattern
     session.task_info = task_info
-    session.cxt.module_map = pattern.module_map
     session.cxt.node_map = pattern.node_map
     session.cxt.metadata["task_info"] = task_info
     session.cxt.metadata["request_id"] = request_id
@@ -424,8 +427,10 @@ async def _run_chat_turn_core(
             await store.save_snapshot(session)
         except Exception:
             logger.exception("会话轮末快照失败: session=%s", session.session_id)
-        # 审查 M-1：sink 失败不阻塞对话，但静默降级必须可见——已知缺行的会话
-        # 每轮提示一次（压缩也会因数量不齐而对它放弃）
+        # Audit finding M-1: sink failures never block the dialogue, but the
+        # silent degradation must stay visible — sessions with known missing
+        # rows get one warning per turn (compression also abandons them on
+        # the count mismatch)
         if session.cxt.sink_failure_count > 0:
             logger.warning(
                 "session=%s 存在未落库消息（本进程内 sink 失败 %d 次，"
@@ -464,7 +469,8 @@ async def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
     response_text, error = await _run_chat_turn_core(session, chat_request.query)
 
     if error is not None:
-        # 对外脱敏：异常细节可能含路径/配置/SQL 信息，只回统一话术（细节已进日志）
+        # External sanitization: exception details may carry path/config/SQL
+        # information — return a uniform message only (details already logged)
         return ChatResponse(
             code="500",
             status=False,
@@ -578,18 +584,40 @@ for _router in build_channel_routers(EngineOps(
 
 
 # ---------------------------------------------------------------------------
-# Hot reload — llm config 缓存失效 + pattern/plugin/channel 代码模块重载。
-# 覆盖面与边界见 host/reload.py 模块注释（tools/MCP/providers 不在其中，
-# 需要时重启进程）。NEXUS_API_KEY 未设置时本端点与核心 API 一样处于无认
-# 证状态（同样的每分钟告警）。
+# Ops-console (ui/, PRD: docs/design/ops-console-prd.md P0) — the ops
+# configuration console. API mounted at /api/v1/console/* (covered by the
+# NEXUS_API_KEY middleware above, same auth as the core API); the
+# build-less static frontend mounts at /console (the page shell itself
+# holds no sensitive data).
+# ---------------------------------------------------------------------------
+from fastapi.staticfiles import StaticFiles  # noqa: E402 -- assembled together with the console
+
+import ui.api as _console  # noqa: E402
+
+app.include_router(_console.router)
+app.mount(
+    "/console",
+    StaticFiles(directory=str(_console.static_dir()), html=True),
+    name="console",
+)
+
+
+# ---------------------------------------------------------------------------
+# Hot reload — llm config cache invalidation + reload of the
+# pattern/plugin/channel code modules. Coverage and boundaries: see the
+# host/reload.py module docstring (tools/MCP/providers are out of scope —
+# restart the process when needed). With NEXUS_API_KEY unset this endpoint
+# is unauthenticated just like the core API (same once-per-minute warning).
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/reload")
 async def reload_modules() -> DialogueResponse:
-    """重载变更的 pattern / plugin / channel 模块 + 失效 llm config 缓存。
+    """Reload changed pattern / plugin / channel modules + invalidate the
+    llm config cache.
 
-    重载后把内存会话重绑到注册表里的最新 pattern 对象（在途轮次持有旧
-    引用的按旧拓扑跑完，不受影响）。
+    Afterwards rebinds in-memory sessions to the registry's latest pattern
+    objects (in-flight turns holding old references finish on the old
+    topology, unaffected).
     """
     from host.reload import reload_all, rebind_sessions
 
@@ -641,6 +669,18 @@ async def list_sessions(
     except Exception as e:
         logger.exception("查询会话列表失败")
         return SessionListResponse(code="500", status=False, message="查询会话列表失败，请稍后重试")
+
+    # graph_state persists as a JSON TEXT column — decode for the typed
+    # response model (a broken payload degrades to an empty state, never a 500)
+    import json as _json
+
+    for row in sessions:
+        raw_state = row.get("graph_state")
+        if isinstance(raw_state, str):
+            try:
+                row["graph_state"] = _json.loads(raw_state or "{}")
+            except ValueError:
+                row["graph_state"] = {}
 
     return SessionListResponse(
         code="0", status=True, message="success", data={"sessions": sessions}

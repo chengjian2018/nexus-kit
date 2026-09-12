@@ -13,7 +13,7 @@
 #   llm_default    编排层：默认 LLM 选择（code + model + temperature /
 #                  max_tokens / enable_thinking），三层合并的兜底层
 #   pattern_llm    pattern 级覆盖：pattern_code -> {code/model/...}，可细化
-#                  到 modules/nodes，优先于 llm_default；空 dict = 全部回退
+#                  到 nodes，优先于 llm_default；空 dict = 全部回退
 
 llm_providers:
   openai:
@@ -32,13 +32,13 @@ llm_default:
   enable_thinking: false
 
 pattern_llm: {}
-# 示例：某 pattern 用更强模型，其某个 module 再单独覆盖
+# 示例：某 pattern 用更强模型，其某个 node 再单独覆盖
 # pattern_llm:
 #   deep_research:
 #     code: openai
 #     model: qwen3.8-max
-#     modules:
-#       report_generator:
+#     nodes:
+#       synthesize:
 #         temperature: 0.3
 
 # ============================================================================
@@ -49,9 +49,13 @@ pattern_llm: {}
 #   transport          stdio | sse | streamable_http
 #   command/args/env   stdio 传输的子进程命令（stdio 必填 command）
 #   url/headers        sse / streamable_http 传输的端点（必填 url）
-#   allowed_patterns   授权使用的 pattern code 列表；["*"] 全放行；
-#                      缺省 = 不授权任何 pattern（deny-by-default）
 #   tool_name_prefix   可选注册名前缀（防跨 server 撞名），默认保留原名
+#
+# 工具授权（deny-by-default，三层收口，均在 pattern 代码里声明）：
+#   pattern.allow_toolset 引用 mcp-<server 名> 工具集（工具集级授权），
+#   节点 node.use_tools 列出具体工具名（空 = 不能用任何工具）。
+#   server 配置里的 allowed_patterns 键已废弃（注册期 ACL 已删除），
+#   写了也不生效。
 
 mcp_servers: {}
 # 示例（stdio 子进程）：
@@ -62,8 +66,9 @@ mcp_servers: {}
 #     args: ["-y", "@example/mcp-server"]
 #     env:
 #       EXAMPLE_API_KEY: "<your-key>"     # 建议改为 $VAR 展开或部署时注入
-#     allowed_patterns:
-#       - deep_research
+# 使用方（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["mcp-websearch"], nodes=[
+#       BaseNode(code="search", use_tools=["web_search"], ...)])
 # 示例（远程 SSE 端点）：
 #   remote_search:
 #     transport: sse

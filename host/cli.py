@@ -26,19 +26,23 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# 仓库是扁平顶层包布局(nexus/ atoms/ apps/ host/ 同级,pytest 靠根
-# conftest 注入 sys.path)。直接以 `python cli.py` 启动时脚本所在目录
-# (host/)成为 sys.path[0],仓库根不在路径上——这里自举补上,使 CLI 从
-# 任何 CWD、任何解释器启动都可用(与 python -m host.cli 等效)
+# The repo is a flat top-level package layout (nexus/ atoms/ apps/ host/
+# as siblings; pytest relies on the root conftest injecting sys.path).
+# Launched directly as `python cli.py`, the script's directory (host/)
+# becomes sys.path[0] and the repo root is missing — bootstrap it here so
+# the CLI works from any CWD and any interpreter (equivalent to
+# `python -m host.cli`)
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import fire  # noqa: E402
 
-# 触发 host.config 的 set_config_path 副作用:裸 `python cli.py` 启动时
-# host 不作为包被 import,配置路径会退化成 CWD 探测而从非仓库根启动时
-# 找不到 local_config.yaml(MCP bootstrap / llm 解析都依赖它)
+# Trigger host.config's set_config_path side effect: launched bare as
+# `python cli.py`, host is not imported as a package, so the config path
+# would degrade to CWD probing and fail to find local_config.yaml when
+# started outside the repo root (both MCP bootstrap and llm resolution
+# depend on it)
 import host.config  # noqa: E402,F401
 
 from nexus.engine.chat import chat as chat_turn  # noqa: E402
@@ -88,19 +92,14 @@ def render_pattern_menu(title: str, patterns: List[Any]) -> str:
 def render_verbose_summary(before: Dict[str, Any], after: Dict[str, Any]) -> str:
     """-v level: node transitions, intent/next_node, slot changes.
 
-    before/after are per-turn snapshot dicts: current_node_code / current_module_code /
+    before/after are per-turn snapshot dicts: current_node_code /
     filled_slots / intent / next_node (missing keys are ignored as unchanged).
     """
     lines: List[str] = []
 
     node_from, node_to = before.get("current_node_code"), after.get("current_node_code")
-    mod_from, mod_to = before.get("current_module_code"), after.get("current_module_code")
-    if mod_from != mod_to and node_from != node_to:
-        lines.append(dim(f"  [{mod_from}·{node_from}] → [{mod_to}·{node_to}]"))
-    elif node_from != node_to:
+    if node_from != node_to:
         lines.append(dim(f"  node: {node_from} → {node_to}"))
-    elif mod_from != mod_to:
-        lines.append(dim(f"  module: {mod_from} → {mod_to}"))
 
     intent = after.get("intent")
     if intent:
@@ -136,12 +135,8 @@ def render_verbose_full(cxt) -> str:
 
     actions = getattr(cxt, "actions", None) or []
     if actions:
-        from nexus.context import ModuleJumpEvent
-
-        rendered = [
-            item.to_dict() if isinstance(item, ModuleJumpEvent) else item
-            for item in actions
-        ]
+        rendered = [item if isinstance(item, dict) else str(item)
+                    for item in actions]
         lines.append(dim("  actions: " + _safe_json(rendered)))
 
     return "\n".join(lines)
@@ -161,20 +156,28 @@ def _safe_json(obj: Any) -> str:
 def render_trace_event(trace) -> str:
     """Render one TraceEvent as a compact CLI trace line (events mode).
 
-    Unknown event names fall through to a generic one-liner — the set is
-    open (custom executors may emit their own names).
+    plan-⑧ event set: node_start/node_end/node_jump/graph_wait/graph_resume/
+    graph_done/tool_call/tool_result/conversation_end. Unknown event names
+    fall through to a generic one-liner — the set is open (custom executors
+    may emit their own names).
     """
     d = getattr(trace, "data", None) or {}
     ev = getattr(trace, "event", "")
-    if ev == "module_jump":
-        src = f" ({d.get('source', '')})" if d.get("source") else ""
-        return cyan(f"  [jump] {d.get('from_module', '')} → {d.get('to_module', '')}{src}")
+    node = getattr(trace, "node_code", "") or d.get("node", "")
+    if ev == "node_start":
+        return cyan(f"  [node] ▶ 开始 {node}（step {d.get('step', '?')}）")
+    if ev == "node_end":
+        return cyan(f"  [node] ✔ 结束 {node}（step {d.get('step', '?')}）")
     if ev == "node_jump":
         return cyan(f"  [node] {d.get('from_node', '')} → {d.get('to_node', '')}")
-    if ev == "route_hit":
-        return cyan(f"  [route] 命中菜单节点 {d.get('to_node', '')}")
-    if ev == "route_root":
-        return cyan(f"  [route] 回到 root（{d.get('from_node', '')} → {d.get('to_node', '')}）")
+    if ev == "graph_wait":
+        return cyan(f"  [graph] ⏸ 挂起等待人工输入: {node}（step {d.get('step', '?')}）")
+    if ev == "graph_resume":
+        return cyan(f"  [graph] ▷ 从挂起恢复: {node}（step {d.get('step', '?')}）")
+    if ev == "graph_done":
+        reason = {"terminal": "无后继", "is_end": "终节点", "max_steps": "步数耗尽",
+                  "undeclared_edge": "未声明边"}.get(d.get("reason", ""), d.get("reason", ""))
+        return cyan(f"  [graph] ■ 图运行结束（{reason}，step {d.get('step', '?')}）")
     if ev == "tool_call":
         args = _safe_json(d.get("args") or {})
         return yellow(f"  [tool_call] {d.get('tool_name', '')} {args}")
@@ -183,11 +186,9 @@ def render_trace_event(trace) -> str:
         shown = result if len(result) <= 120 else result[:117] + "..."
         flag = "（拦截回填）" if d.get("synthetic") else ""
         return yellow(f"  [tool_result] {d.get('tool_name', '')}{flag}: {shown}")
-    if ev == "defer_switch":
-        return cyan(f"  [defer] 底座轮末切换 → {d.get('to_module', '')}（下一轮生效）")
     if ev == "conversation_end":
-        return cyan(f"  [end] 到达终节点 {getattr(trace, 'node_code', '')}，流程结束")
-    return dim(f"  [{ev}] {getattr(trace, 'module_code', '')}".rstrip())
+        return cyan(f"  [end] 到达终节点 {node}，流程结束")
+    return dim(f"  [{ev}] {node}".rstrip())
 
 
 class StreamEventPrinter:
@@ -447,7 +448,6 @@ def build_session(session_id: str, pattern_code: str,
     session = Session(session_id=session_id, pattern_code=pattern_code)
     session.pattern = pattern
     session.task_info = task_info or {}
-    session.cxt.module_map = pattern.module_map
     session.cxt.node_map = pattern.node_map
     if task_info:
         session.cxt.metadata["task_info"] = task_info
@@ -581,7 +581,6 @@ def prompt_task_info(pattern_code: str, preset: str = "") -> Optional[Dict[str, 
 def _snapshot(cxt) -> Dict[str, Any]:
     nlu = cxt.nlu_result or {}
     return {
-        "current_module_code": cxt.current_module_code,
         "current_node_code": cxt.current_node_code,
         "filled_slots": dict(cxt.filled_slots or {}),
         "intent": nlu.get("intent"),
@@ -597,7 +596,7 @@ async def run_turn(session: Session, query: str,
     """Run one dialogue turn: snapshot → chat() → end-of-turn snapshot write-back → verbose rendering.
 
     events=True switches the engine entry to chat_turn_stream: trace
-    (jump/node/route/tool) and round events render live via the printer and
+    (node/graph/tool) and round events render live via the printer and
     the reply streams as deltas. The caller must NOT print the reply again
     in that mode — it was already rendered (the return value stays the
     reply text for callers that need it). chat() behavior is untouched.
@@ -660,7 +659,6 @@ async def _find_or_create(session_id: str, pattern_code: str,
                                  f"'{restored.pattern_code}' 未注册，新建会话"))
                     break
                 restored.pattern = pattern
-                restored.cxt.module_map = pattern.module_map
                 restored.cxt.node_map = pattern.node_map
                 if llm_overrides:
                     picked = {k: v for k, v in llm_overrides.items() if v}
@@ -689,7 +687,7 @@ HELP_TEXT = """\
   /help            显示本帮助
   /exit            退出（Ctrl-D 同效）
   /reset           重置当前会话（同 pattern 重新开始）
-  /slots           显示当前 slots / node / module 状态
+  /slots           显示当前 slots / node / 图挂起状态
   /new [pattern]   换 pattern 新会话（无参数出选择菜单）
   /llm [code]      切换 LLM（无参数出选择菜单，只影响后续轮次）
   /reload          热重载：llm config + 变更的 pattern/plugin/channel 代码\
@@ -857,8 +855,14 @@ def _do_llm(session: Session, arg: str) -> None:
 
 
 def _print_slots(session: Session) -> None:
+    from nexus.engine.chat import PAUSED_NODE_KEY
+
     cxt = session.cxt
-    print(dim(f"  module: {cxt.current_module_code}  node: {cxt.current_node_code}"))
+    paused = (cxt.graph_state or {}).get(PAUSED_NODE_KEY)
+    state = f"  node: {cxt.current_node_code}"
+    if paused:
+        state += f"（图挂起等待人工输入: {paused}）"
+    print(dim(state))
     if cxt.filled_slots:
         for k, v in sorted(cxt.filled_slots.items()):
             print(dim(f"  {k} = {v!r}"))
@@ -902,7 +906,7 @@ def chat(pattern: str = "", session_id: str = "cli", llm: str = "", model: str =
         task_info: JSON string (input prompt after the pattern is picked when omitted; Enter skips)
         verbose: debug level 0/1/2 (-v/-vv expand automatically on the command line)
         persist: persist to data/dialogue.db (on by default)
-        events: live event output (jump/node/route transitions, tool calls,
+        events: live event output (node/graph transitions, tool calls,
             streamed reply); --events=false restores the plain reply-only mode
     """
     _ensure_discovery()
@@ -947,7 +951,7 @@ def ask(query: str, pattern: str = "", session_id: str = "cli-ask", llm: str = "
     """One-shot Q&A (--session-id resumes a session from the db).
 
     events=True enables the same live event output as the REPL
-    (jump/tool traces + streamed reply); off by default for clean output.
+    (node/graph traces + streamed reply); off by default for clean output.
     """
     _ensure_discovery()
     pattern_code = pattern
@@ -1004,9 +1008,11 @@ def list_cmd(target: str = "all") -> None:
     """List registered objects: patterns | llms | tools | all."""
     _ensure_discovery()
     if target in ("tools", "all"):
-        # MCP 工具是启动期异步注册的——观测命令等待连接终态,让列表反映
-        # 真实状态(无 server 配置时立即返回)。一次性命令:单次 asyncio.run
-        # 起 连接 + 等待 + 收尾
+        # MCP tools register asynchronously at startup — the observation
+        # command waits for the connection final state so the list reflects
+        # the real state (returns immediately when no server is
+        # configured). One-shot command: a single asyncio.run spins up
+        # connect + wait + teardown
         async def _wait_mcp():
             from atoms.mcp.manager import get_mcp_manager
             await get_mcp_manager().ensure_started()
@@ -1134,7 +1140,7 @@ def pattern_load(path: str, validate_only: bool = False) -> None:
         print(green(f"校验通过: {p.code}（未注册）"))
         return
     pattern_registry.register(p)
-    print(green(f"已加载并注册 pattern: {p.code}（modules={len(p.module_map)}）"))
+    print(green(f"已加载并注册 pattern: {p.code}（nodes={len(p.node_map)}）"))
 
 
 def _setup_logging() -> None:
