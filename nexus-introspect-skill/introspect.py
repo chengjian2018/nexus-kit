@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""nexus-introspect — 面向 agent 的应用/插件内省 CLI（独立脚本）。
+"""nexus-introspect — application/plugin introspection CLI for agents
+(standalone script).
 
-设计约束：**不改动仓库任何现有文件**——内核能力全部经 import 复用：
+Design constraint: **modify no existing repo files** — kernel capabilities
+are reused entirely via imports:
 
-- 注册表快照：``nexus.registry.patterns`` / ``nexus.registry.plugins``
-  （app→pattern/plugin 归属 = 逐 app 导入 diff 注册表，先导入
-  ``atoms.stages`` / ``atoms.executors`` 把内核注册物摘出去）
-- 装配口径 = 运行时口径：``nexus.pipeline.resolve_stage_code`` /
-  ``builtin_generate_default``（``cxt=None`` 即模块级解析，pipeline 显式
-  支持）；executor 链镜像 ``chat._resolve_executor_code`` 的四层读法
-- pattern YAML：``nexus.model.serialization.pattern_to_yaml``
-- 源码提取：``inspect`` + 三种 factory 形态的 unwrap 规则（类/函数本体、
-  lambda 包装、工厂函数+AST 产物类），``builtin:`` 标记经
-  ``pipeline._resolve_builtin_stage`` 解析
+- Registry snapshots: ``nexus.registry.patterns`` / ``nexus.registry.plugins``
+  (app→pattern/plugin ownership attribution = import each app and diff the
+  registries, importing ``atoms.stages`` / ``atoms.executors`` first so the
+  kernel registrations are set aside)
+- Assembly view = runtime view: ``nexus.pipeline.resolve_stage_code`` /
+  ``builtin_generate_default`` (``cxt=None`` means module-level resolution,
+  explicitly supported by the pipeline); the executor chain mirrors
+  ``chat._resolve_executor_code``'s four-layer read order
+- pattern YAML: ``nexus.model.serialization.pattern_to_yaml``
+- Source extraction: ``inspect`` + unwrap rules for three factory forms
+  (class/function body, lambda wrapper, factory function + AST-scanned
+  product classes); ``builtin:`` markers resolve via
+  ``pipeline._resolve_builtin_stage``
 
-用法（仓库根目录、项目 venv）::
+Usage (repo root, project venv)::
 
     python nexus-introspect-skill/introspect.py apps
     python nexus-introspect-skill/introspect.py plugins --kind stage
@@ -22,8 +27,10 @@
     python nexus-introspect-skill/introspect.py plugin stage install_unified
     python nexus-introspect-skill/introspect.py who-uses stage install_unified
 
-所有子命令支持 ``--json``。只读，无 LLM/DB 依赖（import 副作用为纯注册，
-与 host CLI 的 ``_ensure_discovery`` 同源）。用法与语义说明见同目录 SKILL.md。
+All subcommands support ``--json``. Read-only, no LLM/DB dependency (import
+side effects are pure registration, same source as the host CLI's
+``_ensure_discovery``). For usage and semantics see SKILL.md in the same
+directory.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
-# 仓库根 bootstrap（脚本可从任意 CWD 运行；nexus/atoms 需在 sys.path）
+# Repo-root bootstrap (script is runnable from any CWD; nexus/atoms must be on sys.path)
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,25 +66,26 @@ from nexus.registry.plugins import registry as plugin_registry  # noqa: E402
 
 APPS_DIR = REPO_ROOT / "apps"
 
-# module type value -> executor family（镜像 chat._resolve_executor_code）
-FAMILY_OF_TYPE = {"agent": "loop", "fsm": "fsm", "route": "route"}
+# pattern_type -> executor slot (mirrors chat._resolve_node_executor_code;
+# plan-⑧: FSM resolves at the pattern level, AGENT per node)
+TYPE_SLOT = {"fsm": "fsm", "agent": "loop"}
 
 
 # ---------------------------------------------------------------------------
-# 数据结构
+# Data structures
 # ---------------------------------------------------------------------------
 
 @dataclasses.dataclass
 class PluginInfo:
     kind: str
     code: str
-    file: str                       # 仓库相对路径（解析失败为空）
-    lineno: int                     # 定义起始行（0 = 未知）
+    file: str                       # repo-relative path (empty if resolution fails)
+    lineno: int                     # definition start line (0 = unknown)
     owner: str                      # apps | atoms | nexus | other
-    owner_app: Optional[str]        # 仅 owner=apps
+    owner_app: Optional[str]        # only when owner=apps
     factory_form: str               # class | function | lambda-wrapped | factory-function | builtin-marker | unknown
-    source: str = ""                # 源码纯文本（--no-source / 失败为空）
-    note: str = ""                  # 提取注记（unwrap 说明 / 失败原因）
+    source: str = ""                # plain-text source (empty with --no-source / on failure)
+    note: str = ""                  # extraction note (unwrap explanation / failure reason)
     used_by: List[str] = dataclasses.field(default_factory=list)
 
 
@@ -90,7 +98,7 @@ class AppInfo:
 
 
 # ---------------------------------------------------------------------------
-# 数据层：discovery + 归属 + 源码定位
+# Data layer: discovery + ownership attribution + source location
 # ---------------------------------------------------------------------------
 
 _WARM = False
@@ -98,21 +106,22 @@ _APPS: List[AppInfo] = []
 
 
 def _registry_snapshot() -> Tuple[set, set]:
-    """(pattern 码集合, (kind, code) 插件键集合)——读私有存储，只读内省可接受。"""
+    """(set of pattern codes, set of (kind, code) plugin keys) — reads private storage; acceptable for read-only introspection."""
     return (set(pattern_registry.list_codes()),
             set(plugin_registry._factories.keys()))
 
 
 def warm_up() -> List[AppInfo]:
-    """触发注册（幂等）：先内核 atoms，再逐 app 导入并 diff 归属。"""
+    """Trigger registration (idempotent): kernel atoms first, then import each app and diff ownership."""
     global _WARM, _APPS
     if _WARM:
         return _APPS
 
-    # 内核注册物先落位（apps 的 import 链可能带出它们；先导入保证归属
-    # diff 不会把 default_loop 等算到某个 app 头上）
-    import atoms.executors  # noqa: F401  三默认 executor
-    import atoms.stages     # noqa: F401  内置具名 stage + 默认工厂
+    # Kernel registrations land first (apps' import chains may pull them in;
+    # importing first guarantees the ownership diff never attributes
+    # default_loop etc. to some app)
+    import atoms.executors  # noqa: F401  three default executors
+    import atoms.stages     # noqa: F401  builtin named stages + default factories
 
     apps: List[AppInfo] = []
     if APPS_DIR.is_dir():
@@ -146,7 +155,7 @@ def _relativize(path: str) -> str:
 
 
 def owner_of(file: str) -> Tuple[str, Optional[str]]:
-    """实现文件 → (owner, owner_app)（按路径前缀推断，零注册表改动）。"""
+    """Implementation file → (owner, owner_app) (inferred from path prefix, zero registry changes)."""
     norm = "/" + file.replace("\\", "/").lstrip("/")
     if "/apps/" in norm:
         return "apps", norm.split("/apps/")[1].split("/")[0]
@@ -158,16 +167,19 @@ def owner_of(file: str) -> Tuple[str, Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# 源码提取（三种 factory 形态 + builtin 标记）
+# Source extraction (three factory forms + builtin markers)
 # ---------------------------------------------------------------------------
 
 def _closure_target(fn) -> Optional[Any]:
-    """lambda 工厂 → 真实实现。闭包 cell 优先（单 cell 直指）；
-    无捕获的 lambda（如 ``lambda: customer_agent_messages_builder``、
-    ``lambda: (FSMNLU(), FSMNLG())``——引用的是模块级全局名，非自由变量）
-    回退 ``__code__.co_names``（代码对象引用的全局名元组）→
-    ``__globals__`` 找 类/函数。co_names 无解析、不受 getsource 只能
-    拿到 lambda 所在行片段（常带尾括号、AST 必败）的影响。"""
+    """Lambda factory → real implementation. Closure cells take priority (a
+    single cell points straight at it); capture-free lambdas (e.g.
+    ``lambda: customer_agent_messages_builder``,
+    ``lambda: (FSMNLU(), FSMNLG())`` — these reference module-level global
+    names, not free variables) fall back to ``__code__.co_names`` (the tuple
+    of global names referenced by the code object) → ``__globals__`` to find
+    the class/function. co_names needs no resolution and is unaffected by
+    getsource only returning the lambda's own line fragment (often with a
+    trailing parenthesis, where AST parsing always fails)."""
     for cell in (getattr(fn, "__closure__", None) or ()):
         try:
             value = cell.cell_contents
@@ -184,7 +196,7 @@ def _closure_target(fn) -> Optional[Any]:
 
 
 def _factory_products(fn) -> List[Any]:
-    """AST 扫工厂函数体：return <Name>(...) / return (a(), b()) 中的产物类。"""
+    """AST-scan the factory function body: product classes inside return <Name>(...) / return (a(), b())."""
     try:
         tree = ast.parse(inspect.getsource(fn))
     except (OSError, TypeError, SyntaxError):
@@ -210,21 +222,21 @@ def _factory_products(fn) -> List[Any]:
 
 
 def _locate(obj) -> Tuple[str, int, str]:
-    """(file, lineno, qualname)；取不到源码位置时逐级降级。"""
+    """(file, lineno, qualname); degrades level by level when the source location is unavailable."""
     try:
         file = _relativize(inspect.getfile(obj))
     except TypeError:
         return "", 0, getattr(obj, "__qualname__", repr(obj))
     lineno = 0
     try:
-        lineno = int(inspect.getsourcelines(obj)[1])   # 类与函数通用
+        lineno = int(inspect.getsourcelines(obj)[1])   # works for both classes and functions
     except (OSError, TypeError):
         pass
     return file, lineno, getattr(obj, "__qualname__", getattr(obj, "__name__", ""))
 
 
 def plugin_source(kind: str, code: str) -> PluginInfo:
-    """(kind, code) → 元数据 + 源码纯文本。builtin: 标记单独解析。"""
+    """(kind, code) → metadata + plain-text source. builtin: markers resolve separately."""
     if code.startswith("builtin:"):
         rest = code.removeprefix("builtin:")
         element = 0
@@ -234,7 +246,7 @@ def plugin_source(kind: str, code: str) -> PluginInfo:
         try:
             instance = _resolve_builtin_stage(f"builtin:{rest}", element)
             target = type(instance)
-        except Exception as e:                      # noqa: BLE001 只读查询不炸
+        except Exception as e:                      # noqa: BLE001 read-only query must not crash
             return PluginInfo(kind, code, "", 0, "other", None,
                               "builtin-marker", note=f"解析失败: {e}")
         info = _info_from_target("stage_factory", rest, target,
@@ -248,7 +260,7 @@ def plugin_source(kind: str, code: str) -> PluginInfo:
         raise SystemExit(f"插件未注册: kind={kind!r}, code={code!r}"
                          f"（可用 kinds: {sorted({k for k, _ in plugin_registry._factories})}）")
 
-    # 形态 2：lambda 包装 → 闭包/co_names unwrap 到真实实现
+    # Form 2: lambda wrapper → closure/co_names unwrap to the real implementation
     if inspect.isfunction(factory) and factory.__name__ == "<lambda>":
         target = _closure_target(factory)
         if target is not None:
@@ -260,7 +272,7 @@ def plugin_source(kind: str, code: str) -> PluginInfo:
                                  note="闭包 unwrap 失败，仅有 lambda 本体")
         return info
 
-    # 形态 3：具名工厂函数 → 工厂体 + AST 扫出的产物类（双段）
+    # Form 3: named factory function → factory body + AST-scanned product classes (two segments)
     if inspect.isfunction(factory):
         products = _factory_products(factory)
         if products:
@@ -274,7 +286,7 @@ def plugin_source(kind: str, code: str) -> PluginInfo:
                 pass
             return info
 
-    # 形态 1：类/函数本体（或未识别形态尽力取一次）
+    # Form 1: class/function body (or one best-effort attempt for unrecognized forms)
     return _info_from_target(kind, code, factory)
 
 
@@ -293,55 +305,62 @@ def _info_from_target(kind: str, code: str, target: Any,
 
 
 # ---------------------------------------------------------------------------
-# 查询层：pattern 视图 / 生效装配 / 反向索引
+# Query layer: pattern views / effective assembly / reverse index
 # ---------------------------------------------------------------------------
 
-def _type_value(module) -> str:
-    return getattr(getattr(module, "type", None), "value", "") or ""
+def _pattern_type(pattern) -> str:
+    return getattr(pattern, "pattern_type", "") or "agent"
 
 
-def resolved_executor(module, pattern) -> Tuple[str, str]:
-    """(code, 来源层)——镜像 chat._resolve_executor_code 四层链。"""
-    decl = getattr(module, "executor", None)
+def resolved_executor(node, pattern) -> Tuple[str, str]:
+    """(code, source layer) — mirrors chat._resolve_node_executor_code's
+    two-layer chain: node.plugins['loop'] > pattern.plugins['loop'] >
+    default_loop (AGENT nodes)."""
+    decl = (getattr(node, "plugins", None) or {}).get("loop")
     if decl:
-        return decl, "module.executor"
-    family = FAMILY_OF_TYPE.get(_type_value(module), "")
-    decl = (getattr(module, "plugins", None) or {}).get(family) if family else None
+        return decl, "node.plugins['loop']"
+    decl = (getattr(pattern, "plugins", None) or {}).get("loop")
     if decl:
-        return decl, f"module.plugins[{family!r}]"
-    decl = getattr(pattern, f"executor_{family}", None) if family else None
-    if decl:
-        return decl, f"pattern.executor_{family}"
-    type_key = _type_value(module)
+        return decl, "pattern.plugins['loop']"
+    type_key = _pattern_type(pattern)
     if type_key in DEFAULT_EXECUTOR_CODES:
         return DEFAULT_EXECUTOR_CODES[type_key], "默认链尾"
     return "", "未解析"
 
 
-def resolved_stages(module, pattern) -> List[Dict[str, str]]:
-    """逐槽生效码 + 来源层——复用 resolve_stage_code（cxt=None 模块级），
-    builtin 兜底同 resolve_execution_sequence（仅 nlu/nlg、仅骨架携带的槽）。"""
+def resolved_fsm_executor(pattern) -> Tuple[str, str]:
+    """FSM pattern-level executor: pattern.plugins['fsm'] > default_fsm."""
+    decl = (getattr(pattern, "plugins", None) or {}).get("fsm")
+    if decl:
+        return decl, "pattern.plugins['fsm']"
+    return DEFAULT_EXECUTOR_CODES["fsm"], "默认链尾"
+
+
+def resolved_stages(pattern) -> List[Dict[str, str]]:
+    """Effective code + source layer per skeleton slot (FSM only) — reuses
+    resolve_stage_code at the pattern layer (cxt/node None; per-node
+    overrides are visible in the tree view), with the builtin fallback
+    identical to resolve_execution_sequence."""
+    if _pattern_type(pattern) != "fsm":
+        return []
     skeleton = normalize_skeleton(getattr(pattern, "stages", None))
     skel_vals = {slot: code for entry in skeleton for slot, code in entry.items()}
     codes: Dict[str, Optional[str]] = {}
     for entry in skeleton:
         (slot, _skel), = entry.items()
         codes[slot] = resolve_stage_code(
-            slot, None, module, pattern, skeleton_value=skel_vals.get(slot))
+            slot, None, None, pattern, skeleton_value=skel_vals.get(slot))
     if codes.get("nlu") is None or codes.get("nlg") is None:
-        pair = builtin_generate_default(getattr(module, "type", None))
+        pair = builtin_generate_default("fsm")
         if pair:
             for slot in ("nlu", "nlg"):
                 if codes.get(slot) is None:
                     codes[slot] = pair[slot]
 
     out = []
-    module_stages = getattr(module, "stages", None) or {}
     for slot, code in codes.items():
         if code is None:
             out.append({"slot": slot, "code": None, "layer": "跳过（声明 None）"})
-        elif slot in module_stages and module_stages[slot] == code:
-            out.append({"slot": slot, "code": code, "layer": "module 层"})
         elif skel_vals.get(slot) == code:
             out.append({"slot": slot, "code": code, "layer": "pattern 层"})
         else:
@@ -350,7 +369,7 @@ def resolved_stages(module, pattern) -> List[Dict[str, str]]:
 
 
 def _locate_code(code: str) -> str:
-    """码 → 文件:行 定位串（stage/executor 注册物或 builtin 标记）。"""
+    """Code → file:line location string (stage/executor registrations or builtin markers)."""
     try:
         for kind in ("stage", "executor", "messages_builder", "stage_factory"):
             if plugin_registry.has(kind, code):
@@ -364,62 +383,52 @@ def _locate_code(code: str) -> str:
     return "(未注册码)"
 
 
-def _module_header(module) -> str:
-    nodes = getattr(module, "module_nodes", None) or []
-    bits = [f"[{_type_value(module) or '?'}"]
-    if nodes:
-        bits[0] = f"[{_type_value(module) or '?'}, {len(nodes)} 节点"
-    bits[0] += "]"
-    if getattr(module, "is_end", False):
-        bits.append("is_end")
-    return " ".join(bits)
+def _node_marks(node) -> str:
+    marks = []
+    if getattr(node, "is_end", False):
+        marks.append("is_end")
+    node_stages = getattr(node, "stages", None) or {}
+    if node_stages:
+        marks.append(f"stages={node_stages}")
+    if getattr(node, "slots", None):
+        marks.append(f"slots={list(node.slots)}")
+    if getattr(node, "use_tools", None):
+        marks.append(f"use_tools={node.use_tools}")
+    return f"  ({', '.join(marks)})" if marks else ""
 
 
 def render_tree(pattern) -> str:
-    lines = [f"{pattern.code} — {pattern.name} [entry: {pattern.entry_module_code}]"]
+    lines = [f"{pattern.code} — {pattern.name} "
+             f"[{_pattern_type(pattern)}, entry: {pattern.entry_node_code}]"]
     if getattr(pattern, "description", ""):
         lines.append(f"  {pattern.description}")
-    for module in (pattern.modules or []):
-        lines.append(f"├─ {module.module_code}  {module.module_name}  "
-                     f"{_module_header(module)}")
-        for key, label in (("stages", "stages 声明"),
-                           ("executor", "executor 声明"),
-                           ("messages_builder", "messages_builder"),
-                           ("use_tools", "use_tools")):
-            val = getattr(module, key, None)
-            if val:
-                lines.append(f"│    {label}: {val}")
-        subs = getattr(module, "sub_modules", None) or []
-        if subs:
-            lines.append(f"│    sub_modules: {subs}")
-        for node in (getattr(module, "module_nodes", None) or []):
-            marks = []
-            if getattr(node, "is_end", False):
-                marks.append("is_end")
-            node_stages = getattr(node, "stages", None) or {}
-            if node_stages:
-                marks.append(f"stages={node_stages}")
-            suffix = f"  ({', '.join(marks)})" if marks else ""
-            lines.append(f"│    · {node.node_code}  {node.node_name}"
-                         f"→ {list(node.sub_nodes or [])}{suffix}")
+    if getattr(pattern, "allow_toolset", None):
+        lines.append(f"  allow_toolset: {pattern.allow_toolset}")
+    ptype = _pattern_type(pattern)
+    if ptype == "fsm":
+        skel = {slot: code for e in normalize_skeleton(getattr(pattern, "stages", None))
+                for slot, code in e.items()}
+        lines.append(f"  stages 骨架: {skel}")
+    for node in (pattern.nodes or []):
+        lines.append(f"├─ {node.code}  {node.name or ''}"
+                     f"→ {list(node.sub_nodes or [])}{_node_marks(node)}")
+        node_plugins = getattr(node, "plugins", None) or {}
+        if node_plugins:
+            lines.append(f"│    plugins: {node_plugins}")
     return "\n".join(lines)
 
 
 def render_resolved(pattern) -> str:
-    lines = [f"{pattern.code} — {pattern.name} [entry: {pattern.entry_module_code}]"]
-    lines.append("  （生效装配 = 运行时口径：module > pattern 骨架 > builtin 默认；"
-                 "executor 链 module.executor > pattern.executor_<family> > 默认）")
-    for module in (pattern.modules or []):
-        lines.append(f"├─ {module.module_code}  {module.module_name}  "
-                     f"{_module_header(module)}")
-        ex_code, ex_layer = resolved_executor(module, pattern)
-        lines.append(f"│    executor  {ex_code or '—'}  [{ex_layer}]  "
+    lines = [f"{pattern.code} — {pattern.name} "
+             f"[{_pattern_type(pattern)}, entry: {pattern.entry_node_code}]"]
+    ptype = _pattern_type(pattern)
+    if ptype == "fsm":
+        lines.append("  （生效装配 = 运行时口径：node.stages > pattern 骨架 > builtin 默认；"
+                     "executor 链 pattern.plugins['fsm'] > 默认）")
+        ex_code, ex_layer = resolved_fsm_executor(pattern)
+        lines.append(f"├─ [pattern] executor  {ex_code or '—'}  [{ex_layer}]  "
                      f"{_locate_code(ex_code) if ex_code else ''}")
-        stages = resolved_stages(module, pattern)
-        if all(s["code"] is None for s in stages):
-            lines.append("│    stages    全槽跳过（无声明且无 builtin 默认——"
-                         "agent 模块走 executor 自主管线，不经 stages 流水线）")
-            continue
+        stages = resolved_stages(pattern)
         nlu_code = next((s["code"] for s in stages if s["slot"] == "nlu"), None)
         for s in stages:
             code, slot, layer = s["code"], s["slot"], s["layer"]
@@ -430,41 +439,39 @@ def render_resolved(pattern) -> str:
                 lines.append(f"│    {slot:<8} {code}  [{layer}]  {_locate_code(code)}")
             else:
                 lines.append(f"│    {slot:<8} —  {layer}")
+    else:
+        lines.append("  （生效装配 = 运行时口径：节点执行器链 node.plugins['loop'] > "
+                     "pattern.plugins['loop'] > default_loop；AGENT 不跑 stages）")
+        for node in (pattern.nodes or []):
+            lines.append(f"├─ {node.code}  {node.name or ''}")
+            ex_code, ex_layer = resolved_executor(node, pattern)
+            lines.append(f"│    executor  {ex_code or '—'}  [{ex_layer}]  "
+                         f"{_locate_code(ex_code) if ex_code else ''}")
     return "\n".join(lines)
 
 
 def _declared_refs(pattern) -> List[Tuple[str, str, str]]:
-    """直接声明引用 (kind, code, where)——who-uses 数据源。"""
+    """Directly declared references (kind, code, where) — the who-uses data source."""
     refs: List[Tuple[str, str, str]] = []
-    for module in (pattern.modules or []):
-        for slot, code in (getattr(module, "stages", None) or {}).items():
+    for node in (pattern.nodes or []):
+        for slot, code in (getattr(node, "stages", None) or {}).items():
             if code:
-                refs.append(("stage", code, f"{module.module_code}.stages[{slot!r}]"))
-        for key, kind in (("executor", "executor"), ("messages_builder", "messages_builder"),
-                          ("agent_hooks", "agent_hooks")):
-            code = getattr(module, key, None)
-            if code:
-                refs.append((kind, code, f"{module.module_code}.{key}"))
-        for family, code in (getattr(module, "plugins", None) or {}).items():
-            if code and family in FAMILY_OF_TYPE.values():
-                refs.append(("executor", code, f"{module.module_code}.plugins[{family!r}]"))
+                refs.append(("stage", code, f"{node.code}.stages[{slot!r}]"))
+        for family, code in (getattr(node, "plugins", None) or {}).items():
+            if code and family in TYPE_SLOT.values():
+                refs.append(("executor", code, f"{node.code}.plugins[{family!r}]"))
     for slot, code in {s: c for e in normalize_skeleton(getattr(pattern, "stages", None))
                        for s, c in e.items()}.items():
         if code:
             refs.append(("stage", code, f"pattern.stages[{slot!r}]"))
-    for family in FAMILY_OF_TYPE.values():
-        code = getattr(pattern, f"executor_{family}", None)
-        if code:
-            refs.append(("executor", code, f"pattern.executor_{family}"))
-    for key, kind in (("messages_builder", "messages_builder"), ("agent_hooks", "agent_hooks")):
-        code = getattr(pattern, key, None)
-        if code:
-            refs.append((kind, code, f"pattern.{key}"))
+    for family, code in (getattr(pattern, "plugins", None) or {}).items():
+        if code and family in TYPE_SLOT.values():
+            refs.append(("executor", code, f"pattern.plugins[{family!r}]"))
     return refs
 
 
 def who_uses(kind: str, code: str) -> List[Tuple[str, List[str]]]:
-    """反向索引：[(pattern 码, [引用位置…])]——只含直接声明引用。"""
+    """Reverse index: [(pattern code, [reference sites…])] — directly declared references only."""
     warm_up()
     out = []
     for pattern in pattern_registry.list_patterns():
@@ -476,7 +483,7 @@ def who_uses(kind: str, code: str) -> List[Tuple[str, List[str]]]:
 
 
 # ---------------------------------------------------------------------------
-# 暴露层：子命令渲染
+# Exposure layer: subcommand rendering
 # ---------------------------------------------------------------------------
 
 def cmd_apps(args) -> None:
@@ -535,17 +542,30 @@ def cmd_pattern(args) -> None:
         print(pattern_to_yaml(pattern))
         return
     if args.json:
-        modules = []
-        for module in (pattern.modules or []):
-            modules.append({
-                "module_code": module.module_code,
-                "type": _type_value(module),
-                "executor": resolved_executor(module, pattern),
-                "stages": resolved_stages(module, pattern),
-            })
-        print(json.dumps({"code": pattern.code, "name": pattern.name,
-                          "entry": pattern.entry_module_code,
-                          "modules": modules}, ensure_ascii=False, indent=2))
+        ptype = _pattern_type(pattern)
+        nodes = []
+        for node in (pattern.nodes or []):
+            entry = {
+                "code": node.code,
+                "name": node.name,
+                "sub_nodes": list(node.sub_nodes or []),
+                "is_end": bool(getattr(node, "is_end", False)),
+                "plugins": dict(getattr(node, "plugins", None) or {}),
+            }
+            if getattr(node, "use_tools", None):
+                entry["use_tools"] = list(node.use_tools)
+            if ptype == "agent":
+                entry["executor"] = resolved_executor(node, pattern)
+            nodes.append(entry)
+        doc = {"code": pattern.code, "name": pattern.name,
+               "pattern_type": ptype,
+               "entry": pattern.entry_node_code,
+               "allow_toolset": list(getattr(pattern, "allow_toolset", None) or []),
+               "nodes": nodes}
+        if ptype == "fsm":
+            doc["fsm_executor"] = resolved_fsm_executor(pattern)
+            doc["stages"] = resolved_stages(pattern)
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
         return
     print(render_tree(pattern) if args.view == "tree" else render_resolved(pattern))
 
