@@ -1,21 +1,25 @@
-"""deep_research_agent 的 prompt 常量。
+"""Prompt constants of deep_research_agent.
 
-五段分工:
-- ``DEEP_RESEARCH_BASE_PROMPT``:module.base_prompt(进 system 底座)——
-  角色与报告纪律,所有相位共享
-- ``PREPLAN_SEARCH_PROMPT``:PREPLAN 相位的 user 指令(模型自行决定
-  是否先检索一轮;锚文本 ``preliminary_search`` 供测试脚本匹配)
-- ``PLAN_PHASE_PROMPT``:PLAN 相位的 user 指令(输出 JSON;锚文本
-  ``research_plan`` 供测试脚本匹配)
-- ``PLAN_RETRY_PROMPT``:PLAN JSON 解析失败后的自纠指令(坏输出 +
-  错误信息已回填 messages,``{error}`` 占位符用 replace 注入——模板含
-  JSON 字面量花括号,不能用 format)
-- ``SEARCH_STATE_BOARD_TMPL``:SEARCH 相位每轮重写到 system 的研究状态板
-- ``SYNTHESIZE_PROMPT_TEMPLATE``:SYNTHESIZE 相位的报告生成指令
-  (``format(findings_block=...)``,引用标记形如 [S1])
+Five-way division of labor:
+- ``DEEP_RESEARCH_BASE_PROMPT``: module.base_prompt (into the system
+  base) — role and report discipline, shared by all phases
+- ``PREPLAN_SEARCH_PROMPT``: the PREPLAN phase's user instruction (the
+  model itself decides whether to run a retrieval round first; anchor
+  text ``preliminary_search`` for the test scripts to match)
+- ``PLAN_PHASE_PROMPT``: the PLAN phase's user instruction (outputs
+  JSON; anchor text ``research_plan`` for the test scripts to match)
+- ``PLAN_RETRY_PROMPT``: the self-correcting instruction after a PLAN
+  JSON parse failure (the bad output + error message have been fed back
+  into messages; the ``{error}`` placeholder is injected via replace —
+  the template contains JSON literal braces, so format cannot be used)
+- ``SEARCH_STATE_BOARD_TMPL``: the research state board rewritten into
+  system every SEARCH round
+- ``SYNTHESIZE_PROMPT_TEMPLATE``: the SYNTHESIZE phase's report-writing
+  instruction (``format(findings_block=...)``; citation marks look like
+  [S1])
 """
 
-# 相位锚文本(测试脚本按此识别各相位请求)
+# Phase anchor texts (test scripts identify each phase's request by these)
 PLAN_ANCHOR = "research_plan"
 PREPLAN_ANCHOR = "preliminary_search"
 

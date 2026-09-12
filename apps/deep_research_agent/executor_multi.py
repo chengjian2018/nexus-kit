@@ -1,59 +1,122 @@
-"""DeepResearchExecutor 的多模块版 —— 每个研究相位一个模块,同轮接力。
+"""The four-node graph variant of the deep-research executor — one node per
+research phase, relaying within the same turn via the routing output
+(plan-⑧; the pre-merge single-module executor.py and its ModuleJumpEvent
+hop channel are gone — this file now owns the phase implementations too):
 
-单模块版(executor.py)在一次 execute() 里跑完全部相位;本文件把
-PREPLAN / PLAN / SEARCH / SYNTHESIZE 拆成四个 AGENT 模块,各绑一个
-相位 executor 插件,经 ModuleJumpEvent 在 chat 层 hop 循环里同轮接力
-(ARCHITECTURE.md「跳转多样化配方」的自定义 executor 写事件通道):
+    dr_preplan ──next──> dr_plan ──next──> dr_search ──next──> dr_synthesize
+     pre-retrieval/init    plan sub-questions  iterative search   synthesize report
 
-    dr_preplan ──jump──> dr_plan ──jump──> dr_search ──jump──> dr_synthesize
-     预检索/初始化        规划子问题          迭代检索          综合报告+复位底座
+Phase inventory (the shared phase methods on DeepResearchExecutor):
 
-与单模块版的关键差异:
-- 相位间状态(question / 工作区 messages / findings / plan / 轮次)经
-  ``cxt.metadata["deep_research_state"]`` 传递——轮内瞬态(每轮 begin_turn
-  出清,SYNTHESIZE 收尾即弹出),终态 trace 仍写 ``cxt.metadata
-  ["deep_research"]``(与单模块版同键同构,观测 / 续研不受影响);
-- 研究过程同样不落 cxt.history(相位方法原样复用,私有工作区决策不变),
-  历史仍只有「用户问题 → 研究报告」的 Q/A 对;
-- 每个相位模块各自解析工具面(_resolve_tools),pattern ACL 语义按模块
-  生效;中间相位不转发 delta,唯一流式相位仍是 SYNTHESIZE;
-- SYNTHESIZE 收尾把底座复位到 entry_module_code——current_module_code
-  跨轮保留,不复位的话下一问会直接落进综合模块。
+    PREPLAN  one tool-carrying LLM call: the model itself decides whether
+             to run a retrieval round first for background (no tool_calls =
+             skip); retrieval results stay in messages for PLAN to lean on,
+             findings merge straight into SEARCH
+    PLAN     one tool-less LLM call → {"sub_questions": [...]} (fault-tolerant
+             JSON extraction; on failure the bad output + error message are
+             fed back into messages for a self-correcting retry, and a second
+             failure degrades to [the original question])
+    SEARCH   tool-carrying ReAct loop (≤ _MAX_SEARCH_ROUNDS): every round
+             rewrites the "research state board" into system (sub-question
+             check-off progress / rounds left / hit stats) so the model can
+             decide to keep searching or wrap up; no tool_calls is the
+             wrap-up signal (REFLECT is folded into SEARCH, no separate
+             phase)
+    SYNTHESIZE  slims messages down (report instruction + question/plan/
+             findings digest) and streams the report — the only phase that
+             forwards text deltas to ec.stream
 
-相位实现零拷贝:四个类继承 DeepResearchExecutor 只为复用其无状态相位
-方法(_preplan_phase 等,插件注册中心本就共享单实例),execute 各自只
-做「取状态 → 跑一个相位 → 存状态 → 写跳转」。
+Plan-⑧ adaptations over the pre-merge form:
+
+- inter-phase state (question / workspace messages / findings / plan /
+  rounds) travels via ``cxt.graph_state["deep_research_state"]`` — the
+  graph runtime's state board, shared across the run's nodes and cleared
+  automatically at graph termination (begin_turn never touches it; the
+  pre-merge "SYNTHESIZE pops the turn-scoped transient" and "begin_turn
+  backstop" are both subsumed);
+- the same-turn relay is ``TurnResult(content="", next=<下一站code>)``
+  (the conditional edge) instead of a ModuleJumpEvent through the hop
+  loop; the pre-merge "SYNTHESIZE resets the base back to entry" is gone —
+  every turn re-runs the graph from the entry node anyway;
+- the final trace still goes to ``cxt.metadata["deep_research"]`` (same
+  key, same shape as the pre-merge versions — observability / next-turn
+  research continuation unaffected);
+- the research process likewise never lands in cxt.history (the private
+  workspace decision unchanged); history keeps only the "user question →
+  research report" Q/A pair;
+- each tool-carrying node resolves its own tool surface (_resolve_tools:
+  node.use_tools ∩ pattern.allow_toolset 工具集， both deny-by-default);
+  intermediate phases forward no deltas — the only streaming phase is
+  still SYNTHESIZE.
+
+Zero-instance-state phase implementations: the four classes subclass
+DeepResearchExecutor only to reuse its stateless phase methods
+(_preplan_phase etc.; the plugin registry shares a single instance
+anyway); each execute() does only "load state → run one phase → save
+state → return the routing output".
 """
 
+import json
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from atoms.executors.loop_executor import _emit_round
+from atoms.executors.loop_executor import _emit_round, _stream_round
 from atoms.tools.mcp_tool import ensure_mcp_ready
 
-from apps.deep_research_agent.executor import (
-    DeepResearchExecutor,
-    _current_user_query,
-    _prior_trace,
-)
-from nexus.context import ModuleJumpEvent
 from nexus.engine.agent_hooks import (
     AgentEndEvent,
     AgentStartEvent,
+    LLMCallEvent,
+    LLMResponseEvent,
+    ToolCallEvent,
+    ToolResultEvent,
     collect_fragments,
     fire,
     resolve_agent_hooks,
+    rewrite_tool_call,
+    rewrite_tool_result,
 )
-from nexus.engine.execution import ExecutionContext, ModuleExecutor
-from nexus.engine.loop import TurnResult, _resolve_tools, warn_prompt_length
+from nexus.engine.execution import ExecutionContext, NodeExecutor
+from nexus.engine.loop import (
+    TurnResult,
+    _execute_tool,
+    _parse_args,
+    _resolve_tools,
+    warn_prompt_length,
+)
 from nexus.engine.messages import build_agent_messages
 from nexus.llm.resolve import build_provider
+from apps.deep_research_agent.prompts import (
+    DEEP_RESEARCH_BASE_PROMPT,
+    PLAN_PHASE_PROMPT,
+    PLAN_RETRY_PROMPT,
+    PREPLAN_SEARCH_PROMPT,
+    SEARCH_STATE_BOARD_TMPL,
+    SYNTHESIZE_PROMPT_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 流水线拓扑(模块码 = 插件码,route_multi.py 的四个模块按此绑定)
+# Runaway protection budget (hard LLM call ceiling ≈ 1(pre-retrieval) + 1 +
+# 1(self-correct retry) + 12 + 1 = 16)
+# ---------------------------------------------------------------------------
+
+_MAX_SEARCH_ROUNDS = 12        # SEARCH phase round ceiling
+_PLAN_RETRIES = 1              # PLAN JSON parse-failure retry count
+_PER_RESULT_CHARS = 4000       # per-tool-result truncation (workspace / findings)
+_MAX_FINDINGS = 30             # findings entry ceiling (FIFO evicts the oldest)
+_WORKSPACE_CHAR_BUDGET = 60000 # SEARCH workspace char budget (over budget: middle-truncate the oldest tool rows)
+
+# State-board marks
+_DONE_MARK = "✓"
+_TODO_MARK = "○"
+
+# ---------------------------------------------------------------------------
+# Pipeline topology (node code = plugin code; route_multi.py's four nodes
+# bind accordingly)
 # ---------------------------------------------------------------------------
 
 DR_PREPLAN_CODE = "dr_preplan"
@@ -61,38 +124,35 @@ DR_PLAN_CODE = "dr_plan"
 DR_SEARCH_CODE = "dr_search"
 DR_SYNTHESIZE_CODE = "dr_synthesize"
 
-# 轮内瞬态研究状态键(SYNTHESIZE 弹出;TurnLifecycle.begin_turn 兜底出清,
-# 防中途异常留下陈旧状态);终态 trace 沿用单模块版的 "deep_research" 键
+# In-flight research state key on the graph runtime's state board
+# (cxt.graph_state: shared across the run's nodes, cleared by the runtime
+# at graph termination); the final trace keeps the "deep_research" key
 _STATE_KEY = "deep_research_state"
 _TRACE_KEY = "deep_research"
-_JUMP_SOURCE = "dr_pipeline"
 
 
 def _load_state(cxt) -> Optional[Dict[str, Any]]:
-    """取在途研究状态(非 dict 形态视为无,防脏数据)。"""
-    state = (cxt.metadata or {}).get(_STATE_KEY)
+    """Load the in-flight research state from the graph state board (a
+    non-dict shape counts as none, guarding against dirty data)."""
+    state = (cxt.graph_state or {}).get(_STATE_KEY)
     return state if isinstance(state, dict) else None
 
 
 def _save_state(cxt, state: Dict[str, Any]) -> None:
-    cxt.metadata[_STATE_KEY] = state
+    cxt.graph_state[_STATE_KEY] = state
 
 
-def _jump(cxt, target: str, reason: str = "") -> None:
-    """写同轮跳转事件(hop 循环消费;目标存在性由 chat 层校验)。"""
-    cxt.actions.append(ModuleJumpEvent(
-        target_module_code=target, reason=reason, source=_JUMP_SOURCE))
-
-
-def _orphan_state(cxt, module, phase: str) -> Dict[str, Any]:
-    """异常入口的兜底状态:无在途状态直送收尾,SYNTHESIZE 会以原问题为
-    唯一子问题出「证据不足」报告——流水线任何一站都不因缺状态而卡死。"""
+def _orphan_state(cxt, node, phase: str) -> Dict[str, Any]:
+    """Fallback state for an anomalous entry: with no in-flight state, go
+    straight to wrap-up — SYNTHESIZE will emit an "insufficient evidence"
+    report with the original question as the only sub-question — no
+    pipeline node may deadlock for lack of state."""
     return {
         "question": _current_user_query(cxt),
         "phases": [phase],
         "degraded": True,
         "session_id": cxt.session_id,
-        "module_code": module.module_code,
+        "node_code": node.code,
         "findings": [],
         "tool_stats": {},
         "plan": {},
@@ -102,22 +162,444 @@ def _orphan_state(cxt, module, phase: str) -> Dict[str, Any]:
 _FORCE_CLOSE_REPLY = "(研究流程被强制收尾,未能完成研究。)"
 
 
+class DeepResearchExecutor(NodeExecutor):
+    """Stateless phase-method base of the four graph executors
+    (PREPLAN → PLAN → SEARCH → SYNTHESIZE); the per-node execute()
+    orchestration lives in the Dr* subclasses below."""
+
+    # ------------------------------------------------------------------
+    # PREPLAN
+    # ------------------------------------------------------------------
+
+    async def _preplan_phase(self, provider,
+                             base_messages: List[Dict[str, Any]],
+                             tools: List[Dict[str, Any]], allowed_names: set,
+                             ec: "ExecutionContext", hooks,
+                             trace: Dict[str, Any]
+                             ) -> Tuple[List[Dict[str, Any]],
+                                        List[Dict[str, Any]],
+                                        Dict[str, int]]:
+        """Optional pre-retrieval before PLAN: the model itself decides
+        whether to run one search round for background information.
+
+        One tool-carrying call (no follow-up rounds): with tool_calls →
+        executed via _dispatch_research_round, results stay in messages for
+        PLAN to reference, findings/tool_stats merge into SEARCH; without
+        tool_calls → the model judged pre-retrieval unnecessary and it is
+        skipped (the "skip" reply still enters messages, keeping the
+        user/assistant alternation). No deltas forwarded (pre-retrieval is
+        not the reply).
+
+        Returns: (messages for PLAN, findings, tool_stats).
+        """
+        if not tools:
+            return list(base_messages), [], {}
+
+        cxt = ec.cxt
+        node = ec.node
+        model = (cxt.llm_config or {})["model"]
+        temperature = (cxt.llm_config or {}).get("temperature", 0.7)
+        max_tokens = (cxt.llm_config or {}).get("max_tokens", 2048)
+
+        messages = list(base_messages) + [
+            {"role": "user", "content": PREPLAN_SEARCH_PROMPT}]
+
+        if hooks:
+            fire(hooks, "on_llm_call", LLMCallEvent(
+                session_id=cxt.session_id, node_code=node.code,
+                round_idx=0, messages=messages, model=model))
+
+        result = await _stream_round(
+            provider, messages, model, temperature, max_tokens,
+            None, tools=tools)  # no delta forwarding
+        content = result.get("content", "") or ""
+        tool_calls = result.get("tool_calls", []) or []
+
+        if hooks:
+            fire(hooks, "on_llm_response", LLMResponseEvent(
+                session_id=cxt.session_id, node_code=node.code,
+                round_idx=0, content=content, tool_calls=tool_calls))
+
+        findings: List[Dict[str, Any]] = []
+        tool_stats: Dict[str, int] = {}
+        if tool_calls:
+            # round_idx=-1 → findings record round=0 (pre-retrieval marker,
+            # distinguishing it from SEARCH rounds)
+            findings = await self._dispatch_research_round(
+                messages, tool_calls, hooks, allowed_names, -1,
+                cxt, node, findings, tool_stats)
+            _truncate_workspace(messages)
+            trace["phases"].append("preplan_search")
+            _emit_round(ec.stream, "preplan", 0)
+        else:
+            messages.append({"role": "assistant", "content": content})
+        return messages, findings, tool_stats
+
+    # ------------------------------------------------------------------
+    # PLAN
+    # ------------------------------------------------------------------
+
+    async def _plan_phase(self, provider, messages: List[Dict[str, Any]],
+                          llm_config: Dict[str, Any],
+                          ec: "ExecutionContext", hooks,
+                          trace: Dict[str, Any]) -> Dict[str, Any]:
+        """One tool-less LLM call producing the research plan (messages
+        include the pre-retrieval context, if any).
+
+        Fault-tolerant JSON extraction (the first balanced ``{...}`` block);
+        on failure the messages are not re-sent verbatim — the bad output
+        (assistant row) + parse error (user row) are fed back into messages
+        so the model self-corrects from its own error up to _PLAN_RETRIES
+        times; a final failure degrades to ``{"sub_questions": [the
+        original question]}`` and marks degraded — a PLAN failure never
+        blocks the research itself. No deltas forwarded (the plan JSON is
+        not the reply).
+        """
+        cxt = ec.cxt
+        node = ec.node
+        model = llm_config["model"]
+        temperature = llm_config.get("temperature", 0.7)
+        max_tokens = llm_config.get("max_tokens", 2048)
+
+        plan_messages = list(messages) + [
+            {"role": "user", "content": PLAN_PHASE_PROMPT}]
+
+        plan: Dict[str, Any] = {}
+        for attempt in range(1 + _PLAN_RETRIES):
+            if hooks:
+                fire(hooks, "on_llm_call", LLMCallEvent(
+                    session_id=cxt.session_id,
+                    node_code=node.code,
+                    round_idx=0, messages=plan_messages, model=model))
+            result = await _stream_round(
+                provider, plan_messages, model, temperature, max_tokens,
+                None)  # no delta forwarding
+            content = result.get("content", "") or ""
+            if hooks:
+                fire(hooks, "on_llm_response", LLMResponseEvent(
+                    session_id=cxt.session_id,
+                    node_code=node.code,
+                    round_idx=0, content=content, tool_calls=[]))
+            plan, err = _extract_plan_json(content)
+            if plan:
+                break
+            logger.warning("[deep_research] PLAN JSON 解析失败(第 %d 次): %s",
+                           attempt + 1, err)
+            if attempt < _PLAN_RETRIES:
+                # Self-correcting retry: bad output + error fed back into
+                # messages (not a verbatim re-send)
+                plan_messages.append(
+                    {"role": "assistant", "content": content or "(空输出)"})
+                plan_messages.append(
+                    {"role": "user",
+                     "content": PLAN_RETRY_PROMPT.replace("{error}", err)})
+
+        if not plan:
+            plan = {"sub_questions": [trace.get("question", "")],
+                    "notes": "规划降级:直接研究原问题"}
+            trace["degraded"] = True
+
+        trace["phases"].append("plan")
+        trace["plan"] = plan
+        _emit_round(ec.stream, "plan", 0)
+        return plan
+
+    # ------------------------------------------------------------------
+    # SEARCH
+    # ------------------------------------------------------------------
+
+    async def _search_phase(self, provider, base_messages: List[Dict[str, Any]],
+                            plan: Dict[str, Any], tools: List[Dict[str, Any]],
+                            allowed_names: set, ec: "ExecutionContext", hooks,
+                            trace: Dict[str, Any],
+                            initial_findings: Optional[List[Dict[str, Any]]] = None,
+                            initial_tool_stats: Optional[Dict[str, int]] = None,
+                            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Tool-carrying research loop: a private messages workspace (never
+        lands in cxt.history).
+
+        Each round rewrites the state-board section of system[0] at its
+        start; tool_calls are executed via _dispatch_research_round and the
+        protocol pairs appended; no tool_calls means the model judged the
+        information sufficient — its content becomes reflection_note for
+        SYNTHESIZE.
+
+        The workspace is rebuilt from base_messages (pre-retrieval results
+        do not enter the SEARCH workspace — their conclusions are already
+        distilled into the plan; but the pre-retrieval findings/tool_stats
+        merge in as initial state, so the state board starts from real
+        progress).
+        """
+        cxt = ec.cxt
+        node = ec.node
+        model = (cxt.llm_config or {})["model"]
+        temperature = (cxt.llm_config or {}).get("temperature", 0.7)
+        max_tokens = (cxt.llm_config or {}).get("max_tokens", 2048)
+
+        user_query = trace["question"]
+        sub_questions = plan.get("sub_questions") or [user_query]
+
+        findings: List[Dict[str, Any]] = list(initial_findings or [])
+        tool_stats: Dict[str, int] = dict(initial_tool_stats or {})
+
+        # Initial workspace shape: system (role + plan + state-board
+        # placeholder) + user (the original question)
+        system_base = _system_content(base_messages)
+        covered = _covered_questions(sub_questions, findings)
+        question_lines = [
+            f"{i + 1}. {_DONE_MARK if q in covered else _TODO_MARK} {q}"
+            for i, q in enumerate(sub_questions)]
+        board = SEARCH_STATE_BOARD_TMPL.format(
+            question_lines="\n".join(question_lines),
+            rounds_left=_MAX_SEARCH_ROUNDS, total_rounds=_MAX_SEARCH_ROUNDS,
+            findings_count=len(findings),
+            tool_stats=json.dumps(tool_stats, ensure_ascii=False))
+        workspace: List[Dict[str, Any]] = [
+            {"role": "system",
+             "content": f"{system_base}\n\n【研究计划】\n" + "\n".join(
+                 f"{i + 1}. {q}" for i, q in enumerate(sub_questions)) + board},
+            {"role": "user", "content": user_query},
+        ]
+
+        reflection_note = ""
+        rounds_done = 0
+
+        if tools:
+            for round_idx in range(_MAX_SEARCH_ROUNDS):
+                rounds_done = round_idx + 1
+                # State-board rewrite (done sub-questions get a check mark:
+                # a sub-question counts as covered once its query shows up
+                # in findings)
+                covered = _covered_questions(sub_questions, findings)
+                question_lines = [
+                    f"{i + 1}. {_DONE_MARK if q in covered else _TODO_MARK} {q}"
+                    for i, q in enumerate(sub_questions)]
+                _rewrite_state_board(
+                    workspace, sub_questions, question_lines,
+                    _MAX_SEARCH_ROUNDS - round_idx, _MAX_SEARCH_ROUNDS,
+                    len(findings), tool_stats)
+
+                if hooks:
+                    fire(hooks, "on_llm_call", LLMCallEvent(
+                        session_id=cxt.session_id,
+                        node_code=node.code,
+                        round_idx=round_idx, messages=workspace, model=model))
+
+                result = await _stream_round(
+                    provider, workspace, model, temperature, max_tokens,
+                    None, tools=tools)  # intermediate rounds forward no deltas
+                content = result.get("content", "") or ""
+                tool_calls = result.get("tool_calls", []) or []
+
+                if hooks:
+                    fire(hooks, "on_llm_response", LLMResponseEvent(
+                        session_id=cxt.session_id,
+                        node_code=node.code,
+                        round_idx=round_idx, content=content,
+                        tool_calls=tool_calls))
+
+                if not tool_calls:
+                    # Model judged the information sufficient → wrap up; the
+                    # content becomes the reflection note
+                    reflection_note = content
+                    break
+
+                new_findings = await self._dispatch_research_round(
+                    workspace, tool_calls, hooks, allowed_names, round_idx,
+                    cxt, node, findings, tool_stats)
+                findings.extend(new_findings)
+                if len(findings) > _MAX_FINDINGS:
+                    findings = findings[len(findings) - _MAX_FINDINGS:]
+                _truncate_workspace(workspace)
+                _emit_round(ec.stream, "search", round_idx)
+            else:
+                logger.info(
+                    "[deep_research] SEARCH 达到最大轮次 %d,进入综合",
+                    _MAX_SEARCH_ROUNDS)
+        else:
+            logger.warning(
+                "[deep_research] 无可用工具(节点未声明可用工具或 toolset "
+                "未授权 MCP 工具?),跳过 SEARCH 直接综合")
+
+        trace["phases"].append("search")
+        return findings, {
+            "tool_stats": tool_stats,
+            "rounds": rounds_done,
+            "reflection_note": reflection_note,
+        }
+
+    async def _dispatch_research_round(
+            self, messages: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]],
+            hooks, allowed_names: set, round_idx: int,
+            cxt, node, findings: List[Dict[str, Any]],
+            tool_stats: Dict[str, int]) -> List[Dict[str, Any]]:
+        """Tool dispatch of a research round (the private-workspace version
+        of _dispatch_tool_calls).
+
+        Same semantics as nexus.engine.loop._dispatch_tool_calls (P4 chained
+        rewrite → allowed_names validation (illegal ones get an error fed
+        back) → _execute_tool → P5 rewrite), but it **only appends to the
+        executor's private messages, never writes cxt.history**; successful
+        tool results are also collected into findings (truncated + query
+        recorded).
+
+        Returns: the findings entries added this round.
+        """
+        session_id = cxt.session_id
+        node_code = node.code
+
+        # P4 chained rewrite (applied back to tc, single source of truth)
+        rewrite_audits = {}
+        for idx, tc in enumerate(tool_calls):
+            name = tc.get("function", {}).get("name", "")
+            parsed_args = _parse_args(tc)
+            if hooks:
+                event = ToolCallEvent(
+                    session_id=session_id, node_code=node_code,
+                    round_idx=round_idx, tool_name=name, args=parsed_args)
+                final_name, final_args, original = rewrite_tool_call(
+                    hooks, event, allowed_names)
+            else:
+                final_name, final_args, original = name, parsed_args, None
+            if final_name != name:
+                tc["function"]["name"] = final_name
+            if final_args is not parsed_args:
+                try:
+                    tc["function"]["arguments"] = json.dumps(
+                        final_args, ensure_ascii=False)
+                except (TypeError, ValueError) as e:
+                    logger.warning("[hooks] 改写后 args 无法序列化,保留原串: %s", e)
+            if original is not None:
+                rewrite_audits[idx] = original
+
+        # assistant payload (protocol pairing: ids untouched)
+        messages.append({"role": "assistant", "content": None,
+                         "tool_calls": tool_calls})
+
+        # Per tc: validate → execute / feed back error → P5 → append the tool row
+        new_findings: List[Dict[str, Any]] = []
+        for idx, tc in enumerate(tool_calls):
+            name = tc.get("function", {}).get("name", "")
+            call_id = tc.get("id", "")
+            parsed_args = _parse_args(tc)
+
+            if name not in allowed_names:
+                logger.warning(
+                    "[deep_research] 工具 '%s' 不在本轮可用集合,拦截不执行", name)
+                result_content = json.dumps({
+                    "error": (f"工具 '{name}' 不存在或本轮不可用。"
+                              f"可用工具:{sorted(allowed_names)}。")
+                }, ensure_ascii=False)
+            else:
+                tool_result = await _execute_tool(name, parsed_args)
+                if hooks:
+                    event = ToolResultEvent(
+                        session_id=session_id, node_code=node_code,
+                        round_idx=round_idx, tool_name=name,
+                        tool_call_id=call_id, result=tool_result)
+                    tool_result, _orig = rewrite_tool_result(hooks, event)
+                result_content = tool_result
+
+                # findings collection (success path; error JSON never enters findings)
+                if not result_content.lstrip().startswith("{\"error"):
+                    query = (parsed_args.get("query")
+                             or parsed_args.get("q")
+                             or parsed_args.get("url")
+                             or json.dumps(parsed_args, ensure_ascii=False))
+                    new_findings.append({
+                        "tool": name,
+                        "query": str(query)[:200],
+                        "snippet": result_content[:_PER_RESULT_CHARS],
+                        "round": round_idx + 1,
+                    })
+                    tool_stats[name] = tool_stats.get(name, 0) + 1
+
+            messages.append({"role": "tool", "tool_call_id": call_id,
+                             "content": result_content})
+
+        return new_findings
+
+    # ------------------------------------------------------------------
+    # SYNTHESIZE
+    # ------------------------------------------------------------------
+
+    async def _synthesize_phase(self, provider, user_query: str,
+                                plan: Dict[str, Any],
+                                findings: List[Dict[str, Any]],
+                                llm_config: Dict[str, Any],
+                                ec: "ExecutionContext", hooks,
+                                trace: Dict[str, Any]) -> str:
+        """Slim the messages down and stream the report (the only
+        delta-forwarding phase)."""
+        model = llm_config["model"]
+        temperature = llm_config.get("temperature", 0.7)
+        max_tokens = llm_config.get("max_tokens", 2048)
+
+        findings_lines = []
+        for i, f in enumerate(findings):
+            findings_lines.append(
+                f"[S{i + 1}] (工具: {f['tool']} | 查询: {f['query']})\n"
+                f"{f['snippet']}")
+        findings_block = ("\n".join(findings_lines)
+                          or "(无资料——报告需明示证据不足)")
+
+        sub_questions = plan.get("sub_questions") or [user_query]
+        synth_messages = [
+            {"role": "system", "content": DEEP_RESEARCH_BASE_PROMPT},
+            {"role": "user", "content": (
+                f"用户问题:{user_query}\n\n研究子问题:\n"
+                + "\n".join(f"- {q}" for q in sub_questions)
+                + "\n\n" + SYNTHESIZE_PROMPT_TEMPLATE.format(
+                    findings_block=findings_block)
+                + (f"\n\n【检索阶段小结】\n{trace.get('reflection_note') or ''}"
+                   if trace.get("reflection_note") else ""))},
+        ]
+
+        if hooks:
+            fire(hooks, "on_llm_call", LLMCallEvent(
+                session_id=ec.cxt.session_id,
+                node_code=ec.node.code,
+                round_idx=0, messages=synth_messages, model=model))
+
+        result = await _stream_round(
+            provider, synth_messages, model, temperature, max_tokens,
+            ec.stream)  # report deltas forwarded optimistically
+        report = result.get("content", "") or ""
+
+        if hooks:
+            fire(hooks, "on_llm_response", LLMResponseEvent(
+                session_id=ec.cxt.session_id,
+                node_code=ec.node.code,
+                round_idx=0, content=report, tool_calls=[]))
+
+        trace["phases"].append("synthesize")
+        _emit_round(ec.stream, "synthesize", 0)
+        return report
+
+
+# ============================================================================
+# The four node executors (one per graph station; each does
+# "load state → run one phase → save state → return the routing output")
+# ============================================================================
+
 class DrPreplanExecutor(DeepResearchExecutor):
-    """dr_preplan 模块:研究状态初始化 + PREPLAN 相位(可选预检索)。"""
+    """dr_preplan node: research-state initialization + the PREPLAN phase
+    (optional pre-retrieval); relays to dr_plan."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
-        module = ec.module
+        node = ec.node
         pattern = ec.pattern
         llm_config = cxt.llm_config or {}
         provider = build_provider(llm_config)
 
-        # P1 on_agent_start:片段进 PLAN 底座(流水线首站承担,契约同 default loop)
-        hooks = resolve_agent_hooks(module, pattern)
+        # P1 on_agent_start: fragments go into the PLAN base (carried by the
+        # pipeline's first node; same contract as the default loop)
+        hooks = resolve_agent_hooks(node, pattern)
         fragments = collect_fragments(
             hooks,
             AgentStartEvent(session_id=cxt.session_id,
-                            module_code=module.module_code, cxt=cxt),
+                            node_code=node.code, cxt=cxt),
         ) if hooks else []
 
         state: Dict[str, Any] = {
@@ -125,26 +607,28 @@ class DrPreplanExecutor(DeepResearchExecutor):
             "phases": [],
             "degraded": False,
             "session_id": cxt.session_id,
-            "module_code": module.module_code,
+            "node_code": node.code,
             "findings": [],
             "tool_stats": {},
             "plan": {},
         }
 
-        # force_close 防御(线性流水线 + max_hops=4 正常不可达):此时 hop
-        # 循环已不再消费跳转事件,后续相位不会执行,直接收尾话术
+        # force_close defense: the step budget is exhausted, later stations
+        # will not run — return the wrap-up text directly (no next → the
+        # graph terminates on this node)
         if ec.force_close:
             return TurnResult(content=_FORCE_CLOSE_REPLY)
 
-        # MCP 时序闸同单模块版:抢在连接完成前解析工具会把 allowed_names
-        # 冻结成空集,这里等到终态(未配置 server 时零开销)
+        # MCP timing gate: resolving tools before connections complete would
+        # freeze allowed_names as an empty set; wait for the final state
+        # here (zero overhead when no server is configured)
         await ensure_mcp_ready()
-        tools = _resolve_tools(module, pattern)
+        tools = _resolve_tools(node, pattern)
         allowed_names = {t.get("function", {}).get("name", "") for t in tools}
 
         base_messages = build_agent_messages(
-            module, cxt, pattern=pattern, extra_blocks=fragments)
-        warn_prompt_length(base_messages, cxt, module)
+            node, cxt, pattern=pattern, extra_blocks=fragments)
+        warn_prompt_length(base_messages, cxt, node)
 
         plan_base, preplan_findings, preplan_stats = (
             await self._preplan_phase(
@@ -152,19 +636,20 @@ class DrPreplanExecutor(DeepResearchExecutor):
                 ec, hooks, state))
 
         state.update({
-            "messages": plan_base,           # PLAN 底座(含预检索上下文,若有)
-            "base_messages": base_messages,  # SEARCH 工作区重建底座
+            "messages": plan_base,           # PLAN base (includes pre-retrieval context, if any)
+            "base_messages": base_messages,  # rebuild base for the SEARCH workspace
             "findings": preplan_findings,
             "tool_stats": preplan_stats,
         })
         _save_state(cxt, state)
-        _jump(cxt, DR_PLAN_CODE, reason="预检索完成,进入研究规划")
-        # 中间相位 content 为空:hop 循环消费跳转事件后续答,本结果被丢弃
-        return TurnResult(content="")
+        # Intermediate stations return empty content + the conditional edge;
+        # the graph's reply is the last non-empty content along the run
+        return TurnResult(content="", next=DR_PLAN_CODE)
 
 
 class DrPlanExecutor(DeepResearchExecutor):
-    """dr_plan 模块:PLAN 相位(子问题 JSON,自纠重试,降级兜底)。"""
+    """dr_plan node: the PLAN phase (sub-question JSON, self-correcting
+    retry, degradation fallback); relays to dr_search."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -173,24 +658,24 @@ class DrPlanExecutor(DeepResearchExecutor):
 
         state = _load_state(cxt)
         if state is None:
-            _save_state(cxt, _orphan_state(cxt, ec.module, "orphan_plan"))
-            _jump(cxt, DR_SYNTHESIZE_CODE, reason="无在途研究状态,跳过规划")
-            return TurnResult(content="")
+            state = _orphan_state(cxt, ec.node, "orphan_plan")
+            _save_state(cxt, state)
+            return TurnResult(content="", next=DR_SYNTHESIZE_CODE)
 
-        state["module_code"] = ec.module.module_code
+        state["node_code"] = ec.node.code
         provider = build_provider(cxt.llm_config or {})
-        hooks = resolve_agent_hooks(ec.module, ec.pattern)
+        hooks = resolve_agent_hooks(ec.node, ec.pattern)
         plan = await self._plan_phase(
             provider, state.get("messages") or [], cxt.llm_config or {},
             ec, hooks, state)
         state["plan"] = plan
         _save_state(cxt, state)
-        _jump(cxt, DR_SEARCH_CODE, reason="研究计划就绪,进入迭代检索")
-        return TurnResult(content="")
+        return TurnResult(content="", next=DR_SEARCH_CODE)
 
 
 class DrSearchExecutor(DeepResearchExecutor):
-    """dr_search 模块:SEARCH 相位(带工具 ReAct 循环 + 反思状态板)。"""
+    """dr_search node: the SEARCH phase (tool-carrying ReAct loop +
+    reflection state board); relays to dr_synthesize."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -199,16 +684,16 @@ class DrSearchExecutor(DeepResearchExecutor):
 
         state = _load_state(cxt)
         if state is None:
-            _save_state(cxt, _orphan_state(cxt, ec.module, "orphan_search"))
-            _jump(cxt, DR_SYNTHESIZE_CODE, reason="无在途研究状态,跳过检索")
-            return TurnResult(content="")
+            state = _orphan_state(cxt, ec.node, "orphan_search")
+            _save_state(cxt, state)
+            return TurnResult(content="", next=DR_SYNTHESIZE_CODE)
 
-        state["module_code"] = ec.module.module_code
+        state["node_code"] = ec.node.code
         await ensure_mcp_ready()
-        tools = _resolve_tools(ec.module, ec.pattern)
+        tools = _resolve_tools(ec.node, ec.pattern)
         allowed_names = {t.get("function", {}).get("name", "") for t in tools}
         provider = build_provider(cxt.llm_config or {})
-        hooks = resolve_agent_hooks(ec.module, ec.pattern)
+        hooks = resolve_agent_hooks(ec.node, ec.pattern)
 
         findings, search_stats = await self._search_phase(
             provider, state.get("base_messages") or [],
@@ -222,32 +707,34 @@ class DrSearchExecutor(DeepResearchExecutor):
             "reflection_note": search_stats["reflection_note"],
         })
         _save_state(cxt, state)
-        _jump(cxt, DR_SYNTHESIZE_CODE, reason="检索完成,进入综合")
-        return TurnResult(content="")
+        return TurnResult(content="", next=DR_SYNTHESIZE_CODE)
 
 
 class DrSynthesizeExecutor(DeepResearchExecutor):
-    """dr_synthesize 模块:SYNTHESIZE 相位——唯一流式相位,收尾 + 复位底座。"""
+    """dr_synthesize node: the SYNTHESIZE phase — the only streaming phase;
+    wrap-up (terminal: no next, is_end=True; the next turn re-enters the
+    graph at the entry node, no base reset needed)."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
-        module = ec.module
+        node = ec.node
         pattern = ec.pattern
 
         state = _load_state(cxt)
         if state is None:
-            # 防御(正常流程不可达):以既有 trace 的 sources / 空资料收尾
+            # Defensive (unreachable via the normal flow): wrap up with the
+            # existing trace's sources / no material
             prior = _prior_trace(cxt)
-            state = _orphan_state(cxt, module, "orphan_synthesize")
+            state = _orphan_state(cxt, node, "orphan_synthesize")
             if prior:
                 state["findings"] = list(prior.get("sources", []))
                 state["tool_stats"] = dict(prior.get("tool_stats", {}))
                 state["degraded"] = bool(prior.get("degraded", False))
 
-        state["module_code"] = module.module_code
+        state["node_code"] = node.code
         llm_config = cxt.llm_config or {}
         provider = build_provider(llm_config)
-        hooks = resolve_agent_hooks(module, pattern)
+        hooks = resolve_agent_hooks(node, pattern)
 
         plan = state.get("plan") or {}
         findings = state.get("findings") or []
@@ -255,8 +742,10 @@ class DrSynthesizeExecutor(DeepResearchExecutor):
             provider, state.get("question", ""), plan, findings,
             llm_config, ec, hooks, state)
 
-        # 终态 trace:与单模块版同键同构(_synthesize_phase 已 append
-        # "synthesize" 进 phases)
+        # Final trace: same key and shape as the pre-merge versions
+        # (_synthesize_phase already appended "synthesize" to phases); the
+        # in-flight graph_state board is cleared by the graph runtime at
+        # termination — nothing to reset here
         trace = {
             "question": state.get("question", ""),
             "phases": state.get("phases", []),
@@ -271,29 +760,137 @@ class DrSynthesizeExecutor(DeepResearchExecutor):
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }
         cxt.metadata[_TRACE_KEY] = trace
-        cxt.metadata.pop(_STATE_KEY, None)  # 轮内瞬态出清
 
-        # P7 on_agent_end:报告即本轮回复
+        # P7 on_agent_end: the report is this turn's reply
         if hooks:
             fire(hooks, "on_agent_end", AgentEndEvent(
                 session_id=cxt.session_id,
-                module_code=module.module_code,
+                node_code=node.code,
                 rounds=trace["rounds"] + 2, outcome="reply", reply=report))
 
         _emit_round(ec.stream, "final", trace["rounds"])
-
-        # 底座复位:研究流水线一轮走完,下一轮从首站重新进入(hop 循环的
-        # reroute 把底座留在了 dr_synthesize,不复位下一问会直接进综合模块)
-        if pattern is not None and pattern.entry_module_code:
-            cxt.current_module_code = pattern.entry_module_code
-            cxt.current_node_code = None
 
         return TurnResult(content=report, extra={"deep_research": trace})
 
 
 # ============================================================================
-# 插件注册 —— 底部 import 副作用(route_multi.py 末尾 import 本模块完成
-# 注册;与 executor.py 同一 idiom)
+# Module-level helpers
+# ============================================================================
+
+def _current_user_query(cxt) -> str:
+    """This turn's user question (the last user message in cxt.history;
+    empty string as fallback).
+
+    history is a list of SessionMessage objects (role/content attributes);
+    the user row at turn start was already written by the chat layer, so
+    take the most recent from the end.
+    """
+    for m in reversed(cxt.history or []):
+        if getattr(m, "role", "") == "user":
+            return getattr(m, "content", "") or ""
+    return ""
+
+
+def _prior_trace(cxt) -> Optional[Dict[str, Any]]:
+    """The previous turn's research trace (cxt.metadata; for continuation /
+    force_close)."""
+    prior = (cxt.metadata or {}).get(_TRACE_KEY)
+    return prior if isinstance(prior, dict) else None
+
+
+def _system_content(messages: List[Dict[str, Any]]) -> str:
+    """Take the first system row's content (empty string if none)."""
+    for m in messages:
+        if m.get("role") == "system":
+            return m.get("content", "") or ""
+    return ""
+
+
+def _extract_plan_json(content: str) -> Tuple[Dict[str, Any], str]:
+    """Fault-tolerant PLAN JSON extraction: first balanced ``{...}`` block →
+    parse → validate sub_questions is a non-empty list of strings.
+
+    Returns: (plan, err) — on success plan is non-empty and err an empty
+    string; on failure plan is an empty dict and err a model-facing
+    self-correction description (fed into PLAN_RETRY_PROMPT).
+    """
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        return {}, "输出中找不到 JSON 对象(缺少 {...})"
+    try:
+        data = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError) as e:
+        return {}, f"JSON 语法错误: {e}"
+    if not isinstance(data, dict):
+        return {}, "JSON 顶层不是对象"
+    questions = data.get("sub_questions")
+    if (not isinstance(questions, list)
+            or not questions
+            or not all(isinstance(q, str) and q.strip() for q in questions)):
+        return {}, "缺少合法的 sub_questions 字段(需非空字符串数组)"
+    return {"sub_questions": [q.strip() for q in questions],
+            "notes": str(data.get("notes", ""))}, ""
+
+
+def _covered_questions(sub_questions: List[str],
+                       findings: List[Dict[str, Any]]) -> set:
+    """The set of covered sub-questions (a sub-question counts once any of
+    its keywords shows up in some finding's query; a simple heuristic, good
+    enough for the state board)."""
+    covered = set()
+    for q in sub_questions:
+        keywords = [w for w in re.split(r"[\s,，。?？]+", q) if len(w) >= 2]
+        for f in findings:
+            query = f.get("query", "")
+            if any(k in query for k in keywords):
+                covered.add(q)
+                break
+    return covered
+
+
+def _rewrite_state_board(workspace: List[Dict[str, Any]],
+                         sub_questions: List[str],
+                         question_lines: List[str],
+                         rounds_left: int, total_rounds: int,
+                         findings_count: int,
+                         tool_stats: Dict[str, int]) -> None:
+    """Rewrite the state-board section of system[0] (the board is always
+    system's last section)."""
+    board = SEARCH_STATE_BOARD_TMPL.format(
+        question_lines="\n".join(question_lines),
+        rounds_left=rounds_left, total_rounds=total_rounds,
+        findings_count=findings_count,
+        tool_stats=json.dumps(tool_stats, ensure_ascii=False))
+    system = workspace[0]
+    content = system.get("content", "") or ""
+    idx = content.find("\n\n【研究状态板】")
+    if idx >= 0:
+        content = content[:idx]
+    system["content"] = content + board
+
+
+def _truncate_workspace(workspace: List[Dict[str, Any]],
+                        budget: int = _WORKSPACE_CHAR_BUDGET) -> None:
+    """When the workspace exceeds budget, middle-truncate the oldest tool
+    rows (keep head and tail)."""
+    total = sum(len(str(m.get("content", "") or "")) for m in workspace)
+    for m in workspace:
+        if total <= budget:
+            return
+        if m.get("role") == "tool" and not m.get("_truncated"):
+            content = str(m.get("content", "") or "")
+            if len(content) > 800:
+                removed = len(content) - 800
+                m["content"] = (
+                    f"{content[:400]}\n...[工作区超预算,已截断 {removed} 字符]...\n"
+                    f"{content[-400:]}")
+                m["_truncated"] = True
+                total -= removed
+
+
+# ============================================================================
+# Plugin registration — import side effect at the bottom (route_multi.py
+# imports this module at its end to complete registration)
 # ============================================================================
 
 from nexus.registry.plugins import registry as plugin_registry  # noqa: E402

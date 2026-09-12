@@ -12,7 +12,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `route.py` | 全部节点定义（16 个）+ FSMModule + Pattern 注册 + stages 装配声明 |
+| `route.py` | 全部节点定义（16 个）+ FSM Pattern 注册（pattern_type=fsm）+ stages 骨架装配声明 |
 | `stages.py` | 应用本地 stage：统一阶段子类（可约守卫/推荐改写/联系时间裁定）+ 关键词卡控 clarify + 插件注册 |
 | `slots.py` | 纯函数槽位算术（排班解析/时间标注提取/可约匹配/档期推荐），零 LLM、零框架依赖 |
 | `faq.py` | 外呼 FAQ 关键词表（费用/保修/安装时长/自装/改地址/催物流） |
@@ -24,11 +24,11 @@
 ### Pattern 结构（code = `install_booking_agent`）
 
 ```
-install_booking_agent (Pattern, entry: install_booking)
-└── install_booking  安装预约外呼（FSMModule，16 节点单模块）
+install_booking_agent (Pattern, pattern_type=fsm, entry: install_greet)
+└── 16 节点单域 FSM（原单模块流程，plan-⑧ 节点/模块合并后直接挂 pattern）
 ```
 
-主流程（`module_nodes[0]` 为入口）：
+主流程（`nodes[0]` / entry_node_code 为入口）：
 
 ```
 install_greet 外呼开场
@@ -53,10 +53,10 @@ install_end 通话结束语（is_end）
 ### stages 装配
 
 ```
-pattern.stages  [{"query": "time_aug_query"}, {"nlu": None},
-                 {"clarify": None}, {"nlg": None}]
-module.stages   {"nlu": "install_unified", "clarify": "install_clarify",
-                 "nlg": "nlg_pass_through"}
+pattern.stages  [{"query": "time_aug_query"}, {"nlu": "install_unified"},
+                 {"clarify": "install_clarify"}, {"nlg": "nlg_pass_through"}]
+node.stages     每节点 {"clarify": "install_clarify"}（统一阶段 admit "clarify"
+                 的节点级开关；原模块级声明上提为逐节点声明）
 ```
 
 - `time_aug_query`（内置，零 LLM）：把「明天下午3点」改写为带绝对时间标注的
@@ -99,7 +99,7 @@ fallback 轨诚实告知稍后核实 + 拉回。电话节奏：每轮两句话�
 
 ### 插件注册（stages.py 底部，kind="stage"）
 
-`install_unified` / `install_recommend_nlg`（独立可挂载，预留 ROUTE 前门）/
+`install_unified` / `install_recommend_nlg`（独立可挂载的 stage 码）/
 `install_clarify`（工厂注册，占位 recaller）。
 
 ## 运行

@@ -18,7 +18,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `route.py` | 全部节点定义（14 个）+ FSMModule + Pattern 注册 + stages 装配声明 |
+| `route.py` | 全部节点定义（14 个）+ FSM Pattern 注册（pattern_type=fsm）+ stages 骨架装配声明 |
 | `stages.py` | 三个子类：重绑节点码/措辞的统一阶段、推荐 NLG、关键词 clarify + 插件注册 |
 | `faq.py` | 维修 FAQ 关键词表（费用/保修/维修时长/配件/自修咨询…，问题族替换为维修语境） |
 | `prompts.py` | `REPAIR_UNIFIED_PROMPT`：维修场景的外呼统一模板（无到货环节 + 故障采集 section） |
@@ -29,8 +29,8 @@
 ### Pattern 结构（code = `repair_booking_agent`）
 
 ```
-repair_booking_agent (Pattern, entry: repair_booking)
-└── repair_booking  维修预约外呼（FSMModule，14 节点单模块）
+repair_booking_agent (Pattern, pattern_type=fsm, entry: repair_greet)
+└── 14 节点单域 FSM（原单模块流程，plan-⑧ 节点/模块合并后直接挂 pattern）
 ```
 
 主流程：
@@ -55,10 +55,10 @@ repair_confirm_time 时间确认 ──改约──> repair_reschedule 改约重
 ### stages 装配
 
 ```
-pattern.stages  [{"query": "time_aug_query"}, {"nlu": None},
-                 {"clarify": None}, {"nlg": None}]
-module.stages   {"nlu": "repair_unified", "clarify": "repair_clarify",
-                 "nlg": "nlg_pass_through"}
+pattern.stages  [{"query": "time_aug_query"}, {"nlu": "repair_unified"},
+                 {"clarify": "repair_clarify"}, {"nlg": "nlg_pass_through"}]
+node.stages     每节点 {"clarify": "repair_clarify"}（统一阶段 admit "clarify"
+                 的节点级开关；原模块级声明上提为逐节点声明）
 ```
 
 与安装应用逐槽相同（query 时间增强 → 统一阶段 → 关键词 clarify → 直通 NLG）。

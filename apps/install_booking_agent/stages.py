@@ -27,11 +27,12 @@ zero-LLM slot arithmetic (slots.py):
 
 ``InstallRecommendNLG`` (code ``install_recommend_nlg``) is the deterministic
 zero-LLM NLG behind rule 2 — a plain class invoked by the unified stage (and
-registered as a stage code so it stays independently mountable, e.g. by a
-future ROUTE front door).
+registered as a stage code so it stays independently mountable, e.g. as a
+node-level nlg override elsewhere).
 """
 
 import logging
+from datetime import datetime
 from typing import Any, Dict
 
 from atoms.stages.clarify import ClarifyStage
@@ -245,7 +246,7 @@ class InstallBookingUnifiedNLU(FSMUnifiedNLU):
         ctx.nlu_result = nlu_result
 
     # ------------------------------------------------------------------
-    # Callback-time close — next-contact time triage, deterministic (零 LLM)
+    # Callback-time close — next-contact time triage, deterministic (zero LLM)
     # ------------------------------------------------------------------
     # The customer answered install_ask_callback with a next-CONTACT time.
     # Branches (aligned with the time_augment 2-week annotation window, and
@@ -273,7 +274,7 @@ class InstallBookingUnifiedNLU(FSMUnifiedNLU):
         if next_node != self.END_NODE:
             return  # not closing yet (e.g. clarify signal): untouched
 
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
         now = self._now_datetime(ctx)
         annotated = extract_requested_time(
@@ -427,7 +428,7 @@ INSTALL_CLARIFY_PROMPTS = {
 
 
 # ============================================================================
-# Custom clarify stage — keyword-only business detection (关键词卡控)
+# Custom clarify stage — keyword-only business detection (keyword gating)
 # ============================================================================
 
 class KeywordClarifyStage(ClarifyStage):
@@ -557,8 +558,8 @@ class KeywordClarifyStage(ClarifyStage):
 
 # ============================================================================
 # Plugin registration (kind="stage") — string codes referenced by the
-# module stages declaration in route.py; install_recommend_nlg stays
-# independently mountable (e.g. by a future ROUTE front door)
+# pattern stages skeleton / node.stages declarations in route.py;
+# install_recommend_nlg stays independently mountable
 # ============================================================================
 
 plugin_registry.register("stage", "install_unified", InstallBookingUnifiedNLU)

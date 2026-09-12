@@ -59,7 +59,7 @@ def _parse_msg_time(msg_time: str) -> Optional[float]:
     try:
         value = float(text)
         if value != value or value in (float("inf"), float("-inf")):
-            return None  # nan/inf：无法参与 staleness 判定，视为不可解析
+            return None  # nan/inf cannot participate in staleness checks: treat as unparseable
         return value / 1000.0 if value > 1e12 else value
     except ValueError:
         pass

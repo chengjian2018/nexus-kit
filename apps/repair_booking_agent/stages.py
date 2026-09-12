@@ -177,7 +177,7 @@ class RepairKeywordClarifyStage(KeywordClarifyStage):
 
 # ============================================================================
 # Plugin registration (kind="stage") — string codes referenced by the
-# module stages declaration in route.py
+# pattern stages skeleton / node.stages declarations in route.py
 # ============================================================================
 
 plugin_registry.register("stage", "repair_unified", RepairBookingUnifiedNLU)
