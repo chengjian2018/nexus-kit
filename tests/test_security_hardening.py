@@ -22,7 +22,7 @@ from nexus.engine.session import Session
 # ---------------------------------------------------------------------------
 
 def test_channel_id_with_colon_rejected():
-    """account_id 含 ':' 可伪造 session 前缀碰撞 —— 必须 422。"""
+    """An account_id containing ':' could forge session-prefix collisions — must be rejected with 422."""
     with pytest.raises(ValidationError):
         XianyuInboundMessage(account_id="a:1", message="x", chat_id="c")
 

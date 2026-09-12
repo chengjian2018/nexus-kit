@@ -1,11 +1,14 @@
 """Plugin registry tests — registration semantics, conflict policy,
-resolution caching, and the chat layer's executor dispatch."""
+resolution caching, and the chat layer's AGENT node-executor resolution
+(plan-⑧: ``chat._resolve_node_executor_code`` — node.plugins["loop"] >
+pattern.plugins["loop"] > default_loop)."""
 
 import pytest
 
 import atoms.executors  # noqa: F401 -- warm up default executor plugins
-from nexus.engine.chat import _resolve_executor_code
-from nexus.model.module import AgentModule, FSMModule, RouteModule
+from nexus.engine.chat import _resolve_node_executor_code
+from nexus.model.node import BaseNode
+from nexus.model.pattern import Pattern
 from nexus.registry.plugins import (
     DEFAULT_EXECUTOR_CODES,
     PluginRegistry,
@@ -114,58 +117,44 @@ def test_default_executors_registered():
         assert code in codes
 
 
-def test_default_executor_codes_cover_module_types():
+def test_default_executor_codes_cover_pattern_types():
+    # plan-⑧: the module types collapsed to pattern types — the route family
+    # is gone with the module layer
     assert DEFAULT_EXECUTOR_CODES == {
         "agent": "default_loop",
         "fsm": "default_fsm",
-        "route": "default_route",
     }
 
 
 # ---------------------------------------------------------------------------
-# Chat-layer executor resolution (fallback chain)
+# Chat-layer node-executor resolution (fallback chain)
 # ---------------------------------------------------------------------------
 
-class _ShimPattern:
-    """Pattern stand-in exposing only the executor declarations."""
-
-    def __init__(self, executor_loop=None, executor_fsm=None,
-                 executor_route=None):
-        self.executor_loop = executor_loop
-        self.executor_fsm = executor_fsm
-        self.executor_route = executor_route
+def _pattern(plugins=None, node_plugins=None) -> Pattern:
+    return Pattern(
+        code="p", name="t", description="d",
+        plugins=plugins,
+        nodes=[BaseNode(code="n", name="n", plugins=node_plugins)],
+    )
 
 
-class _ShimSession:
-    def __init__(self, pattern):
-        self.pattern = pattern
-
-
-def test_resolve_defaults_by_module_type():
-    session = _ShimSession(_ShimPattern())
-    assert _resolve_executor_code(session, AgentModule()) == "default_loop"
-    assert _resolve_executor_code(session, FSMModule()) == "default_fsm"
-    assert _resolve_executor_code(session, RouteModule()) == "default_route"
+def test_resolve_defaults_to_default_loop():
+    pattern = _pattern()
+    assert _resolve_node_executor_code(pattern, pattern.nodes[0]) == "default_loop"
 
 
 def test_resolve_pattern_level_overrides_default():
-    session = _ShimSession(_ShimPattern(executor_loop="custom_loop",
-                                        executor_fsm="custom_fsm",
-                                        executor_route="custom_route"))
-    assert _resolve_executor_code(session, AgentModule()) == "custom_loop"
-    assert _resolve_executor_code(session, FSMModule()) == "custom_fsm"
-    assert _resolve_executor_code(session, RouteModule()) == "custom_route"
+    pattern = _pattern(plugins={"loop": "custom_loop"})
+    assert _resolve_node_executor_code(pattern, pattern.nodes[0]) == "custom_loop"
 
 
-def test_resolve_module_level_overrides_pattern():
-    session = _ShimSession(_ShimPattern(executor_loop="pattern_loop"))
-    module = AgentModule(executor="module_loop")
-    assert _resolve_executor_code(session, module) == "module_loop"
+def test_resolve_node_level_overrides_pattern():
+    pattern = _pattern(plugins={"loop": "pattern_loop"},
+                       node_plugins={"loop": "node_loop"})
+    assert _resolve_node_executor_code(pattern, pattern.nodes[0]) == "node_loop"
 
 
-def test_resolve_unknown_module_type_raises():
-    session = _ShimSession(_ShimPattern())
-    weird = AgentModule()
-    weird.type = "quantum"  # bare string not in DEFAULT_EXECUTOR_CODES
-    with pytest.raises((AttributeError, KeyError, ValueError)):
-        _resolve_executor_code(session, weird)
+def test_default_executor_code_rejects_module_era_type():
+    """Module-era types (route) have no default executor any more."""
+    with pytest.raises(ValueError):
+        registry.default_executor_code("route")

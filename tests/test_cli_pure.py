@@ -75,11 +75,10 @@ class TestRenderVerboseSummary:
         out = cli.render_verbose_summary(before, after)
         assert "n1" in out and "n2" in out and "→" in out
 
-    def test_module_and_node_transition_shows_both(self):
-        before = self._snap(node="n1", module="m1")
-        after = self._snap(node="n2", module="m2")
+    def test_node_transition_renders_both_ends(self):
+        before, after = self._snap(node="n1"), self._snap(node="n2")
         out = cli.render_verbose_summary(before, after)
-        assert "m1" in out and "m2" in out and "n1" in out and "n2" in out
+        assert "n1" in out and "n2" in out
 
     def test_intent_rendered(self):
         after = self._snap(intent="buy_car")
@@ -320,7 +319,7 @@ class TestBuildSessionTaskInfo:
 
 class TestKeepConfigMenu:
     def test_provider_menu_includes_keep_config(self):
-        """The provider menu carries the fixed "维持 config 配置" entry, listed first."""
+        """The provider menu carries the fixed "keep config settings" entry, listed first."""
         entries = cli._provider_menu_entries()
         assert entries[0]["value"] == cli.KEEP_CONFIG
         assert "维持" in entries[0]["label"]
@@ -330,11 +329,11 @@ class TestKeepConfigMenu:
             assert cli.resolve_llm_choice("", "") == {"code": "", "model": ""}
 
     def test_pick_keep_config_in_model_menu_keeps_code(self):
-        """Selecting "维持 config 配置" in the model menu: keep the chosen code, leave model empty (fall back to the global default)."""
+        """Selecting "keep config settings" in the model menu: keep the chosen code, leave model empty (fall back to the global default)."""
         from fake_provider import FAKE_PROVIDER_CODE, register_fake_provider
 
         register_fake_provider()
-        # the fake provider declares no models list -> the input() manual-entry branch runs; the "维持 config 配置" option is typed in
+        # the fake provider declares no models list -> the input() manual-entry branch runs; the "keep config settings" option is typed in
         with unittest.mock.patch("builtins.input", return_value=cli.KEEP_CONFIG):
             result = cli.resolve_llm_choice(FAKE_PROVIDER_CODE, "")
         assert result == {"code": FAKE_PROVIDER_CODE, "model": ""}
@@ -381,16 +380,12 @@ pattern_llm:
 
 
 def _minimal_pattern(code):
-    from nexus.model.module import FSMModule
     from nexus.model.node import BaseNode
     from nexus.model.pattern import Pattern
 
-    n1 = BaseNode(node_code="f1", node_name="节点一")
-    m = FSMModule(module_code="m1", module_name="m1", module_description="d",
-                  module_todo_description="t", sub_modules=[],
-                  module_nodes=[n1])
     return Pattern(code=code, name="t", description="t",
-                   entry_module_code="m1", modules=[m])
+                   pattern_type="fsm",
+                   nodes=[BaseNode(code="f1", name="节点一")])
 
 
 def _run_chat_turn(tmp_path, session):
@@ -446,7 +441,6 @@ class TestEmptyOverrideNotPinned:
         pattern = _minimal_pattern("p_cli_test")
         session = Session(session_id="t-cross", pattern_code="p_cli_test")
         session.pattern = pattern
-        session.cxt.module_map = pattern.module_map
         session.cxt.node_map = pattern.node_map
         # Simulate the _do_llm write semantics: only explicitly chosen fields are written
         session.cxt.metadata["llm_override"] = {"code": "deepseek",

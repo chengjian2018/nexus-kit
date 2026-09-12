@@ -1,12 +1,17 @@
-"""xianyu_agent (ROUTE mode) offline tests -- replicating xianyu-auto-reply agent dialogue management.
+"""xianyu_agent（plan-⑧ AGENT 图形态）离线测试——复刻闲鱼自动回复的多轮
+对话管理。
 
-LLM output is simulated via the scripted FakeProvider (no real API access). Covers:
-1. Pattern structure and AST auto-discovery registration
-2. Local intent detection keyword tables (price/tech/default, replicating detect_intent)
-3. Intent routing: bargain/tech/default -> corresponding menu nodes, back to root at turn end
-4. Bargain round count control: from the max_bargain_rounds-th haggle on, fixed refusal script and zero LLM
-5. Bargain param injection: bargain_count/max_* enter filled_slots via slots for NLG
-6. Custom bargain settings: metadata.bargain_settings overrides the defaults
+LLM 输出由脚本化 FakeProvider 模拟（无真实 API）。图结构：路由根节点
+（xianyu_router 执行器：本地意图规则 + LLM 兜底 + 议价计数）条件边分发到
+四个菜单节点；议价拒绝节点挂规则执行器（answer_examples 直出，零 LLM），
+其余菜单节点挂生成执行器。每条买家消息从入口重跑全图（原"轮末回根"天然
+成立）。覆盖：
+1. 图结构与 AST 自动发现注册（节点邻接、执行器接线、prompt 资产在 config）
+2. 本地意图关键词表（price/tech/default，复刻 detect_intent）
+3. 意图路由：三轮独立检测、命中对应菜单节点
+4. 议价轮次控制：第 max_bargain_rounds 刀起固定拒绝话术 + 零 LLM
+5. 议价参数注入：bargain_count/max_* 经 slots 进 filled_slots 供 NLG
+6. 自定义议价配置：metadata.bargain_settings 覆盖默认
 """
 
 import logging
@@ -41,7 +46,7 @@ def pattern():
 
     imported = discover_builtin_patterns()
     assert "apps.xianyu_agent.route" in imported, (
-        f"xianyu_agent_route 未被自动发现，已发现: {imported}"
+        f"xianyu_agent 未被自动发现，已发现: {imported}"
     )
     return registry.get("xianyu_agent")
 
@@ -59,7 +64,6 @@ def launch(pattern, sessions, session_id="s1", bargain_settings=None):
     session = Session(session_id=session_id, pattern_code=pattern.code)
     session.pattern = pattern
     session.task_info = {}
-    session.cxt.module_map = pattern.module_map
     session.cxt.node_map = pattern.node_map
     session.cxt.metadata["task_info"] = {
         "channel": "xianyu", "account_id": "acc1", "item_id": "item1",
@@ -76,7 +80,35 @@ def chat(sessions, session_id, query):
     from async_utils import arun
     from nexus.engine.chat import chat as chat_fn
 
-    return arun(chat_fn(query=query, session_id=session_id, all_sessions=sessions))
+    return arun(chat_fn(query=query, session_id=session_id,
+                        all_sessions=sessions))
+
+
+class _PromptSpy:
+    """Install a plain-function hook on FakeProvider to capture every prompt
+    it receives (a plain function rebinds to the calling instance, so the
+    class-level call_count machinery keeps working)."""
+
+    def __init__(self):
+        self.prompts = []
+        self.original = FakeProvider._achat_completion_impl
+        spy = self
+
+        async def _impl(provider, messages, model, temperature, max_tokens,
+                        stream=False, **kwargs):
+            spy.prompts.append(messages[0]["content"])
+            type(provider).call_count += 1
+            from fake_provider import scripted_response
+            return {"content": scripted_response(messages[0]["content"])}
+
+        self._impl = _impl
+
+    def __enter__(self):
+        FakeProvider._achat_completion_impl = self._impl
+        return self
+
+    def __exit__(self, *exc):
+        FakeProvider._achat_completion_impl = self.original
 
 
 # ============================================================================
@@ -84,62 +116,43 @@ def chat(sessions, session_id, query):
 # ============================================================================
 
 def test_pattern_auto_discovered_and_structure(pattern):
-    """Pattern is AST-auto-discoverable; module/node structure and ROUTE semantics are correct."""
-    from nexus.model.module import ModuleType
-
+    """Pattern is AST-auto-discoverable; two-layer graph structure is correct."""
     assert pattern.code == "xianyu_agent"
-    assert pattern.entry_module_code == "xianyu_root"
-    assert set(pattern.module_map) == {"xianyu_root"}
+    assert pattern.pattern_type == "agent"
+    assert pattern.entry_node_code == "xy_route_root"
 
-    root = pattern.module_map["xianyu_root"]
-    assert root.type == ModuleType.ROUTE
-
-    # Route module node order: root must be module_nodes[0] (first node)
-    assert [n.node_code for n in root.module_nodes] == [
+    assert [n.code for n in pattern.nodes] == [
         "xy_route_root", "xy_menu_price", "xy_menu_price_refuse",
         "xy_menu_tech", "xy_menu_default",
     ]
+    # 条件边邻接：根节点路由到四个菜单节点；菜单节点无后继（图自然终止）
+    root = pattern.node_map["xy_route_root"]
+    assert set(root.sub_nodes) == {"xy_menu_price", "xy_menu_price_refuse",
+                                   "xy_menu_tech", "xy_menu_default"}
+    for code in ("xy_menu_price", "xy_menu_price_refuse",
+                 "xy_menu_tech", "xy_menu_default"):
+        assert pattern.node_map[code].sub_nodes == []
 
-    # All intent menu nodes have no jump_module: stay in the route module, return to root every turn
-    for node in root.module_nodes[1:]:
-        assert not getattr(node, "jump_module", None)
+    # 执行器接线：根 = 路由执行器；拒绝节点 = 规则执行器；其余 = 生成执行器
+    assert root.plugins["loop"] == "xianyu_router"
+    assert pattern.node_map["xy_menu_price_refuse"].plugins["loop"] == \
+        "xianyu_rule_reply"
+    for code in ("xy_menu_price", "xy_menu_tech", "xy_menu_default"):
+        assert pattern.node_map[code].plugins["loop"] == "xianyu_reply"
 
-    # Intent menu nodes carry intent-level NLG templates (except the refusal node: fixed script)
-    assert pattern.node_map["xy_menu_price"].base_nlg_prompt
-    assert pattern.node_map["xy_menu_tech"].base_nlg_prompt
-    assert pattern.node_map["xy_menu_default"].base_nlg_prompt
-
-
-def test_generate_wired_at_module_level(pattern):
-    """XianyuIntentNLU / FixedNLG are wired into the module-level generate dict (nlu/nlg slots)."""
-    from apps.xianyu_agent.route import FixedNLG, XianyuIntentNLU
-
-    root = pattern.module_map["xianyu_root"]
-    stages = root.stages
-    assert isinstance(stages, dict)
-    assert stages["nlu"] == "xianyu_intent_nlu"
-    assert stages["nlg"] == "xianyu_fixed_nlg"
-    # 声明的 code 可解析到实现类（插件中心 kind="stage"）
+    # 执行器 code 经插件中心可解析
     from nexus.registry.plugins import registry as plugin_registry
-    import atoms.stages  # noqa: F401
-    import apps.xianyu_agent.route  # noqa: F401 -- registers app-local codes
-    assert isinstance(plugin_registry.resolve("stage", "xianyu_intent_nlu"),
-                      XianyuIntentNLU)
-    assert isinstance(plugin_registry.resolve("stage", "xianyu_fixed_nlg"),
-                      FixedNLG)
+    for code in ("xianyu_router", "xianyu_reply", "xianyu_rule_reply"):
+        assert plugin_registry.has("executor", code), code
 
+    # 意图级 NLG 模板在节点 config（拒绝节点以 answer_examples 承载话术）
+    assert pattern.node_map["xy_menu_price"].get_prompt("base_nlg_prompt")
+    assert pattern.node_map["xy_menu_tech"].get_prompt("base_nlg_prompt")
+    assert pattern.node_map["xy_menu_default"].get_prompt("base_nlg_prompt")
+    assert pattern.node_map["xy_menu_price_refuse"].answer_examples == [REFUSE_TEXT]
 
-def test_query_slot_wired_with_time_aug(pattern):
-    """The pattern-level query slot is wired with TimeAugQueryRewriter (time-augmented rewrite)."""
-    from atoms.stages.query import TimeAugQueryRewriter
-
-    # plan-②: the query slot is declared in the skeleton by string code
-    skeleton_values = {slot: code for e in pattern.stages
-                       for slot, code in e.items()}
-    assert skeleton_values.get("query") == "time_aug_query"
-    from nexus.registry.plugins import registry as plugin_registry
-    assert isinstance(plugin_registry.resolve("stage", "time_aug_query"),
-                      TimeAugQueryRewriter)
+    # AGENT 图不跑 stages（无骨架）
+    assert pattern.stages == []
 
 
 # ============================================================================
@@ -171,13 +184,15 @@ def test_detect_intent_keywords(query, intent):
 # ============================================================================
 
 def test_intent_routing_each_turn(pattern, sessions):
-    """All three intents route to their menu nodes; back to root at turn end (independent detection each turn)."""
+    """All three intents route to their menu nodes; each turn re-routes from
+    the entry (independent detection — the full-graph rerun semantic)."""
     session = launch(pattern, sessions)
 
-    chat(sessions, "s1", "能便宜点吗")
+    reply = chat(sessions, "s1", "能便宜点吗")
     assert session.cxt.nlu_result["next_node"] == "xy_menu_price"
     assert session.cxt.nlu_result["intent"] == "price"
-    assert session.cxt.current_node_code == "xy_route_root"
+    assert session.cxt.current_node_code == "xy_menu_price"  # 图位置镜像=命中的菜单节点
+    assert reply  # 生成执行器产出回复
 
     chat(sessions, "s1", "这个怎么用")
     assert session.cxt.nlu_result["next_node"] == "xy_menu_tech"
@@ -218,7 +233,7 @@ def test_bargain_refuse_at_threshold_zero_llm(pattern, sessions):
             assert session.cxt.nlu_result["next_node"] == "xy_menu_price"
             assert llm_calls[-1] == 1
         else:
-            # Turns 3/4: count >= max (3) -> fixed refusal, zero LLM
+            # Turns 3/4: count >= max (3) -> rule executor, zero LLM
             assert session.cxt.nlu_result["next_node"] == "xy_menu_price_refuse"
             assert reply == REFUSE_TEXT
             assert llm_calls[-1] == 0
@@ -274,24 +289,13 @@ def test_non_price_intent_no_bargain_params(pattern, sessions):
 # ============================================================================
 
 def test_price_prompt_contains_bargain_context(pattern, sessions):
-    """The bargain NLG prompt contains four elements: product info / history / bargain settings / buyer message."""
+    """The bargain reply prompt contains four elements: product info / history / bargain settings / buyer message."""
     session = launch(pattern, sessions)
 
-    captured = {}
-    from atoms.stages.nlg import BaseNLG
-    original = BaseNLG._call_llm
-
-    def spy(self, prompt, llm_config=None):
-        captured["prompt"] = prompt
-        return original(self, prompt, llm_config)
-
-    BaseNLG._call_llm = spy
-    try:
+    with _PromptSpy() as spy:
         chat(sessions, "s1", "能便宜点吗")
-    finally:
-        BaseNLG._call_llm = original
 
-    prompt = captured["prompt"]
+    prompt = spy.prompts[-1]  # 最后一次调用是生成执行器的买家回复
     assert "议价" in prompt
     assert "商品信息" in prompt
     assert "item_id: item1" in prompt          # task_info product info injected
@@ -305,59 +309,33 @@ def test_intent_specific_prompt_selected(pattern, sessions):
     """Tech intent uses the tech template (with the "tech expert" persona); default intent uses the default template."""
     session = launch(pattern, sessions)
 
-    from atoms.stages.nlg import BaseNLG
-    original = BaseNLG._call_llm
-    captured = []
+    with _PromptSpy() as spy:
+        chat(sessions, "s1", "这个怎么用")   # tech（本地命中，1 次生成调用）
+        chat(sessions, "s1", "今天发货吗")   # default（本地未命中 → LLM 分类兜底 + 生成）
 
-    def spy(self, prompt, llm_config=None):
-        captured.append(prompt)
-        return original(self, prompt, llm_config)
-
-    BaseNLG._call_llm = spy
-    try:
-        chat(sessions, "s1", "这个怎么用")   # tech
-        chat(sessions, "s1", "今天发货吗")   # default
-    finally:
-        BaseNLG._call_llm = original
-
-    assert "技术专家" in captured[0]
-    assert "电商卖家" in captured[1]
+    assert "技术专家" in spy.prompts[0]
+    assert "电商卖家" in spy.prompts[-1]  # 末次调用是 default 模板生成
+    # 中间那次是意图分类兜底提示词
+    assert any("通用意图分类器" in p for p in spy.prompts)
 
 
 # ============================================================================
-# Time augmentation rewrite end-to-end tests (query slot -> NLU/NLG consume the augmented message)
+# Time augmentation end-to-end (router inline rewrite → prompts consume it)
 # ============================================================================
 
 def test_time_augmented_query_flows_into_prompt(pattern, sessions):
-    """A buyer message carrying relative time is augmented by TimeAugQueryRewriter and lands in the NLG prompt.
-
-    Injects a fixed time_base (2026-09-03 10:00:00, Thursday); the query asking to
-    ship before "3pm tomorrow" gets an augmented annotation with the resolved absolute
-    time (jionlp range parsing, including the next day 2026-09-04).
-    The default intent goes through the LLM fallback: FakeProvider returns non-label
-    text, falls back to the default menu -> FixedNLG, a single LLM call.
-    """
+    """A buyer message carrying relative time is augmented by the router's
+    inline TimeAugQueryRewriter and lands in the reply prompt."""
     import time as _time
 
     session = launch(pattern, sessions)
     session.cxt.metadata["time_base"] = _time.mktime(
         _time.strptime("2026-09-03 10:00:00", "%Y-%m-%d %H:%M:%S"))
 
-    from atoms.stages.nlg import BaseNLG
-    original = BaseNLG._call_llm
-    captured = {}
-
-    def spy(self, prompt, llm_config=None):
-        captured["prompt"] = prompt
-        return original(self, prompt, llm_config)
-
-    BaseNLG._call_llm = spy
-    try:
+    with _PromptSpy() as spy:
         chat(sessions, "s1", "明天下午3点前能发货吗")
-    finally:
-        BaseNLG._call_llm = original
 
-    # The rewrite lands in ctx and the NLG prompt (the augmented annotation contains the resolved absolute time)
+    # The rewrite lands in ctx and the reply prompt (resolved absolute time)
     assert session.cxt.rewritten_queries[0] != "明天下午3点前能发货吗"
     assert "2026-09-04" in session.cxt.rewritten_queries[0]
-    assert session.cxt.rewritten_queries[0] in captured["prompt"]
+    assert session.cxt.rewritten_queries[0] in spy.prompts[-1]

@@ -225,7 +225,7 @@ def test_restart_recovery_restores_and_continues(client, store, registry_guard):
     assert restored >= 1
     session = main.governor.sessions["rs-1"]
     assert session.pattern is not None  # pattern re-resolved from the registry
-    assert session.cxt.node_map and session.cxt.module_map  # pipeline maps re-injected
+    assert session.cxt.node_map  # node_map re-injected
     assert len(session.cxt.history) >= 2  # history restored from the DB
     assert "rs-1" in main.governor.last_active  # last-active time converted and registered
 

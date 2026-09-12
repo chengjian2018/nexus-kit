@@ -53,8 +53,8 @@ def test_create_session_roundtrip(tmp_path):
     db = str(tmp_path / "t.db")
     store = arun(SessionStore.create(db))
     session = make_session()
-    session.cxt.current_module_code = "xianyu_root"
     session.cxt.current_node_code = "route_root"
+    session.cxt.graph_state = {"__paused_node__": "n1", "custom": "v"}
     session.cxt.filled_slots = {"brand": "特斯拉"}
     arun(store.create_session(session))
     arun(store.close())
@@ -64,8 +64,9 @@ def test_create_session_roundtrip(tmp_path):
     assert row["pattern_code"] == "xianyu_agent"
     assert row["request_id"] == "req-s1"
     assert json.loads(row["task_info"]) == {"caller": "pytest"}
-    assert row["current_module_code"] == "xianyu_root"
+    assert "current_module_code" not in row.keys()  # plan-⑧: 模块列已删
     assert row["current_node_code"] == "route_root"
+    assert json.loads(row["graph_state"]) == {"__paused_node__": "n1", "custom": "v"}
     assert json.loads(row["filled_slots"]) == {"brand": "特斯拉"}
     assert row["created_at"] > 0 and row["last_active_at"] > 0
 
@@ -220,8 +221,8 @@ def test_load_active_sessions_restores_fields(tmp_path):
     db = str(tmp_path / "t.db")
     store = arun(SessionStore.create(db))
     session = make_session("alive")
-    session.cxt.current_module_code = "xianyu_root"
     session.cxt.current_node_code = "menu_sales"
+    session.cxt.graph_state = {"__paused_node__": "menu_sales"}
     session.cxt.filled_slots = {"brand": "特斯拉"}
     arun(store.create_session(session))
     store.attach(session)
@@ -239,8 +240,8 @@ def test_load_active_sessions_restores_fields(tmp_path):
     assert r.pattern is None
     assert r.task_info == {"caller": "pytest"}
     assert r.cxt.metadata["request_id"] == "req-alive"
-    assert r.cxt.current_module_code == "xianyu_root"
     assert r.cxt.current_node_code == "menu_sales"
+    assert r.cxt.graph_state == {"__paused_node__": "menu_sales"}  # 挂起图重启可续
     assert r.cxt.filled_slots == {"brand": "特斯拉"}
     assert [(m.role, m.content) for m in r.cxt.history] == [
         ("user", "你好"),
@@ -382,10 +383,17 @@ def test_migrate_adds_tool_columns_to_legacy_db(tmp_path):
             " VALUES ('s1', 'user', '旧数据', 'chat', '{}', 1.0)")
     conn.close()
 
-    store = arun(SessionStore.create(db))  # usable on open (the payload scheme needs no migration)
+    store = arun(SessionStore.create(db))  # 打开即迁移：drop 模块列 + 增加 graph_state
     msgs = arun(store.get_messages("s1"))
     assert msgs is not None and msgs[0]["content"] == "旧数据"
     arun(store.close())
+
+    probe = sqlite3.connect(db)
+    cols = {r[1] for r in probe.execute("PRAGMA table_info(sessions)").fetchall()}
+    probe.close()
+    assert "current_module_code" not in cols
+    assert "graph_state" in cols
+    assert "current_node_code" in cols
 
 
 def test_messages_table_has_no_tool_columns(tmp_path):
@@ -498,8 +506,9 @@ def test_replace_history_mismatch_leaves_db_untouched(tmp_path):
 
 
 def test_replace_history_midway_failure_rolls_back_delete(tmp_path, monkeypatch):
-    """审查 M-2：delete+insert 中途失败必须整体回滚——悬挂的未提交 DELETE
-    若留给下一个 commit（如 append_message 的），旧消息会被静默删除。"""
+    """Audit M-2: a midway failure of delete+insert must roll back as a
+    whole — a dangling uncommitted DELETE left for the next commit (e.g.
+    append_message's) would silently delete the old messages."""
     import pytest
     from nexus.context import SessionMessage
     store = arun(SessionStore.create(str(tmp_path / "t.db")))
@@ -522,11 +531,11 @@ def test_replace_history_midway_failure_rolls_back_delete(tmp_path, monkeypatch)
         arun(store.replace_history(session, "摘要", keep_idx=2))
     monkeypatch.undo()
 
-    # DELETE 已回滚：4 条旧消息仍在
+    # DELETE rolled back: the 4 old messages are still there
     history = arun(store.get_history("s1"))
     assert [m.content for m in history] == ["旧问题", "旧回答", "新问题", "新回答"]
 
-    # 回归关键点：下一次写路径的 commit 不得把悬挂 DELETE 一并提交
+    # regression key point: the next write path's commit must not commit the dangling DELETE too
     arun(store.append_message(session, SessionMessage(
         role="user", content="又一条", stage="chat")))
     history = arun(store.get_history("s1"))

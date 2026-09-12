@@ -200,7 +200,7 @@ def test_compress_empty_summary_aborts(tmp_path):
 
 def test_after_compress_query_appears_once(tmp_path):
     from nexus.engine.messages import default_build_messages
-    from nexus.model.module import AgentModule
+    from nexus.model.node import BaseNode
 
     store = arun(SessionStore.create(str(tmp_path / "t.db")))
     session = _mk_session_with_history(store)
@@ -213,7 +213,7 @@ def test_after_compress_query_appears_once(tmp_path):
                                    {"code": "f", "model": "m"}, retain_count=4))
     assert ok is True
 
-    messages = default_build_messages(AgentModule(module_code="m"), session.cxt)
+    messages = default_build_messages(BaseNode(code="m"), session.cxt)
     user_contents = [m["content"] for m in messages if m["role"] == "user"]
     assert user_contents.count("新问题") == 1
     assert any("untrusted_会话摘要" in c for c in user_contents)

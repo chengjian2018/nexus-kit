@@ -1,11 +1,15 @@
-"""Pattern dict/yaml round-trip tests — serialize → load → serialize is
-stable, and a loaded pattern behaves identically to its python-declared
-twin (module_map/node_map/stages/declarations all equal)."""
+"""Pattern YAML round-trip tests (plan-⑧ two-layer shape).
 
-import pytest
+- dict/yaml serialize → load → re-serialize stable
+- loaded structure equivalent to the python declaration (pattern_type /
+  nodes / stages / plugins / allow_toolset / config)
+- from_dict goes through the full construction path (compile fail-fast on
+  dangling sub_nodes edges)
+- non-mapping yaml raises
+- empty stages normalize to the default skeleton (FSM only)
+"""
 
-import atoms.executors  # noqa: F401 -- warm executor codes
-import atoms.stages  # noqa: F401 -- warm stage codes
+from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from nexus.model.serialization import (
     pattern_from_dict,
@@ -13,142 +17,107 @@ from nexus.model.serialization import (
     pattern_to_dict,
     pattern_to_yaml,
 )
+from nexus.pipeline import DEFAULT_SKELETON_SLOTS
 
 
-def _sample_pattern():
-    from nexus.model.module import AgentModule, FSMModule, RouteModule
-    from nexus.model.node import BaseNode
-
+def _fsm_pattern() -> Pattern:
     return Pattern(
-        code="demo",
-        name="演示",
-        description="round-trip 样例",
-        entry_module_code="root",
-        stages=[
-            {"pre_recall": None},
-            {"query": "time_aug_query"},
-            {"post_recall": None},
-            {"nlu": None},
-            {"clarify": None},
-            {"nlg": None},
+        code="yaml_fsm",
+        name="预约安装",
+        description="外呼预约安装 FSM",
+        pattern_type="fsm",
+        nodes=[
+            BaseNode(code="n_open", name="外呼开场", description="开场确认",
+                     task_description="确认是否需要安装",
+                     sub_nodes=["n_end"], slots={"addr": "安装地址"},
+                     answer_examples=["您好，请问是..."]),
+            BaseNode(code="n_end", name="通话结束语", is_end=True),
         ],
-        modules=[
-            RouteModule(
-                module_code="root", module_name="路由",
-                module_description="顶层路由", module_todo_description="分发",
-                module_nodes=[
-                    BaseNode(node_code="r_root", node_name="根",
-                             sub_nodes=["r_menu"]),
-                    BaseNode(node_code="r_menu", node_name="菜单",
-                             jump_module="flow"),
-                ],
-                stages={"nlu": "route_unified", "nlg": "nlg_pass_through"},
-                sub_modules=[{"target": "flow", "lend_knowledge": True,
-                              "lend_tools": []}],
-            ),
-            FSMModule(
-                module_code="flow", module_name="流程",
-                module_description="流程模块",
-                module_nodes=[
-                    BaseNode(node_code="f1", node_name="第一步",
-                             sub_nodes=["f2"], node_slots={"a": "槽A"}),
-                    BaseNode(node_code="f2", node_name="第二步",
-                             is_end=True),
-                ],
-                stages={"clarify": "clarify_default"},
-            ),
-            AgentModule(
-                module_code="helper", module_name="助手",
-                messages_builder="customer_agent_messages_builder",
-                use_tools=["search_product_knowledge"],
-            ),
-        ],
-        executor_loop="default_loop",
-        plugins={"messages_builder": "default"},
-        max_hops=3,
+        stages=[{"nlu": None}, {"nlg": None}],
     )
 
 
-def test_round_trip_dict_stable():
-    pattern = _sample_pattern()
-    d1 = pattern_to_dict(pattern)
-    loaded = pattern_from_dict(d1)
-    d2 = pattern_to_dict(loaded)
-    assert d1 == d2
-
-
-def test_round_trip_yaml_stable():
-    pattern = _sample_pattern()
-    y1 = pattern_to_yaml(pattern)
-    loaded = pattern_from_yaml(y1)
-    y2 = pattern_to_yaml(loaded)
-    assert y1 == y2
-
-
-def test_loaded_pattern_structure_equivalent():
-    pattern = _sample_pattern()
-    loaded = pattern_from_dict(pattern_to_dict(pattern))
-
-    assert loaded.code == pattern.code
-    assert loaded.entry_module_code == pattern.entry_module_code
-    assert loaded.stages == pattern.stages
-    assert loaded.max_hops == pattern.max_hops
-    assert loaded.executor_loop == pattern.executor_loop
-    # unified plugins dict survives（legacy executor_loop 折入 dict）
-    assert loaded.plugins == pattern.plugins
-    assert loaded.plugins == {"loop": "default_loop",
-                              "messages_builder": "default"}
-    # module-level plugins ride inside the same dict
-    assert loaded.module_map["helper"].plugins == {
-        "messages_builder": "customer_agent_messages_builder"}
-    assert set(loaded.module_map) == set(pattern.module_map)
-    assert set(loaded.node_map) == set(pattern.node_map)
-    # module types survive
-    from nexus.model.module import ModuleType
-    assert loaded.module_map["root"].type == ModuleType.ROUTE
-    assert loaded.module_map["flow"].type == ModuleType.FSM
-    assert loaded.module_map["helper"].type == ModuleType.AGENT
-    # stages declarations survive
-    assert loaded.module_map["root"].stages == {
-        "nlu": "route_unified", "nlg": "nlg_pass_through"}
-    # jump_module survives (rides node kwargs)
-    assert loaded.node_map["r_menu"].jump_module == "flow"
-    # dict links survive
-    assert loaded.module_map["root"].sub_modules == [
-        {"target": "flow", "lend_knowledge": True, "lend_tools": []}]
-
-
-def test_from_dict_graph_checks_still_run():
-    """from_dict goes through the constructor: dangling edges still fail fast."""
-    from nexus.model.module import AgentModule
-
-    data = {
-        "code": "bad", "name": "t", "description": "t",
-        "entry_module_code": "a",
-        "modules": [
-            {"type": "agent", "module_code": "a",
-             "sub_modules": [{"target": "missing"}]},
+def _agent_pattern() -> Pattern:
+    return Pattern(
+        code="yaml_agent",
+        name="图应用",
+        description="agent 图",
+        pattern_type="agent",
+        nodes=[
+            BaseNode(code="root", name="根", sub_nodes=["leaf"],
+                     use_tools=["t1"]),
+            BaseNode(code="leaf", name="叶"),
         ],
-        "stages": [],
-    }
-    with pytest.raises(ValueError, match="悬空转移边"):
+        allow_toolset=["knowledge"],
+        plugins={"loop": "default_loop"},
+        max_steps=5,
+    )
+
+
+def test_yaml_roundtrip_stable():
+    for pattern in (_fsm_pattern(), _agent_pattern()):
+        text1 = pattern_to_yaml(pattern)
+        loaded = pattern_from_yaml(text1)
+        text2 = pattern_to_yaml(loaded)
+        assert text1 == text2
+
+
+def test_dict_roundtrip_structure():
+    p = _agent_pattern()
+    loaded = pattern_from_dict(pattern_to_dict(p))
+    assert loaded.pattern_type == "agent"
+    assert [n.code for n in loaded.nodes] == ["root", "leaf"]
+    assert loaded.node_map["root"].sub_nodes == ["leaf"]
+    assert loaded.node_map["root"].use_tools == ["t1"]
+    assert loaded.allow_toolset == ["knowledge"]
+    assert loaded.plugins == {"loop": "default_loop"}
+    assert loaded.max_steps == 5
+    assert loaded.entry_node_code == "root"
+
+
+def test_fsm_node_fields_roundtrip():
+    loaded = pattern_from_dict(pattern_to_dict(_fsm_pattern()))
+    node = loaded.node_map["n_open"]
+    assert node.slots == {"addr": "安装地址"}
+    assert node.answer_examples == ["您好，请问是..."]
+    assert node.task_description == "确认是否需要安装"
+    assert loaded.node_map["n_end"].is_end is True
+    assert [slot for entry in loaded.stages for slot in entry] == ["nlu", "nlg"]
+
+
+def test_node_config_rides_along():
+    p = Pattern(code="cfg_p", name="n", description="d",
+                nodes=[BaseNode(code="only", base_prompt="你是客服")])
+    loaded = pattern_from_dict(pattern_to_dict(p))
+    assert loaded.node_map["only"].config["base_prompt"] == "你是客服"
+
+
+def test_from_dict_keeps_compile_failfast():
+    data = pattern_to_dict(_agent_pattern())
+    data["nodes"][0]["sub_nodes"] = ["ghost"]
+    try:
         pattern_from_dict(data)
+        raise AssertionError("悬空边应当在构造期 raise")
+    except ValueError as e:
+        assert "悬空边" in str(e)
 
 
-def test_from_yaml_non_mapping_raises():
-    with pytest.raises(ValueError, match="pattern 映射"):
-        pattern_from_yaml("- just\n- a\n- list\n")
+def test_non_mapping_yaml_raises():
+    try:
+        pattern_from_yaml("- a\n- b\n")
+        raise AssertionError("非映射 yaml 应当 raise")
+    except ValueError:
+        pass
 
 
-def test_none_skeleton_round_trips_to_default():
-    from nexus.model.module import AgentModule
+def test_empty_stages_default_skeleton():
+    p = pattern_from_dict({"code": "sk", "name": "sk", "description": "d",
+                           "pattern_type": "fsm",
+                           "nodes": [{"code": "a"}]})
+    assert [slot for entry in p.stages for slot in entry] == \
+        DEFAULT_SKELETON_SLOTS
 
-    data = {
-        "code": "s", "name": "t", "description": "t",
-        "entry_module_code": "a",
-        "modules": [{"type": "agent", "module_code": "a"}],
-    }
-    loaded = pattern_from_dict(data)
-    # empty stages → constructor normalizes to the default skeleton
-    from nexus.pipeline import default_skeleton
-    assert loaded.stages == default_skeleton()
+
+def test_agent_pattern_serializes_without_stages():
+    data = pattern_to_dict(_agent_pattern())
+    assert "stages" not in data  # AGENT 无骨架，不出现在序列化形态

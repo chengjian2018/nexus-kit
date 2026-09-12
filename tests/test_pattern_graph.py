@@ -1,82 +1,112 @@
-"""Tests for pattern module-topology registration and registration-time fail fast."""
+"""Tests for Pattern construction-time compilation (plan-⑧):
+node codes / sub_nodes edges / entry resolution / pattern_type dispatch
+semantics / config single-source folding / slots & stages FSM-only."""
 
 import pytest
 
-from nexus.model.module import AgentModule, FSMModule
 from nexus.model.node import BaseNode
-from nexus.model.pattern import Pattern
+from nexus.model.pattern import DEFAULT_MAX_STEPS, Pattern
 
 
-def _mk_pattern(modules, **kw):
-    return Pattern(
-        code="p_test", name="t", description="t",
-        entry_module_code=modules[0].module_code, modules=modules, **kw,
-    )
+def test_duplicate_node_code_raises():
+    with pytest.raises(ValueError, match="重复"):
+        Pattern(code="p", name="n", description="d",
+                nodes=[BaseNode(code="a"), BaseNode(code="a")])
 
 
-def test_module_map_and_node_map_registered():
-    a = AgentModule(module_code="a", sub_modules=["b", {"target": "c"}])
-    b = AgentModule(module_code="b")
-    c = FSMModule(module_code="c")
-    p = _mk_pattern([a, b, c])
-    assert set(p.module_map) == {"a", "b", "c"}
-    # Adjacency declared via links produces no runtime graph (jump detection
-    # only checks module_map membership); it is validated at registration only
-    assert not hasattr(p, "dispatch_graph")
+def test_dangling_sub_nodes_edge_raises():
+    with pytest.raises(ValueError, match="悬空边"):
+        Pattern(code="p", name="n", description="d",
+                nodes=[BaseNode(code="a", sub_nodes=["ghost"])])
 
 
-def test_dangling_link_raises():
-    a = AgentModule(module_code="a", sub_modules=["ghost"])
-    b = AgentModule(module_code="b")
-    with pytest.raises(ValueError, match="悬空"):
-        _mk_pattern([a, b])
+def test_entry_node_code_validated():
+    with pytest.raises(ValueError, match="entry_node_code"):
+        Pattern(code="p", name="n", description="d",
+                nodes=[BaseNode(code="a")], entry_node_code="ghost")
+    p = Pattern(code="p", name="n", description="d",
+                nodes=[BaseNode(code="a"), BaseNode(code="b")],
+                entry_node_code="b")
+    assert p.entry_node_code == "b"
 
 
-def test_dangling_jump_module_raises():
-    """A node's jump_module pointing at a nonexistent module -> dangling-reference fail fast at registration."""
-    menu = BaseNode(node_code="menu_x", node_name="x", jump_module="ghost")
-    root = BaseNode(node_code="root", node_name="r", sub_nodes=["menu_x"])
-    route_mod = AgentModule(module_code="rt", module_nodes=[root, menu])
-    with pytest.raises(ValueError, match="悬空"):
-        _mk_pattern([route_mod])
+def test_entry_defaults_to_first_node():
+    p = Pattern(code="p", name="n", description="d",
+                nodes=[BaseNode(code="a"), BaseNode(code="b")])
+    assert p.entry_node_code == "a"
 
 
-def test_unauthorized_lend_raises():
-    b = AgentModule(module_code="b", use_tools=["t1"])
-    a = AgentModule(
-        module_code="a",
-        sub_modules=[{"target": "b", "lend_tools": ["t_not_in_b"]}],
-    )
-    with pytest.raises(ValueError, match="借出"):
-        _mk_pattern([a, b])
+def test_default_pattern_type_agent():
+    p = Pattern(code="p", name="n", description="d")
+    assert p.pattern_type == "agent"
 
 
-def test_self_loop_raises():
-    a = AgentModule(module_code="a", sub_modules=["a"])
-    with pytest.raises(ValueError, match="自环"):
-        _mk_pattern([a])
+def test_illegal_pattern_type_raises():
+    with pytest.raises(ValueError, match="pattern_type"):
+        Pattern(code="p", name="n", description="d", pattern_type="route")
 
 
-def test_agent_to_fsm_link_allowed():
-    """Mixed pattern: an AGENT -> FSM edge is legal (not blocked)."""
-    a = AgentModule(module_code="a", sub_modules=["f"])
-    f = FSMModule(module_code="f", module_nodes=[
-        BaseNode(node_code="f1", node_name="n1", is_end=True)
-    ])
-    p = _mk_pattern([a, f])
-    assert p.module_map["f"].type.value == "fsm"
+def test_empty_nodes_autocreate_default():
+    p = Pattern(code="solo", name="单节点", description="d")
+    assert [n.code for n in p.nodes] == ["solo"]
+    assert p.entry_node_code == "solo"
+    assert p.node_map["solo"].name == "单节点"
 
 
-def test_max_hops_default_and_override():
-    a = AgentModule(module_code="a")
-    assert _mk_pattern([a]).max_hops == 2
-    assert _mk_pattern([a], max_hops=1).max_hops == 1
+def test_agent_node_slots_raises():
+    with pytest.raises(ValueError, match="slots"):
+        Pattern(code="p", name="n", description="d",
+                pattern_type="agent",
+                nodes=[BaseNode(code="a", slots={"s": "v"})])
 
 
-def test_route_jump_module_self_loop_raises():
-    """M-1: jump_module pointing at its own module -> self-loop fail fast at registration."""
-    menu = BaseNode(node_code="menu_self", node_name="m", jump_module="rt")
-    root = BaseNode(node_code="root2", node_name="r", sub_nodes=["menu_self"])
-    route_mod = AgentModule(module_code="rt", module_nodes=[root, menu])
-    with pytest.raises(ValueError, match="自环"):
-        _mk_pattern([route_mod])
+def test_agent_pattern_stages_raises():
+    with pytest.raises(ValueError, match="stages"):
+        Pattern(code="p", name="n", description="d",
+                pattern_type="agent", stages=[{"nlu": None}])
+
+
+def test_fsm_slots_and_stages_legal():
+    p = Pattern(code="p", name="n", description="d", pattern_type="fsm",
+                nodes=[BaseNode(code="a", slots={"s": "v"},
+                                sub_nodes=["b"]),
+                       BaseNode(code="b", is_end=True)],
+                stages=[{"nlu": None}])
+    assert p.stages == [{"nlu": None}]
+    assert p.node_map["a"].slots == {"s": "v"}
+
+
+def test_nodes_accept_inline_dicts():
+    p = Pattern(code="p", name="n", description="d",
+                nodes=[{"code": "a", "name": "A", "sub_nodes": []}])
+    assert p.node_map["a"].name == "A"
+
+
+def test_config_single_source_and_precedence():
+    p = Pattern(code="p", name="n", description="d",
+                config={"max_steps": 3, "flavor": "x"})
+    assert p.max_steps == 3
+    assert p.config["flavor"] == "x"
+    # explicit param wins over the same config key
+    p2 = Pattern(code="p2", name="n", description="d",
+                 max_steps=9, config={"max_steps": 3})
+    assert p2.max_steps == 9
+    # config key can also carry what the param left unset
+    p3 = Pattern(code="p3", name="n", description="d",
+                 config={"pattern_type": "fsm"})
+    assert p3.pattern_type == "fsm"
+    # free kwargs ride into config
+    p4 = Pattern(code="p4", name="n", description="d", custom_key="v")
+    assert p4.config["custom_key"] == "v"
+
+
+def test_default_max_steps():
+    p = Pattern(code="p", name="n", description="d")
+    assert p.max_steps == DEFAULT_MAX_STEPS == 10
+
+
+def test_self_loop_edge_legal():
+    # 环是合法语义（AGENT 图环由 max_steps 预算防护；FSM 环是自然推进）
+    p = Pattern(code="p", name="n", description="d",
+                nodes=[BaseNode(code="a", sub_nodes=["a"])])
+    assert p.node_map["a"].sub_nodes == ["a"]

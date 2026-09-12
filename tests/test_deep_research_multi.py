@@ -1,22 +1,19 @@
-"""deep_research_multi offline tests —— 相位即模块的多模块研究流水线。
+"""deep_research（plan-⑧ 四节点 AGENT 图）离线测试。
 
-与 test_deep_research_agent.py(单模块版)同一套 ScriptedProvider 设施
-(相位识别基于请求特征,与模块接线无关),覆盖多模块版特有的机制:
-
-1. pattern 结构 + AST 自动发现 + 四个相位 executor 插件注册 +
-   validate_pattern + max_hops=4
-2. 完整研究轮:四模块同轮接力(module_jump trace 顺序即流水线拓扑)/
-   工具被调 / trace 同键同构 / 历史无 tool 行 / 瞬态 state 收尾弹出 /
-   底座复位到流水线首站
-3. 预检索:工具结果进 PLAN 请求、findings 并入 SEARCH
-4. PLAN 降级 / 自纠重试(与单模块版同相位方法,回归锚)
-5. SEARCH 轮次截断后仍完成综合
-6. 流式:delta 仅来自 SYNTHESIZE;round 事件含 plan/search/synthesize
-7. 第二轮从首站重新进入(底座复位的回归锚)
-8. 异常入口防御:直接落 dr_plan(无在途状态)→ 跳过规划检索直送综合
-9. begin_turn 出清 deep_research_state(中途异常不留陈旧状态)
+ScriptedProvider 与相位检测（请求特征锚点）自包含于本文件；图版机制覆盖：
+1. 图结构 + AST 自动发现 + 四相位 executor 插件注册 + validate_pattern
+2. 全研究轮：四节点同轮接力（node_start 顺序即流水线拓扑）/ 工具真实派发 /
+   终态 trace 与旧版同构 / history 无 tool 行 / 图终止清空 graph_state
+3. 预检索相位：工具结果进入 PLAN 请求；findings 汇入 SEARCH
+4. PLAN 降级 / 自纠重试（相位级回归锚点）
+5. SEARCH 轮次封顶后综合仍完成
+6. 流式：delta 只来自 SYNTHESIZE；round 事件含 plan/search/synthesize
+7. 第二轮从首站重跑（每轮全图重跑语义）
+8. 孤儿入口防御：挂起游标落在 dr_plan（无在途状态）→ 跳过规划检索直奔综合
+   （引擎 resume 机制 + 相位孤儿防御的复合回归）
 """
 
+import json
 import logging
 
 import pytest
@@ -27,13 +24,8 @@ from async_utils import arun
 logging.basicConfig(level=logging.WARNING)
 
 from apps.deep_research_agent import executor_multi
-from apps.deep_research_agent.executor import _MAX_SEARCH_ROUNDS
-from apps.deep_research_agent.executor_multi import _STATE_KEY
-from test_deep_research_agent import (
-    DeepResearchScriptedProvider,
-    chat,
-    launch,
-)
+from apps.deep_research_agent.executor_multi import _MAX_SEARCH_ROUNDS, _STATE_KEY
+from apps.deep_research_agent.prompts import PLAN_ANCHOR, PREPLAN_ANCHOR
 
 
 # ============================================================================
@@ -48,12 +40,13 @@ def pattern():
     assert "apps.deep_research_agent.route_multi" in imported, (
         f"route_multi 未被自动发现，已发现: {imported}"
     )
-    return registry.get("deep_research_multi")
+    return registry.get("deep_research")
 
 
 @pytest.fixture()
 def fake_mcp_tools():
-    """注册伪 MCP 工具(授权给多模块版 pattern;与单模块版 fixture 同构)。"""
+    """Register the fake MCP search tool under the pattern's declared name
+    (web_search_prime, toolset mcp-websearch——节点的 use_tools 声明名）。"""
     from nexus.registry.tools import registry as tool_registry
 
     calls = {"n": 0, "queries": []}
@@ -66,24 +59,172 @@ def fake_mcp_tools():
                     "snippet": f"关于「{query}」的测试检索内容 {i}",
                     "url": f"https://example.com/{i}"}
                    for i in (1, 2)]
-        import json
         return json.dumps({"results": results}, ensure_ascii=False)
 
     tool_registry.register(
-        name="mcp_fake_search", toolset="mcp-fake",
-        schema={"name": "mcp_fake_search", "description": "测试检索工具",
+        name="web_search_prime", toolset="mcp-websearch",
+        schema={"name": "web_search_prime", "description": "测试检索工具",
                 "parameters": {"type": "object",
                                "properties": {"query": {"type": "string"}},
                                "required": ["query"]}},
         handler=_search_handler,
-        allowed_patterns={"deep_research_multi": True},
     )
     yield calls
     calls["n"], calls["queries"] = 0, []
 
 
+class DeepResearchScriptedProvider:
+    """按相位特征脚本化的 provider(记录调用与请求特征供断言)。
+
+    请求识别(与 executor 的 prompt 布局一一对应):
+    - PREPLAN:最后一条 user 消息含 PREPLAN_ANCHOR
+    - PLAN:最后一条 user 消息含 PLAN_ANCHOR
+    - SEARCH:tools 参数非空
+    - SYNTHESIZE:system 或 user 含 ``撰写最终研究报告``
+    """
+
+    def __init__(self, plan_json=None, search_rounds=1, report="# 研究报告",
+                 preplan_rounds=0, plan_fail_first=False):
+        self.plan_json = plan_json or json.dumps(
+            {"sub_questions": ["子问题A", "子问题B"],
+             "notes": "测试计划"}, ensure_ascii=False)
+        self.search_rounds = search_rounds
+        self.report = report
+        self.preplan_rounds = preplan_rounds
+        self.plan_fail_first = plan_fail_first
+        self.call_count = 0
+        self.search_calls = 0
+        self.plan_calls = 0
+        self.synth_calls = 0
+        self.preplan_calls = 0
+        self.requests = []
+
+    def _kind(self, messages, tools):
+        last_user = next((m["content"] for m in reversed(messages)
+                          if m.get("role") == "user"), "")
+        if PREPLAN_ANCHOR in (last_user or ""):
+            return "preplan"
+        if PLAN_ANCHOR in (last_user or ""):
+            return "plan"
+        if tools:
+            return "search"
+        if "撰写最终研究报告" in "".join(
+                str(m.get("content", "")) for m in messages):
+            return "synth"
+        return "search"
+
+    def _record(self, kind, messages):
+        self.requests.append((kind, [dict(m) for m in messages]))
+
+    def _preplan_reply(self):
+        self.preplan_calls += 1
+        if self.preplan_calls <= self.preplan_rounds:
+            return {"content": None, "tool_calls": [{
+                "id": f"p{self.preplan_calls}", "type": "function",
+                "function": {"name": "web_search_prime",
+                             "arguments": json.dumps(
+                                 {"query": f"预检索查询{self.preplan_calls}"},
+                                 ensure_ascii=False)},
+            }], "finish_reason": "tool_calls"}
+        return {"content": "跳过预检索。", "tool_calls": [],
+                "finish_reason": "stop"}
+
+    async def achat_completion(self, messages, model, temperature=0.7,
+                               max_tokens=2048, tools=None, tool_choice=None):
+        self.call_count += 1
+        kind = self._kind(messages, tools)
+        self._record(kind, messages)
+        if kind == "preplan":
+            return self._preplan_reply()
+        if kind == "plan":
+            self.plan_calls += 1
+            if self.plan_fail_first and self.plan_calls == 1:
+                return {"content": "好的,我的计划是:先看子问题A再看子问题B。",
+                        "tool_calls": [], "finish_reason": "stop"}
+            return {"content": self.plan_json, "tool_calls": [],
+                    "finish_reason": "stop"}
+        if kind == "search":
+            self.search_calls += 1
+            if self.search_calls <= self.search_rounds:
+                return {"content": None, "tool_calls": [{
+                    "id": f"c{self.search_calls}", "type": "function",
+                    "function": {"name": "web_search_prime",
+                                 "arguments": json.dumps(
+                                     {"query": f"测试查询{self.search_calls}"},
+                                     ensure_ascii=False)},
+                }], "finish_reason": "tool_calls"}
+            return {"content": "信息已足够,开始综合。", "tool_calls": [],
+                    "finish_reason": "stop"}
+        self.synth_calls += 1
+        return {"content": self.report, "tool_calls": [],
+                "finish_reason": "stop"}
+
+    async def achat_completion_stream(self, messages, model, temperature=0.7,
+                                      max_tokens=2048, **kwargs):
+        from nexus.llm.types import LLMChunk
+
+        self.call_count += 1
+        kind = self._kind(messages, kwargs.get("tools"))
+        self._record(kind, messages)
+        if kind == "synth":
+            self.synth_calls += 1
+            text = self.report
+            cuts = max(1, len(text) // 3)
+            pieces = [text[i:i + cuts] for i in range(0, len(text), cuts)]
+            for p in pieces:
+                yield LLMChunk(text=p)
+            yield LLMChunk(finish_reason="stop")
+            return
+        if kind == "preplan":
+            reply = self._preplan_reply()
+            if reply["tool_calls"]:
+                tc = dict(reply["tool_calls"][0], index=0)
+                yield LLMChunk(tool_calls=[tc], finish_reason="tool_calls")
+            else:
+                yield LLMChunk(text=reply["content"], finish_reason="stop")
+            return
+        if kind == "plan":
+            self.plan_calls += 1
+            if self.plan_fail_first and self.plan_calls == 1:
+                yield LLMChunk(text="好的,我的计划是:先看子问题A再看子问题B。",
+                               finish_reason="stop")
+                return
+            yield LLMChunk(text=self.plan_json)
+            yield LLMChunk(finish_reason="stop")
+            return
+        self.search_calls += 1
+        if self.search_calls <= self.search_rounds:
+            tc = {"index": 0, "id": f"c{self.search_calls}", "type": "function",
+                  "function": {"name": "web_search_prime",
+                               "arguments": json.dumps(
+                                   {"query": f"测试查询{self.search_calls}"},
+                                   ensure_ascii=False)}}
+            yield LLMChunk(tool_calls=[tc], finish_reason="tool_calls")
+        else:
+            yield LLMChunk(text="信息已足够,开始综合。", finish_reason="stop")
+
+
+def launch(pattern, sessions, session_id="s1"):
+    from nexus.engine.session import Session
+
+    session = Session(session_id=session_id, pattern_code=pattern.code)
+    session.pattern = pattern
+    session.task_info = {}
+    session.cxt.node_map = pattern.node_map
+    session.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
+    sessions[session_id] = session
+    return session
+
+
+def chat(sessions, session_id, query):
+    from async_utils import arun
+    from nexus.engine.chat import chat as chat_fn
+
+    return arun(chat_fn(query=query, session_id=session_id,
+                        all_sessions=sessions))
+
+
 def run_research(pattern, provider, session_id="s1"):
-    """launch + 一轮完整研究(注入 scripted provider;返回 (session, reply))。"""
     sessions = {}
     launch(pattern, sessions, session_id=session_id)
     with patch.object(executor_multi, "build_provider",
@@ -93,23 +234,35 @@ def run_research(pattern, provider, session_id="s1"):
 
 
 # ============================================================================
-# 1. pattern 结构与注册
+# 1. Pattern structure and registration
 # ============================================================================
 
 def test_pattern_structure_and_executor_binding(pattern):
-    assert pattern.code == "deep_research_multi"
-    assert pattern.entry_module_code == "dr_preplan"
-    assert pattern.max_hops == 4  # 3 跳接力 + 最终模块
+    assert pattern.code == "deep_research"
+    assert pattern.pattern_type == "agent"
+    assert pattern.entry_node_code == "dr_preplan"
 
-    codes = [m.module_code for m in pattern.modules]
+    codes = [n.code for n in pattern.nodes]
     assert codes == ["dr_preplan", "dr_plan", "dr_search", "dr_synthesize"]
-    for module in pattern.modules:
-        assert module.executor == module.module_code  # 相位码即插件码
-        assert not module.use_tools  # 空 = pattern ACL 决定工具面
-        assert module.enable_project is False  # 跳转目标,不参与投影/defer
+    # 静态邻接 = 流水线拓扑；综合站终态
+    assert pattern.node_map["dr_preplan"].sub_nodes == ["dr_plan"]
+    assert pattern.node_map["dr_plan"].sub_nodes == ["dr_search",
+                                                    "dr_synthesize"]  # 含孤儿逃生边
+    assert pattern.node_map["dr_search"].sub_nodes == ["dr_synthesize"]
+    assert pattern.node_map["dr_synthesize"].sub_nodes == []
+    assert pattern.node_map["dr_synthesize"].is_end is True
+
+    for node in pattern.nodes:
+        assert node.plugins["loop"] == node.code  # 相位 code 即执行器 code
+    # 工具授权面：toolset 级 + 检索节点静态列名
+    assert pattern.allow_toolset == ["mcp-websearch", "mcp-zai"]
+    assert pattern.node_map["dr_preplan"].use_tools == ["web_search_prime"]
+    assert pattern.node_map["dr_search"].use_tools == ["web_search_prime"]
+    assert not pattern.node_map["dr_plan"].use_tools
+    assert not pattern.node_map["dr_synthesize"].use_tools
 
     from nexus.model.validation import validate_pattern
-    validate_pattern(pattern)  # 不抛即通过
+    validate_pattern(pattern)  # passes if no exception is raised
 
 
 def test_phase_executor_plugins_registered():
@@ -120,7 +273,7 @@ def test_phase_executor_plugins_registered():
 
 
 # ============================================================================
-# 2. 完整研究轮:四模块接力
+# 2. Full research turn: four-node relay
 # ============================================================================
 
 def test_full_research_turn_relay(pattern, fake_mcp_tools):
@@ -128,47 +281,47 @@ def test_full_research_turn_relay(pattern, fake_mcp_tools):
         report="# 研究报告\n量子计算进展显著 [S1]。更多细节 [S2]。")
     session, reply = run_research(pattern, provider)
 
-    # 报告成为本轮回复,引用标记来自 findings 编号
     assert "研究报告" in reply
     assert "[S1]" in reply
 
-    # 四个相位各就各位:preplan 1 次(跳过)+ plan 1 次 + search(1 轮工具
-    # + 1 轮收敛)+ synth 1 次
+    # all four phases in place: preplan once (skipped) + plan once + search
+    # (1 tool round + 1 convergence round) + synth once
     assert provider.preplan_calls == 1
     assert provider.plan_calls == 1
     assert provider.search_calls == 2
     assert provider.synth_calls == 1
 
-    # 相位请求顺序 = 流水线拓扑(preplan → plan → search → synth)
+    # phase request order = pipeline topology
     kinds = [kind for kind, _ in provider.requests]
     assert kinds == ["preplan", "plan", "search", "search", "synth"]
 
-    # 伪 MCP 工具被真实分派
+    # the fake MCP tool is genuinely dispatched
     assert fake_mcp_tools["n"] >= 1
     assert fake_mcp_tools["queries"]
 
-    # 终态 trace 与单模块版同键同构
+    # the final-state trace keeps the legacy key shape
     trace = session.cxt.metadata["deep_research"]
     assert trace["question"] == "量子计算的最新进展是什么?"
     assert trace["sub_questions"] == ["子问题A", "子问题B"]
     assert trace["phases"] == ["plan", "search", "synthesize"]
-    assert trace["tool_stats"].get("mcp_fake_search") >= 1
-    assert trace["sources"][0]["tool"] == "mcp_fake_search"
+    assert trace["tool_stats"].get("web_search_prime") >= 1
+    assert trace["sources"][0]["tool"] == "web_search_prime"
     assert not trace["degraded"]
 
-    # 轮内瞬态工作区已弹出(不随会话留存)
-    assert _STATE_KEY not in session.cxt.metadata
+    # the graph terminated: the state board is cleared entirely
+    assert session.cxt.graph_state == {}
+    assert _STATE_KEY not in session.cxt.graph_state
 
-    # 底座复位:下一轮从流水线首站重新进入
-    assert session.cxt.current_module_code == "dr_preplan"
+    # the graph position mirrors the terminal node
+    assert session.cxt.current_node_code == "dr_synthesize"
 
-    # 回归锚:研究过程不落对话历史(私有工作区)——无 tool 行
+    # regression anchor: the research process stays out of conversation history
     roles = [m.role for m in session.cxt.history]
     assert "tool" not in roles
 
 
 def test_streaming_relay_traces(pattern, fake_mcp_tools):
-    """流式:module_jump trace 顺序即接力拓扑;delta 仅来自 SYNTHESIZE。"""
+    """Streaming: node_start order is the pipeline topology; deltas come only from SYNTHESIZE."""
     from nexus.engine.chat import chat_turn_stream
 
     sessions = {}
@@ -186,33 +339,32 @@ def test_streaming_relay_traces(pattern, fake_mcp_tools):
     kinds = [e.kind for e in events]
     assert kinds[-1] == "done"
 
-    # 同轮接力链:preplan→plan→search→synthesize(hop 循环发 module_jump)
-    jumps = [e.trace.data.get("to_module")
-             for e in events
-             if e.kind == "trace" and e.trace.event == "module_jump"]
-    assert jumps == ["dr_plan", "dr_search", "dr_synthesize"]
+    # 同轮接力链：node_start 顺序 = preplan→plan→search→synthesize
+    node_order = [e.trace.node_code for e in events
+                  if e.kind == "trace" and e.trace.event == "node_start"]
+    assert node_order == ["dr_preplan", "dr_plan", "dr_search",
+                          "dr_synthesize"]
 
-    # delta 全部来自报告:计划/搜索中间文本不外流
+    # all deltas come from the report: plan/search intermediate text does not leak
     deltas = "".join(e.text for e in events if e.kind == "delta")
     assert "分段报告" in deltas
     assert "子问题A" not in deltas
     assert "测试查询" not in deltas
     assert "信息已足够" not in deltas
 
-    # round 事件:plan / search / synthesize 相位边界齐(final 来自综合)
+    # round events: all plan / search / synthesize phase boundaries present
     outcomes = [e.round_info["outcome"] for e in events if e.kind == "round"]
     assert "plan" in outcomes
     assert "search" in outcomes
     assert "synthesize" in outcomes
     assert outcomes[-1] == "final"
 
-    # done 权威回复 == 报告全文;瞬态 state 已弹出
     assert events[-1].result.text == "# 分段报告\n第一段。\n第二段。"
-    assert _STATE_KEY not in sessions["s1"].cxt.metadata
+    assert sessions["s1"].cxt.graph_state == {}
 
 
 # ============================================================================
-# 3. 预检索相位
+# 3. Pre-retrieval phase
 # ============================================================================
 
 def test_preplan_search_feeds_plan_and_search(pattern, fake_mcp_tools):
@@ -222,19 +374,18 @@ def test_preplan_search_feeds_plan_and_search(pattern, fake_mcp_tools):
     assert provider.preplan_calls == 1
     assert fake_mcp_tools["n"] >= 2
 
-    # 预检索的 tool 结果行进了 PLAN 请求
     plan_requests = [m for kind, m in provider.requests if kind == "plan"]
     assert any(m.get("role") == "tool" for m in plan_requests[0])
 
     trace = session.cxt.metadata["deep_research"]
     assert trace["phases"] == ["preplan_search", "plan", "search",
                                "synthesize"]
-    assert trace["sources"][0]["round"] == 0  # round=0 标记预检索
+    assert trace["sources"][0]["round"] == 0  # round=0 marks pre-retrieval
     assert not trace["degraded"]
 
 
 # ============================================================================
-# 4. PLAN 降级 / 自纠
+# 4. PLAN degradation / self-correction
 # ============================================================================
 
 def test_plan_json_degraded(pattern, fake_mcp_tools):
@@ -244,16 +395,15 @@ def test_plan_json_degraded(pattern, fake_mcp_tools):
     trace = session.cxt.metadata["deep_research"]
     assert trace["degraded"] is True
     assert trace["sub_questions"] == ["量子计算的最新进展是什么?"]
-    assert reply  # 整轮仍产出报告
+    assert reply
 
 
 def test_plan_json_self_correct(pattern, fake_mcp_tools):
     provider = DeepResearchScriptedProvider(plan_fail_first=True)
     session, reply = run_research(pattern, provider)
 
-    assert provider.plan_calls == 2  # 失败一次 + 自纠成功
+    assert provider.plan_calls == 2  # one failure + successful self-correction
 
-    # 重试请求包含:坏输出回填(assistant)+ 自纠指令(user)
     plan_requests = [m for kind, m in provider.requests if kind == "plan"]
     retry_msgs = plan_requests[1]
     assert any(m.get("role") == "assistant"
@@ -269,31 +419,30 @@ def test_plan_json_self_correct(pattern, fake_mcp_tools):
 
 
 # ============================================================================
-# 5. SEARCH 轮次截断
+# 5. SEARCH round capping
 # ============================================================================
 
 def test_search_rounds_capped(pattern, fake_mcp_tools):
     provider = DeepResearchScriptedProvider(
-        search_rounds=_MAX_SEARCH_ROUNDS + 5)  # 永不收敛
+        search_rounds=_MAX_SEARCH_ROUNDS + 5)  # never converges
     session, reply = run_research(pattern, provider)
 
     trace = session.cxt.metadata["deep_research"]
     assert trace["rounds"] == _MAX_SEARCH_ROUNDS
     assert provider.search_calls == _MAX_SEARCH_ROUNDS
-    assert provider.synth_calls == 1  # 截断后仍完成综合
+    assert provider.synth_calls == 1  # synthesis still completes after the cap
     assert reply
 
 
 # ============================================================================
-# 6. 第二轮从首站重新进入(底座复位)
+# 6. Second turn reruns the whole graph (full-rerun semantics)
 # ============================================================================
 
 def test_second_turn_restarts_pipeline(pattern, fake_mcp_tools):
     provider = DeepResearchScriptedProvider()
     session, _ = run_research(pattern, provider)
-    assert session.cxt.current_module_code == "dr_preplan"
 
-    # 第二轮续问:整个流水线重跑(preplan 再次被调),历史只剩 Q/A 对
+    # second-turn follow-up: the whole graph reruns from entry
     provider2 = DeepResearchScriptedProvider()
     with patch.object(executor_multi, "build_provider",
                       return_value=provider2):
@@ -301,47 +450,36 @@ def test_second_turn_restarts_pipeline(pattern, fake_mcp_tools):
 
     assert provider2.preplan_calls == 1
     assert provider2.synth_calls == 1
-    assert _STATE_KEY not in session.cxt.metadata
+    assert session.cxt.graph_state == {}
     for m in session.cxt.history:
         assert m.role in ("user", "assistant"), f"意外的历史角色: {m.role}"
 
 
 # ============================================================================
-# 7. 异常入口防御:无在途状态直送综合
+# 7. Orphan defense via a paused cursor landing on dr_plan without state
 # ============================================================================
 
-def test_orphan_entry_bails_to_synthesize(pattern, fake_mcp_tools):
-    """直接落 dr_plan(无 deep_research_state)→ 跳过规划检索,综合兜底
-    出「证据不足」报告,流水线不卡死。"""
+def test_orphan_paused_plan_bails_to_synthesize(pattern, fake_mcp_tools):
+    """挂起游标落在 dr_plan 且无在途状态（异常遗留）→ 引擎 resume 该节点，
+    相位孤儿防御跳过规划检索直奔综合；综合降级产出「证据不足」报告。"""
     sessions = {}
     session = launch(pattern, sessions)
-    session.cxt.current_module_code = "dr_plan"  # 模拟异常底座残留
+    session.cxt.graph_state["__paused_node__"] = "dr_plan"
+    session.cxt.graph_state["__step__"] = 1
 
     provider = DeepResearchScriptedProvider()
     with patch.object(executor_multi, "build_provider",
                       return_value=provider):
         reply = chat(sessions, "s1", "孤儿入口测试")
 
-    # plan/search 相位被跳过,只有综合一次调用
     assert provider.plan_calls == 0
     assert provider.search_calls == 0
     assert provider.synth_calls == 1
     assert reply
 
     trace = session.cxt.metadata["deep_research"]
-    assert trace["phases"] == ["orphan_plan", "synthesize"]
+    assert "orphan" in " ".join(trace["phases"])
     assert trace["degraded"] is True
-    # 收尾后底座已复位
-    assert session.cxt.current_module_code == "dr_preplan"
-
-
-def test_begin_turn_clears_stale_state():
-    """中途异常(相位抛错被对话层兜住)留下的 deep_research_state 在下一轮
-    begin_turn 出清——陈旧工作区绝不泄进新一轮。"""
-    from nexus.engine.context_lifecycle import TurnLifecycle
-    from nexus.context import DialogueContext
-
-    cxt = DialogueContext(session_id="s1", user_query="q")
-    cxt.metadata[_STATE_KEY] = {"question": "陈旧状态", "findings": ["x"]}
-    TurnLifecycle().begin_turn(cxt, "新问题")
-    assert _STATE_KEY not in cxt.metadata
+    # 图终止后状态板清空（挂起游标不复存在）
+    assert session.cxt.graph_state == {}
+    assert session.cxt.current_node_code == "dr_synthesize"

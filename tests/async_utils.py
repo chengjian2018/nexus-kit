@@ -22,9 +22,10 @@ import threading
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_lock = threading.Lock()
 
-# 审查 M-25：被测协程挂起时，无超时的 .result() 会挂死整个 pytest 进程
-# 而不是失败。默认 30s（经 NEXUS_TEST_ARUN_TIMEOUT 可调）——远大于任何
-# 正常用例，只兜"永不完成"的协程。
+# Audit M-25: when the coroutine under test hangs, a timeout-less .result()
+# would hang the entire pytest process instead of failing. Default 30s
+# (tunable via NEXUS_TEST_ARUN_TIMEOUT) — far above any normal case; only a
+# backstop for coroutines that never complete.
 _DEFAULT_TIMEOUT = float(os.environ.get("NEXUS_TEST_ARUN_TIMEOUT", "30"))
 
 

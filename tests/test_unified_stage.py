@@ -1,15 +1,20 @@
-"""Unified stage (single call + structured output) offline tests.
+"""Unified stage (single call + structured output) offline tests — FSM-only
+form (plan-⑧: the ROUTE family is gone; the pattern is one FSM Pattern whose
+skeleton wires the unified stage + pass-through NLG; the clarify declaration
+lives on the node).
 
 Uses the scripted FakeProvider to simulate LLM output (no real API access), covering:
-1. Pattern auto-discovery + module-level unified stage injection (ROUTE / FSM dual forms)
-2. End-to-end flow: exactly 1 LLM call per turn (2 for the two-stage variant), correct jumps and slots
+1. Pattern structure + stage wiring (skeleton / node.stages / registry codes)
+2. End-to-end flow: exactly 1 LLM call per turn, correct jumps and slots
 3. Prompt assembly: candidate nodes carry answer styles, next_node allowed-values list
 4. Code-level hard guard against invalid next_node (keeps the current node, reply preserved)
 5. Parse-failure retry success / exhausted-retry fallback without crashing
 6. PassThroughNLG keeps the already-generated reply
-7. Dual-track clarify combination: off-topic turn emits a clarify signal → kb answer + bring back
-   on topic (2 calls on the clarify turn, still 1 on a normal turn); a clarify signal from a module
-   without clarify is rejected by the allowed-values hard guard
+7. Opening broadcast (zero LLM, pure concatenation)
+8. Dual-track clarify combination: off-topic turn emits a clarify signal → kb
+   answer + bring back on topic (2 calls on the clarify turn, still 1 on a
+   normal turn); a clarify signal from a node without the clarify declaration
+   is rejected by the allowed-values hard guard
 """
 
 import logging
@@ -38,95 +43,46 @@ def _fake_provider():
 
 @pytest.fixture(scope="module")
 def pattern():
-    """Return the inline-built unified stage pattern (node codes/names stay
+    """Return the inline-built unified stage FSM pattern (node codes/names stay
     consistent with the fake_provider script conventions)."""
-    from nexus.model.module import FSMModule, RouteModule
     from nexus.model.node import BaseNode
     from nexus.model.pattern import Pattern
-    from nexus.registry.patterns import discover_builtin_patterns
-    from atoms.stages.unified import FSMUnifiedNLU, RouteUnifiedNLU
 
-    # AST auto-discovery still works (verified against the retained builtin pattern)
-    imported = discover_builtin_patterns()
-    assert "apps.xianyu_agent.route" in imported, (
-        f"xianyu_agent_route 未被自动发现，已发现: {imported}"
-    )
-
-    root = RouteModule(
-        module_code="unified_root",
-        module_name="统一路由模块",
-        module_description="顶层路由：意图分类并分发到购车子流程或闲聊",
-        module_todo_description="判断用户是购车咨询还是闲聊，分发到对应菜单",
-        module_nodes=[
-            BaseNode(
-                node_code="u_route_root",
-                node_name="统一路由根节点",
-                node_description="助手入口，负责顶层意图分类",
-                node_todo_description="理解用户输入，匹配到购车或闲聊意图菜单",
-                sub_nodes=["u_menu_sales", "u_menu_chitchat"],
-                answer_examples=["您好，请问您是想看车还是有其他问题呢？"],
-            ),
-            BaseNode(
-                node_code="u_menu_sales",
-                node_name="购车菜单",
-                node_description="购车咨询入口菜单",
-                node_todo_description="用户有购车意图时选中本菜单",
-                jump_module="unified_buy",
-                answer_examples=["您好，购车咨询为您服务！"],
-            ),
-            BaseNode(
-                node_code="u_menu_chitchat",
-                node_name="闲聊菜单",
-                node_description="寒暄与闲聊承接",
-                node_todo_description="用户打招呼或闲聊时选中本菜单",
-                answer_examples=["您好呀～有什么能帮到您的，随时告诉我！"],
-            ),
-        ],
-        stages={"nlu": "route_unified", "nlg": "nlg_pass_through"},
-    )
-    buy = FSMModule(
-        module_code="unified_buy",
-        module_name="统一购车流程模块",
-        module_description="购车信息收集流程：品牌 → 预算 → 确认",
-        module_todo_description="按节点链收集品牌与预算，最终确认购车信息",
-        module_nodes=[
-            BaseNode(
-                node_code="u_ask_brand",
-                node_name="询问品牌",
-                node_description="收集用户心仪的汽车品牌",
-                node_todo_description="理解用户提到的汽车品牌并抽取 brand 槽位",
-                sub_nodes=["u_ask_budget"],
-                node_slots={"brand": "汽车品牌，如比亚迪、特斯拉"},
-                answer_examples=["好的，您对{brand}感兴趣呀！方便说下预算吗？"],
-            ),
-            BaseNode(
-                node_code="u_ask_budget",
-                node_name="询问预算",
-                node_description="收集用户的购车预算区间",
-                node_todo_description="理解用户提到的预算并抽取 budget 槽位",
-                sub_nodes=["u_confirm"],
-                node_slots={"budget": "预算区间，如20万左右"},
-                answer_examples=["预算{budget}很清晰！下面帮您确认一下信息。"],
-            ),
-            BaseNode(
-                node_code="u_confirm",
-                node_name="确认购车信息",
-                node_description="向用户确认已收集的品牌与预算信息",
-                node_todo_description="确认信息无误；流程到此结束",
-                sub_nodes=[],
-                node_slots={},
-                answer_examples=["为您确认：品牌{brand}，预算{budget}。"],
-                is_end=True,
-            ),
-        ],
-        stages={"nlu": "fsm_unified", "nlg": "nlg_pass_through"},
-    )
     return Pattern(
         code="unified_demo",
         name="统一阶段测试 pattern",
-        description="ROUTE + FSM 全统一阶段（内联测试 fixture）",
-        entry_module_code="unified_root",
-        modules=[root, buy],
+        description="FSM 统一阶段（内联测试 fixture）",
+        pattern_type="fsm",
+        stages=[{"nlu": "fsm_unified"}, {"clarify": None},
+                {"nlg": "nlg_pass_through"}],
+        nodes=[
+            BaseNode(
+                code="u_ask_brand",
+                name="询问品牌",
+                description="收集用户心仪的汽车品牌",
+                task_description="理解用户提到的汽车品牌并抽取 brand 槽位",
+                sub_nodes=["u_ask_budget"],
+                slots={"brand": "汽车品牌，如比亚迪、特斯拉"},
+                answer_examples=["好的，您对{brand}感兴趣呀！方便说下预算吗？"],
+            ),
+            BaseNode(
+                code="u_ask_budget",
+                name="询问预算",
+                description="收集用户的购车预算区间",
+                task_description="理解用户提到的预算并抽取 budget 槽位",
+                sub_nodes=["u_confirm"],
+                slots={"budget": "预算区间，如20万左右"},
+                answer_examples=["预算{budget}很清晰！下面帮您确认一下信息。"],
+            ),
+            BaseNode(
+                code="u_confirm",
+                name="确认购车信息",
+                description="向用户确认已收集的品牌与预算信息",
+                task_description="确认信息无误；流程到此结束",
+                is_end=True,
+                answer_examples=["为您确认：品牌{brand}，预算{budget}。"],
+            ),
+        ],
     )
 
 
@@ -143,7 +99,6 @@ def launch(pattern, sessions, session_id="s1"):
     session = Session(session_id=session_id, pattern_code=pattern.code)
     session.pattern = pattern
     session.task_info = {}
-    session.cxt.module_map = pattern.module_map
     session.cxt.node_map = pattern.node_map
     session.cxt.metadata["task_info"] = {}
     session.cxt.metadata["llm_override"] = fake_llm_config()
@@ -153,7 +108,6 @@ def launch(pattern, sessions, session_id="s1"):
 
 def chat(sessions, session_id, query):
     """Call nexus.engine.chat to process one dialogue turn."""
-    from async_utils import arun
     from nexus.engine.chat import chat as chat_fn
 
     return arun(chat_fn(query=query, session_id=session_id, all_sessions=sessions))
@@ -162,9 +116,7 @@ def chat(sessions, session_id, query):
 def chat_once(pattern, sessions, query, expect_calls=1):
     """Process one dialogue turn and assert exactly expect_calls LLM calls are consumed.
 
-    A normal turn is 1 call (the core benefit of the unified stage); on a ROUTE silent-dispatch
-    turn, the target FSM first node re-enters within the same turn and digests the query, so it
-    is 2 calls (route unified stage + FSM unified stage).
+    A normal turn is 1 call (the core benefit of the unified stage).
     """
     before = FakeProvider.call_count
     reply = chat(sessions, "s1", query)
@@ -179,35 +131,25 @@ def chat_once(pattern, sessions, query, expect_calls=1):
 # Structure and wiring tests
 # ============================================================================
 
-def test_pattern_discovered_and_stage_wiring(pattern):
-    """The pattern is AST-auto-discoverable; both ROUTE/FSM modules get the unified stage injected."""
-    from nexus.model.module import ModuleType
-    from atoms.stages.unified import FSMUnifiedNLU, RouteUnifiedNLU
+def test_pattern_structure_and_stage_wiring(pattern):
+    """The FSM pattern wires the unified stage via the skeleton; codes resolve
+    through the plugin registry."""
+    from atoms.stages.unified import FSMUnifiedNLU, PassThroughNLG
 
     assert pattern.code == "unified_demo"
-    assert pattern.entry_module_code == "unified_root"
+    assert pattern.pattern_type == "fsm"
+    assert pattern.entry_node_code == "u_ask_brand"
+    # skeleton shape: unified nlu → clarify slot (opt-in, None) → pass-through nlg
+    assert [list(e.keys())[0] for e in pattern.stages] == [
+        "nlu", "clarify", "nlg"]
+    assert [list(e.values())[0] for e in pattern.stages] == [
+        "fsm_unified", None, "nlg_pass_through"]
 
-    root_module = pattern.module_map["unified_root"]
-    buy_module = pattern.module_map["unified_buy"]
-    assert root_module.type == ModuleType.ROUTE
-    assert buy_module.type == ModuleType.FSM
-
-    # module-level unified stage injection (generate single-stage form, resolved via GenerateSlot)
-    # module-level unified wiring declared by string codes (plugin registry)
-    assert root_module.stages["nlu"] == "route_unified"
-    assert buy_module.stages["nlu"] == "fsm_unified"
     from nexus.registry.plugins import registry as plugin_registry
-    assert isinstance(plugin_registry.resolve("stage", "route_unified"),
-                      RouteUnifiedNLU)
     assert isinstance(plugin_registry.resolve("stage", "fsm_unified"),
                       FSMUnifiedNLU)
-
-    # Routing structure and menu dispatch
-    assert pattern.node_map["u_route_root"].sub_nodes == [
-        "u_menu_sales", "u_menu_chitchat",
-    ]
-    assert pattern.node_map["u_menu_sales"].jump_module == "unified_buy"
-    assert not hasattr(pattern.node_map["u_menu_chitchat"], "jump_module")
+    assert isinstance(plugin_registry.resolve("stage", "nlg_pass_through"),
+                      PassThroughNLG)
 
     # FSM node chain and end node
     assert pattern.node_map["u_ask_brand"].sub_nodes == ["u_ask_budget"]
@@ -221,9 +163,7 @@ def test_prompt_embeds_candidates_and_valid_values(pattern):
     from atoms.stages.unified import FSMUnifiedNLU
 
     ctx = DialogueContext(session_id="s-prompt", user_query="比亚迪")
-    ctx.module_map = pattern.module_map
     ctx.node_map = pattern.node_map
-    ctx.current_module_code = "unified_buy"
     ctx.current_node_code = "u_ask_brand"
 
     prompt = FSMUnifiedNLU().prompt_build(ctx)
@@ -244,15 +184,14 @@ def test_prompt_embeds_candidates_and_valid_values(pattern):
 # End-to-end flow tests (single call per turn)
 # ============================================================================
 
-def test_route_then_fsm_full_flow_single_call_per_turn(pattern, sessions):
-    """Full car-buying flow: route dispatch → brand → budget → confirm, exactly 1 call per turn."""
+def test_full_flow_single_call_per_turn(pattern, sessions):
+    """Full car-buying flow: brand → budget → confirm, exactly 1 call per turn."""
     session = launch(pattern, sessions)
 
-    # Turn 1: routing hits u_menu_sales → silent dispatch; FSM first node u_ask_brand digests the
-    # sentence in the same turn (route unified stage + FSM unified stage = 2 calls; reply from the FSM side)
-    reply = chat_once(pattern, sessions, "我想买车，看看有什么车型", expect_calls=2)
-    assert "询问预算" in reply, f"回复应来自 FSM 首节点统一阶段直出，实际: {reply!r}"
-    assert session.cxt.current_module_code == "unified_buy"
+    # Turn 1: the FSM first node u_ask_brand digests the sentence in one call
+    # (brand slot = the whole query, jump to u_ask_budget)
+    reply = chat_once(pattern, sessions, "我想买车，看看有什么车型")
+    assert "询问预算" in reply, f"回复应来自统一阶段直出，实际: {reply!r}"
     assert session.cxt.current_node_code == "u_ask_budget"
     assert session.cxt.filled_slots["brand"] == "我想买车，看看有什么车型"
 
@@ -268,29 +207,13 @@ def test_route_then_fsm_full_flow_single_call_per_turn(pattern, sessions):
     assert session.cxt.current_node_code == "u_confirm"
     assert session.cxt.filled_slots["budget"] == "比亚迪"
 
-    # Slots carry through the whole flow (brand was digested with the full sentence by the first
-    # node in the silent-dispatch turn); unified-stage observation metadata written
+    # Slots carry through the whole flow; unified-stage observation metadata written
     assert session.cxt.filled_slots == {
         "brand": "我想买车，看看有什么车型",
         "budget": "比亚迪",
     }
     assert session.cxt.metadata["unified"]["triggered"] is True
     assert "reply" in session.cxt.metadata["unified"]
-
-
-def test_chitchat_stays_route_root(pattern, sessions):
-    """Chitchat intent: after a single-call reply it resets back to the root node; the next turn still routes normally."""
-    session = launch(pattern, sessions)
-
-    reply = chat_once(pattern, sessions, "你好呀")
-    assert "闲聊菜单" in reply
-    assert session.cxt.current_module_code == "unified_root"
-    assert session.cxt.current_node_code == "u_route_root"
-
-    # The next turn can still route to the buy sub-module (silent dispatch: 2 calls, FSM first node digests in the same turn)
-    reply = chat_once(pattern, sessions, "我想买车", expect_calls=2)
-    assert session.cxt.current_module_code == "unified_buy"
-    assert session.cxt.current_node_code == "u_ask_budget"
 
 
 # ============================================================================
@@ -303,8 +226,7 @@ def test_invalid_next_node_guarded(pattern, sessions):
 
     reply = chat_once(pattern, sessions, "跳到不存在节点")
 
-    assert session.cxt.current_module_code == "unified_root"
-    assert session.cxt.current_node_code == "u_route_root"
+    assert session.cxt.current_node_code == "u_ask_brand"
     assert session.cxt.nlu_result["next_node"] == ""
     # Reply preserved (still returned to the user); observation metadata records the invalid value
     assert "非法节点" in reply
@@ -312,16 +234,14 @@ def test_invalid_next_node_guarded(pattern, sessions):
 
 
 def test_parse_failure_retry_recovers(pattern, sessions):
-    """First output is non-JSON → retry corrects it → normal dispatch (2 calls in total)."""
+    """First output is non-JSON → retry corrects it → normal jump (2 calls in total)."""
     session = launch(pattern, sessions)
     before = FakeProvider.call_count
 
     reply = chat(sessions, "s1", "解析失败重试 买车")
 
-    # Failure + retry (route unified stage) + FSM first-node failure + retry = 4 calls
-    # (the query still contains "parse failure retry"; the re-entered FSM first node also fails first, then retries)
-    assert FakeProvider.call_count - before == 4
-    assert session.cxt.current_module_code == "unified_buy"
+    # Failure + retry = 2 calls on the single unified stage
+    assert FakeProvider.call_count - before == 2
     assert session.cxt.current_node_code == "u_ask_budget"
     assert "询问预算" in reply
 
@@ -339,8 +259,7 @@ def test_parse_failure_exhausted_falls_back(pattern, sessions):
     assert reply == FSMUnifiedNLU.fallback_reply
     assert session.cxt.metadata["unified"]["parse_failed"] is True
     assert session.cxt.nlu_result == {"next_node": "", "slots": {}}
-    assert session.cxt.current_module_code == "unified_root"
-    assert session.cxt.current_node_code == "u_route_root"
+    assert session.cxt.current_node_code == "u_ask_brand"
 
 
 def test_pass_through_nlg_keeps_existing_result():
@@ -407,16 +326,17 @@ def test_opening_broadcast_template_missing_field_falls_back():
 
 
 # ============================================================================
-# Dual-track clarify combination tests (FSM module with enable_clarify=True)
+# Dual-track clarify combination tests (clarify declared on the node)
 # ============================================================================
 
 def test_clarify_next_node_rejected_when_disabled(pattern, sessions):
-    """A module without clarify outputs a clarify signal: the allowed-values hard guard falls
-    back to keeping the current node.
+    """A node without the clarify declaration outputs a clarify signal: the
+    allowed-values hard guard falls back to keeping the current node.
 
-    The model's reply is an acknowledgment-style promise ("let me confirm for you"), but the
-    module has no clarify stage installed to honor it, so the reply is replaced with the
-    fallback copy as well (avoiding an empty promise).
+    The model's reply is an acknowledgment-style promise ("let me confirm for
+    you"), but the node has no clarify stage installed to honor it, so the
+    reply is replaced with the fallback copy as well (avoiding an empty
+    promise).
     """
     from atoms.stages.unified import FSMUnifiedNLU
 
@@ -424,8 +344,7 @@ def test_clarify_next_node_rejected_when_disabled(pattern, sessions):
 
     reply = chat_once(pattern, sessions, "硬造澄清意图")
 
-    assert session.cxt.current_module_code == "unified_root"
-    assert session.cxt.current_node_code == "u_route_root"
+    assert session.cxt.current_node_code == "u_ask_brand"
     assert session.cxt.nlu_result["next_node"] == ""
     assert session.cxt.metadata["unified"]["invalid_next_node"] == "clarify"
     assert reply == FSMUnifiedNLU.fallback_reply
@@ -456,13 +375,12 @@ def test_unified_with_clarify_off_topic_turn(pattern, sessions):
         },
     ]
 
-    # Test injection: declare the clarify slot on the buy sub-module with a
+    # Test injection: declare the clarify slot on the u_ask_budget node with a
     # KB-backed stage registered under a unique code (restored afterwards, so
     # other cases in this file stay unpolluted)
     from nexus.registry.plugins import registry as plugin_registry
-    from stage_stubs import register_stage_stub
-    buy = pattern.module_map["unified_buy"]
-    saved_stages = dict(buy.stages or {})
+    budget = pattern.node_map["u_ask_budget"]
+    saved_stages = dict(budget.stages or {})
     clarify_code = "clarify_kb_unified"
     if not plugin_registry.has("stage", clarify_code):
         plugin_registry.register("stage", clarify_code, lambda: ClarifyStage(
@@ -473,15 +391,13 @@ def test_unified_with_clarify_off_topic_turn(pattern, sessions):
             ),
             rule=ClarifyRouteRule(),
         ))
-    buy.stages = {**saved_stages, "clarify": clarify_code}
+    budget.stages = {**saved_stages, "clarify": clarify_code}
 
     try:
         session = launch(pattern, sessions)
 
-        # Turn 1: routing hits → silent dispatch; FSM first node u_ask_brand digests the sentence
-        # in the same turn (route unified stage + FSM unified stage = 2 calls), advancing to u_ask_budget
-        chat_once(pattern, sessions, "我想买车", expect_calls=2)
-        assert session.cxt.current_module_code == "unified_buy"
+        # Turn 1: u_ask_brand digests the sentence in one call, advancing to u_ask_budget
+        chat_once(pattern, sessions, "我想买车")
         assert session.cxt.current_node_code == "u_ask_budget"
         assert session.cxt.filled_slots.get("brand") == "我想买车"
 
@@ -507,4 +423,4 @@ def test_unified_with_clarify_off_topic_turn(pattern, sessions):
         assert session.cxt.current_node_code == "u_confirm"
         assert session.cxt.filled_slots["budget"] == "20万左右"
     finally:
-        buy.stages = saved_stages
+        budget.stages = saved_stages

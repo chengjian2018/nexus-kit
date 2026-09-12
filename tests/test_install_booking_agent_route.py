@@ -1,5 +1,6 @@
 """install_booking_agent (FSM mode) offline tests — transcription of the
-hand-drawn FSM template with OUTBOUND-call semantics (客服主动外呼约安装)
+hand-drawn FSM template with OUTBOUND-call semantics (the agent proactively
+calls the customer to schedule the installation)
 + the supplemented scenarios (generic decline / callback / reschedule) and
 the booking-time hard guard.
 
@@ -7,17 +8,21 @@ LLM output is simulated via the scripted FakeProvider (install branch in
 _install_unified). Covers:
 1. Pattern structure and AST auto-discovery registration (node graph mirrors
    the sketch + supplemented nodes; decline edges from every business node)
-2. Outbound opening: the connect turn lands on 外呼开场 and advances on the
-   customer's first response
-3. Happy path walk: 开场→地址核对→到货(已到)→时间协商(具体日期)→确认→通话结束
+2. Outbound opening: the connect turn lands on the outbound-opening node and
+   advances on the customer's first response
+3. Happy path walk: opening → address confirmation → arrival (arrived) →
+   time negotiation (specific date) → confirmation → call close
    (transitions + slot accumulation)
-4. The sketch's lateral branches: 未到货→到货时间询问(不知道)→上门方便确认
-   →时间协商; 都不知道→档期推荐→选定
-5. Terminal edges fire is_end (conversation_end action): 地址不符 / 预约完成
+4. The sketch's lateral branches: not-arrived → ETA inquiry (doesn't know)
+   → availability check → time negotiation; knows neither → schedule
+   recommendation → picks one
+5. Terminal edges fire is_end (conversation_end action): address mismatch /
+   booking completed
 6. Supplemented scenarios:
-   - generic decline intents (不想预约/已安装/质量问题/退货/非本人) at any
-     node → install_decline → install_end
-   - 现在没空/不想现在预约 → install_ask_callback → end
+   - generic decline intents (booking unwanted / already installed / quality
+     issue / returned / not the account holder) at any node →
+     install_decline → install_end
+   - busy now / not ready to book now → install_ask_callback → end
    - confirm-time reschedule → install_reschedule → back to negotiation
 7. Booking-time hard guard (stages.InstallBookingUnifiedNLU):
    - bookable request annotated (bookable/matched_slot) and proceeds
@@ -94,7 +99,6 @@ def launch(pattern, sessions, session_id="s1", task_info=None):
     session = Session(session_id=session_id, pattern_code=pattern.code)
     session.pattern = pattern
     session.task_info = {}
-    session.cxt.module_map = pattern.module_map
     session.cxt.node_map = pattern.node_map
     session.cxt.metadata["task_info"] = dict(
         TASK_INFO if task_info is None else task_info)
@@ -117,7 +121,7 @@ def end_actions(cxt):
 
 
 def reach_ask_time(sessions, with_arrival="到货了"):
-    """Walk the happy prefix (greet → address → arrival) up to 上门时间协商."""
+    """Walk the happy prefix (greet → address → arrival) up to visit-time negotiation."""
     chat(sessions, "s1", "方便的，是要安装")
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", with_arrival)
@@ -130,15 +134,11 @@ def reach_ask_time(sessions, with_arrival="到货了"):
 def test_pattern_auto_discovered_and_structure(pattern):
     """Node graph mirrors the sketch + supplemented nodes; every business
     node carries a decline edge; terminals merge into install_end (is_end)."""
-    from nexus.model.module import ModuleType
-
     assert pattern.code == "install_booking_agent"
-    assert pattern.entry_module_code == "install_booking"
+    assert pattern.entry_node_code == "install_greet"
+    assert pattern.pattern_type == "fsm"
 
-    module = pattern.module_map["install_booking"]
-    assert module.type == ModuleType.FSM
-
-    assert [n.node_code for n in module.module_nodes] == [
+    assert [n.code for n in pattern.nodes] == [
         "install_greet", "install_confirm_addr", "install_check_arrival",
         "install_ask_eta", "install_time_window", "install_available",
         "install_ask_time", "install_recommend", "install_specific_date",
@@ -148,7 +148,7 @@ def test_pattern_auto_discovered_and_structure(pattern):
     ]
 
     # The sketch's labeled edges + supplemented branches as sub_nodes
-    sub = {n.node_code: set(n.sub_nodes) for n in module.module_nodes}
+    sub = {n.code: set(n.sub_nodes) for n in pattern.nodes}
     assert sub["install_greet"] == {"install_confirm_addr", "install_end",
                                     "install_decline"}
     assert sub["install_confirm_addr"] == {"install_check_arrival",
@@ -189,35 +189,36 @@ def test_pattern_auto_discovered_and_structure(pattern):
 
     # The terminal ovals merged into one is_end node
     assert pattern.node_map["install_end"].is_end is True
-    assert not any(n.is_end for n in module.module_nodes[:-1])
+    assert not any(n.is_end for n in pattern.nodes[:-1])
 
     # Every sub_nodes target exists (dangling edges would fail Pattern init)
-    for n in module.module_nodes:
+    for n in pattern.nodes:
         for target in n.sub_nodes:
             assert target in pattern.node_map
 
 
 def test_stage_wiring(pattern):
-    """Module-level guarded unified pair + keyword clarify + builtin time_aug
-    at the pattern skeleton; no node-level stage overrides (the recommend
-    rewrite lives in the unified stage — see the timing note in route.py)."""
-    root = pattern.module_map["install_booking"]
-    assert root.stages == {"nlu": "install_unified",
-                           "clarify": "install_clarify",
-                           "nlg": "nlg_pass_through"}
-
-    for node in root.module_nodes:
-        assert not node.stages, (
-            f"node {node.node_code} 不应携带节点级 stages（推荐改写已并入"
-            " install_unified，节点级 nlg 会因 FSM 轮末转移时序晚一轮生效）"
-        )
-
+    """Pattern-skeleton guarded unified pair + keyword clarify + builtin
+    time_aug; node-level stages only carry the clarify admission switch
+    (the recommend rewrite lives in the unified stage — see the timing note
+    in route.py)."""
     skeleton_values = {slot: code for e in pattern.stages
                        for slot, code in e.items()}
+    assert skeleton_values == {"query": "time_aug_query",
+                                "nlu": "install_unified",
+                                "clarify": "install_clarify",
+                                "nlg": "nlg_pass_through"}
+
+    for node in pattern.nodes:
+        assert node.stages in ({}, {"clarify": "install_clarify"}), (
+            f"node {node.code} 不应携带除 clarify 准入开关外的节点级 stages"
+            "（推荐改写已并入 install_unified，节点级 nlg 会因 FSM 轮末转移"
+            "时序晚一轮生效）"
+        )
     assert skeleton_values.get("query") == "time_aug_query"
-    assert skeleton_values.get("nlu") is None
-    assert skeleton_values.get("clarify") is None
-    assert skeleton_values.get("nlg") is None
+    assert skeleton_values.get("nlu") == "install_unified"
+    assert skeleton_values.get("clarify") == "install_clarify"
+    assert skeleton_values.get("nlg") == "nlg_pass_through"
 
     # All declared codes resolve (app-local codes registered by stages.py,
     # pulled in by route.py's bottom import)
@@ -230,7 +231,7 @@ def test_stage_wiring(pattern):
 
 
 def test_module_prompt_override_carries_task_info(pattern, sessions):
-    """The module-level template override adds the ### 任务信息 section (with
+    """The module-level template override adds the task-info section (with
     the schedule) and the special-intent routing guidance."""
     session = launch(pattern, sessions)
 
@@ -273,8 +274,9 @@ def test_pattern_passes_validation(pattern):
 # ============================================================================
 
 def test_connect_turn_opens_call_and_advances(pattern, sessions):
-    """Outbound opening: the connect turn runs on 外呼开场 (module_nodes[0]);
-    the customer's first response advances to 地址核对."""
+    """Outbound opening: the connect turn runs on the outbound-opening node
+    (module_nodes[0]); the customer's first response advances to address
+    confirmation."""
     session = launch(pattern, sessions)
     reply = chat(sessions, "s1", "喂，你好，方便的你说")
 
@@ -287,8 +289,9 @@ def test_connect_turn_opens_call_and_advances(pattern, sessions):
 # ============================================================================
 
 def test_happy_path_full_walk(pattern, sessions):
-    """Main flow: 开场→地址核对→到货(已到)→时间协商(具体日期)→确认→通话结束;
-    slots accumulate in filled_slots; one LLM call per turn (unified).
+    """Main flow: opening → address confirmation → arrival (arrived) → time
+    negotiation (specific date) → confirmation → call close; slots
+    accumulate in filled_slots; one LLM call per turn (unified).
 
     The picked date has no time annotation (no time_aug hit) → guard is a
     no-op pass-through; booking proceeds."""
@@ -326,51 +329,51 @@ def test_happy_path_full_walk(pattern, sessions):
 # ============================================================================
 
 def test_not_arrived_eta_unknown_path(pattern, sessions):
-    """Sketch lateral path: 未到货→不知道到货时间→方便→时间协商(最近)→确认→结束."""
+    """Sketch lateral path: not arrived → arrival time unknown → convenient → time negotiation (nearest) → confirm → close."""
     session = launch(pattern, sessions)
-    chat(sessions, "s1", "方便的，是要安装")     # → 地址核对
-    chat(sessions, "s1", "地址对的")             # → 到货确认
-    chat(sessions, "s1", "还没到货")             # → 到货时间询问（否边）
+    chat(sessions, "s1", "方便的，是要安装")     # → address confirmation
+    chat(sessions, "s1", "地址对的")             # → arrival check
+    chat(sessions, "s1", "还没到货")             # → ETA inquiry (negative edge)
     assert session.cxt.current_node_code == "install_ask_eta"
-    chat(sessions, "s1", "不知道什么时候到")      # 不知道 → 上门方便确认
+    chat(sessions, "s1", "不知道什么时候到")      # does not know → availability check
     assert session.cxt.current_node_code == "install_available"
-    chat(sessions, "s1", "方便的")               # → 时间协商
+    chat(sessions, "s1", "方便的")               # → time negotiation
     assert session.cxt.current_node_code == "install_ask_time"
-    reply = chat(sessions, "s1", "最近的就行")    # 最近分支
+    reply = chat(sessions, "s1", "最近的就行")    # nearest branch
     assert session.cxt.current_node_code == "install_nearest"
     assert reply == "外呼回复: 最近档期安排"
-    chat(sessions, "s1", "可以")                 # → 时间确认
+    chat(sessions, "s1", "可以")                 # → time confirmation
     assert session.cxt.current_node_code == "install_confirm_time"
-    chat(sessions, "s1", "确认")                 # → 通话结束
+    chat(sessions, "s1", "确认")                 # → call close
     assert session.cxt.current_node_code == "install_end"
     assert end_actions(session.cxt)
 
 
 def test_eta_known_time_window_path(pattern, sessions):
-    """Sketch lateral path: 知道到货时间→提供时间段→时间协商→推荐→选定."""
+    """Sketch lateral path: knows arrival time → provides a time window → time negotiation → recommendation → picks one."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要安装")
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", "还没到货")
-    chat(sessions, "s1", "大概周五到")           # 知道 → 时间段询问
+    chat(sessions, "s1", "大概周五到")           # knows → time-window inquiry
     assert session.cxt.current_node_code == "install_time_window"
-    chat(sessions, "s1", "周末上午都行")         # 提供时间 → 时间协商
+    chat(sessions, "s1", "周末上午都行")         # provides a window → time negotiation
     assert session.cxt.current_node_code == "install_ask_time"
-    chat(sessions, "s1", "你们看着安排吧")       # 都不知道 → 档期推荐
+    chat(sessions, "s1", "你们看着安排吧")       # knows neither → schedule recommendation
     assert session.cxt.current_node_code == "install_recommend"
-    reply = chat(sessions, "s1", "第一个不错")   # 选定 → 具体日期约定
+    reply = chat(sessions, "s1", "第一个不错")   # picks one → specific-date booking
     assert session.cxt.current_node_code == "install_specific_date"
     assert reply == "外呼回复: 具体日期约定"
 
 
 def test_time_window_not_provided_falls_to_available(pattern, sessions):
-    """Sketch edge: 时间段不提供 → 是否方便（而非直接进时间协商）."""
+    """Sketch edge: no time window provided → availability check (instead of going straight into time negotiation)."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要安装")
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", "还没到货")
     chat(sessions, "s1", "大概周五到")
-    chat(sessions, "s1", "说不好时间段")         # 不提供 → 上门方便确认
+    chat(sessions, "s1", "说不好时间段")         # not provided → availability check
     assert session.cxt.current_node_code == "install_available"
 
 
@@ -379,10 +382,10 @@ def test_time_window_not_provided_falls_to_available(pattern, sessions):
 # ============================================================================
 
 def test_address_mismatch_ends(pattern, sessions):
-    """Sketch terminal edge: 地址不一致 → 通话结束（会话结束 action 触发）."""
+    """Sketch terminal edge: address mismatch → call close (conversation_end action fired)."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要安装")
-    reply = chat(sessions, "s1", "地址不对")      # 否 → 通话结束
+    reply = chat(sessions, "s1", "地址不对")      # negative → call close
 
     assert session.cxt.current_node_code == "install_end"
     assert reply == "外呼回复: 通话结束语"
@@ -394,11 +397,11 @@ def test_address_mismatch_ends(pattern, sessions):
 # ============================================================================
 
 @pytest.mark.parametrize("decline_query", [
-    "不需要安装了，别约了",       # 不想预约
-    "已经装过了",                # 已安装
-    "冰箱有质量问题",            # 质量问题
-    "我已经退货了",              # 退货
-    "我不是本人，打错了",        # 非本人
+    "不需要安装了，别约了",       # does not want to book
+    "已经装过了",                # already installed
+    "冰箱有质量问题",            # quality issue
+    "我已经退货了",              # returned
+    "我不是本人，打错了",        # not the account holder
 ])
 def test_generic_decline_at_any_node(pattern, sessions, decline_query):
     """Supplemented: the five decline intents, heard mid-flow, land on
@@ -429,8 +432,9 @@ def test_decline_heard_at_opening(pattern, sessions):
 
 
 def test_not_available_now_books_callback(pattern, sessions):
-    """Supplemented: 不方便（现在没空，但没拒绝安装）→ 下次联系时间 →
-    客户给了有效未来时间（周五下午，2周窗口内）→ 按客户时间收尾."""
+    """Supplemented: not available (busy now, install not declined) → callback
+    time → the customer gives a valid future time (Friday afternoon, within
+    the 2-week window) → close on the customer's time."""
     import time as _time
 
     session = launch(pattern, sessions)
@@ -440,36 +444,36 @@ def test_not_available_now_books_callback(pattern, sessions):
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", "还没到货")
     chat(sessions, "s1", "不知道到货时间")
-    reply = chat(sessions, "s1", "最近都不方便")  # 否边 → 下次联系时间
+    reply = chat(sessions, "s1", "最近都不方便")  # negative edge → callback time
     assert session.cxt.current_node_code == "install_ask_callback"
     assert reply == "外呼回复: 下次联系时间"
 
-    reply = chat(sessions, "s1", "周五下午再打给我")  # (2026-09-11) 有效未来时间
+    reply = chat(sessions, "s1", "周五下午再打给我")  # (2026-09-11) valid future time
     assert session.cxt.current_node_code == "install_end"
     slots = session.cxt.filled_slots
     assert slots.get("callback_source") == "customer"
     assert "2026-09-11" in slots.get("callback_time", "")
-    assert "2026-09-11" in reply          # 播报复述了客户时间
+    assert "2026-09-11" in reply          # the spoken reply restates the customer time
     assert end_actions(session.cxt)
 
 
 def test_confirm_time_reschedule_loops(pattern, sessions):
-    """Supplemented: 确认后改约 → 改约重协商 → 回到时间协商重新约定."""
+    """Supplemented: reschedule after confirmation → reschedule renegotiation → back to time negotiation to rebook."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要安装")
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", "到货了")
-    chat(sessions, "s1", "10月1号下午3点")       # → 具体日期约定
-    chat(sessions, "s1", "可以的没问题")          # → 时间确认
+    chat(sessions, "s1", "10月1号下午3点")       # → specific-date booking
+    chat(sessions, "s1", "可以的没问题")          # → time confirmation
     assert session.cxt.current_node_code == "install_confirm_time"
 
-    reply = chat(sessions, "s1", "时间想改一下")  # 改约 → 改约重协商
+    reply = chat(sessions, "s1", "时间想改一下")  # reschedule → reschedule renegotiation
     assert session.cxt.current_node_code == "install_reschedule"
     assert reply == "外呼回复: 改约重协商"
 
-    chat(sessions, "s1", "嗯重新约")             # → 时间协商
+    chat(sessions, "s1", "嗯重新约")             # → time negotiation
     assert session.cxt.current_node_code == "install_ask_time"
-    chat(sessions, "s1", "10月2号上午10点")       # 重新约定
+    chat(sessions, "s1", "10月2号上午10点")       # rebooked
     assert session.cxt.current_node_code == "install_specific_date"
 
 
@@ -512,7 +516,7 @@ def test_guard_unbookable_time_reroutes_to_recommend(pattern, sessions):
     session.cxt.metadata["time_base"] = _time.mktime(
         _time.strptime("2026-09-09 10:00:00", "%Y-%m-%d %H:%M:%S"))
 
-    reach_ask_time(sessions)                        # walk to 时间协商 (3 turns)
+    reach_ask_time(sessions)                        # walk to time negotiation (3 turns)
     before = FakeProvider.call_count
     reply = chat(sessions, "s1", "明天下午3点")       # (2026-09-10 15:00)
     assert FakeProvider.call_count - before == 1     # only the unified call
@@ -562,7 +566,7 @@ def test_guard_skips_callback_times(pattern, sessions):
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", "还没到货")
     chat(sessions, "s1", "不知道到货时间")
-    chat(sessions, "s1", "现在没空，晚点再说")    # → 下次联系时间
+    chat(sessions, "s1", "现在没空，晚点再说")    # → callback time
     # A callback time FAR outside the installer's windows — the booking
     # guard never fires (no bookable/matched_slot annotations); the
     # callback triage reroutes it to the default-callback node instead
@@ -592,12 +596,12 @@ def test_guard_no_schedule_injected_is_noop(pattern, sessions):
 def test_recommend_nlg_schedule_backed(pattern, sessions):
     """The recommend node's NLG always speaks the real schedule (task_info's
     available_slots), zero LLM — including a fresh model-driven landing
-    (都不知道 → 推荐)."""
+    (knows neither → recommendation)."""
     session = launch(pattern, sessions)
     reach_ask_time(sessions)
 
     before = FakeProvider.call_count
-    reply = chat(sessions, "s1", "你们看着安排吧")   # → 档期推荐
+    reply = chat(sessions, "s1", "你们看着安排吧")   # → schedule recommendation
     assert session.cxt.current_node_code == "install_recommend"
     assert FakeProvider.call_count - before == 1     # only the unified call
 
@@ -611,7 +615,7 @@ def test_recommend_nlg_schedule_backed(pattern, sessions):
 
 def test_time_augmented_query_flows_into_prompt(pattern, sessions):
     """A visit-time reply carrying relative time is augmented by
-    TimeAugQueryRewriter and lands in the unified prompt's 改写结果 section."""
+    TimeAugQueryRewriter and lands in the unified prompt's rewrite-result section."""
     import time as _time
 
     session = launch(pattern, sessions)
@@ -636,8 +640,8 @@ def test_time_augmented_query_flows_into_prompt(pattern, sessions):
     finally:
         InstallBookingUnifiedNLU._call_llm = original
 
-    # The rewrite resolved the relative time ("明天" -> 2026-09-10) before the
-    # unified prompt; the prompt's 改写结果 section carries the annotation
+    # The rewrite resolved the relative time (tomorrow -> 2026-09-10) before the
+    # unified prompt; the prompt's rewrite-result section carries the annotation
     assert "2026-09-10" in session.cxt.rewritten_queries[0]
     rewrite_section = captured["prompt"].split("### 改写结果", 1)[1]
     assert "2026-09-10" in rewrite_section
@@ -751,7 +755,7 @@ def test_clarify_turn_then_flow_resumes(pattern, sessions):
 
 
 # ============================================================================
-# Callback-time close tests (three branches after 下次联系时间)
+# Callback-time close tests (three branches after the callback-time node)
 # ============================================================================
 
 def _reach_callback(sessions):
@@ -765,7 +769,7 @@ def _reach_callback(sessions):
 
 
 def test_callback_valid_time_closes_on_customer_time(pattern, sessions):
-    """Branch 2: a valid future time within 2 weeks (下周一, annotated) →
+    """Branch 2: a valid future time within 2 weeks (next Monday, annotated) →
     close restating the customer's time; callback_source=customer."""
     import time as _time
 
@@ -785,10 +789,10 @@ def test_callback_valid_time_closes_on_customer_time(pattern, sessions):
 
 
 def test_callback_too_far_falls_back_to_default(pattern, sessions):
-    """Branch 1: a time beyond 2 weeks (下个月20号 — outside the annotation
-    window, unannotated) → rerouted to install_callback_default (default
-    3-days proposal, far date never announced); the customer's answer closes
-    the call (two beats)."""
+    """Branch 1: a time beyond 2 weeks (the 20th of next month — outside the
+    annotation window, unannotated) → rerouted to install_callback_default
+    (default 3-days proposal, far date never announced); the customer's
+    answer closes the call (two beats)."""
     import time as _time
 
     session = launch(pattern, sessions)
@@ -814,7 +818,7 @@ def test_callback_too_far_falls_back_to_default(pattern, sessions):
 
 
 def test_callback_past_time_falls_back_to_default(pattern, sessions):
-    """Branch 1 (past): a past time (上周五, unannotated) → default node."""
+    """Branch 1 (past): a past time (last Friday, unannotated) → default node."""
     import time as _time
 
     session = launch(pattern, sessions)
@@ -833,7 +837,7 @@ def test_callback_past_time_falls_back_to_default(pattern, sessions):
 
 
 def test_callback_vague_or_missing_falls_back_to_default(pattern, sessions):
-    """Branch 3: 都行/没给时间 → default node → close on answer."""
+    """Branch 3: any time / no time given → default node → close on answer."""
     import time as _time
 
     session = launch(pattern, sessions)

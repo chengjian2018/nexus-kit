@@ -84,7 +84,7 @@ def test_message_sink_failure_does_not_break_dialogue():
 
 
 def test_message_sink_failure_counts_are_cumulative():
-    """审查 M-1：sink 失败必须可观测——计数累积，供压缩放弃告警与轮末快照提示引用。"""
+    """Audit M-1: sink failures must be observable — the count accumulates and is referenced by the compression-abandonment alert and the end-of-turn snapshot hint."""
     def flaky_sink(msg):
         if msg.content != "落库成功":
             raise RuntimeError("db down")
@@ -93,8 +93,8 @@ def test_message_sink_failure_counts_are_cumulative():
     arun(cxt.add_message("user", "失败1", stage="chat"))
     arun(cxt.add_message("user", "落库成功", stage="chat"))
     arun(cxt.add_message("user", "失败2", stage="chat"))
-    assert len(cxt.history) == 3                 # 内存始终完整
-    assert cxt.sink_failure_count == 2           # 计数与失败次数一致（不因成功归零）
+    assert len(cxt.history) == 3                 # memory stays complete throughout
+    assert cxt.sink_failure_count == 2           # count matches the failures (not reset by successes)
 
 
 # ---------------------------------------------------------------------------

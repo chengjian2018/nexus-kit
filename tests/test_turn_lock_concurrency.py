@@ -1,13 +1,17 @@
-"""同会话并发 turn 的串行化行为回归（审查 M-4）。
+"""Serialization regression for concurrent turns on the same session (audit
+M-4).
 
-生产代码靠 ``_run_chat_turn_core`` 里的 ``async with session.turn_lock``
-防止同 session 并发 turn 交错 begin_turn 重置与 history 追加（买家重试 /
-渠道重放场景）；此前唯一相关测试只断言了 ``isinstance(turn_lock,
-asyncio.Lock)``。这里用行为级验证：
+Production code relies on ``async with session.turn_lock`` inside
+``_run_chat_turn_core`` to keep concurrent turns on the same session from
+interleaving begin_turn resets and history appends (buyer retry / channel
+replay scenarios); the only related test previously just asserted
+``isinstance(turn_lock, asyncio.Lock)``. This is behavior-level verification:
 
-- 同 session 两个并发 turn：history 是两个完整 (user, assistant) 对，
-  绝不交错（相邻 user 行 = 串行化失效的直接症状）
-- 跨 session：慢 turn 不阻塞别的 session（锁是 per-session 的）
+- Two concurrent turns on the same session: history holds two complete
+  (user, assistant) pairs, never interleaved (adjacent user rows = the
+  direct symptom of failed serialization)
+- Across sessions: a slow turn does not block other sessions (the lock is
+  per-session)
 """
 
 import asyncio
@@ -49,7 +53,7 @@ def _make_stub_chat():
     async def stub_chat(query, session_id, all_sessions, store=None, **kw):
         cxt = all_sessions[session_id].cxt
         await cxt.add_message("user", query, stage="chat")
-        await asyncio.sleep(0.2)  # 慢 LLM：给并发交错留足窗口
+        await asyncio.sleep(0.2)  # slow LLM: leaves ample window for concurrent interleaving
         await cxt.add_message("assistant", f"reply::{query}", stage="chat")
         return f"reply::{query}"
 
@@ -72,8 +76,9 @@ def test_concurrent_turns_same_session_serialize(monkeypatch):
     assert r1 == "reply::q1" and r2 == "reply::q2"
 
     pairs = [(m.role, m.content) for m in s.cxt.history]
-    # 两个完整 (user, assistant) 对，以某种顺序排列，但绝不交错：
-    # user 后必须紧跟本 turn 的 assistant（相邻 user 行 = 锁失效）
+    # Two complete (user, assistant) pairs in some order, but never
+    # interleaved: a user row must be immediately followed by its own
+    # turn's assistant (adjacent user rows = lock failure)
     assert len(pairs) == 4
     for i, (role, content) in enumerate(pairs):
         if role == "user":
@@ -84,7 +89,7 @@ def test_concurrent_turns_same_session_serialize(monkeypatch):
 
 
 def test_cross_session_turns_do_not_block_each_other(monkeypatch):
-    """per-session 锁：慢 session 的 turn 进行中，快 session 的 turn 照常完成。"""
+    """Per-session lock: while the slow session's turn is in flight, the fast session's turn completes normally."""
     s_slow, s_fast = _mk_session("s-slow"), _mk_session("s-fast")
     main, restore = _install_chat(monkeypatch, s_slow, s_fast)
     done: list[tuple[str, float]] = []

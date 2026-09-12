@@ -1,12 +1,11 @@
-"""Agent-hooks interface contract tests (plan-④).
+"""Agent-hooks interface contract tests (plan-⑧ node form).
 
-The hooks machinery is retained (7 points / event classes / declaration
+The hooks machinery is retained (6 points — on_transfer went with the
+defer/transfer machinery — / event classes carrying node_code / declaration
 resolution / dispatcher signatures) but the default behavior is a no-op
 pass-through: with no hooks package declared, every point costs nothing and
 every dispatcher returns its input unchanged. These tests pin THAT contract
-(the signature and the pass-through), not hook behaviors — the behavioral
-suite was removed with plan-④ (git history has it; restore when the hooks
-implementation is revived).
+(the signature and the pass-through), not hook behaviors.
 """
 
 import logging
@@ -26,16 +25,16 @@ from nexus.engine.agent_hooks import (
 )
 
 
-class _Module:
+class _Node:
     def __init__(self, agent_hooks=None):
-        self.module_code = "m"
-        self.agent_hooks = agent_hooks
+        self.code = "n"
+        self.plugins = {"agent_hooks": agent_hooks} if agent_hooks else {}
 
 
 class _Pattern:
     def __init__(self, agent_hooks=None):
         self.code = "p"
-        self.agent_hooks = agent_hooks
+        self.plugins = {"agent_hooks": agent_hooks} if agent_hooks else {}
 
 
 # ---------------------------------------------------------------------------
@@ -45,28 +44,33 @@ class _Pattern:
 def test_hook_points_inventory():
     assert HOOK_POINTS == (
         "on_agent_start", "on_llm_call", "on_llm_response",
-        "on_tool_call", "on_tool_result", "on_transfer", "on_agent_end",
+        "on_tool_call", "on_tool_result", "on_agent_end",
     )
 
 
 # ---------------------------------------------------------------------------
-# Declaration resolution: str code / callable / legacy dict / degradation
+# Declaration resolution: str code / legacy dict / degradation
 # ---------------------------------------------------------------------------
 
 def test_no_declaration_resolves_empty():
-    assert resolve_agent_hooks(_Module(), _Pattern()) == {}
+    assert resolve_agent_hooks(_Node(), _Pattern()) == {}
 
 
-def test_module_replaces_pattern_wholesale():
+def test_node_replaces_pattern_wholesale():
     hooks_map = {"on_agent_start": [lambda e: None]}
-    resolved = resolve_agent_hooks(_Module(hooks_map),
+    resolved = resolve_agent_hooks(_Node(hooks_map),
                                    _Pattern({"on_llm_call": [lambda e: None]}))
     assert set(resolved) == {"on_agent_start"}
 
 
+def test_pattern_level_declares_when_node_silent():
+    resolved = resolve_agent_hooks(
+        _Node(), _Pattern({"on_llm_call": [lambda e: None]}))
+    assert set(resolved) == {"on_llm_call"}
+
+
 def test_legacy_dict_form_still_resolves():
-    """Transitional: the inline {point: [hook]} dict keeps working (used by
-    in-repo tests until hooks packages get registered)."""
+    """Transitional: the inline {point: [hook]} dict keeps working."""
     seen = []
     resolved = resolve_agent_hooks(
         _Pattern({"on_agent_end": [lambda e: seen.append(e)]}))
@@ -112,23 +116,23 @@ def test_unknown_point_and_non_callable_degrade(caplog):
 
 def test_fire_with_empty_hooks_is_noop():
     fire({}, "on_agent_end", AgentStartEvent(session_id="s",
-                                             module_code="m", cxt=None))
+                                             node_code="n", cxt=None))
 
 
 def test_collect_fragments_empty_returns_empty():
     assert collect_fragments({}, AgentStartEvent(
-        session_id="s", module_code="m", cxt=None)) == []
+        session_id="s", node_code="n", cxt=None)) == []
 
 
 def test_rewrite_tool_call_empty_hooks_returns_original():
-    event = ToolCallEvent(session_id="s", module_code="m", round_idx=0,
+    event = ToolCallEvent(session_id="s", node_code="n", round_idx=0,
                           tool_name="t", args={"a": 1})
     name, args, audit = rewrite_tool_call({}, event, {"t"})
     assert name == "t" and args == {"a": 1} and audit is None
 
 
 def test_rewrite_tool_result_empty_hooks_returns_original():
-    event = ToolResultEvent(session_id="s", module_code="m", round_idx=0,
+    event = ToolResultEvent(session_id="s", node_code="n", round_idx=0,
                             tool_name="t", tool_call_id="c",
                             result="raw")
     result, audit = rewrite_tool_result({}, event)
@@ -141,7 +145,7 @@ def test_fire_swallows_hook_exception():
 
     hooks = {"on_agent_end": [_boom]}
     fire(hooks, "on_agent_end", LLMCallEvent(session_id="s",
-                                             module_code="m", round_idx=0,
+                                             node_code="n", round_idx=0,
                                              messages=[], model="x"))
     # no raise: exception containment is part of the contract
 
@@ -151,9 +155,9 @@ def test_fire_swallows_hook_exception():
 # ---------------------------------------------------------------------------
 
 def test_event_classes_field_shape():
-    e = AgentStartEvent(session_id="s", module_code="m", cxt=None)
-    assert e.session_id == "s" and e.module_code == "m"
-    e2 = ToolCallEvent(session_id="s", module_code="m", round_idx=1,
+    e = AgentStartEvent(session_id="s", node_code="n", cxt=None)
+    assert e.session_id == "s" and e.node_code == "n"
+    e2 = ToolCallEvent(session_id="s", node_code="n", round_idx=1,
                        tool_name="t", args={})
     assert e2.round_idx == 1 and e2.tool_name == "t"
     r = RewriteToolCall(name="t2", args={"x": 1})

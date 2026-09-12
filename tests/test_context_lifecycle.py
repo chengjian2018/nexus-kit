@@ -1,15 +1,20 @@
-"""TurnLifecycle / ChatResult offline unit tests (no LLM dependency)."""
+"""TurnLifecycle / ChatResult offline unit tests (no LLM dependency).
+
+plan-⑧ form: the module layer is gone (no current_module_code / module_map /
+ModuleJumpEvent); graph_state (the AGENT graph state board) is PERSISTENT —
+begin_turn never touches it, the graph runtime itself clears/re-initializes
+it on termination / fresh runs.
+"""
 
 from async_utils import arun
 from nexus.engine.context_lifecycle import TurnLifecycle
 from nexus.engine.response import ChatResult, build_chat_result
-from nexus.context import DialogueContext, ModuleJumpEvent
+from nexus.context import DialogueContext
 
 
 def _make_cxt() -> DialogueContext:
     """Build a cxt in a "leftover from the previous turn" state: every kind of field non-empty."""
     cxt = DialogueContext(session_id="s1", user_query="旧问题")
-    cxt.current_module_code = "m1"
     cxt.current_node_code = "n1"
     cxt.filled_slots = {"price": "100"}
     cxt.task_basic_info = {"city": "杭州"}
@@ -20,6 +25,9 @@ def _make_cxt() -> DialogueContext:
     cxt.rewritten_queries = ["旧改写"]
     cxt.post_recall_results = [{"doc": "旧2"}]
     cxt.actions = [{"type": "old_action"}]
+    # a suspended graph's state board (paused cursor + free workflow data)
+    cxt.graph_state = {"__paused_node__": "n1", "__step__": 2,
+                       "subtasks": ["调研竞品"]}
     cxt.metadata = {
         "bargain_settings": {"max_rounds": 3},
         "task_info": {"order_id": "o1"},
@@ -27,7 +35,6 @@ def _make_cxt() -> DialogueContext:
         "pattern_code": "p1",
         "unified": {"used": True},
         "clarify": {"triggered": True, "topic": "旧主题"},
-        "served_by_projection": {"module": "m1", "source": "m0"},
     }
     arun(cxt.add_message("user", "旧问题", stage="chat"))
     return cxt
@@ -57,19 +64,27 @@ class TestBeginTurn:
     def test_per_turn_metadata_keys_popped(self):
         cxt = _make_cxt()
         TurnLifecycle().begin_turn(cxt, "新问题")
-        for key in ("unified", "clarify", "served_by_projection"):
+        for key in ("unified", "clarify"):
             assert key not in cxt.metadata
 
     def test_persistent_fields_survive(self):
         cxt = _make_cxt()
         history_len = len(cxt.history)
         TurnLifecycle().begin_turn(cxt, "新问题")
-        assert cxt.current_module_code == "m1"
         assert cxt.current_node_code == "n1"
         assert cxt.filled_slots == {"price": "100"}
         assert cxt.task_basic_info == {"city": "杭州"}
         assert len(cxt.history) == history_len
-        assert cxt.node_map == {} and cxt.module_map == {}  # original references kept
+        assert cxt.node_map == {}  # original reference kept
+
+    def test_graph_state_is_persistent(self):
+        """graph_state (the AGENT state board) survives begin_turn: while a
+        graph is suspended, the paused cursor IS the cross-turn state — only
+        the graph runtime itself clears it (on termination / fresh runs)."""
+        cxt = _make_cxt()
+        TurnLifecycle().begin_turn(cxt, "新问题")
+        assert cxt.graph_state == {"__paused_node__": "n1", "__step__": 2,
+                                   "subtasks": ["调研竞品"]}
 
     def test_persistent_metadata_keys_survive(self):
         cxt = _make_cxt()
@@ -130,17 +145,20 @@ class TestChatResult:
         assert result.text == "回复文本"
         assert result.actions == [{"type": "old_action"}]
 
-    def test_build_snapshots_jump_event_as_dict(self):
-        """A leftover ModuleJumpEvent (unconsumed after exceeding the hop limit) is snapshotted as an observation dict."""
+    def test_build_snapshots_graph_wait_action_as_dict(self):
+        """A graph_wait action (wait_human suspension) is a dict action —
+        snapshotted verbatim into ChatResult.actions."""
         cxt = _make_cxt()
-        cxt.actions.append(ModuleJumpEvent(
-            target_module_code="m2", reason="r", source="nlu_jump"))
+        cxt.actions.append({"graph_wait": {"node": "n2", "step": 1,
+                                           "message": ""}})
         result = build_chat_result("t", cxt)
         assert result.actions == [
             {"type": "old_action"},
-            {"module_jump": {"target": "m2", "reason": "r",
-                             "source": "nlu_jump"}},
+            {"graph_wait": {"node": "n2", "step": 1, "message": ""}},
         ]
+        # json-serializable (the API layer's observation channel)
+        import json
+        json.dumps(result.actions, ensure_ascii=False)
 
     def test_build_with_empty_cxt(self):
         cxt = DialogueContext(session_id="s", user_query="q")

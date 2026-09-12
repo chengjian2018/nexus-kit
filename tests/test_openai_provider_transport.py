@@ -1,13 +1,19 @@
-"""Transport-layer tests for OpenAICompatibleProvider（审查 H-2 回归网）.
+"""Transport-layer tests for OpenAICompatibleProvider (audit H-2 regression
+net).
 
-全仓唯一真实网络模块此前零传输层测试。用 httpx.MockTransport 注入脚本化
-响应，不发出任何真实网络请求。注意公共入口 ``achat_completion`` 统一路由
-到流式实现再聚合（plan-⑤），因此：
+The repo's only real-network module previously had zero transport-layer
+tests. Scripted responses are injected via httpx.MockTransport — no real
+network requests are made. Note the public entry ``achat_completion`` routes
+uniformly to the streaming implementation and then aggregates (plan-⑤),
+hence:
 
-- 流式重试 / 4xx fail-fast / 耗尽 —— 经公共 ``achat_completion`` 验证（生产路径）
-- 非流式 ``_achat_completion_impl`` 的重试 —— 直测实现（默认桥接的兜底路径）
-- SSE 解析（text 增量、tool_call 分片、finish_reason、usage-only 尾 chunk、
-  坏 JSON 行、非 data 行、[DONE] 终止）—— 直测 ``achat_completion_stream``
+- Streaming retry / 4xx fail-fast / exhaustion — verified through the public
+  ``achat_completion`` (production path)
+- Non-streaming ``_achat_completion_impl`` retry — implementation tested
+  directly (the default bridge's fallback path)
+- SSE parsing (text deltas, tool_call fragments, finish_reason, usage-only
+  tail chunk, broken JSON lines, non-data lines, [DONE] termination) —
+  ``achat_completion_stream`` tested directly
 """
 
 import asyncio
@@ -97,7 +103,7 @@ class _Flaky:
 
 
 # ============================================================================
-# 流式路径（生产路径：achat_completion → stream → aggregate）
+# Streaming path (production path: achat_completion → stream → aggregate)
 # ============================================================================
 
 def test_stream_retry_then_success(monkeypatch):
@@ -107,8 +113,8 @@ def test_stream_retry_then_success(monkeypatch):
     assert result["content"] == "最终成功"
     assert result["finish_reason"] == "stop"
     assert result["usage"] == {"total_tokens": 7}
-    assert handler.n == 3                          # 两次失败 + 第三次成功
-    assert sleeps == [1.0, 2.0]                    # 线性退避 1s, 2s
+    assert handler.n == 3                          # two failures + third succeeds
+    assert sleeps == [1.0, 2.0]                    # linear backoff 1s, 2s
 
 
 def test_stream_retry_exhausted(monkeypatch):
@@ -129,15 +135,15 @@ def test_stream_429_retried(monkeypatch):
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404])
 def test_stream_non_retryable_4xx_fails_fast(monkeypatch, status):
-    """4xx 表示请求本身错误（鉴权/参数/路径），退避重试只会推迟必然的失败。"""
+    """4xx means the request itself is wrong (auth/params/path); backoff retries only postpone the inevitable failure."""
     calls, _ = _install(monkeypatch, lambda req: httpx.Response(status, text="nope"))
     with pytest.raises(httpx.HTTPStatusError):
         arun(_provider().achat_completion(MESSAGES))
-    assert len(calls) == 1                         # 立即失败，不消耗重试
+    assert len(calls) == 1                         # fails immediately, consumes no retries
 
 
 def test_stream_transport_error_retried(monkeypatch):
-    """连接层错误（非 HTTPStatusError）仍应走重试路径。"""
+    """Connection-layer errors (not HTTPStatusError) should still go through the retry path."""
     state = {"n": 0}
 
     def handler(req):
@@ -169,7 +175,7 @@ def test_request_carries_auth_and_payload(monkeypatch):
 
 
 # ============================================================================
-# 非流式实现（默认桥接兜底路径，此类经公共入口不可达，直测）
+# Non-streaming implementation (default-bridge fallback path; unreachable through the public entry, tested directly)
 # ============================================================================
 
 def _call_impl(p, **kw):
@@ -203,14 +209,14 @@ def test_impl_retry_exhausted(monkeypatch):
 
 
 # ============================================================================
-# SSE 解析（achat_completion_stream 直测）
+# SSE parsing (achat_completion_stream tested directly)
 # ============================================================================
 
 SSE_BODY = "\n".join([
-    ": keepalive comment",                                     # 非 data 行 → 跳过
+    ": keepalive comment",                                     # non-data line → skipped
     'data: {"choices":[{"delta":{"content":"你"}}]}',
     'data: {"choices":[{"delta":{"content":"好"}}]}',
-    "data: {broken json",                                      # 坏 JSON 行 → 跳过
+    "data: {broken json",                                      # broken JSON line → skipped
     'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
     '"id":"call_1","type":"function","function":{"name":"search",'
     '"arguments":"{\\"q\\": "}}]}}]}',
@@ -218,9 +224,9 @@ SSE_BODY = "\n".join([
     '"function":{"arguments":"\\"天气\\"}"}}]}}]}',
     'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
     'data: {"choices":[],"usage":{"prompt_tokens":3,'
-    '"completion_tokens":9,"total_tokens":12}}',               # usage-only 尾 chunk
+    '"completion_tokens":9,"total_tokens":12}}',               # usage-only tail chunk
     "data: [DONE]",
-    'data: {"choices":[{"delta":{"content":"after done"}}]}',  # DONE 后 → 忽略
+    'data: {"choices":[{"delta":{"content":"after done"}}]}',  # after DONE → ignored
 ]) + "\n"
 
 
@@ -243,7 +249,7 @@ def test_sse_stream_parsing(monkeypatch):
     assert first["function"]["arguments"] == '{"q": '
     second = tool_chunks[1].tool_calls[0]
     assert second["function"]["arguments"] == '"天气"}'
-    # 两片拼接应为合法 tool_call 参数 JSON
+    # the two fragments concatenated must form valid tool_call arguments JSON
     assert json.loads(first["function"]["arguments"] + second["function"]["arguments"]) == {"q": "天气"}
 
     finishes = [c.finish_reason for c in chunks if c.finish_reason]
@@ -252,5 +258,5 @@ def test_sse_stream_parsing(monkeypatch):
     usages = [c.usage for c in chunks if c.usage]
     assert usages == [{"prompt_tokens": 3, "completion_tokens": 9, "total_tokens": 12}]
 
-    # [DONE] 之后的内容不得产出 chunk
+    # content after [DONE] must not produce a chunk
     assert all(c.text != "after done" for c in chunks)

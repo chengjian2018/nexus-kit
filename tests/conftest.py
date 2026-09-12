@@ -6,10 +6,12 @@ import os
 import sys
 from pathlib import Path
 
-# 测试隔离:pytest 从仓库根运行时,CWD 探测会命中真实的
-# host/config/local_config.yaml(可能配置了真实 MCP server)——不关掉则
-# 每个测试进程都会真连 server(网络依赖 + ensure_mcp_ready 时序闸把每轮
-# 对话拖慢数十秒)。必须在任何 atoms.tools import 之前置位
+# Test isolation: when pytest runs from the repo root, CWD probing would hit
+# the real host/config/local_config.yaml (which may configure real MCP
+# servers) — without disabling it, every test process would actually connect
+# to servers (network dependency + the ensure_mcp_ready timing gate slows
+# each dialogue round by tens of seconds). Must be set before any
+# atoms.tools import.
 os.environ.setdefault("NEXUS_MCP_DISABLED", "1")
 
 TESTS_DIR = Path(__file__).resolve().parent

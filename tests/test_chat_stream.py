@@ -13,12 +13,12 @@ from async_utils import arun
 from nexus.engine.chat import chat_turn, chat_turn_stream
 from nexus.engine.session import Session
 from nexus.engine.streaming import aggregate_turn
-from nexus.model.module import AgentModule
+from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 
 
 # ============================================================================
-# Fixture: an AGENT pattern driven by a scripted provider
+# Fixture: a single-node AGENT pattern driven by a scripted provider
 # ============================================================================
 
 class _StreamProvider:
@@ -42,15 +42,11 @@ class _StreamProvider:
 
 
 def _stream_session():
-    main = AgentModule(module_code="sm", module_name="主",
-                       module_description="d")
     p = Pattern(code="sp", name="t", description="t",
-                entry_module_code="sm", modules=[main])
+                nodes=[BaseNode(code="n1", name="主节点")])
     s = Session(session_id="ss", pattern_code="sp")
     s.pattern = p
-    s.cxt.module_map = p.module_map
     s.cxt.node_map = p.node_map
-    s.cxt.current_module_code = "sm"
     s.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
     s.cxt.llm_config = {"code": "x", "model": "m"}
     return s
@@ -91,11 +87,16 @@ def test_delta_then_round_then_done_sequence():
     with patch("atoms.executors.loop_executor.build_provider",
                return_value=provider):
         events = arun(_collect_events(chat_turn_stream("q", "ss", {"ss": s})))
-    kinds = [e.kind for e in events]
-    # deltas arrive as streamed, then the round marker, then done
-    assert kinds == ["delta", "delta", "round", "done"]
+    kinds = [(e.kind, getattr(e.trace, "event", None)) for e in events]
+    # deltas arrive as streamed (inside the node execution, wrapped by the
+    # graph runtime's node_start/node_end/graph_done traces), then done
+    assert kinds == [("trace", "node_start"),
+                     ("delta", None), ("delta", None), ("round", None),
+                     ("trace", "node_end"), ("trace", "graph_done"),
+                     ("done", None)]
     assert "".join(e.text for e in events if e.kind == "delta") == "你好"
-    assert events[-2].round_info == {"outcome": "final", "round_idx": 0}
+    rounds = [e.round_info for e in events if e.kind == "round"]
+    assert rounds == [{"outcome": "final", "round_idx": 0}]
     assert events[-1].result.text == "你好"
 
 
@@ -152,7 +153,10 @@ def test_fallback_without_stream_method_still_works():
     with patch("atoms.executors.loop_executor.build_provider",
                return_value=_Legacy()):
         events = arun(_collect_events(chat_turn_stream("q", "ss", {"ss": s})))
-    assert [e.kind for e in events] == ["round", "done"]
+    kinds = [e.kind for e in events]
+    # no deltas (non-streaming provider); only the round marker between the
+    # node lifecycle traces and done
+    assert kinds == ["trace", "round", "trace", "trace", "done"]
     assert events[-1].result.text == "legacy 答复"
 
 
@@ -181,7 +185,9 @@ def test_sse_endpoint_streams_events(_stream_debug_env, monkeypatch):
     payloads = [json.loads(line[6:]) for line in resp.text.splitlines()
                 if line.startswith("data: ")]
     kinds = [p["kind"] for p in payloads]
-    assert kinds == ["delta", "delta", "round", "done"]
+    # node lifecycle traces wrap the streamed deltas / round marker
+    assert kinds == ["trace", "delta", "delta", "round",
+                     "trace", "trace", "done"]
     assert payloads[-1]["result"]["text"] == "流式回复"
 
 

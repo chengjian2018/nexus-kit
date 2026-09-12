@@ -9,13 +9,15 @@ _repair_unified; the install/repair FSMs share node names, so the branch
 is picked by the node-code prefix in the prompt). Covers:
 1. Pattern structure and AST auto-discovery registration (14 nodes; no
    arrival nodes; confirm-time → ask_fault edge; fault → end edge)
-2. Outbound opening + happy path: 开场→地址核对→时间协商(具体日期)→确认
-   →故障信息询问→故障信息确认→通话结束 (fault slot accumulates before end)
-3. Time negotiation branches: 最近 / 都不知道→推荐→选定
+2. Outbound opening + happy path: opening → address confirmation → time
+   negotiation (specific date) → confirmation → fault-info inquiry →
+   fault-info confirmation → call close (fault slot accumulates before end)
+3. Time negotiation branches: nearest / knows neither → recommendation →
+   picks one
 4. Repair-shaped decline intents at any node → repair_decline → repair_end;
-   install-only intents (质量问题/退货) are NOT decline exits here
-5. 现在没空 → 下次联系时间 → end; callback triage branches (valid / too far /
-   past / vague → default 3-day proposal)
+   install-only intents (quality issue / return) are NOT decline exits here
+5. Busy now → callback time → end; callback triage branches (valid / too
+   far / past / vague → default 3-day proposal)
 6. Booking-time hard guard (subclass-reused machinery, repair node codes):
    bookable annotated / unbookable rerouted to repair_recommend with the
    schedule-backed reply / callback times skipped / no-schedule no-op
@@ -86,7 +88,6 @@ def launch(pattern, sessions, session_id="s1", task_info=None):
     session = Session(session_id=session_id, pattern_code=pattern.code)
     session.pattern = pattern
     session.task_info = {}
-    session.cxt.module_map = pattern.module_map
     session.cxt.node_map = pattern.node_map
     session.cxt.metadata["task_info"] = dict(
         TASK_INFO if task_info is None else task_info)
@@ -109,7 +110,7 @@ def end_actions(cxt):
 
 
 def reach_confirm_time(sessions):
-    """Walk the happy prefix (greet → address → time) up to 上门时间确认."""
+    """Walk the happy prefix (greet → address → time) up to visit-time confirmation."""
     chat(sessions, "s1", "方便的，是要维修")
     chat(sessions, "s1", "地址对的")
     chat(sessions, "s1", "10月1号下午3点吧")
@@ -124,15 +125,11 @@ def test_pattern_auto_discovered_and_structure(pattern):
     """14 nodes; no arrival subtree; confirm-time routes to fault collection
     (not end); every business node carries a decline edge; repair_end is the
     sole is_end terminal."""
-    from nexus.model.module import ModuleType
-
     assert pattern.code == "repair_booking_agent"
-    assert pattern.entry_module_code == "repair_booking"
+    assert pattern.entry_node_code == "repair_greet"
+    assert pattern.pattern_type == "fsm"
 
-    module = pattern.module_map["repair_booking"]
-    assert module.type == ModuleType.FSM
-
-    assert [n.node_code for n in module.module_nodes] == [
+    assert [n.code for n in pattern.nodes] == [
         "repair_greet", "repair_confirm_addr", "repair_ask_time",
         "repair_recommend", "repair_specific_date", "repair_nearest",
         "repair_confirm_time", "repair_reschedule", "repair_ask_fault",
@@ -146,7 +143,7 @@ def test_pattern_auto_discovered_and_structure(pattern):
                    "eta" in c or "time_window" in c or "available" in c
                    for c in codes)
 
-    sub = {n.node_code: set(n.sub_nodes) for n in module.module_nodes}
+    sub = {n.code: set(n.sub_nodes) for n in pattern.nodes}
     assert sub["repair_greet"] == {"repair_confirm_addr", "repair_end",
                                    "repair_decline"}
     # No arrival hop: address ok → straight into time negotiation
@@ -182,23 +179,22 @@ def test_pattern_auto_discovered_and_structure(pattern):
     assert sub["repair_end"] == set()
 
     assert pattern.node_map["repair_end"].is_end is True
-    assert not any(n.is_end for n in module.module_nodes[:-1])
+    assert not any(n.is_end for n in pattern.nodes[:-1])
 
 
 def test_stage_wiring(pattern):
-    """Module stages bind the app-local repair codes; the skeleton carries
-    the clarify slot for the module layer to fill."""
-    root = pattern.module_map["repair_booking"]
-    assert root.stages == {"nlu": "repair_unified",
-                           "clarify": "repair_clarify",
-                           "nlg": "nlg_pass_through"}
-
+    """Pattern 骨架绑 app-local repair codes；节点级 stages 只带 clarify
+    准入开关（同 install 形态）。"""
     skeleton_values = {slot: code for e in pattern.stages
                        for slot, code in e.items()}
-    assert skeleton_values.get("query") == "time_aug_query"
-    assert skeleton_values.get("nlu") is None
-    assert skeleton_values.get("clarify") is None
-    assert skeleton_values.get("nlg") is None
+    assert skeleton_values == {"query": "time_aug_query",
+                               "nlu": "repair_unified",
+                               "clarify": "repair_clarify",
+                               "nlg": "nlg_pass_through"}
+
+    for node in pattern.nodes:
+        assert node.stages in ({}, {"clarify": "repair_clarify"}), (
+            f"node {node.code} 不应携带除 clarify 准入开关外的节点级 stages")
 
     from nexus.registry.plugins import registry as plugin_registry
     for code in ("repair_unified", "repair_recommend_nlg", "repair_clarify"):
@@ -243,8 +239,8 @@ def test_pattern_passes_validation(pattern):
 # ============================================================================
 
 def test_connect_turn_opens_call_and_advances(pattern, sessions):
-    """Outbound opening: the connect turn runs on 外呼开场; the customer's
-    first response advances to 地址核对."""
+    """Outbound opening: the connect turn runs on the outbound-opening node;
+    the customer's first response advances to address confirmation."""
     session = launch(pattern, sessions)
     reply = chat(sessions, "s1", "喂，你好，方便的你说")
 
@@ -253,9 +249,10 @@ def test_connect_turn_opens_call_and_advances(pattern, sessions):
 
 
 def test_happy_path_full_walk_collects_fault_before_end(pattern, sessions):
-    """Main flow: 开场→地址核对→时间协商(具体日期)→确认→故障询问→故障确认→
-    通话结束; the fault slot is collected BETWEEN time confirmation and the
-    hang-up; one LLM call per turn (unified)."""
+    """Main flow: opening → address confirmation → time negotiation (specific
+    date) → confirmation → fault inquiry → fault confirmation → call close;
+    the fault slot is collected BETWEEN time confirmation and the hang-up;
+    one LLM call per turn (unified)."""
     session = launch(pattern, sessions)
 
     steps = [
@@ -288,19 +285,19 @@ def test_happy_path_full_walk_collects_fault_before_end(pattern, sessions):
 
 
 def test_fault_unclear_stays_asking(pattern, sessions):
-    """Fault collection: 说不清 → stays on 故障信息询问 (empty next_node),
-    a clear description on the retry advances."""
+    """Fault collection: cannot describe it → stays on fault-info inquiry
+    (empty next_node); a clear description on the retry advances."""
     session = launch(pattern, sessions)
     reach_confirm_time(sessions)
     assert session.cxt.current_node_code == "repair_confirm_time"
 
-    chat(sessions, "s1", "好的确认")                # → 故障信息询问
+    chat(sessions, "s1", "好的确认")                # → fault-info inquiry
     assert session.cxt.current_node_code == "repair_ask_fault"
-    reply = chat(sessions, "s1", "说不清楚什么问题")  # 说不清 → 留在原节点
+    reply = chat(sessions, "s1", "说不清楚什么问题")  # cannot describe → stays on the node
     assert session.cxt.current_node_code == "repair_ask_fault"
     assert reply == "外呼回复: 故障信息询问"
 
-    reply = chat(sessions, "s1", "就是有异响，嗡嗡的")  # 描述清楚 → 故障确认
+    reply = chat(sessions, "s1", "就是有异响，嗡嗡的")  # clear description → fault confirmation
     assert session.cxt.current_node_code == "repair_confirm_fault"
     chat(sessions, "s1", "对的")
     assert session.cxt.current_node_code == "repair_end"
@@ -312,7 +309,7 @@ def test_fault_unclear_stays_asking(pattern, sessions):
 # ============================================================================
 
 def test_nearest_slot_path(pattern, sessions):
-    """最近 branch: 时间协商→最近档期安排→时间确认→故障询问→结束."""
+    """Nearest branch: time negotiation → nearest-slot arrangement → time confirmation → fault inquiry → close."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要维修")
     chat(sessions, "s1", "地址对的")
@@ -331,19 +328,19 @@ def test_nearest_slot_path(pattern, sessions):
 
 
 def test_recommend_pick_path(pattern, sessions):
-    """都不知道→档期推荐→选定→具体日期约定."""
+    """Knows neither → schedule recommendation → picks one → specific-date booking."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要维修")
     chat(sessions, "s1", "地址对的")
-    chat(sessions, "s1", "你们看着安排吧")           # 都不知道 → 推荐
+    chat(sessions, "s1", "你们看着安排吧")           # knows neither → recommendation
     assert session.cxt.current_node_code == "repair_recommend"
-    reply = chat(sessions, "s1", "第一个不错")        # 选定 → 具体日期
+    reply = chat(sessions, "s1", "第一个不错")        # picks one → specific date
     assert session.cxt.current_node_code == "repair_specific_date"
     assert reply == "外呼回复: 具体日期约定"
 
 
 def test_confirm_time_reschedule_loops(pattern, sessions):
-    """确认后改约 → 改约重协商 → 回到时间协商重新约定."""
+    """Reschedule after confirmation → reschedule renegotiation → back to time negotiation to rebook."""
     session = launch(pattern, sessions)
     reach_confirm_time(sessions)
     assert session.cxt.current_node_code == "repair_confirm_time"
@@ -359,7 +356,7 @@ def test_confirm_time_reschedule_loops(pattern, sessions):
 
 
 def test_address_mismatch_ends(pattern, sessions):
-    """地址不一致 → 通话结束."""
+    """Address mismatch → call close."""
     session = launch(pattern, sessions)
     chat(sessions, "s1", "方便的，是要维修")
     reply = chat(sessions, "s1", "地址不对")
@@ -374,10 +371,10 @@ def test_address_mismatch_ends(pattern, sessions):
 # ============================================================================
 
 @pytest.mark.parametrize("decline_query", [
-    "不需要维修了，别约了",       # 不想维修
-    "已经自己修好了",            # 已自修
-    "已经找别人修过了",          # 已找别人修
-    "我不是本人，打错了",        # 非本人
+    "不需要维修了，别约了",       # does not want the repair
+    "已经自己修好了",            # self-repaired
+    "已经找别人修过了",          # repaired by someone else
+    "我不是本人，打错了",        # not the account holder
 ])
 def test_generic_decline_at_any_node(pattern, sessions, decline_query):
     """The repair decline intents, heard mid-flow, land on repair_decline
@@ -406,7 +403,7 @@ def test_quality_complaint_is_not_a_decline(pattern, sessions):
     chat(sessions, "s1", "10月1号下午3点")
     chat(sessions, "s1", "可以")
 
-    reply = chat(sessions, "s1", "冰箱有质量问题，不制冷")  # → 故障询问
+    reply = chat(sessions, "s1", "冰箱有质量问题，不制冷")  # → fault inquiry
     assert session.cxt.current_node_code == "repair_ask_fault"
     assert session.cxt.current_node_code != "repair_decline"
 
@@ -416,10 +413,10 @@ def test_quality_complaint_is_not_a_decline(pattern, sessions):
 # ============================================================================
 
 def _reach_callback(sessions):
-    """Walk to the callback node: greet → address → 没空."""
+    """Walk to the callback node: greet → address → busy now."""
     chat(sessions, "s1", "方便的，是要维修")
     chat(sessions, "s1", "地址对的")
-    chat(sessions, "s1", "最近都没空，晚点再说")      # → 下次联系时间
+    chat(sessions, "s1", "最近都没空，晚点再说")      # → callback time
 
 
 def test_callback_valid_time_closes_on_customer_time(pattern, sessions):
@@ -467,7 +464,7 @@ def test_callback_too_far_falls_back_to_default(pattern, sessions):
 
 
 def test_callback_vague_falls_back_to_default(pattern, sessions):
-    """Branch 3: 都行/没给时间 → default node → close on answer."""
+    """Branch 3: any time / no time given → default node → close on answer."""
     import time as _time
 
     session = launch(pattern, sessions)
@@ -497,7 +494,7 @@ def test_guard_bookable_time_annotated(pattern, sessions):
 
     chat(sessions, "s1", "方便的，是要维修")
     chat(sessions, "s1", "地址对的")
-    chat(sessions, "s1", "明天上午10点")   # (2026-09-10 10:00) 可约
+    chat(sessions, "s1", "明天上午10点")   # (2026-09-10 10:00) bookable
     assert session.cxt.current_node_code == "repair_specific_date"
 
     slots = session.cxt.filled_slots
@@ -517,7 +514,7 @@ def test_guard_unbookable_time_reroutes_to_recommend(pattern, sessions):
     chat(sessions, "s1", "方便的，是要维修")
     chat(sessions, "s1", "地址对的")
     before = FakeProvider.call_count
-    reply = chat(sessions, "s1", "明天下午3点")       # (2026-09-10 15:00) 不可约
+    reply = chat(sessions, "s1", "明天下午3点")       # (2026-09-10 15:00) unbookable
     assert FakeProvider.call_count - before == 1
 
     assert session.cxt.current_node_code == "repair_recommend"

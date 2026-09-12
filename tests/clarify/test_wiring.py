@@ -1,40 +1,31 @@
-"""Framework wiring tests — skeleton insertion, NLG skip, slots not merged, node unchanged.
-
-Post-plan-②: clarify is a skeleton slot declared via module.stages
-({"clarify": code}); the default skeleton keeps clarify=None (opt-in).
+"""Framework wiring tests — skeleton insertion, NLG skip, slots not merged,
+node unchanged (plan-⑧ two-layer form: clarify is a skeleton slot declared
+via node.stages ({"clarify": code}); the default skeleton keeps clarify=None
+(opt-in), the pattern skeleton must carry the slot for it to run).
 """
 
 from async_utils import arun
 import pytest
 
-from nexus.engine.chat import _default_skeleton, _handle_node_transition
+from nexus.engine.chat import _fsm_node_transition
 from nexus.context import DialogueContext
-from nexus.model.module import FSMModule, RouteModule
-from atoms.stages.nlg import FSMNLG
-from nexus.pipeline import resolve_execution_sequence
+from nexus.model.node import BaseNode
+from nexus.model.pattern import Pattern
+from nexus.pipeline import default_skeleton, resolve_execution_sequence
 
 from stage_stubs import register_stage_stub
 
 
-def make_fsm_module(stages=None):
-    return FSMModule(
-        module_code="m_fsm",
-        module_nodes=[type("N", (), {"node_code": "n1", "nlu_stage": None,
-                                      "nlg_stage": None})()],
-        stages=stages,
-    )
-
-
-def _pattern_of(module):
-    from nexus.model.pattern import Pattern
+def make_fsm_pattern(stages=None, node_stages=None):
+    n1 = BaseNode(code="n1", name="n1", stages=node_stages)
     return Pattern(code="pw", name="t", description="t",
-                   entry_module_code=module.module_code, modules=[module])
+                   pattern_type="fsm", nodes=[n1], stages=stages)
 
 
 class TestBuildStages:
 
     def test_default_skeleton_is_six_slots(self):
-        skeleton = _default_skeleton(make_fsm_module())
+        skeleton = default_skeleton()
         assert [list(e.keys())[0] for e in skeleton] == [
             "pre_recall", "query", "post_recall", "nlu", "clarify", "nlg",
         ]
@@ -47,13 +38,7 @@ class TestBuildStages:
                 return ctx
 
         cl_code = register_stage_stub(_Clarify)
-        module = make_fsm_module(stages={"clarify": cl_code})
-        ctx = DialogueContext(session_id="t", user_query="q")
-        ctx.current_module_code = "m_fsm"
-        ctx.current_node_code = "n1"
-        ctx.node_map = {"n1": module.module_nodes[0]}
-
-        # skeleton with clarify slot present; nlu/nlg stubbed to no-op codes
+        # skeleton with a clarify slot present; nlu/nlg stubbed to no-op codes
         ran = []
 
         class _Noop:
@@ -65,34 +50,54 @@ class TestBuildStages:
 
         nlu_code = register_stage_stub(_Noop)
         nlg_code = register_stage_stub(_Noop)
-        from nexus.model.pattern import Pattern
-        pattern = Pattern(
-            code="pw2", name="t", description="t",
-            entry_module_code="m_fsm", modules=[module],
+        # the clarify declaration lives on the NODE (the plan-⑧ replacement
+        # of the module-level enable_clarify)
+        pattern = make_fsm_pattern(
             stages=[{"nlu": nlu_code}, {"clarify": None}, {"nlg": nlg_code}],
+            node_stages={"clarify": cl_code},
         )
-        sequence = resolve_execution_sequence(ctx, module, pattern)
+        ctx = DialogueContext(session_id="t", user_query="q")
+        ctx.current_node_code = "n1"
+        ctx.node_map = pattern.node_map
+
+        sequence = resolve_execution_sequence(ctx, pattern.nodes[0], pattern)
         names = [getattr(s, "stage_name", "?") for _, s in sequence]
-        assert names == ["noop", "my_clarify", "nlg(deferred)"]
+        assert names == ["noop", "my_clarify", "noop"]
         for _, stage in sequence:
             arun(stage.execute(ctx))
-        assert ran == ["noop", "noop"]  # clarify + nlu/nlg executed
+        assert ran == ["noop", "noop"]  # nlu + nlg executed (clarify is a no-op here)
 
     def test_undeclared_clarify_never_inserted(self):
-        module = make_fsm_module()  # no clarify declaration
+        pattern = make_fsm_pattern()  # default skeleton, no clarify declaration
         ctx = DialogueContext(session_id="t", user_query="q")
-        ctx.current_module_code = "m_fsm"
         ctx.current_node_code = "n1"
-        ctx.node_map = {"n1": module.module_nodes[0]}
+        ctx.node_map = pattern.node_map
 
-        sequence = resolve_execution_sequence(ctx, module, _pattern_of(module))
+        sequence = resolve_execution_sequence(ctx, pattern.nodes[0], pattern)
         slots = [slot for slot, _ in sequence]
         assert "clarify" not in slots
+
+    def test_node_clarify_without_skeleton_slot_never_runs(self):
+        """The node layer only overrides slots the skeleton carries: a node
+        declaring clarify under a skeleton without the slot never runs it."""
+        cl_code = register_stage_stub(lambda: type("_C", (), {
+            "stage_name": "never",
+            "execute": staticmethod(lambda ctx: ctx)})())
+        pattern = make_fsm_pattern(
+            stages=[{"nlu": None}, {"nlg": None}],   # no clarify slot
+            node_stages={"clarify": cl_code},
+        )
+        ctx = DialogueContext(session_id="t2", user_query="q")
+        ctx.current_node_code = "n1"
+        ctx.node_map = pattern.node_map
+        sequence = resolve_execution_sequence(ctx, pattern.nodes[0], pattern)
+        assert "clarify" not in [slot for slot, _ in sequence]
 
 
 class TestNlgSkipGuard:
 
     def test_fsmnlg_skips_when_clarify_triggered(self):
+        from atoms.stages.nlg import FSMNLG
         ctx = DialogueContext(session_id="t", user_query="q")
         ctx.metadata["clarify"] = {"triggered": True, "mode": "kb"}
         ctx.nlg_result = {"content": "[clarify:kb] 已生成"}
@@ -114,7 +119,7 @@ class TestTransitionGuard:
         ctx.nlu_result = {"next_node": "clarify",
                           "slots": {"topic": "费用", "keywords": ["收费"]}}
         ctx.metadata["clarify"] = {"triggered": True, "mode": "kb"}
-        module = make_fsm_module(stages={"clarify": "clarify_default"})
-        _handle_node_transition(ctx, module)
+        pattern = make_fsm_pattern(node_stages={"clarify": "clarify_default"})
+        _fsm_node_transition(ctx, pattern)
         assert ctx.filled_slots == {}
         assert ctx.current_node_code == "n1"

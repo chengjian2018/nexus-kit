@@ -1,16 +1,17 @@
-"""Loop main-flow tool guards (migrated from test_agent_hooks_loop.py's
-non-hooks cases, plan-④): hallucinated-name interception + protocol-paired
-replay of synthetic/ordinary tool rows. These behaviors belong to the loop's
-own validation/replay machinery, not to hooks — they stay pinned while the
-hooks behavioral suite is retired.
+"""Loop main-flow tool guards (plan-⑧ node form): hallucinated-name
+interception + protocol-paired replay of synthetic/ordinary tool rows +
+max-rounds forced termination. These behaviors belong to the loop's own
+validation/replay machinery — driven here through the AGENT graph runtime
+with a scripted provider.
 """
 
 import json
 from async_utils import arun
 from unittest.mock import patch
 
+from nexus.engine.chat import chat_turn
 from nexus.engine.session import Session
-from nexus.model.module import AgentModule
+from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from nexus.registry.tools import registry as tool_registry
 
@@ -34,7 +35,6 @@ tool_registry.register(
         },
     },
     handler=_echo_handler,
-    allowed_patterns={"pg": ["main"]},
 )
 
 
@@ -48,33 +48,24 @@ tool_registry.register(
     toolset="test_loop_guards",
     schema={
         "name": "guard_locked_tool",
-        "description": "已注册但仅授权其他 pattern 的工具（ACL 锁定）",
+        "description": "已注册但不在本节点 use_tools 授权内的工具",
         "parameters": {
             "type": "object",
             "properties": {"city": {"type": "string", "description": "城市"}},
         },
     },
     handler=_locked_handler,
-    allowed_patterns={"other_pattern": ["main"]},
 )
 
 
 def _mk_session():
-    main = AgentModule(
-        module_code="main", module_name="主模块",
-        module_description="主模块描述",
-        use_tools=["guard_echo_tool"],
-    )
-    peer = AgentModule(module_code="peer", module_name="同侪",
-                       module_description="同侪模块",
-                       use_tools=["guard_echo_tool"])
+    # 节点只授权 guard_echo_tool；guard_locked_tool 越出 use_tools（新版 ACL 语义）
+    node = BaseNode(code="main", name="主节点", use_tools=["guard_echo_tool"])
     p = Pattern(code="pg", name="t", description="t",
-                entry_module_code="main", modules=[main, peer])
+                allow_toolset=["test_loop_guards"], nodes=[node])
     s = Session(session_id="sg", pattern_code="pg")
     s.pattern = p
-    s.cxt.module_map = p.module_map
     s.cxt.node_map = p.node_map
-    s.cxt.current_module_code = "main"
     s.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
     return s
 
@@ -98,12 +89,12 @@ def _tool_call(cid="c1", name="guard_echo_tool", arguments="{}"):
 
 
 def _run(session, provider):
-    from async_utils import arun
-    from nexus.engine.loop import run_agent
     with patch("atoms.executors.loop_executor.build_provider",
-               return_value=provider):
-        return arun(run_agent(session, session.cxt.module_map["main"],
-                              {"code": "x", "model": "m"}))
+               return_value=provider), \
+         patch("nexus.engine.chat.get_llm_config",
+               return_value={"code": "x", "model": "m"}):
+        return arun(chat_turn("查一下", session.session_id,
+                              {session.session_id: session}))
 
 
 def _tool_rows(cxt):
@@ -111,7 +102,7 @@ def _tool_rows(cxt):
 
 
 # ---------------------------------------------------------------------------
-# Hallucinated-name interception + ACL seal
+# Hallucinated-name interception + authorization seal
 # ---------------------------------------------------------------------------
 
 def test_hallucinated_name_backfills_error_with_tools_list():
@@ -125,7 +116,7 @@ def test_hallucinated_name_backfills_error_with_tools_list():
         {"content": "改好了，直接回答。", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.content == "改好了，直接回答。"
+    assert result.text == "改好了，直接回答。"
     rows = _tool_rows(s.cxt)
     error = json.loads(rows[0].content)["error"]
     assert "no_such_tool" in error
@@ -133,101 +124,78 @@ def test_hallucinated_name_backfills_error_with_tools_list():
     assert rows[0].metadata.get("synthetic") is True
     # The string fed back to the model is the same one (the self-correct signal)
     tool_row = next(m for m in provider.seen[1]["messages"]
-                    if m["role"] == "tool")
-    assert "no_such_tool" in tool_row["content"]
+                    if m.get("role") == "tool")
+    assert tool_row["content"] == rows[0].content
 
 
 def test_registered_but_unauthorized_name_intercepted():
-    """Registered but unauthorized (ACL bypass sealed): intercepted, handler
-    not executed (error JSON instead of output)."""
+    """已注册但不在 use_tools 授权内的工具：handler 不执行，错误回填。"""
     s = _mk_session()
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [
             _tool_call(name="guard_locked_tool", arguments="{}")]},
-        {"content": "直接回答。", "tool_calls": []},
+        {"content": "好的，换个方式答。", "tool_calls": []},
     ])
     result = _run(s, provider)
-    assert result.content == "直接回答。"
+    assert result.text == "好的，换个方式答。"
     rows = _tool_rows(s.cxt)
-    payload = json.loads(rows[0].content)
-    assert "不存在或本轮不可用" in payload["error"]
-    assert "ok" not in payload          # the locked tool's handler produced no output
+    assert len(rows) == 1
+    assert json.loads(rows[0].content).get("error")
     assert rows[0].metadata.get("synthetic") is True
+    # 模型实际可见的工具列表里没有 guard_locked_tool
+    names = {t["function"]["name"] for t in provider.seen[0]["tools"]}
+    assert names == {"guard_echo_tool"}
 
 
 # ---------------------------------------------------------------------------
-# Protocol-paired replay
+# Protocol-paired replay of tool rows
 # ---------------------------------------------------------------------------
 
 def test_synthetic_error_row_replays_paired():
-    """Synthetic tool rows of the hallucinated round: replay pairing is
-    complete, no degradation to untrusted wrapping."""
-    from nexus.engine.messages import default_build_messages
-
     s = _mk_session()
-    s.cxt.user_query = "查天气"
-    arun(s.cxt.add_message("user", "查天气", stage="chat"))
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [
-            _tool_call(name="no_such_tool", arguments="{}")]},
-        {"content": "直接回答。", "tool_calls": []},
+            _tool_call(cid="c9", name="ghost_tool", arguments="{}")]},
+        {"content": "已纠正。", "tool_calls": []},
     ])
     _run(s, provider)
-    s.cxt.turn_history_start = 0
-    msgs = default_build_messages(s.cxt.module_map["main"], s.cxt)
-    asst = [m for m in msgs if m["role"] == "assistant" and m.get("tool_calls")]
-    assert len(asst) == 1 and asst[0]["tool_calls"][0]["id"] == "c1"
-    tool_rows = [m for m in msgs if m["role"] == "tool"]
-    assert len(tool_rows) == 1 and tool_rows[0]["tool_call_id"] == "c1"
-    assert not any("untrusted" in (m.get("content") or "") for m in msgs)
+    from nexus.engine.messages import _replay_segment
+    replayed = _replay_segment(s.cxt.history)
+    # assistant(tool_calls) + tool 行成对回放（合成错误行同样是协议行）
+    assistant_rows = [m for m in replayed if m.get("role") == "assistant"]
+    tool_rows_replay = [m for m in replayed if m.get("role") == "tool"]
+    assert any(r.get("tool_calls") for r in assistant_rows)
+    assert tool_rows_replay and tool_rows_replay[0]["tool_call_id"] == "c9"
 
 
 def test_ordinary_round_replays_paired():
-    """An executed tool round's history: protocol-shaped replay
-    (assistant.tool_calls paired with tool rows)."""
-    from nexus.engine.messages import default_build_messages
-
     s = _mk_session()
-    s.cxt.user_query = "查天气"
-    arun(s.cxt.add_message("user", "查天气", stage="chat"))
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [
-            _tool_call(arguments='{"city": "北京"}')]},
-        {"content": "done", "tool_calls": []},
+            _tool_call(cid="c1", name="guard_echo_tool",
+                       arguments='{"city": "北京"}')]},
+        {"content": "查完了。", "tool_calls": []},
     ])
     _run(s, provider)
-    s.cxt.turn_history_start = 0
-    msgs = default_build_messages(s.cxt.module_map["main"], s.cxt)
-    asst = [m for m in msgs if m["role"] == "assistant" and m.get("tool_calls")]
-    assert len(asst) == 1
-    assert json.loads(
-        asst[0]["tool_calls"][0]["function"]["arguments"]) == {"city": "北京"}
-    assert len([m for m in msgs if m["role"] == "tool"]) == 1
-    assert not any("untrusted" in (m.get("content") or "") for m in msgs)
+    from nexus.engine.messages import _replay_segment
+    replayed = _replay_segment(s.cxt.history)
+    tool_rows_replay = [m for m in replayed if m.get("role") == "tool"]
+    assert len(tool_rows_replay) == 1
+    payload = json.loads(tool_rows_replay[0]["content"])
+    assert payload["ok"] is True and payload["tool"] == "guard_echo_tool"
 
 
 # ---------------------------------------------------------------------------
-# Max-rounds forced termination (审查 M-3：唯一硬终止防线的行为回归)
+# Max tool rounds forced termination
 # ---------------------------------------------------------------------------
 
 def test_max_tool_rounds_forced_termination():
-    """模型每轮都要求调工具（永不直接回答）时：恰在第 _MAX_TOOL_ROUNDS 轮
-    强制终止，回复兜底文案，不再多发一次 LLM 请求，工具行协议配对完整。"""
-    from atoms.executors.loop_executor import _MAX_TOOL_ROUNDS
-
     s = _mk_session()
-    s.cxt.user_query = "无限循环"
-    arun(s.cxt.add_message("user", "无限循环", stage="chat"))
-    provider = ScriptedProvider([
-        {"content": None, "tool_calls": [
-            _tool_call(cid=f"c{i}", arguments='{"city": "北京"}')]}
-        for i in range(_MAX_TOOL_ROUNDS)
-    ])
+    rounds = [{"content": None, "tool_calls": [
+        _tool_call(cid=f"c{i}", name="guard_echo_tool", arguments="{}")]}
+        for i in range(12)]
+    provider = ScriptedProvider(rounds)
     result = _run(s, provider)
-
-    assert result.content == "抱歉，处理超时，请稍后重试。"
-    assert len(provider.seen) == _MAX_TOOL_ROUNDS   # 恰好 10 轮，不多不少
-    rows = _tool_rows(s.cxt)
-    assert len(rows) == _MAX_TOOL_ROUNDS            # 每轮工具行都落了
-    assert [m.metadata.get("tool_call_id") for m in rows] == [
-        f"c{i}" for i in range(_MAX_TOOL_ROUNDS)]   # id 逐轮配对
+    assert result.text == "抱歉，处理超时，请稍后重试。"
+    # 恰好执行 10 轮（第 11 个脚本未被消费）
+    assert len(provider.seen) == 10

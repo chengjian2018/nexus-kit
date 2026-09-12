@@ -7,8 +7,8 @@ Contract:
   fallback as the LLM version)
 - time_base comes from ctx.metadata["time_base"] (current time when not injected)
 - slot-mechanism compatible: passes is_valid_stage and is reachable through
-  the query slot's three-layer resolution (declared by string code since
-  plan-②)
+  the query slot's two-layer resolution (declared by string code since
+  plan-②; two-layer since plan-⑧)
 """
 
 import time as _time
@@ -20,7 +20,6 @@ from async_utils import arun
 from atoms.augmentation import augment_time
 from nexus.context import DialogueContext
 from nexus.model.node import BaseNode
-from nexus.model.module import FSMModule
 from atoms.stages.query import TimeAugQueryRewriter
 from nexus.pipeline import is_valid_stage, resolve_execution_sequence
 
@@ -108,30 +107,38 @@ def test_time_base_defaults_to_now(monkeypatch):
 
 
 def test_query_slot_resolves_to_time_aug_rewriter():
-    """Three-layer slot resolution: a module-level "time_aug_query" code is
-    hit by the query slot of the skeleton."""
+    """Two-layer slot resolution: the node-level "time_aug_query" code is hit
+    by the query slot of the pattern skeleton."""
     import atoms.stages  # noqa: F401 -- registers the named stage codes
+    from nexus.model.pattern import Pattern
+
     ctx = DialogueContext(session_id="t", user_query="q")
-    ctx.current_module_code = "m1"
     ctx.current_node_code = "n1"
-    module = FSMModule(
-        module_code="m1", module_name="m1", module_description="d",
-        module_todo_description="t", sub_modules=[],
-        module_nodes=[BaseNode(node_code="n1", node_name="节点一")],
-        stages={"query": "time_aug_query"},
-    )
-    sequence = _resolve_with_skeleton(ctx, module)
+    n1 = BaseNode(code="n1", name="节点一",
+                  stages={"query": "time_aug_query"})
+    pattern = Pattern(code="pt", name="t", description="t",
+                      pattern_type="fsm", nodes=[n1],
+                      stages=[{"query": None}])
+    sequence = resolve_execution_sequence(ctx, n1, pattern)
     assert [(slot, type(stage).__name__) for slot, stage in sequence] == [
         ("query", "TimeAugQueryRewriter")]
 
 
-def _resolve_with_skeleton(ctx, module):
-    from nexus.pipeline import normalize_skeleton
+def test_query_slot_resolves_via_pattern_skeleton():
+    """The same builtin code declared as the skeleton value resolves too (the
+    pattern-layer of the two-layer resolution)."""
+    import atoms.stages  # noqa: F401 -- registers the named stage codes
     from nexus.model.pattern import Pattern
-    pattern = Pattern(code="pt", name="t", description="t",
-                      entry_module_code="m1", modules=[module],
-                      stages=[{"query": None}])
-    return resolve_execution_sequence(ctx, module, pattern)
+
+    ctx = DialogueContext(session_id="t2", user_query="q")
+    ctx.current_node_code = "n1"
+    n1 = BaseNode(code="n1", name="节点一")
+    pattern = Pattern(code="pt2", name="t", description="t",
+                      pattern_type="fsm", nodes=[n1],
+                      stages=[{"query": "time_aug_query"}])
+    sequence = resolve_execution_sequence(ctx, n1, pattern)
+    assert [(slot, type(stage).__name__) for slot, stage in sequence] == [
+        ("query", "TimeAugQueryRewriter")]
 
 
 def test_augment_time_consistency():

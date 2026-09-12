@@ -201,8 +201,8 @@ def _unified(node_name: str, query: str, retry: bool, prompt: str = "") -> str:
 
     # install_booking_agent / repair_booking_agent nodes: scripted by
     # (node name, customer-reply keyword) pairs. The two FSMs SHARE node
-    # names (外呼开场/地址核对/上门时间协商...), so the branch is picked by
-    # the node-code prefix visible in the prompt (候选节点编码/合法取值
+    # names (outbound opening / address confirmation / visit-time negotiation...), so the branch is picked by
+    # the node-code prefix visible in the prompt (candidate-node-code / valid-values
     # sections), not by name alone.
     if _detect_pattern(prompt) == "repair":
         repair = _repair_unified(node_name, query)
@@ -224,9 +224,10 @@ def _install_unified(node_name: str, query: str):
     hand-drawn template transcription + supplemented scenarios).
 
     Branch selection is (current node, customer reply) driven, mirroring the
-    sketch's labeled edges (是/否、知道/不知道、方便/不方便、具体日期/最近/
-    都不知道) plus the supplemented intents (generic decline / callback /
-    reschedule); returns None when the node is not an install node.
+    sketch's labeled edges (yes/no, knows/doesn't-know, convenient/not-
+    convenient, specific-date/nearest/knows-neither) plus the supplemented
+    intents (generic decline / callback / reschedule); returns None when
+    the node is not an install node.
     """
     install_mapping = {
         "外呼开场": (["需要", "是的", "对", "方便"], "install_confirm_addr",
@@ -243,9 +244,9 @@ def _install_unified(node_name: str, query: str):
                         "available", "外呼回复: 上门时间协商"),
         "上门时间协商": ([], None, None, ""),  # decided below (three-way)
         "档期推荐": ([], None, None, ""),      # decided below (two-way)
-        "具体日期约定": ([], None, None, ""),  # decided below (confirm/回环)
-        "最近档期安排": ([], None, None, ""),  # decided below (confirm/回环)
-        "上门时间确认": ([], None, None, ""),  # decided below (confirm/改约)
+        "具体日期约定": ([], None, None, ""),  # decided below (confirm/loop back)
+        "最近档期安排": ([], None, None, ""),  # decided below (confirm/loop back)
+        "上门时间确认": ([], None, None, ""),  # decided below (confirm/reschedule)
         "改约重协商": ([], "install_ask_time", None,
                       "外呼回复: 上门时间协商"),
         "下次联系时间": ([], "install_end", "callback_time",
@@ -259,7 +260,7 @@ def _install_unified(node_name: str, query: str):
     if node_name not in install_mapping:
         return None
 
-    # Generic decline intents (supplemented): heard at ANY node → 通用拒绝承接
+    # Generic decline intents (supplemented): heard at ANY node → generic decline handling
     if any(k in query for k in ("不想预约", "不需要安装", "不用安装",
                                 "已安装", "装过了", "装好了",
                                 "质量问题", "有质量问题", "有问题",
@@ -268,7 +269,7 @@ def _install_unified(node_name: str, query: str):
             {"reply": "外呼回复: 通用拒绝承接", "next_node": "install_decline",
              "slots": {"decline_reason": query}},
             ensure_ascii=False)
-    # Callback intent (supplemented): 现在没空/暂时不想约（没拒绝安装） → 下次联系时间
+    # Callback intent (supplemented): busy now / not ready to book (install not declined) → callback time
     if any(k in query for k in ("现在没空", "现在不方便", "晚点再说",
                                 "以后再约", "改天再打", "再说吧")):
         return json.dumps(
@@ -276,7 +277,7 @@ def _install_unified(node_name: str, query: str):
              "slots": {}},
             ensure_ascii=False)
     # Off-flow business questions (clarify): mid-flow FAQ-type asks trigger
-    # the clarify signal — 费用/保修/时长/自装/改地址/催物流
+    # the clarify signal — fee / warranty / duration / self-install / address change / shipping
     _FAQ_TOPIC_RULES = [
         ("费用", ("收费", "要钱吗", "多少钱", "免费吗", "收钱")),
         ("保修", ("保修", "质保", "三包")),
@@ -295,7 +296,7 @@ def _install_unified(node_name: str, query: str):
                  "slots": {"topic": topic, "keywords": [hit]}},
                 ensure_ascii=False)
 
-    # 上门时间协商 three-way branch (sketch: 具体日期 / 最近 / 都不知道→推荐)
+    # Visit-time negotiation three-way branch (sketch: specific date / nearest / knows-neither → recommendation)
     if node_name == "上门时间协商":
         if "最近" in query:
             return json.dumps(
@@ -312,7 +313,7 @@ def _install_unified(node_name: str, query: str):
             {"reply": "外呼回复: 具体日期约定", "next_node": "install_specific_date",
              "slots": {"visit_date": query}},
             ensure_ascii=False)
-    # 档期推荐: customer picks one of the recommended slots -> 具体日期约定
+    # Schedule recommendation: customer picks one of the recommended slots -> specific-date booking
     if node_name == "档期推荐":
         if any(k in query for k in ("第一个", "上午", "明天", "后天", "点")):
             return json.dumps(
@@ -324,7 +325,7 @@ def _install_unified(node_name: str, query: str):
             {"reply": "外呼回复: 上门时间协商", "next_node": "install_ask_time",
              "slots": {}},
             ensure_ascii=False)
-    # 具体日期约定 / 最近档期安排: 可约→确认，不可约→回环再协商
+    # Specific-date booking / nearest-slot arrangement: bookable → confirm, not bookable → loop back
     if node_name in ("具体日期约定", "最近档期安排"):
         if any(k in query for k in ("不行", "不可以", "没空", "换")):
             return json.dumps(
@@ -335,7 +336,7 @@ def _install_unified(node_name: str, query: str):
             {"reply": "外呼回复: 上门时间确认", "next_node": "install_confirm_time",
              "slots": {"visit_date": query, "visit_hour": ""}},
             ensure_ascii=False)
-    # 上门时间确认: 确认→结束语；改约（supplemented）→改约重协商
+    # Visit-time confirmation: confirmed → close script; reschedule (supplemented) → reschedule renegotiation
     if node_name == "上门时间确认":
         if any(k in query for k in ("改", "换", "不行", "再想想")):
             return json.dumps(
@@ -349,7 +350,7 @@ def _install_unified(node_name: str, query: str):
 
     keywords, next_node, slot_key, reply = install_mapping[node_name]
     # Negative-first overrides: a negative reply containing a positive
-    # keyword ("还没到货" has "到货"; "说不好时间段" has "时间")
+    # keyword ("not-arrived-yet" contains "arrived"; "cannot-say-a-window" contains "time")
     negatives = {
         "到货确认": ("还没", "没到", "没有"),
         "时间段询问": ("说不好", "不好说", "不确定", "没有", "没啥"),
@@ -362,10 +363,10 @@ def _install_unified(node_name: str, query: str):
     else:
         hit = any(k in query for k in keywords) if keywords else True
     if not hit:
-        # negative branch: 地址不符 → 通话结束语,
-        # except the sketch's in-flow negative edges: 到货确认-未到货 → 到货
-        # 时间询问、到货时间询问-知道 → 时间段询问、时间段询问-不提供 →
-        # 上门方便确认、上门方便确认-不方便 → 下次联系时间（supplemented）
+        # negative branch: address mismatch → call-close script,
+        # except the sketch's in-flow negative edges: arrival check + not-arrived → ETA
+        # inquiry; ETA inquiry + knows → time-window inquiry; time-window inquiry + not provided →
+        # availability check; availability check + not convenient → callback time (supplemented)
         in_flow_negatives = {
             "到货确认": ("install_ask_eta", "外呼回复: 到货时间询问",
                          {"arrived": "否"}),
@@ -397,10 +398,12 @@ def _repair_unified(node_name: str, query: str):
 
     Same (node name, customer-reply keyword) scripting shape as
     _install_unified, with the repair-specific branches:
-    - decline intents drop 已安装/质量问题/退货, add 已自行修好/已找别人修过;
-    - 上门时间协商 carries the callback branch inline (no separate
-      available node in the repair FSM);
-    - 上门时间确认 → 故障信息询问 → 故障信息确认 → 通话结束.
+    - decline intents drop already-installed/quality-issue/return, add
+      fixed-it-themselves / repaired-elsewhere;
+    - visit-time negotiation carries the callback branch inline (no separate
+      availability node in the repair FSM);
+    - visit-time confirmation → fault-info inquiry → fault-info confirmation
+      → call close.
     Returns None when the node is not a repair node.
     """
     repair_mapping = {
@@ -410,10 +413,10 @@ def _repair_unified(node_name: str, query: str):
                     "address_confirmed", "外呼回复: 上门时间协商"),
         "上门时间协商": ([], None, None, ""),  # decided below (four-way)
         "档期推荐": ([], None, None, ""),      # decided below (two-way)
-        "具体日期约定": ([], None, None, ""),  # decided below (confirm/回环)
-        "最近档期安排": ([], None, None, ""),  # decided below (confirm/回环)
-        "上门时间确认": ([], None, None, ""),  # decided below (fault/改约)
-        "故障信息询问": ([], None, None, ""),  # decided below (描述/说不清)
+        "具体日期约定": ([], None, None, ""),  # decided below (confirm/loop back)
+        "最近档期安排": ([], None, None, ""),  # decided below (confirm/loop back)
+        "上门时间确认": ([], None, None, ""),  # decided below (fault/reschedule)
+        "故障信息询问": ([], None, None, ""),  # decided below (describe/cannot-describe)
         "改约重协商": ([], "repair_ask_time", None,
                       "外呼回复: 上门时间协商"),
         "故障信息确认": ([], "repair_end", None,
@@ -429,7 +432,7 @@ def _repair_unified(node_name: str, query: str):
     if node_name not in repair_mapping:
         return None
 
-    # Generic decline intents (repair variant): heard at ANY node → 通用拒绝承接
+    # Generic decline intents (repair variant): heard at ANY node → generic decline handling
     if any(k in query for k in ("不想维修", "不需要维修", "不用维修",
                                 "自己修好了", "修好了", "已经修好",
                                 "别人修", "找人修了", "修过了",
@@ -438,7 +441,7 @@ def _repair_unified(node_name: str, query: str):
             {"reply": "外呼回复: 通用拒绝承接", "next_node": "repair_decline",
              "slots": {"decline_reason": query}},
             ensure_ascii=False)
-    # Callback intent: 现在没空/暂时不想约（没拒绝维修）→ 下次联系时间
+    # Callback intent: busy now / not ready to book (repair not declined) → callback time
     if any(k in query for k in ("现在没空", "现在不方便", "晚点再说",
                                 "以后再约", "改天再打", "再说吧")):
         return json.dumps(
@@ -464,7 +467,7 @@ def _repair_unified(node_name: str, query: str):
                  "slots": {"topic": topic, "keywords": [hit]}},
                 ensure_ascii=False)
 
-    # 上门时间协商 four-way branch (具体日期 / 最近 / 都不知道→推荐 / 没空→callback)
+    # Visit-time negotiation four-way branch (specific date / nearest / knows-neither → recommendation / busy → callback)
     if node_name == "上门时间协商":
         if "最近" in query:
             return json.dumps(
@@ -481,7 +484,7 @@ def _repair_unified(node_name: str, query: str):
             {"reply": "外呼回复: 具体日期约定", "next_node": "repair_specific_date",
              "slots": {"visit_date": query}},
             ensure_ascii=False)
-    # 档期推荐: customer picks one of the recommended slots -> 具体日期约定
+    # Schedule recommendation: customer picks one of the recommended slots -> specific-date booking
     if node_name == "档期推荐":
         if any(k in query for k in ("第一个", "上午", "明天", "后天", "点")):
             return json.dumps(
@@ -493,7 +496,7 @@ def _repair_unified(node_name: str, query: str):
             {"reply": "外呼回复: 上门时间协商", "next_node": "repair_ask_time",
              "slots": {}},
             ensure_ascii=False)
-    # 具体日期约定 / 最近档期安排: 可约→确认，不可约→回环再协商
+    # Specific-date booking / nearest-slot arrangement: bookable → confirm, not bookable → loop back
     if node_name in ("具体日期约定", "最近档期安排"):
         if any(k in query for k in ("不行", "不可以", "没空", "换")):
             return json.dumps(
@@ -504,7 +507,7 @@ def _repair_unified(node_name: str, query: str):
             {"reply": "外呼回复: 上门时间确认", "next_node": "repair_confirm_time",
              "slots": {"visit_date": query, "visit_hour": ""}},
             ensure_ascii=False)
-    # 上门时间确认: 确认→故障信息询问；改约→改约重协商
+    # Visit-time confirmation: confirmed → fault-info inquiry; reschedule → reschedule renegotiation
     if node_name == "上门时间确认":
         if any(k in query for k in ("改", "换", "不行", "再想想")):
             return json.dumps(
@@ -515,7 +518,7 @@ def _repair_unified(node_name: str, query: str):
             {"reply": "外呼回复: 故障信息询问", "next_node": "repair_ask_fault",
              "slots": {"visit_time": "已约定"}},
             ensure_ascii=False)
-    # 故障信息询问: 说不清→留待（next_node 空，保持当前节点继续引导）
+    # Fault-info inquiry: cannot describe → hold (next_node empty, stay on the node and keep prompting)
     if node_name == "故障信息询问":
         if any(k in query for k in ("说不清", "不知道哪", "说不出来")):
             return json.dumps(
@@ -584,7 +587,13 @@ def scripted_response(prompt: str) -> str:
     """Return the scripted LLM output for the prompt type."""
     node_name = _extract_node_name(prompt)
 
-    # Xianyu intent NLG prompt: no node-name line (uses node.base_nlg_prompt
+    # Xianyu intent-classification prompt (the graph router's LLM fallback):
+    # unmatched messages fall to the default label (price/tech hits are
+    # caught by the local rule tier and never reach here)
+    if "通用意图分类器" in prompt:
+        return "default"
+
+    # Xianyu intent NLG prompt: no node-name line (uses node-level nlg
     # intent templates); identified by the buyer-message section header
     # (checked before the generic NLG fallback)
     if "### 买家消息" in prompt:
@@ -619,7 +628,7 @@ def scripted_response(prompt: str) -> str:
         return "解答：除车价外仅收取上牌费与服务费。请问您的预算大概是多少呢？"
 
     # Install clarify prompt (custom keyword-gated stage; carries the FAQ
-    # answer section or the fallback 未命中 wording)
+    # answer section or the fallback miss wording)
     if "FAQ 答案" in prompt:
         return "澄清解答: 收费问题已答复，咱们继续约时间。"
     if "关键词卡控未命中" in prompt:

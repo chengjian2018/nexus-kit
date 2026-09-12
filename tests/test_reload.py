@@ -1,9 +1,10 @@
-"""热重载机制测试：llm config mtime 缓存 + pattern/plugin/channel re-import。
+"""Hot-reload mechanism tests: llm config mtime caching + pattern/plugin/channel re-import.
 
-Config 侧：指纹命中不重读文件 / 文件变更自动重解析 / invalidate 与
-reload 编程入口 / 返回深拷贝互不污染。
-代码侧：host.reload 的 mtime 检测、replace 模式收编、依赖序重放、会话
-重绑、channel spec 每请求活取。
+Config side: fingerprint hit skips the file re-read / file change re-parses
+automatically / programmatic invalidate and reload entries / returned deep
+copies do not pollute each other.
+Code side: host.reload mtime detection, replace-mode takeover, dependency
+order replay, session rebinding, channel spec fetched live per request.
 """
 
 import os
@@ -38,29 +39,29 @@ def _write(tmp_path, text, name="local_config.yaml"):
 
 
 def _bump_mtime(path, delta=10.0):
-    """显式推移 mtime（部分文件系统 mtime 粒度粗，同秒重写指纹不变）。"""
+    """Explicitly bump mtime (some filesystems have coarse mtime granularity, so a same-second rewrite leaves the fingerprint unchanged)."""
     st = os.stat(path)
     os.utime(path, (st.st_atime, st.st_mtime + delta))
 
 
 # ============================================================================
-# llm config: mtime 指纹缓存
+# llm config: mtime fingerprint caching
 # ============================================================================
 
 def test_config_cache_hit_skips_file_read(tmp_path):
-    """指纹未变：返回缓存，不重读文件（read 次数不增加）。"""
+    """Fingerprint unchanged: return the cached value without re-reading the file (read count does not increase)."""
     path = _write(tmp_path, _LLM_MIN)
     with patch("nexus.settings._parse_config_file",
                wraps=settings._parse_config_file) as spy:
         load_config(path)
         assert spy.call_count == 1
         cfg2 = load_config(path)
-        assert spy.call_count == 1  # 缓存命中
+        assert spy.call_count == 1  # cache hit
     assert cfg2["llm_default"]["model"] == "qwen3.8-max"
 
 
 def test_config_cache_invalidated_on_edit(tmp_path):
-    """文件变更（mtime 推移）：自动重新解析，读到新值。"""
+    """File changed (mtime bumped): re-parsed automatically, the new value is read."""
     path = _write(tmp_path, _LLM_MIN)
     assert load_config(path)["llm_default"]["model"] == "qwen3.8-max"
 
@@ -70,7 +71,7 @@ def test_config_cache_invalidated_on_edit(tmp_path):
 
 
 def test_config_deep_copy_no_cache_pollution(tmp_path):
-    """调用方改写返回值不污染缓存：下一次 load 仍拿到原始内容。"""
+    """Caller mutations of the returned value do not pollute the cache: the next load still gets the original content."""
     path = _write(tmp_path, _LLM_MIN)
     cfg = load_config(path)
     cfg["llm_default"]["model"] = "hacked"
@@ -81,25 +82,27 @@ def test_config_deep_copy_no_cache_pollution(tmp_path):
 
 
 def test_reload_config_programmatic_entry(tmp_path):
-    """reload_config 强制重读（绕过指纹）；同指纹重写走缓存、强制入口重解析。"""
+    """reload_config forces a re-read (bypassing the fingerprint); a same-fingerprint rewrite hits the cache, the forced entry re-parses."""
     path = _write(tmp_path, _LLM_MIN)
     load_config(path)
-    # 等长替换 + 精确恢复 mtime 纳秒：伪造"同指纹重写"（粗粒度文件系统
-    # 场景）；APFS 纳秒级粒度下正常重写必变指纹（见 invalidation 测试）
+    # Same-length replacement + exact mtime nanosecond restore: fake a
+    # "same-fingerprint rewrite" (coarse-grained filesystem scenario); with
+    # APFS nanosecond granularity a normal rewrite always changes the
+    # fingerprint (see the invalidation test)
     st = os.stat(path)
-    _write(tmp_path, _LLM_MIN.replace("qwen3.8-max", "qwen-bbbbbb"))  # 等长
+    _write(tmp_path, _LLM_MIN.replace("qwen3.8-max", "qwen-bbbbbb"))  # same length
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
     with patch("nexus.settings._parse_config_file",
                wraps=settings._parse_config_file) as spy:
         assert load_config(path)["llm_default"]["model"] == "qwen3.8-max"
-        assert spy.call_count == 0  # 指纹未变，仍走缓存
+        assert spy.call_count == 0  # fingerprint unchanged, still served from cache
         reload_config(path)
-        assert spy.call_count == 1  # 强制重读
+        assert spy.call_count == 1  # forced re-read
     assert load_config(path)["llm_default"]["model"] == "qwen-bbbbbb"
 
 
 def test_get_llm_config_uses_cache(tmp_path):
-    """三级编排入口 get_llm_config 同样吃到缓存（每轮 R1 的热路径）。"""
+    """The three-level orchestration entry get_llm_config also benefits from the cache (hot path of every R1 round)."""
     path = _write(tmp_path, _LLM_MIN + "\npattern_llm:\n  p1:\n    model: pm\n")
     assert get_llm_config("p1", config_path=path)["model"] == "pm"
     with patch("nexus.settings._parse_config_file",
@@ -109,7 +112,7 @@ def test_get_llm_config_uses_cache(tmp_path):
 
 
 # ============================================================================
-# registry replace 模式
+# registry replace mode
 # ============================================================================
 
 def test_plugin_registry_replace_mode():
@@ -124,9 +127,9 @@ def test_plugin_registry_replace_mode():
     reg = PluginRegistry()
     reg.register("executor", "x", _A)
     with pytest.raises(ValueError):
-        reg.register("executor", "x", _B)  # 默认严格：不同 factory 拒绝
+        reg.register("executor", "x", _B)  # strict by default: a different factory is rejected
     reg.replace_on_conflict = True
-    reg.register("executor", "x", _B)  # replace 窗口：替换
+    reg.register("executor", "x", _B)  # replace window: swaps it in
     reg.replace_on_conflict = False
     inst = reg.resolve("executor", "x")
     assert isinstance(inst, _B)
@@ -147,7 +150,7 @@ def test_plugin_registry_replace_drops_cached_instance():
     reg.replace_on_conflict = True
     reg.register("executor", "x", _B)
     reg.replace_on_conflict = False
-    assert isinstance(reg.resolve("executor", "x"), _B)  # 实例缓存被清
+    assert isinstance(reg.resolve("executor", "x"), _B)  # instance cache cleared
 
 
 def test_channel_registry_replace_mode():
@@ -170,18 +173,18 @@ def test_channel_registry_replace_mode():
     a = _SpecA()
     reg.register(a)
     with pytest.raises(ValueError):
-        reg.register(_SpecB())  # 默认拒绝同名
+        reg.register(_SpecB())  # duplicate name rejected by default
     reg.replace_on_conflict = True
     b = _SpecB()
     reg.register(b)
     reg.replace_on_conflict = False
     assert reg.get("a") is b
-    # 同对象重复注册幂等（不开 replace 也不报错）
+    # re-registering the same object is idempotent (no replace mode needed, no error)
     reg.register(b)
 
 
 def test_channel_router_uses_live_spec():
-    """router handler 每请求活取 registry 的 spec：replace 后下一请求生效。"""
+    """The router handler fetches the registry spec live per request: a replace takes effect on the next request."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from pydantic import BaseModel
@@ -234,36 +237,38 @@ def test_channel_router_uses_live_spec():
         assert client.post("/api/v1/channel/hotchan",
                            json={"user_id": "u"}).json()["reply"] == "v1"
 
-        # 热替换（不开 replace 开关直接改 dict，模拟注册表内容更新）
+        # hot swap (mutate the dict directly without the replace flag, simulating a registry content update)
         reg._channels["hotchan"] = _SpecV2()
         assert client.post("/api/v1/channel/hotchan",
                            json={"user_id": "u"}).json()["reply"] == "v2"
 
-        # 注销后回落到装配时 spec（不 500）
+        # after deregistration, fall back to the spec captured at wiring time (no 500)
         reg._channels.pop("hotchan")
         assert client.post("/api/v1/channel/hotchan",
                            json={"user_id": "u"}).json()["reply"] == "v1"
 
 
 # ============================================================================
-# host.reload: mtime 检测 + 依赖序重放 + 会话重绑
+# host.reload: mtime detection + dependency-order replay + session rebinding
 # ============================================================================
 
 class ReloadHarness:
-    """tmp 目录里的自注册 pattern/plugin/channel 模块 + host.reload 驱动。
+    """Self-registering pattern/plugin/channel modules under a tmp directory + a host.reload driver.
 
-    写真实 .py 文件、真实 import、真实 mtime 推移——不走任何 mock 捷径，
-    验证的就是"改文件 → reload → 注册表拿新对象"这条完整链路。模块用
-    ``_reload_test.`` 前缀的独一名挂在 sys.modules（fixture patch 名单
-    生成为 tmp 根的等价物）。
+    Writes real .py files, does real imports, real mtime bumps — no mock
+    shortcuts; what is verified is the full "edit file -> reload -> registry
+    returns the new object" chain. Modules live in sys.modules under unique
+    ``_reload_test.``-prefixed names (the fixture patches the discovery list
+    generation with a tmp-root equivalent).
     """
 
     def __init__(self, tmp_path):
         self.root = tmp_path
         (self.root / "apps" / "demo_app").mkdir(parents=True)
         (self.root / "atoms" / "executors").mkdir(parents=True)
-        # apps/__init__ / atoms 包不需要——扫描直接 glob 目录，模块经
-        # spec_from_file_location 以独一名导入
+        # apps/__init__ / atoms packages are not needed — discovery globs
+        # the directories directly, and modules are imported under unique
+        # names via spec_from_file_location
         self._counter = 0
 
     def write_module(self, relpath: str, body: str) -> Path:
@@ -279,7 +284,7 @@ class ReloadHarness:
 
 _PATTERN_MODULE = '''\
 """Self-registering pattern module (reload test fixture)."""
-from nexus.model.module import AgentModule
+from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from nexus.registry.patterns import registry
 
@@ -287,10 +292,8 @@ registry.register(Pattern(
     code="reload_demo",
     name="reload demo v{ver}",
     description="d",
-    entry_module_code="m1",
-    modules=[AgentModule(module_code="m1", module_name="m1",
-                         module_description="d", module_todo_description="t",
-                         sub_modules=[])],
+    nodes=[BaseNode(code="m1", name="m1", description="d",
+                    task_description="t")],
 ))
 '''
 
@@ -309,12 +312,16 @@ registry.register("executor", "reload_demo_exec", _Exec{ver})
 
 
 def _import_out_of_repo(harness, dotted, relpath):
-    """以独一模块名导入 repo 外的注册模块（同 channel 测试的桥）。
+    """Import out-of-repo registration modules under a unique module name (same bridge as the channel tests).
 
-    sys.modules 里逐级放置祖先包：**直接父包**的 ``__path__`` 指向文件
-    真实目录（``importlib.reload`` 靠它重找 spec）；更上层祖先只需占位
-    （模块体内跨模块 import 的名字解析逐级查 sys.modules，不走到磁盘）。
-    重执行读到新内容靠 mtime 变化使 pyc 缓存失效（_bump_mtime 保证）。
+    Ancestor packages are placed into sys.modules level by level: the
+    **direct parent package's** ``__path__`` points at the file's real
+    directory (``importlib.reload`` relies on it to re-find the spec);
+    higher ancestors only need placeholders (name resolution for
+    cross-module imports inside the module body consults sys.modules level
+    by level and never reaches disk). Re-execution reads the new content
+    because the mtime change invalidates the pyc cache (guaranteed by
+    _bump_mtime).
     """
     import importlib.util
     import types
@@ -338,17 +345,19 @@ def _import_out_of_repo(harness, dotted, relpath):
 
 @pytest.fixture()
 def reload_env(tmp_path, monkeypatch):
-    """隔离的 host.reload 环境：tmp 扫描根 + 干净的注册表状态。"""
+    """Isolated host.reload environment: tmp scan root + clean registry state."""
     import host.reload as hr
     from nexus.registry.patterns import registry as pattern_registry
     from nexus.registry.plugins import registry as plugin_registry
 
     harness = ReloadHarness(tmp_path)
-    # 生产 discovery 按 sys.modules 名字前缀（apps./atoms.executors.）过滤；
-    # repo 外的测试模块用 _reload_test. 前缀——patch 名单生成，把独一名交回
+    # Production discovery filters by sys.modules name prefixes (apps.,
+    # atoms.executors.); out-of-repo test modules use the _reload_test.
+    # prefix — patch the list generation to hand the unique names back
     monkeypatch.setattr(hr, "_discover_module_names", _make_discover(harness))
-    # 清掉其它测试可能留下的 mtime 基线（模块名带 _reload_test 前缀互不
-    # 冲突，但同名重跑会误判变更）
+    # Clear mtime baselines other tests may have left behind (module names
+    # with the _reload_test prefix do not clash, but re-running with the
+    # same name would falsely report a change)
     hr._MODULE_MTIMES.clear()
     yield harness
     pattern_registry.deregister("reload_demo")
@@ -359,8 +368,7 @@ def reload_env(tmp_path, monkeypatch):
 
 
 def _make_discover(harness):
-    """替代 _discover_module_names：枚举 tmp 根下已加载模块（不限于注册
-    模块——镜像生产语义），按 sys.modules 插入序排（依赖先于消费者）。"""
+    """Stands in for _discover_module_names: enumerate loaded modules under the tmp root (not limited to registration modules — mirroring production semantics), ordered by sys.modules insertion order (dependencies before consumers)."""
     def _discover():
         order = {n: i for i, n in enumerate(list(sys.modules))}
         names = []
@@ -386,7 +394,7 @@ def _make_discover(harness):
 
 
 def test_reload_detects_and_replaces_pattern(reload_env):
-    """pattern 文件变更 → reload → 注册表里是新对象（name 带 v2）。"""
+    """Pattern file changed -> reload -> the registry holds the new object (name contains v2)."""
     import host.reload as hr
     from nexus.registry.patterns import registry as pattern_registry
 
@@ -396,7 +404,7 @@ def test_reload_detects_and_replaces_pattern(reload_env):
                         "apps/demo_app/route.py")
     assert pattern_registry.get("reload_demo").name == "reload demo v1"
     old = pattern_registry.get("reload_demo")
-    hr.reload_changed()  # 首跑只建立 mtime 基线（watcher 启动时同此）
+    hr.reload_changed()  # first run only establishes the mtime baseline (same at watcher startup)
 
     time.sleep(0.02)
     reload_env.write_module("apps/demo_app/route.py",
@@ -409,13 +417,13 @@ def test_reload_detects_and_replaces_pattern(reload_env):
     new = pattern_registry.get("reload_demo")
     assert new is not old
     assert new.name == "reload demo v2"
-    # 幂等：无再变更时第二次 reload 是 no-op
+    # idempotent: with no further changes the second reload is a no-op
     again = hr.reload_changed()
     assert again["changed"] == []
 
 
 def test_reload_replaces_plugin_class(reload_env):
-    """plugin（executor）文件变更 → replace 模式收编新类，实例缓存刷新。"""
+    """Plugin (executor) file changed -> replace mode takes over the new class, instance cache refreshed."""
     import host.reload as hr
     from nexus.registry.plugins import registry as plugin_registry
 
@@ -425,7 +433,7 @@ def test_reload_replaces_plugin_class(reload_env):
                         "atoms/executors/demo_exec.py")
     v1 = plugin_registry.resolve("executor", "reload_demo_exec")
     assert type(v1).__name__ == "_Exec1"
-    hr.reload_changed()  # 建立基线
+    hr.reload_changed()  # establish the baseline
 
     time.sleep(0.02)
     reload_env.write_module("atoms/executors/demo_exec.py",
@@ -440,7 +448,7 @@ def test_reload_replaces_plugin_class(reload_env):
 
 
 def test_reload_failure_keeps_old_registration(reload_env):
-    """重放失败（语法错误）→ 告警并保持旧注册，其余模块不受影响。"""
+    """Replay failure (syntax error) -> warns and keeps the old registration; other modules are unaffected."""
     import host.reload as hr
     from nexus.registry.patterns import registry as pattern_registry
 
@@ -448,7 +456,7 @@ def test_reload_failure_keeps_old_registration(reload_env):
         "apps/demo_app/route.py", _PATTERN_MODULE.format(ver=1))
     _import_out_of_repo(reload_env, "_reload_test.apps.demo_app.route",
                         "apps/demo_app/route.py")
-    hr.reload_changed()  # 建立基线
+    hr.reload_changed()  # establish the baseline
 
     time.sleep(0.02)
     reload_env.write_module("apps/demo_app/route.py", "def broken(:\n")
@@ -461,7 +469,7 @@ def test_reload_failure_keeps_old_registration(reload_env):
 
 
 def test_reload_rebind_sessions(reload_env):
-    """rebind_sessions：重载后内存会话切到新 pattern 对象并重建 map。"""
+    """rebind_sessions: after reload, in-memory sessions switch to the new pattern object and rebuild the map."""
     import host.reload as hr
     from nexus.engine.session import Session
     from nexus.registry.patterns import registry as pattern_registry
@@ -473,9 +481,9 @@ def test_reload_rebind_sessions(reload_env):
 
     session = Session(session_id="s1", pattern_code="reload_demo")
     session.pattern = pattern_registry.get("reload_demo")
-    session.cxt.module_map = session.pattern.module_map
+    session.cxt.node_map = session.pattern.node_map
     old_pattern = session.pattern
-    hr.reload_changed()  # 建立基线
+    hr.reload_changed()  # establish the baseline
 
     time.sleep(0.02)
     reload_env.write_module("apps/demo_app/route.py",
@@ -487,9 +495,9 @@ def test_reload_rebind_sessions(reload_env):
     assert hr.rebind_sessions(sessions, pattern_registry) == 1
     assert session.pattern is not old_pattern
     assert session.pattern.name == "reload demo v2"
-    assert session.cxt.module_map is session.pattern.module_map
+    assert session.cxt.node_map is session.pattern.node_map
 
-    # 已注销 pattern 的会话：保持旧引用
+    # sessions of a deregistered pattern: keep the old reference
     pattern_registry.deregister("reload_demo")
     sessions = {"s1": session}
     assert hr.rebind_sessions(sessions, pattern_registry) == 0
@@ -497,12 +505,12 @@ def test_reload_rebind_sessions(reload_env):
 
 
 def test_reload_all_invalidates_config(reload_env):
-    """reload_all 失效 config 缓存：同指纹重写后的下一次解析重读文件。"""
+    """reload_all invalidates the config cache: after a same-fingerprint rewrite, the next parse re-reads the file."""
     import host.reload as hr
 
     path = _write(reload_env.root, _LLM_MIN)
     load_config(path)
-    # 等长替换 + 精确恢复 mtime 纳秒：伪造"同指纹重写"，只有缓存失效能救
+    # Same-length replacement + exact mtime nanosecond restore: fake a "same-fingerprint rewrite"; only cache invalidation rescues this
     st = os.stat(path)
     _write(reload_env.root, _LLM_MIN.replace("qwen3.8-max", "qwen-cccccc"))
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -511,23 +519,23 @@ def test_reload_all_invalidates_config(reload_env):
     with patch("nexus.settings._parse_config_file",
                wraps=settings._parse_config_file) as spy:
         assert load_config(path)["llm_default"]["model"] == "qwen-cccccc"
-        assert spy.call_count == 1  # 失效后必然重解析
+        assert spy.call_count == 1  # re-parse is guaranteed after invalidation
     invalidate_config_cache(path)
 
 
 # ============================================================================
-# 依赖序：非注册模块（prompts）变更经重放消费者生效
+# Dependency order: non-registration module (prompts) changes take effect via replayed consumers
 # ============================================================================
 
 _PROMPTS_MODULE = '''\
-"""纯数据模块（无任何注册）——reload 依赖序的连带刷新验证。"""
+"""Pure data module (no registrations) — verifies transitive refresh of the reload dependency order."""
 TITLE = "v{ver}"
 '''
 
 _DEP_PATTERN_MODULE = '''\
-"""依赖 prompts 的注册模块：Pattern name 取自 prompts.TITLE。"""
+"""Registration module depending on prompts: the Pattern name comes from prompts.TITLE."""
 from _reload_test.apps.demo_app.prompts import TITLE
-from nexus.model.module import AgentModule
+from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from nexus.registry.patterns import registry
 
@@ -535,18 +543,18 @@ registry.register(Pattern(
     code="reload_demo",
     name=TITLE,
     description="d",
-    entry_module_code="m1",
-    modules=[AgentModule(module_code="m1", module_name="m1",
-                         module_description="d", module_todo_description="t",
-                         sub_modules=[])],
+    nodes=[BaseNode(code="m1", name="m1", description="d",
+                    task_description="t")],
 ))
 '''
 
 
 def test_reload_prompts_change_propagates_via_consumer(reload_env):
-    """非注册模块（prompts）变更：重放按 sys.modules 插入序先刷 prompts
-    再重放 route（消费者），注册表里的 Pattern 拿到新 TITLE——reload 不
-    级联依赖，消费者必须自己重执行才能绑定新对象。"""
+    """Non-registration module (prompts) change: replay refreshes prompts
+    first (by sys.modules insertion order) and then replays route (the
+    consumer), so the Pattern in the registry picks up the new TITLE —
+    reload does not cascade dependencies; consumers must re-execute
+    themselves to bind the new object."""
     import host.reload as hr
     from nexus.registry.patterns import registry as pattern_registry
 
@@ -554,12 +562,13 @@ def test_reload_prompts_change_propagates_via_consumer(reload_env):
                             _PROMPTS_MODULE.format(ver=1))
     reload_env.write_module("apps/demo_app/route.py",
                             _DEP_PATTERN_MODULE.format())
-    # 只显式 import route：prompts 由 route 的 import 连带载入（插入序
-    # prompts < route，正是生产里 route→prompts 的依赖形态）
+    # Only import route explicitly: prompts is loaded transitively by
+    # route's import (insertion order prompts < route, exactly the
+    # route->prompts dependency shape of production)
     _import_out_of_repo(reload_env, "_reload_test.apps.demo_app.route",
                         "apps/demo_app/route.py")
     assert pattern_registry.get("reload_demo").name == "v1"
-    hr.reload_changed()  # 建立基线（含非注册模块 prompts）
+    hr.reload_changed()  # establish the baseline (including the non-registration module prompts)
 
     time.sleep(0.02)
     p_prompts = reload_env.write_module("apps/demo_app/prompts.py",
@@ -569,5 +578,5 @@ def test_reload_prompts_change_propagates_via_consumer(reload_env):
     result = hr.reload_changed()
     assert "_reload_test.apps.demo_app.prompts" in result["changed"]
     assert result["failed"] == []
-    # route 未变更但被连带重放 → 注册进注册表的 Pattern 用上新 TITLE
+    # route unchanged but transitively replayed -> the Pattern registered into the registry uses the new TITLE
     assert pattern_registry.get("reload_demo").name == "v2"

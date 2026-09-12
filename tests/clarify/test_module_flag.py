@@ -1,21 +1,34 @@
 """Tests for the clarify slot declaration (the plan-② replacement of the
-enable_clarify flag) + the clarify-intent directive in the FSM NLU prompt."""
+enable_clarify flag; plan-⑧ moved the declaration from the module layer to
+node.stages) + the clarify-intent directive in the FSM NLU prompt."""
 
 
 def test_default_off():
     """No stages declaration → no clarify slot (opt-in by declaration)."""
-    from nexus.model.module import FSMModule
+    from nexus.model.node import BaseNode
 
-    m = FSMModule(module_code="m1")
-    assert "clarify" not in (m.stages or {})
+    n = BaseNode(code="n1")
+    assert "clarify" not in (n.stages or {})
 
 
-def test_declared_via_stages():
-    from nexus.model.module import FSMModule
+def test_declared_via_node_stages():
+    from nexus.model.node import BaseNode
 
-    m = FSMModule(module_code="m1",
-                  stages={"clarify": "clarify_default"})
-    assert m.stages["clarify"] == "clarify_default"
+    n = BaseNode(code="n1", stages={"clarify": "clarify_default"})
+    assert n.stages["clarify"] == "clarify_default"
+
+
+def test_declared_within_fsm_pattern_skeleton():
+    """The pattern skeleton must carry the clarify slot for the node-level
+    declaration to run (two-layer resolution: node > skeleton)."""
+    from nexus.model.node import BaseNode
+    from nexus.model.pattern import Pattern
+
+    n = BaseNode(code="n1", stages={"clarify": "clarify_default"})
+    p = Pattern(code="pf", name="t", description="t", pattern_type="fsm",
+                nodes=[n], stages=[{"nlu": None}, {"clarify": None},
+                                   {"nlg": None}])
+    assert [list(e.keys())[0] for e in p.stages] == ["nlu", "clarify", "nlg"]
 
 
 def test_builtin_code_registered():

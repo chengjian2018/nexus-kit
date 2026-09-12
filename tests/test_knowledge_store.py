@@ -69,6 +69,95 @@ def test_scope_isolation(store):
 
 
 # ---------------------------------------------------------------------------
+# Console management CRUD (ops-console P0)
+# ---------------------------------------------------------------------------
+
+def test_list_scopes_aggregates_both_tables(store):
+    store.upsert_product("xianyu:a1", 1001, "商品")
+    store.upsert_product("xianyu:a2", 2001, "商品")
+    store.add_cs("xianyu:a1", "政策", "内容")
+    scopes = store.list_scopes()
+    by_scope = {s["scope"]: s for s in scopes}
+    assert set(by_scope) == {"xianyu:a1", "xianyu:a2"}
+    assert by_scope["xianyu:a1"]["product_count"] == 1
+    assert by_scope["xianyu:a1"]["cs_count"] == 1
+    assert by_scope["xianyu:a2"]["cs_count"] == 0
+    assert by_scope["xianyu:a1"]["updated_at"] > 0
+
+
+def test_update_product_partial_and_explicit_clear(store):
+    store.upsert_product("s", 1, "iPhone", price="2699",
+                         extracted_content="# 正文")
+    # only present keys are updated; absent keys are left untouched
+    assert store.update_product("s", 1, {"price": "2599"}) is True
+    row = store.get_product("s", 1)
+    assert row["price"] == "2599"
+    assert row["extracted_content"] == "# 正文"
+    # None = explicit clear (unlike upsert's COALESCE retention)
+    assert store.update_product("s", 1, {"extracted_content": None}) is True
+    row = store.get_product("s", 1)
+    assert row["extracted_content"] is None
+    # empty fields = no-op, merely probing existence
+    assert store.update_product("s", 1, {}) is True
+    assert store.update_product("s", 999, {}) is False
+    # unknown fields fail fast
+    with pytest.raises(ValueError):
+        store.update_product("s", 1, {"no_such_column": 1})
+
+
+def test_delete_product(store):
+    store.upsert_product("s", 1, "iPhone")
+    assert store.delete_product("s", 1) is True
+    assert store.get_product("s", 1) is None
+    assert store.delete_product("s", 1) is False
+
+
+def test_list_cs_includes_disabled_and_pagination(store):
+    store.add_cs("s", "条目1", "内容")
+    store.add_cs("s", "条目2", "内容", enabled=False)
+    rows = store.list_cs("s")
+    assert len(rows) == 2  # management view includes disabled entries
+    assert {r["title"] for r in rows} == {"条目1", "条目2"}
+    rows = store.list_cs("s", include_disabled=False)
+    assert [r["title"] for r in rows] == ["条目1"]
+    assert len(store.list_cs("s", limit=1)) == 1
+    assert len(store.list_cs("s", limit=1, offset=1)) == 1
+
+
+def test_update_cs_toggle_enable_and_delete(store):
+    store.add_cs("s", "退货政策", "7 天无理由")
+    entry_id = store.list_cs("s")[0]["id"]
+
+    assert store.update_cs(entry_id, {"enabled": False}) is True
+    assert store.get_cs(entry_id)["enabled"] == 0
+    assert store.search_cs("s", "退货") == []  # search view filters disabled entries
+
+    assert store.update_cs(entry_id, {"content": "15 天可退换"}) is True
+    row = store.get_cs(entry_id)
+    assert row["content"] == "15 天可退换"
+    assert row["title"] == "退货政策"  # keys not provided stay unchanged
+
+    with pytest.raises(ValueError):
+        store.update_cs(entry_id, {"no_such_column": 1})
+
+    assert store.delete_cs(entry_id) is True
+    assert store.get_cs(entry_id) is None
+    assert store.delete_cs(entry_id) is False
+
+
+def test_clear_scope(store):
+    store.upsert_product("s", 1, "商品")
+    store.upsert_product("s", 2, "商品")
+    store.add_cs("s", "政策", "内容")
+    store.upsert_product("other", 1, "别动我")
+    counts = store.clear_scope("s")
+    assert counts == {"products_deleted": 2, "cs_deleted": 1}
+    scopes = store.list_scopes()
+    assert [s["scope"] for s in scopes] == ["other"]
+    assert scopes[0]["product_count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Search semantics
 # ---------------------------------------------------------------------------
 

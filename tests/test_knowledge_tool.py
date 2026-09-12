@@ -39,17 +39,29 @@ def test_tools_registered():
         assert registry.get_toolset_for_tool(name) == "knowledge"
 
 
-def test_pattern_acl_grant_and_deny():
-    allowed = registry.get_allowed_tools_for_pattern(
-        "customer_agent", "customer_service")
-    for name in ("search_product_knowledge",
-                 "search_customer_service_knowledge",
-                 "list_products", "send_goods_link"):
-        assert name in allowed
+def test_toolset_authorization_grant_and_deny():
+    """plan-⑧ §4：授权 = pattern.allow_toolset ∩ node.use_tools（双双
+    deny-by-default）。"""
+    from nexus.engine.loop import _resolve_tools
+    from nexus.model.node import BaseNode
+    from nexus.model.pattern import Pattern
 
-    # deny-by-default: other patterns get nothing
-    assert registry.get_allowed_tools_for_pattern("xianyu_agent", "xianyu_root") \
-        & {"search_product_knowledge", "send_goods_link"} == set()
+    names = ("search_product_knowledge",
+             "search_customer_service_knowledge",
+             "list_products", "send_goods_link")
+
+    grant = Pattern(code="customer_agent", name="c", description="d",
+                    allow_toolset=["knowledge"],
+                    nodes=[BaseNode(code="main", use_tools=list(names))])
+    resolved = {t["function"]["name"]
+                for t in _resolve_tools(grant.node_map["main"], grant)}
+    assert set(names) <= resolved
+
+    # deny-by-default：pattern 未授权该 toolset → 节点列了也没用
+    deny = Pattern(code="xianyu_agent", name="x", description="d",
+                   allow_toolset=["mcp-websearch"],
+                   nodes=[BaseNode(code="root", use_tools=list(names))])
+    assert _resolve_tools(deny.node_map["root"], deny) == []
 
 
 # ---------------------------------------------------------------------------
