@@ -5,8 +5,8 @@ The ReAct loop body lives in the executor atom
 "default_loop" — the AGENT graph's default node executor); this kernel
 module keeps:
 
-- TurnResult — the executor return contract (content/next/wait_human/
-  actions/extra; re-exported from turn_result)
+- TurnResult — the executor return contract (content/next/sends/
+  wait_human/actions/extra; re-exported from turn_result)
 - the tool-resolution / dispatch toolbox (_resolve_tools /
   _dispatch_tool_calls / _parse_args / _execute_tool) shared by the default
   executor and custom loops — kept in the kernel so the layering stays

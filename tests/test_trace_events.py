@@ -179,13 +179,14 @@ def test_agent_node_step_events_around_the_loop():
                return_value=provider):
         events = _collect(chat_turn_stream("q", "as", {"as": s}))
 
-    assert _kinds(events) == [("trace", "node_start"),
+    assert _kinds(events) == [("trace", "graph_compile"),
+                              ("trace", "node_start"),
                               ("delta", None),
                               ("round", None),
                               ("trace", "node_end"),
                               ("trace", "graph_done"),
                               ("done", None)]
-    start, end, done = events[0].trace, events[3].trace, events[4].trace
+    start, end, done = events[1].trace, events[4].trace, events[5].trace
     assert (start.node_code, start.data["step"]) == ("n1", 0)
     assert (end.node_code, end.data["step"]) == ("n1", 0)
     assert done.data["reason"] == "terminal"
@@ -204,15 +205,16 @@ def test_agent_tool_round_traces():
                return_value=provider):
         events = _collect(chat_turn_stream("q", "as", {"as": s}))
 
-    assert _kinds(events) == [("trace", "node_start"),
+    assert _kinds(events) == [("trace", "graph_compile"),
+                              ("trace", "node_start"),
                               ("delta", None), ("trace", "tool_call"),
                               ("trace", "tool_result"), ("round", None),
                               ("delta", None), ("round", None),
                               ("trace", "node_end"),
                               ("trace", "graph_done"),
                               ("done", None)]
-    call = events[2].trace
-    result = events[3].trace
+    call = events[3].trace
+    result = events[4].trace
     assert call.data["tool_name"] == "noop"
     assert call.data["args"] == {}
     assert call.data["round_idx"] == 0
@@ -260,12 +262,14 @@ def test_graph_wait_then_resume_trace_events():
                return_value={"code": "x", "model": "m"}):
         events = _collect(chat_turn_stream("开始", "wg", {"wg": s}))
 
-    # suspension turn: node_start → node_end → graph_wait → done
-    assert _kinds(events) == [("trace", "node_start"),
+    # suspension turn: graph_compile → node_start → node_end → graph_wait
+    # → done（恢复轮不重发 graph_compile，以 graph_resume 开头）
+    assert _kinds(events) == [("trace", "graph_compile"),
+                              ("trace", "node_start"),
                               ("trace", "node_end"),
                               ("trace", "graph_wait"),
                               ("done", None)]
-    wait = events[2].trace
+    wait = events[3].trace
     assert (wait.node_code, wait.data["step"]) == ("n1", 0)
     assert events[-1].result.text == "请提供审批意见"
 

@@ -39,6 +39,10 @@ DEFAULT_PATTERN_TYPE = "agent"
 # step — aligns with the loop executor's _MAX_TOOL_ROUNDS guard scale)
 DEFAULT_MAX_STEPS = 10
 
+# Runtime fan-out width default (config.max_fanout; plan-⑨ §3.3 — the
+# per-dimension guard bounding one sends' worker-instance count)
+DEFAULT_MAX_FANOUT = 8
+
 
 class Pattern:
     def __init__(self,
@@ -180,6 +184,11 @@ class Pattern:
         if not isinstance(cfg.get("max_steps"), int):
             cfg["max_steps"] = DEFAULT_MAX_STEPS
 
+        # max_fanout 钉进 config（缺省 DEFAULT_MAX_FANOUT；运行时扇出宽度
+        # 预算——同构实例数上限，plan-⑨ §3.3 三层守卫的宽度维度）
+        if not isinstance(cfg.get("max_fanout"), int) or cfg["max_fanout"] < 1:
+            cfg["max_fanout"] = DEFAULT_MAX_FANOUT
+
         self.config = cfg
 
     # ------------------------------------------------------------------
@@ -190,6 +199,11 @@ class Pattern:
     def max_steps(self) -> int:
         """AGENT 图步数预算（FSM 不消费此值——每轮恰好一个节点）。"""
         return int(self.config.get("max_steps", DEFAULT_MAX_STEPS))
+
+    @property
+    def max_fanout(self) -> int:
+        """运行时扇出宽度上限（一次 sends 的同构实例数，plan-⑨ §3.3）。"""
+        return int(self.config.get("max_fanout", DEFAULT_MAX_FANOUT))
 
     @property
     def agent_hooks(self):

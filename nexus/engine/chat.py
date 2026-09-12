@@ -14,10 +14,24 @@ cxt turn lifecycle → **dispatch by pattern_type** → produce a ChatResult.
   when ``cxt.graph_state`` carries a wait_human cursor:
     - conditional edges = the node executor's routing output
       (``TurnResult.next``, mapped back onto the node's sub_nodes);
+    - runtime fan-out = the node executor's dispatch output
+      (``TurnResult.sends``, plan-⑨): N homogeneous instances of ONE
+      declared worker node run concurrently (asyncio.gather — same-loop
+      interleaving, no locks), each in a structurally isolated private
+      workspace (own history / message_sink cut / task payload as the
+      explicit query); every instance settles into the graph_state results
+      board (completion order), then the worker's single declared
+      successor — the join node — executes with the board readable.
+      A failed branch settles as an error entry and never kills the run
+      (wait-for-all, failure-tolerant); branches may not suspend or nest
+      (wait_human/sends inside a branch = that branch fails);
     - node executor resolution: node.plugins["loop"] >
       pattern.plugins["loop"] > default_loop (the ReAct tool loop);
-    - step budget ``pattern.max_steps`` (one node execution per step; on
-      exhaustion a force-close reply ends the run);
+    - step budget ``pattern.max_steps`` (one node execution per step;
+      worker instances do NOT consume graph steps — fan-out node and join
+      each count one, width is bounded by ``pattern.max_fanout`` and
+      branch-internal rounds by each executor's own guards; on exhaustion
+      a force-close reply ends the run);
     - suspension: ``TurnResult.wait_human`` persists the cursor + step into
       cxt.graph_state (sessions-table graph_state column — process-restart
       safe) and ends the turn; the NEXT user message re-executes the paused
@@ -44,8 +58,11 @@ Entries:
   chat_turn().text
 """
 
+import asyncio
+import copy
+import json
 import logging
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from nexus.settings import get_llm_config
 from nexus.engine.compression import maybe_compress
@@ -69,6 +86,9 @@ _lifecycle = TurnLifecycle()
 # node executors' workflow data)
 PAUSED_NODE_KEY = "__paused_node__"
 STEP_KEY = "__step__"
+# plan-⑨: the fan-out results board — rebuilt (overwritten) on every
+# fanout_start; join/later nodes read it until the graph terminates
+FANOUT_RESULTS_KEY = "__fanout_results__"
 
 
 # ============================================================================
@@ -248,6 +268,163 @@ async def _handle_node(session: Session, node, force_close: bool = False,
 
 
 # ============================================================================
+# Runtime fan-out (plan-⑨: sends -> N homogeneous instances -> barrier join)
+# ============================================================================
+
+def _branch_cxt(cxt, branch_input: Any):
+    """Structurally isolated worker context (plan-⑨ §2.3).
+
+    Shallow copy with the mutable channels replaced: a private messages
+    workspace (own history; message_sink cut — branch rows never persist to
+    the session), own actions / graph_state scratch (write-discard; results
+    travel back exclusively via TurnResult), and the task payload as the
+    explicit query (default messages builders need no special casing).
+    Read-shared fields (llm_config / node_map / metadata / filled_slots)
+    pass by reference — worker executors treat them read-only.
+    """
+    bcxt = copy.copy(cxt)
+    bcxt.history = []
+    bcxt.message_sink = None
+    bcxt.actions = []
+    bcxt.graph_state = {}
+    bcxt.turn_history_start = 0
+    if isinstance(branch_input, str):
+        bcxt.user_query = branch_input
+    elif branch_input is not None:
+        bcxt.user_query = json.dumps(branch_input, ensure_ascii=False)
+    return bcxt
+
+
+async def _run_fanout(session: Session, node, result: TurnResult,
+                      stream, step: int) -> Optional[str]:
+    """Execute one fan-out declaration: validate -> run N homogeneous worker
+    instances concurrently -> settle each into the results board (completion
+    order) -> return the join node code.
+
+    Concurrency: asyncio.gather on the turn's event loop — same-loop
+    interleaving means the shared emitter queue and the board appends need
+    no locks (plan-⑨ decision #2's intent: no engine-wide concurrency
+    rewrite; executors' async signatures unchanged).
+
+    Failure semantics: a branch exception — including the forbidden
+    wait_human / nested sends — settles that branch as an error entry; the
+    run continues and the join still fires (wait-for-all,
+    failure-tolerant). Returns None ONLY on the tolerant undeclared-target
+    termination (the next-routing guard family); every other contract
+    violation raises ValueError.
+    """
+    from nexus.engine.streaming import BranchStreamEmitter
+
+    cxt = session.cxt
+    pattern = session.pattern
+    graph_state = cxt.graph_state
+    sends = result.sends or []
+    _emit = getattr(stream, "emit_trace", None)
+    max_fanout = pattern.max_fanout
+
+    if result.next is not None:
+        raise ValueError(
+            f"节点 {node.code!r} 同时返回 next 与 sends"
+            f"（互斥，见 plan-⑨ §2.1）"
+        )
+    targets = {s.node_code for s in sends}
+    if len(targets) != 1:
+        raise ValueError(
+            f"节点 {node.code!r} 扇出目标不唯一（v1 同构扇出）: {sorted(targets)}"
+        )
+    worker_code = sends[0].node_code
+    if worker_code not in node.sub_nodes:
+        logger.warning(
+            "[graph] 节点 %s 的扇出目标 %r 不在其 sub_nodes %s 中"
+            "（未声明边），图终止",
+            node.code, worker_code, node.sub_nodes,
+        )
+        if _emit is not None:
+            _emit("graph_done", reason="undeclared_edge", step=step)
+        graph_state.clear()
+        return None
+    if len(sends) > max_fanout:
+        raise ValueError(
+            f"节点 {node.code!r} 扇出宽度 {len(sends)} 超过 "
+            f"max_fanout={max_fanout}（plan-⑨ §3.3 宽度守卫）"
+        )
+    worker = pattern.node_map[worker_code]
+    if len(worker.sub_nodes) != 1:
+        raise ValueError(
+            f"join 不可解析: worker 节点 {worker_code!r} 的 sub_nodes"
+            f" 必须有且仅有一个目标（join 节点），实际: {worker.sub_nodes}"
+        )
+    join_code = worker.sub_nodes[0]
+
+    board: List[Dict[str, Any]] = []
+    graph_state[FANOUT_RESULTS_KEY] = board
+    branch_ids = [f"{worker_code}#{i + 1}" for i in range(len(sends))]
+    cxt.actions.append({"fanout_start": {
+        "node": node.code, "branches": len(sends), "join": join_code}})
+    logger.info("[graph] 节点 %s 扇出 %d 个 %s 实例（join=%s）",
+                node.code, len(sends), worker_code, join_code)
+    if _emit is not None:
+        _emit("fanout_start", node_code=node.code,
+              branch_ids=branch_ids, join_node=join_code)
+
+    # Worker-level LLM config BEFORE the copy — branches inherit the
+    # resolved config through the shared reference
+    _refresh_llm_config(session, node_code=worker_code)
+    cxt.current_node_code = worker_code
+    executor = plugin_registry.resolve(
+        "executor", _resolve_node_executor_code(pattern, worker))
+
+    async def _run_branch(branch_id: str, branch_input: Any) -> None:
+        if _emit is not None:
+            _emit("branch_start", node_code=worker_code, branch_id=branch_id)
+        branch_stream = (BranchStreamEmitter(stream, branch_id)
+                         if stream is not None else None)
+        ec = ExecutionContext(
+            cxt=_branch_cxt(cxt, branch_input),
+            pattern=pattern,
+            node=worker,
+            stream=branch_stream,
+            step=step,
+            branch_id=branch_id,
+            branch_input=branch_input,
+        )
+        entry: Dict[str, Any]
+        try:
+            bres = await executor.execute(ec)
+            if bres.wait_human or bres.sends:
+                # v1 guards: no suspension, no nested fan-out inside a
+                # branch — the branch fails loudly, the run continues
+                raise ValueError(
+                    f"扇出分支 {branch_id!r} 返回了 wait_human/sends"
+                    f"（v1 禁止分支内挂起/嵌套扇出，见 plan-⑨ §2.3）"
+                )
+            entry = {"branch_id": branch_id, "node_code": worker_code,
+                     "ok": True, "content": bres.content or "",
+                     "extra": bres.extra or {}}
+        except Exception as e:
+            logger.exception("[graph] 扇出分支 %s 失败", branch_id)
+            entry = {"branch_id": branch_id, "node_code": worker_code,
+                     "ok": False, "error": str(e)}
+        board.append(entry)  # completion order (single event loop)
+        if _emit is not None:
+            _emit("branch_end", node_code=worker_code, branch_id=branch_id,
+                  ok=entry["ok"], error=entry.get("error", ""))
+
+    await asyncio.gather(*[
+        _run_branch(bid, s.input) for bid, s in zip(branch_ids, sends)])
+
+    failed = sum(1 for e in board if not e["ok"])
+    cxt.actions.append({"fanout_join": {
+        "node": join_code, "total": len(board), "failed": failed}})
+    logger.info("[graph] 扇出汇聚: join=%s, total=%d, failed=%d",
+                join_code, len(board), failed)
+    if _emit is not None:
+        _emit("fanout_join", node_code=join_code,
+              total=len(board), failed=failed)
+    return join_code
+
+
+# ============================================================================
 # AGENT graph runtime (whole-graph run per message + suspension/resumption)
 # ============================================================================
 
@@ -287,6 +464,10 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
         current = pattern.node_map[pattern.entry_node_code]
         step = 0
         graph_state.clear()
+        if _emit is not None:
+            _emit("graph_compile", node_code=pattern.entry_node_code,
+                  pattern=pattern.code, nodes=len(pattern.node_map),
+                  entry=pattern.entry_node_code)
 
     content = ""
     while True:
@@ -345,6 +526,18 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
             graph_state.clear()
             return TurnResult(content=content, extra=result.extra)
 
+        # ---- Fan-out (sends: N homogeneous instances + barrier join) --
+        if result.sends:
+            join_code = await _run_fanout(session, node, result,
+                                          stream, step)
+            if join_code is None:
+                # Undeclared dispatch target — tolerant termination
+                # (same guard family as the next-routing branch below)
+                return TurnResult(content=content, extra=result.extra)
+            step += 1
+            current = pattern.node_map[join_code]
+            continue
+
         # ---- Routing (conditional edge via TurnResult.next) ---------
         nxt = result.next
         if isinstance(nxt, (list, tuple)):
@@ -353,7 +546,8 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
             else:
                 if len(nxt) > 1:
                     logger.warning(
-                        "[graph] 运行时扇出未实现，仅消费首个目标: %r", nxt)
+                        "[graph] next 的 list 形态为遗留容忍（运行时扇出"
+                        "请用 sends），仅消费首个目标: %r", nxt)
                 nxt = nxt[0]
 
         if nxt is None:
@@ -398,7 +592,12 @@ async def _run_fsm_turn(session: Session, pattern, stream=None) -> TurnResult:
     executor = plugin_registry.resolve("executor", code)
     ec = ExecutionContext(
         cxt=cxt, pattern=pattern, node=None, stream=stream)
-    return await executor.execute(ec)
+    result = await executor.execute(ec)
+    if result.sends:
+        raise ValueError(
+            "FSM 路径不支持扇出 sends（仅 AGENT 图运行时消费，见 plan-⑨）"
+        )
+    return result
 
 
 # ============================================================================

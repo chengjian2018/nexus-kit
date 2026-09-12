@@ -45,6 +45,12 @@ class ExecutionContext:
             this payload — the langgraph-interrupt-style handoff
         step: the graph step index of this execution (0-based; trace
             observability)
+        branch_id: fan-out branch identifier ("{node}#{seq}", e.g.
+            "dr_search#3") — non-None ONLY inside a worker instance
+            (plan-⑨); None on every main-path execution
+        branch_input: the Send.input payload of this worker instance
+            (None on every main-path execution). Together with branch_id
+            these are the instance's dispatch coordinates
     """
 
     cxt: Any = None
@@ -54,6 +60,8 @@ class ExecutionContext:
     stream: Optional[Any] = None
     resume_input: Optional[str] = None
     step: int = 0
+    branch_id: Optional[str] = None
+    branch_input: Any = None
 
 
 @dataclass

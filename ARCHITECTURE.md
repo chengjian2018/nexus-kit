@@ -34,22 +34,31 @@ host POST /api/v1/chat
          "agent" → 图运行时（chat._run_agent_graph）：
                     挂起游标存在则恢复（resume_input=本轮消息），否则从 entry 跑全图；
                     每步：R4 按节点刷新 → 解析 loop executor → execute → 消费
-                    TurnResult.next（条件边，须在 sub_nodes 内）；
+                    TurnResult.next（条件边，须在 sub_nodes 内）或
+                    TurnResult.sends（运行时扇出，见下节）；
                     wait_human → 挂起（游标+步数入 graph_state，轮次结束）；
                     终止 = 无后继 / is_end / max_steps 耗尽（兜底话术）
       5. end_turn → build_chat_result（text + actions 快照）
 ```
 
-## AGENT 图运行时（计划⑧）
+## AGENT 图运行时（计划⑧；计划⑨扩展运行时扇出）
 
 自研轻量图运行时（零第三方依赖，借鉴 langgraph 的概念：编译期静态图 /
-条件边 / interrupt-checkpointer），取代计划⑥-⑦时代的事件接力机制
+条件边 / interrupt-checkpointer / Send 式扇出），取代计划⑥-⑦时代的事件接力机制
 （ModuleJumpEvent / hop 循环 / DeferredModuleSwitch 全部删除）：
 
 - **图 = 静态邻接**：`node.sub_nodes` 一个字段两种编译期语义——FSM =
   next_node 合法转移集，AGENT = 图邻接边。条件边不在边上挂函数，而在
   **节点执行契约的路由输出**（`TurnResult.next`，单值映射 sub_nodes；
-  list 形态是运行时扇出/并行分支的扩展位，本期串行消费首个）。
+  list 形态为遗留容忍——串行消费首个，扇出改用 `sends` 声明）。
+- **运行时扇出（计划⑨，map-reduce）**：`TurnResult.sends=[Send(node,
+  input), ...]` 派发 N 个**同构** worker 实例（同一声明节点多次带参调用，
+  "子 agent"零新概念）——`asyncio.gather` 并发执行（同事件循环交错，
+  无锁），每个实例跑在结构隔离的私有工作区（cxt 浅拷贝：空 history、
+  message_sink 切断、Send.input 作显式查询）；实例落定即写入结果板
+  `graph_state["__fanout_results__"]`（完成序），全部落定后执行 join 节点
+  （worker 的唯一 sub_node 目标，普通节点语义：可路由可挂起）。失败分支
+  落 error 条目不阻塞图；分支内 wait_human/嵌套扇出 = 该分支失败。
 - **每条用户消息跑全图**（从 entry），或**从挂起节点恢复**——两种行为同一
   引擎零配置：从不 wait_human 的图（闲聊客服）自然单轮跑完，会挂起的图
   （审批流）跨轮延续。
@@ -58,19 +67,24 @@ host POST /api/v1/chat
   `cxt.graph_state`（sessions 表落盘，进程重启可续）；下一轮用户消息作为
   `ec.resume_input` 送达，**恢复时该节点重新执行**——副作用（工具调用）
   幂等责任在节点执行器（v1 文档化责任，不做事重放）。
-- **预算**：`config.max_steps`（默认 10）限单次运行的总节点执行次数
-  （挂起续跑跨轮延续记账）；耗尽 → force-close 兜底话术。环因此是合法
-  语义。FSM 无预算——每轮恰好一个节点。
+- **预算三层守卫（各管各维度）**：`config.max_steps`（默认 10）限主循环
+  节点执行次数（扇出节点 + join 各占 1 步，**worker 实例不占图步数**；
+  挂起续跑跨轮延续记账）；`config.max_fanout`（默认 8）限一次 sends 的
+  实例宽度；executor 内部守卫（`_MAX_TOOL_ROUNDS` 等）限分支内轮次。
+  耗尽 → force-close 兜底话术。环因此是合法语义。FSM 无预算——每轮恰好
+  一个节点，也不收 sends。
 - **跨轮状态**：挂起游标走 graph_state；业务状态走 cxt 既有字段
   （metadata / filled_slots / history），无图级持久状态。
 
-### In-repo 实例：`deep_research`（四节点静态图）
+### In-repo 实例：`deep_research`（四节点图 + 引擎级扇出，计划⑨验收）
 
 `apps/deep_research_agent/route_multi.py`——preplan→plan→search→synthesize
-四个节点（sub_nodes 声明边），各挂 dr_* 执行器返回 `TurnResult(next=...)`
-接力；相位间状态走 `cxt.graph_state`（图终止自动清空）；search 节点
-executor 内部循环处理多子问题（运行时扇出的配方级表达）。单模块版
-executor 已删除（图版即其声明式形态）。
+四个节点：plan 站产出子问题后 `sends=[Send(dr_search, …) × N]` 引擎级扇出
+（宽度受 max_fanout 截断），search 站是 worker（一实例一子问题、私有工作区、
+每实例独立轮次守卫，实例隔离结构化取代了旧的全局覆盖度启发式），synthesize
+站是 join（合并预检索资料与全部分支成果，失败分支降级不阻塞）——检索延迟
+从"子问题之和"降为"最慢分支"。相位间状态走 `cxt.graph_state`（图终止自动
+清空）。单模块版 executor 已删除（图版即其声明式形态）。
 
 ## 插件中心（计划①引入）
 

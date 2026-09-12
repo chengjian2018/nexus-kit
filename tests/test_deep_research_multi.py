@@ -1,13 +1,14 @@
-"""deep_research（plan-⑧ 四节点 AGENT 图）离线测试。
+"""deep_research（plan-⑨ 扇出版四节点 AGENT 图）离线测试。
 
 ScriptedProvider 与相位检测（请求特征锚点）自包含于本文件；图版机制覆盖：
 1. 图结构 + AST 自动发现 + 四相位 executor 插件注册 + validate_pattern
-2. 全研究轮：四节点同轮接力（node_start 顺序即流水线拓扑）/ 工具真实派发 /
-   终态 trace 与旧版同构 / history 无 tool 行 / 图终止清空 graph_state
-3. 预检索相位：工具结果进入 PLAN 请求；findings 汇入 SEARCH
-4. PLAN 降级 / 自纠重试（相位级回归锚点）
-5. SEARCH 轮次封顶后综合仍完成
-6. 流式：delta 只来自 SYNTHESIZE；round 事件含 plan/search/synthesize
+2. 全研究轮：PLAN 按子问题 sends 扇出（search×N 并行 worker）→ join 综合 /
+   工具真实派发 / 终态 trace 与旧版同构（+additive branches 摘要）/
+   history 无 tool 行 / 图终止清空 graph_state
+3. 预检索相位：工具结果进入 PLAN 请求；findings 汇入 join
+4. PLAN 降级 / 自纠重试（相位级回归锚点）；子问题数超过 max_fanout 截断
+5. SEARCH 每分支轮次封顶后综合仍完成；单分支失败降级不阻塞 join
+6. 流式：delta 只来自 SYNTHESIZE；fanout_*/branch_* 事件 + branch_id tagging
 7. 第二轮从首站重跑（每轮全图重跑语义）
 8. 孤儿入口防御：挂起游标落在 dr_plan（无在途状态）→ 跳过规划检索直奔综合
    （引擎 resume 机制 + 相位孤儿防御的复合回归）
@@ -79,12 +80,14 @@ class DeepResearchScriptedProvider:
     请求识别(与 executor 的 prompt 布局一一对应):
     - PREPLAN:最后一条 user 消息含 PREPLAN_ANCHOR
     - PLAN:最后一条 user 消息含 PLAN_ANCHOR
-    - SEARCH:tools 参数非空
+    - SEARCH:tools 参数非空（扇出 worker 的请求——分支以其工作区 user
+      行(子问题)标识，轮次按分支独立计数，并发互不干扰）
     - SYNTHESIZE:system 或 user 含 ``撰写最终研究报告``
     """
 
     def __init__(self, plan_json=None, search_rounds=1, report="# 研究报告",
-                 preplan_rounds=0, plan_fail_first=False):
+                 preplan_rounds=0, plan_fail_first=False,
+                 fail_sub_question=None):
         self.plan_json = plan_json or json.dumps(
             {"sub_questions": ["子问题A", "子问题B"],
              "notes": "测试计划"}, ensure_ascii=False)
@@ -92,8 +95,10 @@ class DeepResearchScriptedProvider:
         self.report = report
         self.preplan_rounds = preplan_rounds
         self.plan_fail_first = plan_fail_first
+        self.fail_sub_question = fail_sub_question
         self.call_count = 0
         self.search_calls = 0
+        self.search_branches = {}   # 子问题 -> {"tool_rounds", "calls"}
         self.plan_calls = 0
         self.synth_calls = 0
         self.preplan_calls = 0
@@ -129,6 +134,15 @@ class DeepResearchScriptedProvider:
         return {"content": "跳过预检索。", "tool_calls": [],
                 "finish_reason": "stop"}
 
+    def _branch_key(self, messages) -> str:
+        return next((m["content"] for m in reversed(messages)
+                     if m.get("role") == "user"), "")
+
+    def _search_state(self, messages) -> dict:
+        key = self._branch_key(messages)
+        return self.search_branches.setdefault(
+            key, {"tool_rounds": 0, "calls": 0})
+
     async def achat_completion(self, messages, model, temperature=0.7,
                                max_tokens=2048, tools=None, tool_choice=None):
         self.call_count += 1
@@ -144,13 +158,19 @@ class DeepResearchScriptedProvider:
             return {"content": self.plan_json, "tool_calls": [],
                     "finish_reason": "stop"}
         if kind == "search":
+            st = self._search_state(messages)
             self.search_calls += 1
-            if self.search_calls <= self.search_rounds:
+            st["calls"] += 1
+            if self.fail_sub_question and \
+                    self._branch_key(messages).startswith(self.fail_sub_question):
+                raise RuntimeError(f"分支炸了: {self._branch_key(messages)}")
+            if st["tool_rounds"] < self.search_rounds:
+                st["tool_rounds"] += 1
                 return {"content": None, "tool_calls": [{
                     "id": f"c{self.search_calls}", "type": "function",
                     "function": {"name": "web_search_prime",
                                  "arguments": json.dumps(
-                                     {"query": f"测试查询{self.search_calls}"},
+                                     {"query": f"测试查询{st['calls']}"},
                                      ensure_ascii=False)},
                 }], "finish_reason": "tool_calls"}
             return {"content": "信息已足够,开始综合。", "tool_calls": [],
@@ -192,12 +212,18 @@ class DeepResearchScriptedProvider:
             yield LLMChunk(text=self.plan_json)
             yield LLMChunk(finish_reason="stop")
             return
+        st = self._search_state(messages)
         self.search_calls += 1
-        if self.search_calls <= self.search_rounds:
+        st["calls"] += 1
+        if self.fail_sub_question and \
+                self._branch_key(messages).startswith(self.fail_sub_question):
+            raise RuntimeError(f"分支炸了: {self._branch_key(messages)}")
+        if st["tool_rounds"] < self.search_rounds:
+            st["tool_rounds"] += 1
             tc = {"index": 0, "id": f"c{self.search_calls}", "type": "function",
                   "function": {"name": "web_search_prime",
                                "arguments": json.dumps(
-                                   {"query": f"测试查询{self.search_calls}"},
+                                   {"query": f"测试查询{st['calls']}"},
                                    ensure_ascii=False)}}
             yield LLMChunk(tool_calls=[tc], finish_reason="tool_calls")
         else:
@@ -284,28 +310,35 @@ def test_full_research_turn_relay(pattern, fake_mcp_tools):
     assert "研究报告" in reply
     assert "[S1]" in reply
 
-    # all four phases in place: preplan once (skipped) + plan once + search
-    # (1 tool round + 1 convergence round) + synth once
+    # all four phases in place: preplan once (skipped) + plan once + two
+    # concurrent search branches (1 tool round + 1 convergence round each)
+    # + synth once
     assert provider.preplan_calls == 1
     assert provider.plan_calls == 1
-    assert provider.search_calls == 2
+    assert provider.search_calls == 4
     assert provider.synth_calls == 1
+    assert len(provider.search_branches) == 2   # one workspace per sub-question
 
-    # phase request order = pipeline topology
+    # phase request order: pipeline topology (the 4 search calls of the two
+    # concurrent branches may interleave in any order between plan and synth)
     kinds = [kind for kind, _ in provider.requests]
-    assert kinds == ["preplan", "plan", "search", "search", "synth"]
+    assert kinds[:2] == ["preplan", "plan"]
+    assert kinds[-1] == "synth"
+    assert kinds.count("search") == 4
 
-    # the fake MCP tool is genuinely dispatched
-    assert fake_mcp_tools["n"] >= 1
+    # the fake MCP tool is genuinely dispatched (once per branch round)
+    assert fake_mcp_tools["n"] >= 2
     assert fake_mcp_tools["queries"]
 
-    # the final-state trace keeps the legacy key shape
+    # the final-state trace keeps the legacy key shape (+ branches summary)
     trace = session.cxt.metadata["deep_research"]
     assert trace["question"] == "量子计算的最新进展是什么?"
     assert trace["sub_questions"] == ["子问题A", "子问题B"]
     assert trace["phases"] == ["plan", "search", "synthesize"]
-    assert trace["tool_stats"].get("web_search_prime") >= 1
+    assert trace["tool_stats"].get("web_search_prime") == 2  # merged, 1/branch
     assert trace["sources"][0]["tool"] == "web_search_prime"
+    assert trace["rounds"] == 4   # 2 rounds/branch (tool + convergence)
+    assert trace["branches"] == {"total": 2, "failed": 0}
     assert not trace["degraded"]
 
     # the graph terminated: the state board is cleared entirely
@@ -321,7 +354,8 @@ def test_full_research_turn_relay(pattern, fake_mcp_tools):
 
 
 def test_streaming_relay_traces(pattern, fake_mcp_tools):
-    """Streaming: node_start order is the pipeline topology; deltas come only from SYNTHESIZE."""
+    """Streaming: fan-out vocabulary + branch tagging; worker deltas never
+    leak (only SYNTHESIZE streams)."""
     from nexus.engine.chat import chat_turn_stream
 
     sessions = {}
@@ -339,11 +373,23 @@ def test_streaming_relay_traces(pattern, fake_mcp_tools):
     kinds = [e.kind for e in events]
     assert kinds[-1] == "done"
 
-    # 同轮接力链：node_start 顺序 = preplan→plan→search→synthesize
+    # main-path nodes only (workers surface as branch_*, not node_start):
+    # preplan → plan → (fanout: 2 branches) → synthesize
     node_order = [e.trace.node_code for e in events
                   if e.kind == "trace" and e.trace.event == "node_start"]
-    assert node_order == ["dr_preplan", "dr_plan", "dr_search",
-                          "dr_synthesize"]
+    assert node_order == ["dr_preplan", "dr_plan", "dr_synthesize"]
+
+    traces = [e.trace for e in events if e.kind == "trace"]
+    fanout = [t for t in traces if t.event == "fanout_start"]
+    assert len(fanout) == 1
+    assert fanout[0].data["branch_ids"] == ["dr_search#1", "dr_search#2"]
+    assert fanout[0].data["join_node"] == "dr_synthesize"
+    assert sum(1 for t in traces if t.event == "branch_start") == 2
+    ends = [t for t in traces if t.event == "branch_end"]
+    assert len(ends) == 2 and all(t.data.get("ok") for t in ends)
+    joins = [t for t in traces if t.event == "fanout_join"]
+    assert len(joins) == 1
+    assert joins[0].data == {"total": 2, "failed": 0}
 
     # all deltas come from the report: plan/search intermediate text does not leak
     deltas = "".join(e.text for e in events if e.kind == "delta")
@@ -353,11 +399,16 @@ def test_streaming_relay_traces(pattern, fake_mcp_tools):
     assert "信息已足够" not in deltas
 
     # round events: all plan / search / synthesize phase boundaries present
-    outcomes = [e.round_info["outcome"] for e in events if e.kind == "round"]
+    # (search rounds are branch-tagged)
+    rounds = [e for e in events if e.kind == "round"]
+    outcomes = [e.round_info["outcome"] for e in rounds]
     assert "plan" in outcomes
     assert "search" in outcomes
     assert "synthesize" in outcomes
     assert outcomes[-1] == "final"
+    search_rounds = [e for e in rounds
+                     if e.round_info["outcome"] == "search"]
+    assert all(e.branch_id for e in search_rounds)
 
     assert events[-1].result.text == "# 分段报告\n第一段。\n第二段。"
     assert sessions["s1"].cxt.graph_state == {}
@@ -419,18 +470,57 @@ def test_plan_json_self_correct(pattern, fake_mcp_tools):
 
 
 # ============================================================================
-# 5. SEARCH round capping
+# 5. SEARCH per-branch round capping / branch failure tolerance
 # ============================================================================
 
-def test_search_rounds_capped(pattern, fake_mcp_tools):
+def test_search_rounds_capped_per_branch(pattern, fake_mcp_tools):
     provider = DeepResearchScriptedProvider(
         search_rounds=_MAX_SEARCH_ROUNDS + 5)  # never converges
     session, reply = run_research(pattern, provider)
 
     trace = session.cxt.metadata["deep_research"]
-    assert trace["rounds"] == _MAX_SEARCH_ROUNDS
-    assert provider.search_calls == _MAX_SEARCH_ROUNDS
+    # two branches, each capped at the per-branch ceiling
+    assert trace["rounds"] == _MAX_SEARCH_ROUNDS * 2
+    assert provider.search_calls == _MAX_SEARCH_ROUNDS * 2
     assert provider.synth_calls == 1  # synthesis still completes after the cap
+    assert reply
+
+
+def test_branch_failure_degrades_but_completes(pattern, fake_mcp_tools):
+    """A branch whose LLM calls blow up settles as an error entry — the join
+    still fires, the report is produced from the surviving branch's
+    material, and the trace marks degraded."""
+    provider = DeepResearchScriptedProvider(fail_sub_question="子问题B")
+    session, reply = run_research(pattern, provider)
+
+    assert provider.synth_calls == 1
+    assert reply
+
+    trace = session.cxt.metadata["deep_research"]
+    assert trace["branches"] == {"total": 2, "failed": 1}
+    assert trace["degraded"] is True
+    # findings from the surviving branch still made it into the report
+    assert trace["sources"]
+    assert trace["tool_stats"].get("web_search_prime") == 1
+
+
+# ============================================================================
+# 5b. PLAN dispatch width capping
+# ============================================================================
+
+def test_plan_overflow_caps_fanout_width(pattern, fake_mcp_tools):
+    provider = DeepResearchScriptedProvider(plan_json=json.dumps(
+        {"sub_questions": [f"子问题{i}" for i in range(1, 11)],
+         "notes": "超宽计划"}, ensure_ascii=False))
+    session, reply = run_research(pattern, provider)
+
+    trace = session.cxt.metadata["deep_research"]
+    # dispatch capped at the pattern's max_fanout (default 8)
+    assert trace["branches"]["total"] == 8
+    assert len(provider.search_branches) == 8
+    # the trace keeps the FULL plan (the report explains the study scope;
+    # the cap note lives in the plan's notes field)
+    assert len(trace["sub_questions"]) == 10
     assert reply
 
 

@@ -68,21 +68,29 @@ class ChatStreamEvent:
     round_info: Optional[Dict[str, Any]] = None     # round: outcome info
     trace: Optional["TraceEvent"] = None            # trace: transition event
     result: Optional[ChatResult] = None             # done: terminal ChatResult
+    branch_id: str = ""                             # fan-out branch tag
+                                                   # ("" = main path; plan-⑨)
 
 
 # Canonical trace event names (all optional fields default to ""/{} —
 # consumers render what is present; unknown names pass through untouched).
 # plan-⑧: the module-jump family (module_jump / route_hit / route_root /
 # defer_switch / module_start) is gone with the module layer; the graph
-# runtime emits the node_* / graph_* family.
+# runtime emits the node_* / graph_* family. plan-⑨ adds the fan-out family
+# (worker instances of a runtime sends dispatch) + graph_compile.
 TRACE_EVENT_NAMES = (
     "node_start",        # an AGENT graph node's execution begins
     "node_end",          # an AGENT graph node's execution finished
     "node_jump",         # FSM end-of-turn node transition
+    "graph_compile",     # a fresh graph run started (compiled shape summary)
     "graph_wait",        # AGENT graph suspended (wait_human)
     "graph_resume",      # AGENT graph resumed from suspension
     "graph_done",        # AGENT graph run terminated (reason: terminal /
                          # is_end / max_steps / undeclared_edge)
+    "fanout_start",      # plan-⑨: a node dispatched N worker instances
+    "branch_start",      # plan-⑨: one worker instance began (branch_id)
+    "branch_end",        # plan-⑨: one worker instance settled (ok/error)
+    "fanout_join",       # plan-⑨: all instances settled, join node fires
     "tool_call",         # agent loop: one tool invocation issued
     "tool_result",       # agent loop: one tool invocation returned
     "conversation_end",  # FSM reached a terminal node (is_end)
@@ -102,6 +110,7 @@ class TraceEvent:
     event: str                       # one of TRACE_EVENT_NAMES (open set)
     module_code: str = ""
     node_code: str = ""
+    branch_id: str = ""              # fan-out branch tag ("" = main path)
     data: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -110,6 +119,8 @@ class TraceEvent:
                                "module_code": self.module_code}
         if self.node_code:
             out["node_code"] = self.node_code
+        if self.branch_id:
+            out["branch_id"] = self.branch_id
         if self.data:
             out["data"] = self.data
         return out
@@ -141,26 +152,64 @@ class StreamEmitter:
         else:
             self.events.append(event)
 
-    def emit_delta(self, text: str) -> None:
+    def emit_delta(self, text: str, branch_id: str = "") -> None:
         if text:
-            self._append(ChatStreamEvent(kind="delta", text=text))
+            self._append(ChatStreamEvent(kind="delta", text=text,
+                                         branch_id=branch_id))
 
-    def emit_round(self, outcome: str, round_idx: int) -> None:
+    def emit_round(self, outcome: str, round_idx: int,
+                   branch_id: str = "") -> None:
         self._append(ChatStreamEvent(
-            kind="round", round_info={"outcome": outcome,
-                                      "round_idx": round_idx}))
+            kind="round", branch_id=branch_id,
+            round_info={"outcome": outcome,
+                        "round_idx": round_idx,
+                        **({"branch_id": branch_id} if branch_id else {})}))
 
     def emit_trace(self, event: str, module_code: str = "",
-                   node_code: str = "", **data: Any) -> None:
+                   node_code: str = "", branch_id: str = "",
+                   **data: Any) -> None:
         """Append a trace event (extra kwargs become TraceEvent.data)."""
         self._append(ChatStreamEvent(
             kind="trace",
             trace=TraceEvent(event=event, module_code=module_code,
-                             node_code=node_code, data=dict(data))))
+                             node_code=node_code, branch_id=branch_id,
+                             data=dict(data))))
 
     def drain(self) -> List[ChatStreamEvent]:
         out, self.events = self.events, []
         return out
+
+
+class BranchStreamEmitter:
+    """Tags every event of ONE fan-out branch with its branch_id (plan-⑨
+    §4.1).
+
+    A worker instance receives this as ``ec.stream`` instead of the turn
+    emitter — the executor keeps calling emit_delta / emit_round /
+    emit_trace unchanged and every event reaches the turn sink already
+    tagged, so concurrent branches demultiplex cleanly on the consumer
+    side (CLI branch prefixes / console lanes). Drain passthrough keeps
+    pull-mode consumers working.
+    """
+
+    def __init__(self, inner: StreamEmitter, branch_id: str):
+        self._inner = inner
+        self._branch_id = branch_id
+
+    def emit_delta(self, text: str) -> None:
+        self._inner.emit_delta(text, branch_id=self._branch_id)
+
+    def emit_round(self, outcome: str, round_idx: int) -> None:
+        self._inner.emit_round(outcome, round_idx, branch_id=self._branch_id)
+
+    def emit_trace(self, event: str, module_code: str = "",
+                   node_code: str = "", **data: Any) -> None:
+        self._inner.emit_trace(event, module_code=module_code,
+                               node_code=node_code,
+                               branch_id=self._branch_id, **data)
+
+    def drain(self) -> List[ChatStreamEvent]:
+        return self._inner.drain()
 
 
 async def aggregate_turn(events: AsyncGenerator[ChatStreamEvent, None]

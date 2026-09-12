@@ -1,49 +1,54 @@
 """The four-node graph variant of the deep-research executor — one node per
-research phase, relaying within the same turn via the routing output
-(plan-⑧; the pre-merge single-module executor.py and its ModuleJumpEvent
-hop channel are gone — this file now owns the phase implementations too):
+research phase (plan-⑧ form; plan-⑨ migrates the SEARCH station to the
+engine's runtime fan-out):
 
-    dr_preplan ──next──> dr_plan ──next──> dr_search ──next──> dr_synthesize
-     pre-retrieval/init    plan sub-questions  iterative search   synthesize report
+    dr_preplan ──next──> dr_plan ──sends──> dr_search ×N ──join──> dr_synthesize
+     pre-retrieval/init    plan sub-questions  one per sub-question   merge & report
 
 Phase inventory (the shared phase methods on DeepResearchExecutor):
 
     PREPLAN  one tool-carrying LLM call: the model itself decides whether
              to run a retrieval round first for background (no tool_calls =
              skip); retrieval results stay in messages for PLAN to lean on,
-             findings merge straight into SEARCH
+             findings merge into the join's findings
     PLAN     one tool-less LLM call → {"sub_questions": [...]} (fault-tolerant
              JSON extraction; on failure the bad output + error message are
              fed back into messages for a self-correcting retry, and a second
-             failure degrades to [the original question])
-    SEARCH   tool-carrying ReAct loop (≤ _MAX_SEARCH_ROUNDS): every round
-             rewrites the "research state board" into system (sub-question
-             check-off progress / rounds left / hit stats) so the model can
-             decide to keep searching or wrap up; no tool_calls is the
-             wrap-up signal (REFLECT is folded into SEARCH, no separate
-             phase)
-    SYNTHESIZE  slims messages down (report instruction + question/plan/
-             findings digest) and streams the report — the only phase that
-             forwards text deltas to ec.stream
+             failure degrades to [the original question]); then dispatches
+             ONE worker instance per sub-question via ``TurnResult.sends``
+             (capped at ``pattern.max_fanout``)
+    SEARCH   a fan-out WORKER (plan-⑨ §5): one instance researches ONE
+             sub-question in its own private workspace — a small tool-
+             carrying ReAct loop (≤ _MAX_SEARCH_ROUNDS per instance) with a
+             per-instance state board. Instance isolation structurally
+             replaces the pre-fan-out coverage heuristics across a shared
+             12-round loop; results travel back ONLY via TurnResult.extra
+             (the engine settles them into the ``__fanout_results__`` board)
+    SYNTHESIZE  the JOIN node (barrier): merges the state board's pre-
+             retrieval findings with every branch's findings/tool_stats,
+             then slims messages down and streams the report — the only
+             phase that forwards text deltas to ec.stream
 
-Plan-⑧ adaptations over the pre-merge form:
+Plan-⑨ adaptations over the plan-⑧ form:
 
-- inter-phase state (question / workspace messages / findings / plan /
-  rounds) travels via ``cxt.graph_state["deep_research_state"]`` — the
-  graph runtime's state board, shared across the run's nodes and cleared
-  automatically at graph termination (begin_turn never touches it; the
-  pre-merge "SYNTHESIZE pops the turn-scoped transient" and "begin_turn
-  backstop" are both subsumed);
-- the same-turn relay is ``TurnResult(content="", next=<下一站code>)``
-  (the conditional edge) instead of a ModuleJumpEvent through the hop
-  loop; the pre-merge "SYNTHESIZE resets the base back to entry" is gone —
-  every turn re-runs the graph from the entry node anyway;
+- the same-turn relay is ``TurnResult(content="", next=...)`` for PREPLAN/
+  SYNTHESIZE-degraded, ``TurnResult(content="", sends=[Send(dr_search,
+  payload), ...])`` for PLAN — the engine runs the instances concurrently
+  (asyncio.gather; retrieval latency = slowest branch, not the sum) and
+  executes this node as the join once all settle (a failed branch settles
+  as an error entry and degrades the report, never killing the run);
+- inter-phase state (question / workspace messages / pre-retrieval
+  findings / plan) still travels via ``cxt.graph_state[
+  "deep_research_state"]`` — workers see NONE of it (branch isolation:
+  their cxt copy carries an empty graph_state/history), which is why the
+  dispatch payload folds in the theme + sub-question;
 - the final trace still goes to ``cxt.metadata["deep_research"]`` (same
-  key, same shape as the pre-merge versions — observability / next-turn
-  research continuation unaffected);
+  key, same shape + an additive ``branches`` summary) — observability /
+  next-turn research continuation unaffected;
 - the research process likewise never lands in cxt.history (the private
-  workspace decision unchanged); history keeps only the "user question →
-  research report" Q/A pair;
+  workspace decision now doubly enforced: worker branches run on isolated
+  cxt copies whose message_sink is cut); history keeps only the "user
+  question → research report" Q/A pair;
 - each tool-carrying node resolves its own tool surface (_resolve_tools:
   node.use_tools ∩ pattern.allow_toolset 工具集， both deny-by-default);
   intermediate phases forward no deltas — the only streaming phase is
@@ -53,7 +58,7 @@ Zero-instance-state phase implementations: the four classes subclass
 DeepResearchExecutor only to reuse its stateless phase methods
 (_preplan_phase etc.; the plugin registry shares a single instance
 anyway); each execute() does only "load state → run one phase → save
-state → return the routing output".
+state → return the routing/dispatch output".
 """
 
 import json
@@ -78,6 +83,7 @@ from nexus.engine.agent_hooks import (
     rewrite_tool_call,
     rewrite_tool_result,
 )
+from nexus.engine.chat import FANOUT_RESULTS_KEY
 from nexus.engine.execution import ExecutionContext, NodeExecutor
 from nexus.engine.loop import (
     TurnResult,
@@ -87,6 +93,7 @@ from nexus.engine.loop import (
     warn_prompt_length,
 )
 from nexus.engine.messages import build_agent_messages
+from nexus.engine.turn_result import Send
 from nexus.llm.resolve import build_provider
 from apps.deep_research_agent.prompts import (
     DEEP_RESEARCH_BASE_PROMPT,
@@ -101,14 +108,21 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Runaway protection budget (hard LLM call ceiling ≈ 1(pre-retrieval) + 1 +
-# 1(self-correct retry) + 12 + 1 = 16)
+# 1(self-correct retry) + max_fanout × per-branch SEARCH + 1; plan-⑨ trades
+# the pre-fan-out single 12-round loop for N concurrent instances of a
+# tighter per-branch cap — width × depth, each dimension independently
+# bounded)
 # ---------------------------------------------------------------------------
 
-_MAX_SEARCH_ROUNDS = 12        # SEARCH phase round ceiling
+_MAX_SEARCH_ROUNDS = 6         # per-branch SEARCH round ceiling (plan-⑨:
+                               # one sub-question per instance needs fewer
+                               # rounds than the old shared 12)
 _PLAN_RETRIES = 1              # PLAN JSON parse-failure retry count
 _PER_RESULT_CHARS = 4000       # per-tool-result truncation (workspace / findings)
-_MAX_FINDINGS = 30             # findings entry ceiling (FIFO evicts the oldest)
-_WORKSPACE_CHAR_BUDGET = 60000 # SEARCH workspace char budget (over budget: middle-truncate the oldest tool rows)
+_MAX_FINDINGS = 30             # findings entry ceiling (join-side FIFO across
+                               # ALL branches + pre-retrieval)
+_WORKSPACE_CHAR_BUDGET = 60000 # per-branch SEARCH workspace char budget (over
+                               # budget: middle-truncate the oldest tool rows)
 
 # State-board marks
 _DONE_MARK = "✓"
@@ -305,30 +319,30 @@ class DeepResearchExecutor(NodeExecutor):
         return plan
 
     # ------------------------------------------------------------------
-    # SEARCH
+    # SEARCH（fan-out worker：一个实例一个子问题，plan-⑨ §5）
     # ------------------------------------------------------------------
 
-    async def _search_phase(self, provider, base_messages: List[Dict[str, Any]],
-                            plan: Dict[str, Any], tools: List[Dict[str, Any]],
-                            allowed_names: set, ec: "ExecutionContext", hooks,
-                            trace: Dict[str, Any],
-                            initial_findings: Optional[List[Dict[str, Any]]] = None,
-                            initial_tool_stats: Optional[Dict[str, int]] = None,
-                            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Tool-carrying research loop: a private messages workspace (never
-        lands in cxt.history).
+    async def _search_branch(self, provider, theme: str, sub_question: str,
+                             tools: List[Dict[str, Any]], allowed_names: set,
+                             ec: "ExecutionContext", hooks,
+                             ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """One worker instance's research loop: ONE sub-question in a
+        private messages workspace (never lands in cxt.history — and the
+        branch cxt copy's history is empty by construction anyway).
 
-        Each round rewrites the state-board section of system[0] at its
-        start; tool_calls are executed via _dispatch_research_round and the
-        protocol pairs appended; no tool_calls means the model judged the
-        information sufficient — its content becomes reflection_note for
-        SYNTHESIZE.
+        A per-instance state board (rounds left / findings / tool stats /
+        the single sub-question's check-off) is rewritten into system each
+        round; tool_calls are executed via _dispatch_research_round; no
+        tool_calls means the model judged the information sufficient — its
+        content becomes this branch's reflection note.
 
-        The workspace is rebuilt from base_messages (pre-retrieval results
-        do not enter the SEARCH workspace — their conclusions are already
-        distilled into the plan; but the pre-retrieval findings/tool_stats
-        merge in as initial state, so the state board starts from real
-        progress).
+        Instance isolation structurally replaces the pre-fan-out coverage
+        heuristics: there is exactly one sub-question to cover, and the
+        engine runs the instances concurrently (latency = slowest branch).
+
+        Returns: (findings, {"tool_stats", "rounds", "reflection_note"}) —
+        everything travels back via TurnResult.extra; this method never
+        touches the shared state board.
         """
         cxt = ec.cxt
         node = ec.node
@@ -336,19 +350,25 @@ class DeepResearchExecutor(NodeExecutor):
         temperature = (cxt.llm_config or {}).get("temperature", 0.7)
         max_tokens = (cxt.llm_config or {}).get("max_tokens", 2048)
 
-        user_query = trace["question"]
-        sub_questions = plan.get("sub_questions") or [user_query]
+        findings: List[Dict[str, Any]] = []
+        tool_stats: Dict[str, int] = {}
+        reflection_note = ""
+        rounds_done = 0
 
-        findings: List[Dict[str, Any]] = list(initial_findings or [])
-        tool_stats: Dict[str, int] = dict(initial_tool_stats or {})
+        if not tools:
+            logger.warning(
+                "[deep_research] 无可用工具(节点未声明可用工具或 toolset "
+                "未授权 MCP 工具?),本分支跳过检索")
+            return findings, {"tool_stats": tool_stats, "rounds": 0,
+                              "reflection_note": ""}
 
-        # Initial workspace shape: system (role + plan + state-board
-        # placeholder) + user (the original question)
-        system_base = _system_content(base_messages)
+        # Initial workspace shape: system (base + 子任务框定 + 状态板) +
+        # user (the sub-question itself)
+        sub_questions = [sub_question]
         covered = _covered_questions(sub_questions, findings)
         question_lines = [
-            f"{i + 1}. {_DONE_MARK if q in covered else _TODO_MARK} {q}"
-            for i, q in enumerate(sub_questions)]
+            f"1. {_DONE_MARK if sub_question in covered else _TODO_MARK}"
+            f" {sub_question}"]
         board = SEARCH_STATE_BOARD_TMPL.format(
             question_lines="\n".join(question_lines),
             rounds_left=_MAX_SEARCH_ROUNDS, total_rounds=_MAX_SEARCH_ROUNDS,
@@ -356,72 +376,65 @@ class DeepResearchExecutor(NodeExecutor):
             tool_stats=json.dumps(tool_stats, ensure_ascii=False))
         workspace: List[Dict[str, Any]] = [
             {"role": "system",
-             "content": f"{system_base}\n\n【研究计划】\n" + "\n".join(
-                 f"{i + 1}. {q}" for i, q in enumerate(sub_questions)) + board},
-            {"role": "user", "content": user_query},
+             "content": (
+                 f"{DEEP_RESEARCH_BASE_PROMPT}\n\n【研究子任务】\n"
+                 f"你是一个并行检索实例,只负责研究主题「{theme}」下的"
+                 f"这一个子问题,不要展开其他子问题:\n1. {sub_question}"
+                 + board)},
+            {"role": "user", "content": sub_question},
         ]
 
-        reflection_note = ""
-        rounds_done = 0
+        for round_idx in range(_MAX_SEARCH_ROUNDS):
+            rounds_done = round_idx + 1
+            # State-board rewrite (the sub-question gets its check mark once
+            # its keywords show up in findings)
+            covered = _covered_questions(sub_questions, findings)
+            question_lines = [
+                f"1. {_DONE_MARK if sub_question in covered else _TODO_MARK}"
+                f" {sub_question}"]
+            _rewrite_state_board(
+                workspace, sub_questions, question_lines,
+                _MAX_SEARCH_ROUNDS - round_idx, _MAX_SEARCH_ROUNDS,
+                len(findings), tool_stats)
 
-        if tools:
-            for round_idx in range(_MAX_SEARCH_ROUNDS):
-                rounds_done = round_idx + 1
-                # State-board rewrite (done sub-questions get a check mark:
-                # a sub-question counts as covered once its query shows up
-                # in findings)
-                covered = _covered_questions(sub_questions, findings)
-                question_lines = [
-                    f"{i + 1}. {_DONE_MARK if q in covered else _TODO_MARK} {q}"
-                    for i, q in enumerate(sub_questions)]
-                _rewrite_state_board(
-                    workspace, sub_questions, question_lines,
-                    _MAX_SEARCH_ROUNDS - round_idx, _MAX_SEARCH_ROUNDS,
-                    len(findings), tool_stats)
+            if hooks:
+                fire(hooks, "on_llm_call", LLMCallEvent(
+                    session_id=cxt.session_id,
+                    node_code=node.code,
+                    round_idx=round_idx, messages=workspace, model=model))
 
-                if hooks:
-                    fire(hooks, "on_llm_call", LLMCallEvent(
-                        session_id=cxt.session_id,
-                        node_code=node.code,
-                        round_idx=round_idx, messages=workspace, model=model))
+            result = await _stream_round(
+                provider, workspace, model, temperature, max_tokens,
+                None, tools=tools)  # intermediate rounds forward no deltas
+            content = result.get("content", "") or ""
+            tool_calls = result.get("tool_calls", []) or []
 
-                result = await _stream_round(
-                    provider, workspace, model, temperature, max_tokens,
-                    None, tools=tools)  # intermediate rounds forward no deltas
-                content = result.get("content", "") or ""
-                tool_calls = result.get("tool_calls", []) or []
+            if hooks:
+                fire(hooks, "on_llm_response", LLMResponseEvent(
+                    session_id=cxt.session_id,
+                    node_code=node.code,
+                    round_idx=round_idx, content=content,
+                    tool_calls=tool_calls))
 
-                if hooks:
-                    fire(hooks, "on_llm_response", LLMResponseEvent(
-                        session_id=cxt.session_id,
-                        node_code=node.code,
-                        round_idx=round_idx, content=content,
-                        tool_calls=tool_calls))
+            if not tool_calls:
+                # Model judged the information sufficient → wrap up; the
+                # content becomes this branch's reflection note
+                reflection_note = content
+                break
 
-                if not tool_calls:
-                    # Model judged the information sufficient → wrap up; the
-                    # content becomes the reflection note
-                    reflection_note = content
-                    break
-
-                new_findings = await self._dispatch_research_round(
-                    workspace, tool_calls, hooks, allowed_names, round_idx,
-                    cxt, node, findings, tool_stats)
-                findings.extend(new_findings)
-                if len(findings) > _MAX_FINDINGS:
-                    findings = findings[len(findings) - _MAX_FINDINGS:]
-                _truncate_workspace(workspace)
-                _emit_round(ec.stream, "search", round_idx)
-            else:
-                logger.info(
-                    "[deep_research] SEARCH 达到最大轮次 %d,进入综合",
-                    _MAX_SEARCH_ROUNDS)
+            new_findings = await self._dispatch_research_round(
+                workspace, tool_calls, hooks, allowed_names, round_idx,
+                cxt, node, findings, tool_stats)
+            findings.extend(new_findings)
+            if len(findings) > _MAX_FINDINGS:
+                findings = findings[len(findings) - _MAX_FINDINGS:]
+            _truncate_workspace(workspace)
+            _emit_round(ec.stream, "search", round_idx)
         else:
-            logger.warning(
-                "[deep_research] 无可用工具(节点未声明可用工具或 toolset "
-                "未授权 MCP 工具?),跳过 SEARCH 直接综合")
+            logger.info(
+                "[deep_research] SEARCH 分支达到最大轮次 %d,收束(子问题: %s)",
+                _MAX_SEARCH_ROUNDS, sub_question)
 
-        trace["phases"].append("search")
         return findings, {
             "tool_stats": tool_stats,
             "rounds": rounds_done,
@@ -649,7 +662,8 @@ class DrPreplanExecutor(DeepResearchExecutor):
 
 class DrPlanExecutor(DeepResearchExecutor):
     """dr_plan node: the PLAN phase (sub-question JSON, self-correcting
-    retry, degradation fallback); relays to dr_search."""
+    retry, degradation fallback); dispatches one dr_search worker instance
+    per sub-question via ``TurnResult.sends`` (plan-⑨ runtime fan-out)."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -668,52 +682,78 @@ class DrPlanExecutor(DeepResearchExecutor):
         plan = await self._plan_phase(
             provider, state.get("messages") or [], cxt.llm_config or {},
             ec, hooks, state)
+
+        # Dispatch: one worker instance per sub-question, capped at the
+        # pattern's fan-out width (overflow is noted in the plan, not fatal)
+        question = state.get("question", "")
+        sub_questions = plan.get("sub_questions") or [question]
+        max_fanout = ec.pattern.max_fanout
+        if len(sub_questions) > max_fanout:
+            logger.warning(
+                "[deep_research] 子问题 %d 个超过 max_fanout=%d,"
+                "仅研究前 %d 个",
+                len(sub_questions), max_fanout, max_fanout)
+            plan["notes"] = (str(plan.get("notes", ""))
+                             + f";子问题数超过扇出宽度上限 {max_fanout},"
+                               f"仅研究前 {max_fanout} 个").lstrip(";")
+            sub_questions = sub_questions[:max_fanout]
+
         state["plan"] = plan
         _save_state(cxt, state)
-        return TurnResult(content="", next=DR_SEARCH_CODE)
+        return TurnResult(content="", sends=[
+            Send(DR_SEARCH_CODE, {"theme": question, "sub_question": q})
+            for q in sub_questions
+        ])
 
 
 class DrSearchExecutor(DeepResearchExecutor):
-    """dr_search node: the SEARCH phase (tool-carrying ReAct loop +
-    reflection state board); relays to dr_synthesize."""
+    """dr_search node — the fan-out WORKER (plan-⑨ §5): one instance
+    researches ONE sub-question (``ec.branch_input`` carries
+    {"theme", "sub_question"}) in a private workspace; results travel back
+    exclusively via TurnResult.extra, which the engine settles into the
+    ``__fanout_results__`` board for the join node (dr_synthesize)."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
         if ec.force_close:
             return TurnResult(content=_FORCE_CLOSE_REPLY)
 
-        state = _load_state(cxt)
-        if state is None:
-            state = _orphan_state(cxt, ec.node, "orphan_search")
-            _save_state(cxt, state)
+        # Defensive main-path entry (no dispatch coordinates — unreachable
+        # via the normal flow): behave like the old orphan, bail to the join
+        if ec.branch_input is None:
+            state = _load_state(cxt)
+            if state is None:
+                state = _orphan_state(cxt, ec.node, "orphan_search")
+                _save_state(cxt, state)
             return TurnResult(content="", next=DR_SYNTHESIZE_CODE)
 
-        state["node_code"] = ec.node.code
+        payload = ec.branch_input if isinstance(ec.branch_input, dict) else {}
+        theme = str(payload.get("theme") or payload.get("sub_question") or "")
+        sub_question = str(payload.get("sub_question") or theme)
+
         await ensure_mcp_ready()
         tools = _resolve_tools(ec.node, ec.pattern)
         allowed_names = {t.get("function", {}).get("name", "") for t in tools}
         provider = build_provider(cxt.llm_config or {})
         hooks = resolve_agent_hooks(ec.node, ec.pattern)
 
-        findings, search_stats = await self._search_phase(
-            provider, state.get("base_messages") or [],
-            state.get("plan") or {}, tools, allowed_names, ec, hooks, state,
-            initial_findings=state.get("findings"),
-            initial_tool_stats=state.get("tool_stats"))
-        state.update({
+        findings, stats = await self._search_branch(
+            provider, theme, sub_question, tools, allowed_names, ec, hooks)
+        return TurnResult(content="", extra={
+            "sub_question": sub_question,
             "findings": findings,
-            "tool_stats": search_stats["tool_stats"],
-            "rounds": search_stats["rounds"],
-            "reflection_note": search_stats["reflection_note"],
+            "tool_stats": stats["tool_stats"],
+            "rounds": stats["rounds"],
+            "reflection_note": stats["reflection_note"],
         })
-        _save_state(cxt, state)
-        return TurnResult(content="", next=DR_SYNTHESIZE_CODE)
 
 
 class DrSynthesizeExecutor(DeepResearchExecutor):
-    """dr_synthesize node: the SYNTHESIZE phase — the only streaming phase;
-    wrap-up (terminal: no next, is_end=True; the next turn re-enters the
-    graph at the entry node, no base reset needed)."""
+    """dr_synthesize node — the fan-out JOIN (barrier): merges the state
+    board's pre-retrieval findings with every settled branch's
+    findings/tool_stats/notes, then streams the report (the only streaming
+    phase; terminal: no next, is_end=True — the next turn re-enters the
+    graph at the entry node)."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -737,26 +777,63 @@ class DrSynthesizeExecutor(DeepResearchExecutor):
         hooks = resolve_agent_hooks(node, pattern)
 
         plan = state.get("plan") or {}
-        findings = state.get("findings") or []
+
+        # ---- Join: merge the fan-out results board --------------------
+        # (entries: {branch_id, node_code, ok, content, extra, error?};
+        # a failed branch degrades the report, never blocks it)
+        board = [e for e in (cxt.graph_state.get(FANOUT_RESULTS_KEY) or [])
+                 if isinstance(e, dict)]
+        findings: List[Dict[str, Any]] = list(state.get("findings") or [])
+        tool_stats: Dict[str, int] = dict(state.get("tool_stats") or {})
+        rounds = 0
+        notes: List[str] = []
+        failed_branches = sum(1 for e in board if not e.get("ok"))
+        for entry in board:
+            if not entry.get("ok"):
+                continue
+            ex = entry.get("extra") or {}
+            findings.extend(ex.get("findings") or [])
+            for name, cnt in (ex.get("tool_stats") or {}).items():
+                tool_stats[name] = tool_stats.get(name, 0) + cnt
+            rounds += int(ex.get("rounds") or 0)
+            if ex.get("reflection_note"):
+                notes.append(f"[{ex.get('sub_question', '')}] "
+                             f"{ex['reflection_note']}")
+        if len(findings) > _MAX_FINDINGS:
+            findings = findings[len(findings) - _MAX_FINDINGS:]
+        reflection_note = "\n".join(notes)
+        degraded = bool(state.get("degraded")) or failed_branches > 0
+        if failed_branches:
+            logger.warning(
+                "[deep_research] 扇出分支失败 %d/%d,报告将基于部分资料",
+                failed_branches, len(board))
+
+        # The fan-out ran between PLAN and here — one "search" phase mark
+        # for the whole barrier
+        state.setdefault("phases", []).append("search")
+
         report = await self._synthesize_phase(
             provider, state.get("question", ""), plan, findings,
-            llm_config, ec, hooks, state)
+            llm_config, ec, hooks, {
+                # _synthesize_phase appends "synthesize" onto phases and
+                # reads reflection_note; the authoritative trace below is
+                # composed from the state + join merge above
+                "phases": state["phases"],
+                "reflection_note": reflection_note,
+            })
 
-        # Final trace: same key and shape as the pre-merge versions
-        # (_synthesize_phase already appended "synthesize" to phases); the
-        # in-flight graph_state board is cleared by the graph runtime at
-        # termination — nothing to reset here
+        # Final trace: legacy key shape + the additive branches summary
         trace = {
             "question": state.get("question", ""),
             "phases": state.get("phases", []),
-            "degraded": bool(state.get("degraded", False)),
+            "degraded": degraded,
             "sub_questions": plan.get("sub_questions", []),
             "sources": findings,
-            "tool_call_count": sum(
-                (state.get("tool_stats") or {}).values()),
-            "tool_stats": state.get("tool_stats") or {},
-            "rounds": state.get("rounds", 0),
-            "reflection_note": state.get("reflection_note", ""),
+            "tool_call_count": sum(tool_stats.values()),
+            "tool_stats": tool_stats,
+            "rounds": rounds,
+            "reflection_note": reflection_note,
+            "branches": {"total": len(board), "failed": failed_branches},
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }
         cxt.metadata[_TRACE_KEY] = trace
@@ -766,9 +843,9 @@ class DrSynthesizeExecutor(DeepResearchExecutor):
             fire(hooks, "on_agent_end", AgentEndEvent(
                 session_id=cxt.session_id,
                 node_code=node.code,
-                rounds=trace["rounds"] + 2, outcome="reply", reply=report))
+                rounds=rounds + 2, outcome="reply", reply=report))
 
-        _emit_round(ec.stream, "final", trace["rounds"])
+        _emit_round(ec.stream, "final", rounds)
 
         return TurnResult(content=report, extra={"deep_research": trace})
 
@@ -796,14 +873,6 @@ def _prior_trace(cxt) -> Optional[Dict[str, Any]]:
     force_close)."""
     prior = (cxt.metadata or {}).get(_TRACE_KEY)
     return prior if isinstance(prior, dict) else None
-
-
-def _system_content(messages: List[Dict[str, Any]]) -> str:
-    """Take the first system row's content (empty string if none)."""
-    for m in messages:
-        if m.get("role") == "system":
-            return m.get("content", "") or ""
-    return ""
 
 
 def _extract_plan_json(content: str) -> Tuple[Dict[str, Any], str]:

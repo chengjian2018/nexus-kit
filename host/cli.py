@@ -157,19 +157,25 @@ def render_trace_event(trace) -> str:
     """Render one TraceEvent as a compact CLI trace line (events mode).
 
     plan-⑧ event set: node_start/node_end/node_jump/graph_wait/graph_resume/
-    graph_done/tool_call/tool_result/conversation_end. Unknown event names
-    fall through to a generic one-liner — the set is open (custom executors
-    may emit their own names).
+    graph_done/tool_call/tool_result/conversation_end. plan-⑨ adds
+    graph_compile + the fan-out family (fanout_start/branch_start/
+    branch_end/fanout_join, branch events carry TraceEvent.branch_id).
+    Unknown event names fall through to a generic one-liner — the set is
+    open (custom executors may emit their own names).
     """
     d = getattr(trace, "data", None) or {}
     ev = getattr(trace, "event", "")
     node = getattr(trace, "node_code", "") or d.get("node", "")
+    branch = getattr(trace, "branch_id", "") or d.get("branch_id", "")
     if ev == "node_start":
         return cyan(f"  [node] ▶ 开始 {node}（step {d.get('step', '?')}）")
     if ev == "node_end":
         return cyan(f"  [node] ✔ 结束 {node}（step {d.get('step', '?')}）")
     if ev == "node_jump":
         return cyan(f"  [node] {d.get('from_node', '')} → {d.get('to_node', '')}")
+    if ev == "graph_compile":
+        return dim(f"  [graph] 图编译: entry={d.get('entry', node)}"
+                   f" nodes={d.get('nodes', '?')}（{d.get('pattern', '')}）")
     if ev == "graph_wait":
         return cyan(f"  [graph] ⏸ 挂起等待人工输入: {node}（step {d.get('step', '?')}）")
     if ev == "graph_resume":
@@ -178,6 +184,21 @@ def render_trace_event(trace) -> str:
         reason = {"terminal": "无后继", "is_end": "终节点", "max_steps": "步数耗尽",
                   "undeclared_edge": "未声明边"}.get(d.get("reason", ""), d.get("reason", ""))
         return cyan(f"  [graph] ■ 图运行结束（{reason}，step {d.get('step', '?')}）")
+    if ev == "fanout_start":
+        ids = d.get("branch_ids") or []
+        return cyan(f"  [fanout] ✚ {node} 派发 {len(ids)} 个实例"
+                    f"（{' '.join(ids)}）→ join={d.get('join_node', '?')}")
+    if ev == "branch_start":
+        return cyan(f"  [fanout] ▶ 分支 {branch} 开始")
+    if ev == "branch_end":
+        mark = "✔" if d.get("ok", True) else "✘"
+        suffix = f"（{d.get('error', '')}）" if d.get("error") else ""
+        return cyan(f"  [fanout] {mark} 分支 {branch} 结束{suffix}")
+    if ev == "fanout_join":
+        failed = d.get("failed", 0)
+        mark = "全部成功" if not failed else f"失败 {failed}"
+        return cyan(f"  [fanout] ⏏ join {node} 触发"
+                    f"（total {d.get('total', '?')}，{mark}）")
     if ev == "tool_call":
         args = _safe_json(d.get("args") or {})
         return yellow(f"  [tool_call] {d.get('tool_name', '')} {args}")
@@ -188,7 +209,8 @@ def render_trace_event(trace) -> str:
         return yellow(f"  [tool_result] {d.get('tool_name', '')}{flag}: {shown}")
     if ev == "conversation_end":
         return cyan(f"  [end] 到达终节点 {node}，流程结束")
-    return dim(f"  [{ev}] {node}".rstrip())
+    tail = f"（{branch}）" if branch else ""
+    return dim(f"  [{ev}] {node}{tail}".rstrip())
 
 
 class StreamEventPrinter:
@@ -201,6 +223,11 @@ class StreamEventPrinter:
     forwarding superseded a tool round's interim text), the final reply is
     re-printed; otherwise the streamed line IS the reply.
 
+    Fan-out branches (plan-⑨): each branch's deltas/rounds render on their
+    own prefixed line ("[node#3] …") — a line belongs to one branch, a
+    switch closes it. Branch text never joins the main reply stream (the
+    join node's content is the reply).
+
     write(text, nl) is injectable so the unit tests can capture output.
     """
 
@@ -208,6 +235,7 @@ class StreamEventPrinter:
         self._write = write or self._default_write
         self._streamed: List[str] = []
         self._midline = False
+        self._line_branch = ""   # branch_id owning the currently open line
 
     @staticmethod
     def _default_write(text: str, nl: bool = True) -> None:
@@ -218,16 +246,29 @@ class StreamEventPrinter:
         if self._midline:
             self._write("", nl=True)
             self._midline = False
+            self._line_branch = ""
+
+    def _open_line(self, branch_id: str) -> None:
+        """Ensure an open streaming line owned by branch_id（"" = 主回复）."""
+        if self._midline and self._line_branch != branch_id:
+            self._close_line()
+        if not self._midline:
+            if branch_id:
+                self._write(cyan(f"  [{branch_id}] "), nl=False)
+            else:
+                self._write(green("助手: "), nl=False)
+            self._line_branch = branch_id
+            self._midline = True
 
     def handle(self, ev) -> None:
         if ev.kind == "delta":
             if not ev.text:
                 return
-            if not self._midline:
-                self._write(green("助手: "), nl=False)
-                self._midline = True
+            branch = getattr(ev, "branch_id", "") or ""
+            self._open_line(branch)
             self._write(ev.text, nl=False)
-            self._streamed.append(ev.text)
+            if not branch:
+                self._streamed.append(ev.text)  # 主回复才参与终稿去重
         elif ev.kind == "trace":
             line = render_trace_event(ev.trace)
             if line:
@@ -235,8 +276,14 @@ class StreamEventPrinter:
                 self._write(line)
         elif ev.kind == "round":
             info = ev.round_info or {}
+            branch = getattr(ev, "branch_id", "") or ""
             self._close_line()
-            self._write(dim(f"  [round {info.get('round_idx', '?')}] {info.get('outcome', '?')}"))
+            if branch:
+                self._write(dim(f"  [{branch}] [round {info.get('round_idx', '?')}]"
+                                f" {info.get('outcome', '?')}"))
+            else:
+                self._write(dim(f"  [round {info.get('round_idx', '?')}]"
+                                f" {info.get('outcome', '?')}"))
 
     def close(self, final_text: str) -> None:
         self._close_line()

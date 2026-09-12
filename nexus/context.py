@@ -188,10 +188,14 @@ class DialogueContext:
 
     # AGENT graph state board (plan-⑧): turn-scoped workflow data + the
     # suspension cursor. Reserved keys (engine-managed):
-    #   "__paused_node__" : code of the node whose executor returned
-    #                       wait_human — the next user message resumes there
-    #   "__step__"        : step counter surviving a suspension (max_steps
-    #                       budget accounting across turns)
+    #   "__paused_node__"     : code of the node whose executor returned
+    #                           wait_human — the next user message resumes there
+    #   "__step__"            : step counter surviving a suspension (max_steps
+    #                           budget accounting across turns)
+    #   "__fanout_results__"  : plan-⑨ fan-out results board — rebuilt
+    #                           (overwritten) on every fanout_start; the join
+    #                           node reads entries {branch_id, node_code, ok,
+    #                           content, extra, error?} in completion order
     # Everything else is free for node executors to stash workflow data
     # (subtask lists, intermediate findings, approval records). The board is
     # cleared when the graph terminates; while paused it persists (sessions

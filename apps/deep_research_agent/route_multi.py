@@ -1,20 +1,23 @@
 """deep_research pattern — the four-node AGENT-graph deep-research recipe
-(plan-⑧ two-layer form; the pre-merge single-module version is gone).
+(plan-⑧ two-layer form; plan-⑨ migrates the SEARCH station to the engine's
+runtime fan-out — this app is the acceptance case of that plan).
 
 One AGENT node per research phase, adjacency expressed by ``sub_nodes`` —
-each user message runs the whole linear pipeline from the entry node, the
-stations relaying **within the same turn** via the routing output
-(``TurnResult.next``, the plan-⑧ conditional edge):
+each user message runs the whole pipeline from the entry node, the
+stations relaying **within the same turn** via the executor outputs
+(``TurnResult.next`` conditional edge / ``TurnResult.sends`` fan-out
+dispatch):
 
-    dr_preplan ──next──> dr_plan ──next──> dr_search ──next──> dr_synthesize
-     pre-retrieval/init    plan sub-questions  iterative search   synthesize report
+    dr_preplan ──next──> dr_plan ──sends──> dr_search ×N ──join──> dr_synthesize
+     pre-retrieval/init    plan sub-questions  one per sub-question   merge & report
 
 - ``pattern code "deep_research"``: the graph version takes over the code
   the deleted single-module route.py used to register (one deep_research
   registration, the "deep_research_multi" code is gone with it);
-- step budget: the linear pipeline is 4 node executions, comfortably inside
-  the default ``config.max_steps=10`` (the pre-merge ``max_hops=4`` is
-  subsumed — no explicit override needed);
+- step budget: PREPLAN/PLAN/SYNTHESIZE are 3 main-loop steps (the N search
+  worker instances do NOT consume graph steps — plan-⑨ §3.3 three-layer
+  guards: ``max_steps`` graph steps × ``max_fanout`` width (default 8, the
+  pattern caps PLAN's dispatch) × per-branch ``_MAX_SEARCH_ROUNDS``);
 - tools authorization (plan-⑧ §4 deny-by-default): the pattern grants the
   two MCP server toolsets (``mcp-websearch`` retrieval / ``mcp-zai``
   vision), the tool-carrying nodes narrow via ``use_tools`` — only the
@@ -23,11 +26,12 @@ stations relaying **within the same turn** via the routing output
   for future vision-augmented research, no node lists its tools yet —
   MCP tools register asynchronously after startup, so unregistered names
   validate as deferred, see nexus/model/validation.py);
-- inter-phase state travels via ``cxt.graph_state["deep_research_state"]``
-  (the graph runtime's state board: shared across the run's nodes, cleared
-  automatically at graph termination — begin_turn never touches it); the
-  final trace still goes to ``cxt.metadata["deep_research"]`` for
-  observability / next-turn research continuation;
+- inter-phase state (question / plan / pre-retrieval findings) travels via
+  ``cxt.graph_state["deep_research_state"]``; the N search instances see
+  none of it (plan-⑨ branch isolation) — their results settle into the
+  engine's ``__fanout_results__`` board, which dr_synthesize (the join)
+  merges; the final trace still goes to ``cxt.metadata["deep_research"]``
+  for observability / next-turn research continuation;
 - the executors live in apps/deep_research_agent/executor_multi.py (plugin
   codes = node codes, bound via each node's ``plugins={"loop": ...}``).
 """
@@ -53,16 +57,18 @@ dr_preplan = BaseNode(
 
 dr_plan = BaseNode(
     code="dr_plan",
-    name="深度研究·规划",
+    name="深度研究·规划与派发",
     description=(
         "把问题分解为可检索验证的子问题(JSON 计划;解析失败自纠重试,"
-        "仍失败降级为原问题单计划)"
+        "仍失败降级为原问题单计划),随后按子问题扇出 N 个检索实例"
+        "(引擎运行时扇出,宽度受 max_fanout 约束)"
     ),
-    task_description="产出研究计划(子问题清单)",
+    task_description="产出研究计划并派发检索实例",
     # dr_synthesize: the orphan bail-out edge (landing on dr_plan without
     # in-flight state skips planning and jumps to the degraded synthesis) —
     # a legal control-flow edge, so it must be declared for the runtime's
-    # undeclared-edge guard to admit it
+    # undeclared-edge guard to admit it (it is also the sends target edge's
+    # sibling: dr_search is the declared dispatch target)
     sub_nodes=["dr_search", "dr_synthesize"],
     plugins={"loop": "dr_plan"},
     base_prompt=DEEP_RESEARCH_BASE_PROMPT,
@@ -70,12 +76,13 @@ dr_plan = BaseNode(
 
 dr_search = BaseNode(
     code="dr_search",
-    name="深度研究·检索",
+    name="深度研究·检索(worker)",
     description=(
-        "带工具 ReAct 研究循环:按状态板迭代检索,直至子问题覆盖、"
-        "模型判定信息足够或轮次用尽"
+        "扇出 worker:一个实例负责一个子问题的带工具 ReAct 检索循环"
+        "(私有工作区,每实例独立轮次守卫);结果经引擎结果板交给综合站"
     ),
-    task_description="迭代检索收集研究资料",
+    task_description="检索单个子问题收集研究资料",
+    # exactly one successor = the join node (plan-⑨ join resolution rule)
     sub_nodes=["dr_synthesize"],
     plugins={"loop": "dr_search"},
     use_tools=["web_search_prime"],
@@ -84,8 +91,11 @@ dr_search = BaseNode(
 
 dr_synthesize = BaseNode(
     code="dr_synthesize",
-    name="深度研究·综合",
-    description="基于全部资料流式生成带引用的研究报告",
+    name="深度研究·综合(join)",
+    description=(
+        "扇出 join:合并预检索资料与全部检索分支的成果(失败分支降级"
+        "不阻塞),流式生成带引用的研究报告"
+    ),
     task_description="综合资料产出研究报告",
     sub_nodes=[],
     is_end=True,
@@ -98,7 +108,8 @@ deep_research_pattern = Pattern(
     name="深度研究助手",
     description=(
         "Deep research 图配方:PREPLAN/PLAN/SEARCH/SYNTHESIZE 各为一个"
-        " AGENT 节点,sub_nodes 线性邻接,同轮 TurnResult.next 接力"
+        " AGENT 节点;PLAN 按子问题扇出 N 个 SEARCH 实例并行检索,"
+        "SYNTHESIZE 作 join 汇聚综合(plan-⑨ 运行时扇出的验收配方)"
     ),
     pattern_type="agent",
     entry_node_code="dr_preplan",
