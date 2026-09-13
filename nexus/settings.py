@@ -4,7 +4,7 @@ The kernel owns the settings *schema* (three-tier LLM orchestration,
 compression, DB paths); only the host knows where the yaml file lives:
 host/config calls ``set_config_path()`` at boot. LLM config fields come from
 ``ProviderEntry`` / ``BaseLLMProvider`` in ``nexus/llm/provider.py`` plus
-``OpenAICompatibleProvider`` in ``atoms/providers/openai_provider.py``.
+``OpenAICompatibleProvider`` in ``atoms/providers/dashscope_provider.py``.
 """
 
 import copy
@@ -329,7 +329,7 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
     Example:
         >>> config = load_config()
         >>> llm_cfg = config["llm_default"]
-        >>> print(llm_cfg["code"])   # "openai"
+        >>> print(llm_cfg["code"])   # "dashscope"
         >>> print(llm_cfg["model"])  # "qwen3.8-max"
     """
     if config_path:

@@ -16,17 +16,25 @@
 #                  到 nodes，优先于 llm_default；空 dict = 全部回退
 
 llm_providers:
-  openai:
+  dashscope:
     # 任何 OpenAI 兼容端点（DashScope 兼容模式 / OpenAI / 本地 vLLM …）
     api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
     # 实际 key 从该环境变量读取（export DASHSCOPE_API_KEY=sk-...）
     api_key_env: DASHSCOPE_API_KEY
     timeout: 60
     max_retries: 2
+  zai:
+    # GLM Coding Plan（OpenAI Chat Completion 协议端点；Coding Plan 套餐额度
+    # 只在该端点可用，通用 …/api/paas/v4 走按量付费）
+    api_base: https://open.bigmodel.cn/api/coding/paas/v4
+    # 实际 key 从该环境变量读取（export ZAI_API_KEY=...）
+    api_key_env: ZAI_API_KEY
+    timeout: 60
+    max_retries: 2
 
 llm_default:
-  code: openai          # 对应 llm_providers 的 key / 注册的 provider code
-  model: qwen3.8-flash  # 按 DashScope 实际可用模型修改
+  code: dashscope       # 对应 llm_providers 的 key / 注册的 provider code（切 GLM: code: zai）
+  model: qwen3.8-flash  # 按 DashScope 实际可用模型修改（zai: glm-5.3 / glm-5.3-flash）
   temperature: 0.7
   max_tokens: 2048
   enable_thinking: false
@@ -35,7 +43,7 @@ pattern_llm: {}
 # 示例：某 pattern 用更强模型，其某个 node 再单独覆盖
 # pattern_llm:
 #   deep_research:
-#     code: openai
+#     code: dashscope
 #     model: qwen3.8-max
 #     nodes:
 #       synthesize:

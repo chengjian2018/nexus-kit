@@ -1,6 +1,6 @@
 # nexus-kit
 
-积木式对话 / Agent 编排框架。从 [hermes-nexus](../hermes-nexus) 迁移而来，
+积木式对话 / Agent 编排框架。
 按"目标形态"重组为四层，用一条可执行的分层契约（`tests/test_architecture.py`）钉死边界：
 
 ```
@@ -81,7 +81,7 @@ export DASHSCOPE_API_KEY=sk-...
 
 | 变量 | 默认 | 用途 |
 |---|---|---|
-| `DASHSCOPE_API_KEY` | — | 默认 provider（openai，DashScope 兼容模式）的 API key |
+| `DASHSCOPE_API_KEY` | — | 默认 provider（dashscope，DashScope 兼容模式）的 API key |
 | `NEXUS_CONFIG` | 自动探测 | local_config.yaml 路径覆盖（默认探测 `host/config/`、`config/`） |
 | `NEXUS_LOG` | `WARNING` | 根日志级别；排障时 `NEXUS_LOG=INFO` 可见轮次 / MCP / 工具分派日志 |
 | `NEXUS_API_KEY` | 未设置 | 核心 API 鉴权；**未设置时服务无认证**（启动时每分钟告警） |

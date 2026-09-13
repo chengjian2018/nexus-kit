@@ -23,7 +23,7 @@ import httpx
 import pytest
 
 from async_utils import arun
-from atoms.providers.openai_provider import OpenAICompatibleProvider
+from atoms.providers.dashscope_provider import OpenAICompatibleProvider
 
 MESSAGES = [{"role": "user", "content": "hi"}]
 
@@ -55,7 +55,7 @@ def _install(monkeypatch, handler):
         kwargs["transport"] = httpx.MockTransport(wrapped)
         return real_client(*args, **kwargs)
 
-    monkeypatch.setattr("atoms.providers.openai_provider.httpx.AsyncClient", _factory)
+    monkeypatch.setattr("atoms.providers.dashscope_provider.httpx.AsyncClient", _factory)
 
     sleeps: list[float] = []
 

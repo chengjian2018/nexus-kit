@@ -1,6 +1,8 @@
-"""OpenAI-compatible LLM provider.
+"""OpenAI-compatible LLM provider — registered for 阿里云百炼 DashScope.
 
-Supports any OpenAI-compatible API endpoint (OpenAI, Azure, local vLLM, etc.).
+``OpenAICompatibleProvider`` itself is generic: any OpenAI-compatible chat
+endpoint works (OpenAI, Azure, local vLLM, etc.); the module-level
+registration below binds it to Alibaba Cloud DashScope's compatible mode.
 
 Register pattern: call ``registry.register(...)`` at module level so
 ``discover_builtin_providers()`` picks it up automatically.
@@ -79,6 +81,33 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
+    def _build_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        stream: bool,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Build the chat-completions request body (subclass hook: providers
+        for vendors with different extension parameters override this —
+        e.g. zai swaps DashScope's ``enable_thinking`` for GLM's ``thinking``).
+        """
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            # Qwen3 thinking mode switch (DashScope compatible-mode extension parameter), disabled by default
+            "enable_thinking": self.enable_thinking,
+            **kwargs,
+        }
+        if stream and "stream_options" not in payload:
+            payload["stream_options"] = {"include_usage": True}
+        return payload
+
     async def _achat_completion_impl(
         self,
         messages: List[Dict[str, Any]],
@@ -91,16 +120,14 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         """Call the OpenAI-compatible chat completions endpoint."""
         url = self._build_url()
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": stream,
-            # Qwen3 thinking mode switch (DashScope compatible-mode extension parameter), disabled by default
-            "enable_thinking": self.enable_thinking,
+        payload = self._build_payload(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=stream,
             **kwargs,
-        }
+        )
 
         last_exc = None
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -187,17 +214,14 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         """
         url = self._build_url()
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            # Qwen3 thinking mode switch (DashScope compatible-mode extension parameter), disabled by default
-            "enable_thinking": self.enable_thinking,
+        payload = self._build_payload(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
             **kwargs,
-        }
+        )
 
         # Retry shares the non-streaming policy (transport errors + 408/429/5xx
         # with linear backoff), but ONLY until the first chunk is yielded —
@@ -278,9 +302,9 @@ class OpenAICompatibleProvider(BaseLLMProvider):
 
 
 registry.register(
-    code="openai",
-    name="OpenAI",
-    description="OpenAI and OpenAI-compatible API provider",
+    code="dashscope",
+    name="阿里云百炼 (DashScope)",
+    description="阿里云百炼 DashScope Qwen via the OpenAI-compatible protocol",
     provider_class=OpenAICompatibleProvider,
     default_model="qwen3.8-max",
     models=["qwen3.7-plus", "qwen3.8-max", "qwen3.8-flash"],

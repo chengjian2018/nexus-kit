@@ -81,9 +81,9 @@ class LLMProviderRegistry:
         Parameters
         ----------
         code:
-            Unique provider code (e.g. ``"openai"``, ``"azure"``).
+            Unique provider code (e.g. ``"dashscope"``, ``"zai"``).
         name:
-            Human-readable name (e.g. ``"OpenAI"``).
+            Human-readable name (e.g. ``"阿里云百炼 (DashScope)"``).
         description:
             Short description of the provider.
         provider_class:

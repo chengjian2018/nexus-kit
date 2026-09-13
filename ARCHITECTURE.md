@@ -254,7 +254,7 @@ patterns / tools / providers / channels 四个领域注册中心**保持独立**
 | `atoms/executors/` | 两默认 executor（default_loop / default_fsm） |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt |
 | `atoms/tools/` | knowledge / mcp 工具（toolset 标签授权单元） |
-| `atoms/providers/` | OpenAICompatible Provider |
+| `atoms/providers/` | OpenAICompatible Provider（dashscope / zai） |
 | `atoms/knowledge/` | SQLite 知识库 |
 | `atoms/mcp/` | MCP 连接管理器（工具动态注册 toolset `mcp-<server>`） |
 | `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器）+ prompt 资产 + 渠道适配 |
