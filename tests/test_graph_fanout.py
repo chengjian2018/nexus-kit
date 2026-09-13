@@ -1,8 +1,10 @@
-"""Runtime fan-out contract tests (plan-⑨): sends dispatch / barrier join /
-results board (completion order) / branch workspace isolation / guards
-(next+sends 互斥、同构、宽度、未声明目标、join 可解析) / branch failure
-tolerance / budget accounting (workers 不占图步数) / FSM 不收 sends / event
-vocabulary (fanout_* + branch_id tagging + graph_compile).
+"""Runtime fan-out contract tests (plan-⑨ + §9 异构修订): sends dispatch /
+barrier join / results board (completion order) / branch workspace
+isolation / heterogeneous targets / merge 交集解析（离群 worker 忽略、
+不可唯一解析拒绝执行）/ guards (next+sends 互斥、宽度、未声明目标) /
+branch failure tolerance / budget accounting (workers 不占图步数) / FSM
+不收 sends / event vocabulary (fanout_* + branch_id tagging +
+graph_compile).
 
 Drives chat_turn / chat_turn_stream with a scripted node executor (no LLM);
 get_llm_config patched at the chat namespace (the R1/R4 patch-anchor
@@ -194,7 +196,185 @@ def test_workers_do_not_consume_graph_steps():
 
 
 # ---------------------------------------------------------------------------
-# 守卫：互斥 / 同构 / 宽度 / 未声明目标 / join 可解析 / FSM
+# 异构扇出与 merge 交集解析（§9 修订）
+# ---------------------------------------------------------------------------
+
+def _hetero_pattern(**kwargs) -> Pattern:
+    """disp --sends--> work / agg（各自 sub_nodes=[join]）--> join（终节点）。
+
+    异构形状：work = 检索型 worker，agg = 归纳型 worker，共享 join。
+    """
+    defaults = dict(
+        code="gft_hetero",
+        name="异构扇出测试",
+        description="d",
+        pattern_type="agent",
+        nodes=[
+            BaseNode(code="disp", name="D",
+                     sub_nodes=["work", "agg", "join"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="work", name="W", sub_nodes=["join"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="agg", name="A", sub_nodes=["join"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="join", name="J", plugins={"loop": "gft_script"}),
+        ],
+    )
+    defaults.update(kwargs)
+    return Pattern(**defaults)
+
+
+def test_heterogeneous_targets_run_and_join():
+    # 不同 worker 节点混选扇出：各自执行、结果板按 node_code 区分、join 一次
+    _SCRIPT["disp"] = lambda ec: TurnResult(
+        sends=[Send("work", "检索任务"), Send("agg", "归纳任务")])
+    _SCRIPT["work"] = lambda ec: TurnResult(content=f"检索:{ec.branch_input}")
+    _SCRIPT["agg"] = lambda ec: TurnResult(content=f"归纳:{ec.branch_input}")
+    seen = {}
+
+    def _join(ec):
+        seen["board"] = list(ec.cxt.graph_state.get("__fanout_results__"))
+        return TurnResult(content="汇总完成")
+
+    _SCRIPT["join"] = _join
+    s = _session(_hetero_pattern())
+    result = _turn(s, "调研一下")
+    assert result.text == "汇总完成"
+    assert [c[0] for c in _CALLS] == ["disp", "work", "agg", "join"]
+
+    board = seen["board"]
+    assert len(board) == 2 and all(e["ok"] for e in board)
+    assert {(e["node_code"], e["content"]) for e in board} == {
+        ("work", "检索:检索任务"), ("agg", "归纳:归纳任务")}
+    # branch_id 仍为 {node_code}#{全局序}，跨 worker 唯一
+    assert {e["branch_id"] for e in board} == {"work#1", "agg#2"}
+    assert s.cxt.graph_state == {}
+
+
+def test_heterogeneous_mixed_width_runs_each_target():
+    # 同一 worker 多实例 + 另一 worker 单实例混排，宽度按总实例数计
+    _SCRIPT["disp"] = lambda ec: TurnResult(
+        sends=[Send("work", 1), Send("agg", "a"), Send("work", 2)])
+    _SCRIPT["work"] = lambda ec: TurnResult(content=f"w{ec.branch_input}")
+    _SCRIPT["agg"] = lambda ec: TurnResult(content="agg")
+    seen = {}
+
+    def _join(ec):
+        seen["board"] = list(ec.cxt.graph_state.get("__fanout_results__"))
+        return TurnResult(content="join")
+
+    _SCRIPT["join"] = _join
+    s = _session(_hetero_pattern())
+    result = _turn(s, "跑")
+    assert result.text == "join"
+    assert [c[0] for c in _CALLS][0] == "disp" and _CALLS[-1][0] == "join"
+    assert sorted(c[0] for c in _CALLS[1:-1]) == ["agg", "work", "work"]
+    assert {e["branch_id"] for e in seen["board"]} == {
+        "work#1", "agg#2", "work#3"}
+
+
+def test_join_target_send_dropped_as_outlier():
+    # 直接向 join（无后继 → 无共同 merge）send：唯一离群 → 忽略，剩余照常
+    _SCRIPT["disp"] = lambda ec: TurnResult(
+        sends=[Send("work", "a"), Send("join", "b")])
+    _SCRIPT["work"] = lambda ec: TurnResult(content="结果a")
+    s = _session(_fanout_pattern())
+    result = _turn(s, "跑")
+    assert result.text == "done:join"
+    assert [c[0] for c in _CALLS] == ["disp", "work", "join"]
+    # 离群忽略落在 fanout_start actions 快照
+    assert any(a.get("fanout_start", {}).get("dropped") == ["join"]
+               for a in result.actions)
+    assert any(a.get("fanout_start", {}).get("branches") == 1
+               for a in result.actions)
+
+
+def test_outlier_worker_with_foreign_merge_dropped():
+    # w1/w2 → join，w3 → other：w3 离群被忽略，w1/w2 执行，join 正常触发
+    pattern = Pattern(
+        code="gft_outlier", name="离群忽略", description="d",
+        pattern_type="agent",
+        nodes=[
+            BaseNode(code="disp", sub_nodes=["w1", "w2", "w3"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w1", sub_nodes=["join"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w2", sub_nodes=["join"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w3", sub_nodes=["other"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="join", plugins={"loop": "gft_script"}),
+            BaseNode(code="other", plugins={"loop": "gft_script"}),
+        ],
+    )
+    _SCRIPT["disp"] = lambda ec: TurnResult(sends=[
+        Send("w1", "a"), Send("w2", "b"), Send("w3", "c")])
+    seen = {}
+
+    def _join(ec):
+        seen["board"] = list(ec.cxt.graph_state.get("__fanout_results__"))
+        return TurnResult(content="join 完成")
+
+    _SCRIPT["join"] = _join
+    s = _session(pattern)
+    result = _turn(s, "跑")
+    assert result.text == "join 完成"
+    assert [c[0] for c in _CALLS] == ["disp", "w1", "w2", "join"]  # w3 未执行
+    assert {e["node_code"] for e in seen["board"]} == {"w1", "w2"}
+    assert any(a.get("fanout_start", {}).get("dropped") == ["w3"]
+               for a in result.actions)
+
+
+def test_disjoint_merges_raise():
+    # 两个 worker 各指向不同 merge（两个离群）→ 拒绝执行，提醒模板正确性
+    pattern = Pattern(
+        code="gft_disjoint", name="无共同merge", description="d",
+        pattern_type="agent",
+        nodes=[
+            BaseNode(code="disp", sub_nodes=["w1", "w2"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w1", sub_nodes=["j1"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w2", sub_nodes=["j2"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="j1", plugins={"loop": "gft_script"}),
+            BaseNode(code="j2", plugins={"loop": "gft_script"}),
+        ],
+    )
+    _SCRIPT["disp"] = lambda ec: TurnResult(
+        sends=[Send("w1", "a"), Send("w2", "b")])
+    s = _session(pattern)
+    result = _turn(s, "跑")
+    assert result.text == "对话处理异常，请稍后重试"
+    assert [c[0] for c in _CALLS] == ["disp"]  # 任何 worker 都不执行
+
+
+def test_ambiguous_common_merge_raises():
+    # 共同后继不唯一（w1/w2 都声明 join+extra）→ 拒绝执行
+    pattern = Pattern(
+        code="gft_ambiguous", name="merge不唯一", description="d",
+        pattern_type="agent",
+        nodes=[
+            BaseNode(code="disp", sub_nodes=["w1", "w2"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w1", sub_nodes=["join", "extra"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="w2", sub_nodes=["join", "extra"],
+                     plugins={"loop": "gft_script"}),
+            BaseNode(code="join", plugins={"loop": "gft_script"}),
+            BaseNode(code="extra", plugins={"loop": "gft_script"}),
+        ],
+    )
+    _SCRIPT["disp"] = lambda ec: TurnResult(
+        sends=[Send("w1", "a"), Send("w2", "b")])
+    s = _session(pattern)
+    result = _turn(s, "跑")
+    assert result.text == "对话处理异常，请稍后重试"
+    assert [c[0] for c in _CALLS] == ["disp"]
+
+
+# ---------------------------------------------------------------------------
+# 守卫：互斥 / 宽度 / 未声明目标 / join 可解析 / FSM
 # ---------------------------------------------------------------------------
 
 def test_next_and_sends_mutex_raises():
@@ -215,14 +395,6 @@ def test_fanout_width_over_max_raises():
     assert [c[0] for c in _CALLS] == ["disp"]
 
 
-def test_heterogeneous_targets_raise():
-    _SCRIPT["disp"] = lambda ec: TurnResult(
-        sends=[Send("work", "a"), Send("join", "b")])
-    s = _session(_fanout_pattern())
-    result = _turn(s, "跑")
-    assert result.text == "对话处理异常，请稍后重试"
-
-
 def test_undeclared_target_terminates_tolerantly():
     # 目标不在 sub_nodes → 与 next 未声明边同族的宽容终止（不 raise）
     _SCRIPT["disp"] = lambda ec: TurnResult(
@@ -235,7 +407,7 @@ def test_undeclared_target_terminates_tolerantly():
 
 
 def test_join_unresolvable_raises():
-    # worker 声明了两个后继 → join 不可解析（v1 要求唯一目标）
+    # 单 worker 声明了两个后继 → 共同后继不唯一，merge 不可解析
     pattern = _fanout_pattern(nodes=[
         BaseNode(code="disp", sub_nodes=["work"],
                  plugins={"loop": "gft_script"}),

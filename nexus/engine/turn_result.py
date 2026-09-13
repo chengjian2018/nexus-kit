@@ -16,10 +16,14 @@ class Send:
     from langgraph's Send API).
 
     A node executor returns ``TurnResult.sends=[Send(...), ...]`` to spawn N
-    homogeneous instances of ONE declared worker node — the worker must be
-    among the dispatching node's sub_nodes (a declared edge; the
-    compile-time validated graph stays authoritative), and the worker's own
-    sub_nodes must point at exactly one join node (the barrier). ``input``
+    worker instances — heterogeneous fan-out is allowed: each send names
+    its OWN worker node, which must be among the dispatching node's
+    sub_nodes (a declared edge; the compile-time validated graph stays
+    authoritative). The merge (join) node is the single node common to
+    every targeted worker's sub_nodes (set intersection; an unresolvable
+    merge — no common node, several common nodes, or 2+ outlier workers —
+    is a template-correctness error, except exactly one outlier worker
+    which the engine drops with a warning and runs the rest). ``input``
     is the instance's task payload: a str lands as the branch's explicit
     query verbatim, anything else is JSON-serialized into that slot. Folding
     whatever conversation context the branch needs into this payload is the
@@ -47,14 +51,17 @@ class TurnResult:
                    consumed serially) — runtime fan-out is declared via
                    ``sends`` instead. None = no explicit route (terminal if
                    the node has no successors / is_end).
-    - sends      : the fan-out output (plan-⑨) — N homogeneous worker
-                   instances of one declared node, mutually exclusive with
-                   ``next`` (both set = contract error). The engine runs the
-                   instances concurrently (asyncio.gather), settles each
-                   into the graph_state results board (completion order),
-                   then executes the join node named by the worker's single
-                   sub_node. Worker content lands ONLY on the results board
-                   — it never becomes the graph reply directly.
+    - sends      : the fan-out output (plan-⑨) — N worker instances of
+                   declared nodes (heterogeneous targets allowed),
+                   mutually exclusive with ``next`` (both set = contract
+                   error). The engine runs the instances concurrently
+                   (asyncio.gather), settles each into the graph_state
+                   results board (completion order), then executes the
+                   merge node common to every targeted worker's sub_nodes
+                   (exactly one outlier worker without a common merge is
+                   dropped with a warning; an unresolvable merge raises).
+                   Worker content lands ONLY on the results board — it
+                   never becomes the graph reply directly.
     - wait_human : the suspension signal (borrowed from langgraph's
                    interrupt): the graph pauses AT this node — the engine
                    persists the cursor into cxt.graph_state and ends the

@@ -52,12 +52,15 @@ host POST /api/v1/chat
   **节点执行契约的路由输出**（`TurnResult.next`，单值映射 sub_nodes；
   list 形态为遗留容忍——串行消费首个，扇出改用 `sends` 声明）。
 - **运行时扇出（计划⑨，map-reduce）**：`TurnResult.sends=[Send(node,
-  input), ...]` 派发 N 个**同构** worker 实例（同一声明节点多次带参调用，
-  "子 agent"零新概念）——`asyncio.gather` 并发执行（同事件循环交错，
+  input), ...]` 派发 N 个 worker 实例（**异构扇出**：每个 send 指向自己的
+  已声明 sub_node，同一节点多实例 = 同构特例，"子 agent"零新概念）——
+  `asyncio.gather` 并发执行（同事件循环交错，
   无锁），每个实例跑在结构隔离的私有工作区（cxt 浅拷贝：空 history、
   message_sink 切断、Send.input 作显式查询）；实例落定即写入结果板
-  `graph_state["__fanout_results__"]`（完成序），全部落定后执行 join 节点
-  （worker 的唯一 sub_node 目标，普通节点语义：可路由可挂起）。失败分支
+  `graph_state["__fanout_results__"]`（完成序），全部落定后执行 merge 节点
+  （= 各目标 worker `sub_nodes` 交集的**唯一**共同后继；恰好一个 worker
+  无共同 merge 时忽略该 worker 并告警执行剩余，merge 不可唯一解析则拒绝
+  执行并提示模板正确性。join 为普通节点语义：可路由可挂起）。失败分支
   落 error 条目不阻塞图；分支内 wait_human/嵌套扇出 = 该分支失败。
 - **每条用户消息跑全图**（从 entry），或**从挂起节点恢复**——两种行为同一
   引擎零配置：从不 wait_human 的图（闲聊客服）自然单轮跑完，会挂起的图

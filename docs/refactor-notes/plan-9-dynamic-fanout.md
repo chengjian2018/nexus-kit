@@ -1,7 +1,7 @@
 # 计划⑨：动态扇出 —— AGENT 图运行时的 map-reduce 并行子 agent
 
 - 日期：2026-09-12
-- 状态：**已实施（全量测试绿，含实施期勘误 §8）**
+- 状态：**已实施（全量测试绿，含实施期勘误 §8 与后续修订 §9：异构扇出）**
 - 前置：计划⑧（二层模型 + 图运行时）已实施；计划⑦（dispatch）作废归档，
   其扇出设计（BranchFrame / max_fanout / join 语义）**批判性移植**——设计复活，
   载体（module 层）不复活
@@ -255,3 +255,28 @@ todo 跟踪不静默跳过。
 5. **事件面微调**：`ChatStreamEvent` 与 `TraceEvent` 均增 first-class
    `branch_id` 字段（不只是 delta 系——trace 事件同样带）；round 事件
    的 `round_info` 内含 branch_id 便于扁平消费。
+
+---
+
+## 9. 后续修订（2026-09-13）：异构扇出 + merge 交集解析
+
+实施后按需求放开 §2.1 的 v1 同构约束，join 解析从"worker 的唯一
+sub_node"推广为跨 worker 交集。契约变更：
+
+1. **异构扇出**：`sends` 可指向**多个不同**的已声明 worker 节点
+   （§2.1 "v1 全部 Send 指向同一节点" 作废；同构多实例仍是合法特例）。
+   每个 send 按自己的目标节点解析 executor 与 worker 级 LLM 配置，
+   分支 `branch_id` 仍为 `{node_code}#{全局序}`。
+2. **merge（join）解析 = 各目标 worker `sub_nodes` 的交集**，宽容阶梯：
+   - 交集**有且仅有一个**节点 → 正常执行（同构特例下等价于旧语义
+     "worker 的唯一 sub_node"）；
+   - 无交集且**恰好一个** worker 离群（去掉它后剩余交集唯一）→
+     **忽略该 worker 的全部 sends**（logger.warning + fanout_start
+     trace/actions 增 `dropped`），执行剩余 worker；
+   - 其余情形（≥2 个离群 worker / 共同后继不唯一 / 单 worker 后继数
+     ≠1）→ **拒绝执行**，raise ValueError 并提示模板正确性。
+3. **守卫次序**：未声明边（宽容终止）→ merge 解析（含离群忽略）→
+   宽度守卫（按忽略后的有效实例数计）。
+4. 覆盖矩阵 §1.3 的"异构动态图 ❌"指运行时**生成**新节点/整图——本次
+   放开的是运行时在**已编译声明的边集内**混选多个既有节点，编译期
+   fail-fast 体系不破。

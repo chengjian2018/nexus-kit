@@ -15,15 +15,19 @@ cxt turn lifecycle → **dispatch by pattern_type** → produce a ChatResult.
     - conditional edges = the node executor's routing output
       (``TurnResult.next``, mapped back onto the node's sub_nodes);
     - runtime fan-out = the node executor's dispatch output
-      (``TurnResult.sends``, plan-⑨): N homogeneous instances of ONE
-      declared worker node run concurrently (asyncio.gather — same-loop
-      interleaving, no locks), each in a structurally isolated private
-      workspace (own history / message_sink cut / task payload as the
-      explicit query); every instance settles into the graph_state results
-      board (completion order), then the worker's single declared
-      successor — the join node — executes with the board readable.
-      A failed branch settles as an error entry and never kills the run
-      (wait-for-all, failure-tolerant); branches may not suspend or nest
+      (``TurnResult.sends``, plan-⑨): N worker instances run
+      concurrently (asyncio.gather — same-loop interleaving, no locks),
+      each targeting its OWN declared worker node (heterogeneous fan-out:
+      a send names any declared sub_node), in a structurally isolated
+      private workspace (own history / message_sink cut / task payload as
+      the explicit query); every instance settles into the graph_state
+      results board (completion order), then the merge node — the single
+      node common to every targeted worker's sub_nodes (set intersection;
+      exactly one outlier worker without a common merge is dropped with a
+      warning, an unresolvable merge raises a template-correctness error)
+      — executes with the board readable. A failed branch settles as an
+      error entry and never kills the run (wait-for-all,
+      failure-tolerant); branches may not suspend or nest
       (wait_human/sends inside a branch = that branch fails);
     - node executor resolution: node.plugins["loop"] >
       pattern.plugins["loop"] > default_loop (the ReAct tool loop);
@@ -268,7 +272,8 @@ async def _handle_node(session: Session, node, force_close: bool = False,
 
 
 # ============================================================================
-# Runtime fan-out (plan-⑨: sends -> N homogeneous instances -> barrier join)
+# Runtime fan-out (plan-⑨: sends -> N worker instances -> barrier join;
+# heterogeneous targets, merge = common successor intersection)
 # ============================================================================
 
 def _branch_cxt(cxt, branch_input: Any):
@@ -297,9 +302,21 @@ def _branch_cxt(cxt, branch_input: Any):
 
 async def _run_fanout(session: Session, node, result: TurnResult,
                       stream, step: int) -> Optional[str]:
-    """Execute one fan-out declaration: validate -> run N homogeneous worker
-    instances concurrently -> settle each into the results board (completion
-    order) -> return the join node code.
+    """Execute one fan-out declaration: validate -> resolve the common
+    merge node -> run N worker instances concurrently (heterogeneous
+    targets allowed — each send names its own declared worker node) ->
+    settle each into the results board (completion order) -> return the
+    join node code.
+
+    Merge (join) resolution = the set intersection of every targeted
+    worker's sub_nodes, with a template-correctness tolerance ladder:
+    - exactly one common node  -> join resolved, all sends run;
+    - no overlap and exactly ONE outlier worker (removing it pins the
+      merge down) -> that worker's sends are dropped with a warning, the
+      remaining workers execute against their common merge;
+    - anything else (0 or 2+ outliers, or several common nodes, or a
+      single worker without exactly one successor) -> ValueError: the
+      template's merge shape is wrong, refuse to execute.
 
     Concurrency: asyncio.gather on the turn's event loop — same-loop
     interleaving means the shared emitter queue and the board appends need
@@ -318,7 +335,7 @@ async def _run_fanout(session: Session, node, result: TurnResult,
     cxt = session.cxt
     pattern = session.pattern
     graph_state = cxt.graph_state
-    sends = result.sends or []
+    sends = list(result.sends or [])
     _emit = getattr(stream, "emit_trace", None)
     max_fanout = pattern.max_fanout
 
@@ -327,70 +344,125 @@ async def _run_fanout(session: Session, node, result: TurnResult,
             f"节点 {node.code!r} 同时返回 next 与 sends"
             f"（互斥，见 plan-⑨ §2.1）"
         )
-    targets = {s.node_code for s in sends}
-    if len(targets) != 1:
-        raise ValueError(
-            f"节点 {node.code!r} 扇出目标不唯一（v1 同构扇出）: {sorted(targets)}"
-        )
-    worker_code = sends[0].node_code
-    if worker_code not in node.sub_nodes:
+    # Declared-edge guard: every DISTINCT target must be a declared edge
+    # of the dispatching node (hallucinated node codes terminate
+    # tolerantly — same guard family as next-routing)
+    undeclared = sorted({s.node_code for s in sends} - set(node.sub_nodes))
+    if undeclared:
         logger.warning(
-            "[graph] 节点 %s 的扇出目标 %r 不在其 sub_nodes %s 中"
+            "[graph] 节点 %s 的扇出目标 %s 不在其 sub_nodes %s 中"
             "（未声明边），图终止",
-            node.code, worker_code, node.sub_nodes,
+            node.code, undeclared, node.sub_nodes,
         )
         if _emit is not None:
             _emit("graph_done", reason="undeclared_edge", step=step)
         graph_state.clear()
         return None
+
+    # ---- merge (join) resolution across the targeted workers ----------
+    worker_codes: List[str] = []          # first-seen order, deduped
+    for s in sends:
+        if s.node_code not in worker_codes:
+            worker_codes.append(s.node_code)
+    merge_sets = {wc: set(pattern.node_map[wc].sub_nodes)
+                  for wc in worker_codes}
+
+    def _common(codes: List[str]) -> set:
+        # Intersection over the given workers (a lone worker intersects
+        # against nothing — its own successors ARE the merge candidates)
+        if len(codes) == 1:
+            return set(merge_sets[codes[0]])
+        return set.intersection(*(merge_sets[wc] for wc in codes))
+
+    dropped: List[str] = []
+    common = _common(worker_codes)
+    if len(common) != 1 and len(worker_codes) > 1:
+        # Outlier tolerance: exactly one worker without a common merge is
+        # ignorable — the code whose removal leaves a unique intersection
+        outliers = [wc for wc in worker_codes
+                    if len(_common([w for w in worker_codes if w != wc])) == 1]
+        if len(outliers) == 1:
+            dropped = outliers
+            sends = [s for s in sends if s.node_code not in dropped]
+            worker_codes = [wc for wc in worker_codes
+                            if wc not in dropped]
+            for wc in dropped:
+                merge_sets.pop(wc, None)
+            common = _common(worker_codes)
+            logger.warning(
+                "[graph] 节点 %s 的扇出 worker %s 与其余 worker 无共同 "
+                "merge 节点，忽略该 worker（执行剩余 %d 个实例，join=%s）",
+                node.code, dropped, len(sends), sorted(common),
+            )
+    if len(common) == 0:
+        merge_desc = {wc: sorted(merge_sets[wc]) for wc in worker_codes}
+        raise ValueError(
+            f"节点 {node.code!r} 扇出的各 worker 后继无重叠的 merge 节点"
+            f"且无法忽略单一异常 worker（workers={worker_codes} 的 "
+            f"sub_nodes={merge_desc}），不执行——请检查模板正确性"
+        )
+    if len(common) > 1:
+        raise ValueError(
+            f"节点 {node.code!r} 扇出的 merge 节点不唯一（workers="
+            f"{worker_codes} 的共同后继={sorted(common)}，有且仅有一个共同 "
+            f"merge 节点才合法），不执行——请检查模板正确性"
+        )
+    join_code = common.pop()
+
     if len(sends) > max_fanout:
         raise ValueError(
             f"节点 {node.code!r} 扇出宽度 {len(sends)} 超过 "
             f"max_fanout={max_fanout}（plan-⑨ §3.3 宽度守卫）"
         )
-    worker = pattern.node_map[worker_code]
-    if len(worker.sub_nodes) != 1:
-        raise ValueError(
-            f"join 不可解析: worker 节点 {worker_code!r} 的 sub_nodes"
-            f" 必须有且仅有一个目标（join 节点），实际: {worker.sub_nodes}"
-        )
-    join_code = worker.sub_nodes[0]
+
+    # ---- dispatch: per-worker executor + LLM config, then gather -------
+    worker_nodes = {wc: pattern.node_map[wc] for wc in worker_codes}
+    worker_executors = {
+        wc: plugin_registry.resolve(
+            "executor",
+            _resolve_node_executor_code(pattern, worker_nodes[wc]))
+        for wc in worker_codes}
+    # Worker-level LLM configs BEFORE the copies — each branch inherits
+    # its own worker's resolved config through the shared reference
+    worker_llm = {}
+    for wc in worker_codes:
+        _refresh_llm_config(session, node_code=wc)
+        worker_llm[wc] = cxt.llm_config
 
     board: List[Dict[str, Any]] = []
     graph_state[FANOUT_RESULTS_KEY] = board
-    branch_ids = [f"{worker_code}#{i + 1}" for i in range(len(sends))]
+    branch_ids = [f"{s.node_code}#{i + 1}" for i, s in enumerate(sends)]
     cxt.actions.append({"fanout_start": {
-        "node": node.code, "branches": len(sends), "join": join_code}})
-    logger.info("[graph] 节点 %s 扇出 %d 个 %s 实例（join=%s）",
-                node.code, len(sends), worker_code, join_code)
+        "node": node.code, "branches": len(sends), "join": join_code,
+        **({"dropped": dropped} if dropped else {})}})
+    logger.info("[graph] 节点 %s 扇出 %d 个实例（workers=%s, join=%s）",
+                node.code, len(sends), worker_codes, join_code)
     if _emit is not None:
         _emit("fanout_start", node_code=node.code,
-              branch_ids=branch_ids, join_node=join_code)
+              branch_ids=branch_ids, join_node=join_code,
+              **({"dropped_workers": dropped} if dropped else {}))
 
-    # Worker-level LLM config BEFORE the copy — branches inherit the
-    # resolved config through the shared reference
-    _refresh_llm_config(session, node_code=worker_code)
-    cxt.current_node_code = worker_code
-    executor = plugin_registry.resolve(
-        "executor", _resolve_node_executor_code(pattern, worker))
-
-    async def _run_branch(branch_id: str, branch_input: Any) -> None:
+    async def _run_branch(branch_id: str, send) -> None:
+        worker_code = send.node_code
         if _emit is not None:
             _emit("branch_start", node_code=worker_code, branch_id=branch_id)
         branch_stream = (BranchStreamEmitter(stream, branch_id)
                          if stream is not None else None)
+        bcxt = _branch_cxt(cxt, send.input)
+        bcxt.current_node_code = worker_code
+        bcxt.llm_config = worker_llm[worker_code]
         ec = ExecutionContext(
-            cxt=_branch_cxt(cxt, branch_input),
+            cxt=bcxt,
             pattern=pattern,
-            node=worker,
+            node=worker_nodes[worker_code],
             stream=branch_stream,
             step=step,
             branch_id=branch_id,
-            branch_input=branch_input,
+            branch_input=send.input,
         )
         entry: Dict[str, Any]
         try:
-            bres = await executor.execute(ec)
+            bres = await worker_executors[worker_code].execute(ec)
             if bres.wait_human or bres.sends:
                 # v1 guards: no suspension, no nested fan-out inside a
                 # branch — the branch fails loudly, the run continues
@@ -411,7 +483,7 @@ async def _run_fanout(session: Session, node, result: TurnResult,
                   ok=entry["ok"], error=entry.get("error", ""))
 
     await asyncio.gather(*[
-        _run_branch(bid, s.input) for bid, s in zip(branch_ids, sends)])
+        _run_branch(bid, s) for bid, s in zip(branch_ids, sends)])
 
     failed = sum(1 for e in board if not e["ok"])
     cxt.actions.append({"fanout_join": {
