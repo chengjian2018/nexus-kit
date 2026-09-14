@@ -181,3 +181,50 @@ def test_system_reload_bad_mcp_config_keeps_current(client, stub, mcp_cfg):
     assert "配置非法" in body["message"]
     # 拆连接之前就失败——现有工具面保持不动
     assert stub.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 启动装配校验 _validate_registered_patterns：console 托管 pattern 宽松工具面
+# ---------------------------------------------------------------------------
+
+class _StubPatternRegistry:
+    """最小 pattern registry 桩（list_codes/get 即可，校验函数只读这两者）。"""
+
+    def __init__(self, patterns):
+        self._patterns = patterns
+
+    def list_codes(self):
+        return list(self._patterns)
+
+    def get(self, code):
+        return self._patterns[code]
+
+
+def _pattern_with_unregistered_tool(code):
+    from nexus.model.node import BaseNode
+    from nexus.model.pattern import Pattern
+
+    node = BaseNode(code="n1", name="n1")
+    node.use_tools = ["no_such_tool_xyz"]
+    return Pattern(code=code, name=code, description="测试",
+                   pattern_type="fsm", nodes=[node])
+
+
+def test_startup_validation_lenient_for_console_patterns(tmp_path, monkeypatch):
+    # 发布链（store.load_pattern_text）宽松放行未注册工具，启动校验必须
+    # 同宽——否则「发布成功 → 重启 SystemExit 变砖」；代码版 pattern 仍严格
+    (tmp_path / "pub.yml").write_text("placeholder: 1", encoding="utf-8")
+    monkeypatch.setattr("ui.studio.store.PATTERNS_DIR", tmp_path)
+
+    both = _StubPatternRegistry({
+        "pub": _pattern_with_unregistered_tool("pub"),          # console 托管
+        "code_pat": _pattern_with_unregistered_tool("code_pat")  # 纯代码版
+    })
+    monkeypatch.setattr(main, "pattern_registry", both)
+    with pytest.raises(SystemExit):
+        main._validate_registered_patterns()   # 代码版严格 → 启动终止
+
+    only_console = _StubPatternRegistry(
+        {"pub": _pattern_with_unregistered_tool("pub")})
+    monkeypatch.setattr(main, "pattern_registry", only_console)
+    main._validate_registered_patterns()       # console 版宽松 → 放行不抛

@@ -202,13 +202,22 @@ def _validate_registered_patterns() -> None:
     """Assembly-time validation: every registered pattern passes
     base-info + plugin-declaration checks. Runs after the discovery warm-ups
     so plugin codes resolvable; a failure is a declaration bug, fail loudly
-    (startup refuses to serve a mis-declared pattern set)."""
-    from nexus.model.validation import validate_pattern
+    (startup refuses to serve a mis-declared pattern set).
 
+    Console-managed patterns (host/config/patterns/) validate the tool
+    surface leniently — the publish/apply chain (ui.studio.store.
+    load_pattern_text) is lenient by design, so strict here would let an
+    already-published pattern referencing a not-yet-registered tool kill
+    the NEXT startup; deny-by-default runtime resolution stays the net."""
+    from nexus.model.validation import validate_pattern
+    from ui.studio.store import console_pattern_codes
+
+    console_codes = console_pattern_codes()
     for code in pattern_registry.list_codes():
         pattern = pattern_registry.get(code)
         try:
-            validate_pattern(pattern)
+            validate_pattern(pattern,
+                             strict_tools=code not in console_codes)
         except ValueError as e:
             raise SystemExit(f"pattern 声明校验失败（启动终止）: {e}") from e
     logger.info("pattern 校验通过: %d 个", len(pattern_registry.list_codes()))
