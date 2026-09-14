@@ -191,7 +191,55 @@ def validate_plugin_declarations(pattern: Pattern) -> List[str]:
     return errors
 
 
-def validate_tools(pattern: Pattern) -> List[str]:
+def _tool_check_findings(pattern: Pattern) -> List[str]:
+    """Collect the tool-authorization findings (unregistered use_tools
+    names / cross-toolset references) as message strings — shared by the
+    strict path (errors) and the lenient path (notices/warnings)."""
+    from nexus.registry.tools import registry as tool_registry
+
+    findings: List[str] = []
+    pcode = getattr(pattern, "code", "?")
+    allowed_toolsets = set(getattr(pattern, "allow_toolset", None) or [])
+    allows_mcp = any(ts.startswith("mcp-") for ts in allowed_toolsets)
+
+    for node in pattern.nodes:
+        for name in (getattr(node, "use_tools", None) or []):
+            entry = tool_registry.get_entry(name) if name else None
+            if entry is None:
+                if allows_mcp:
+                    # MCP timing exception: mcp tools register asynchronously
+                    # — defer to runtime resolution, not a finding (details
+                    # in validate_tools's docstring)
+                    logger.warning(
+                        "[validation] pattern %r 节点 %r 的 use_tools 声明了"
+                        "未注册的工具 %r（pattern 允许 mcp-* 工具集，MCP 工具"
+                        "启动后异步注册，留待运行期解析）",
+                        pcode, node.code, name)
+                    continue
+                findings.append(
+                    f"pattern {pcode!r} 节点 {node.code!r} 的 use_tools 声明了"
+                    f"未注册的工具 {name!r}")
+                continue
+            if entry.toolset not in allowed_toolsets:
+                findings.append(
+                    f"pattern {pcode!r} 节点 {node.code!r} 的 use_tools 越集: "
+                    f"{name!r}（toolset={entry.toolset!r}，"
+                    f"allow_toolset={sorted(allowed_toolsets) or '空'}）")
+
+    return findings
+
+
+def tool_check_notices(pattern: Pattern) -> List[str]:
+    """The lenient-path soft notices (same findings, phrased as warnings) —
+    the display payload of generation-workbench previews: a use_tools
+    reference to a not-yet-registered tool (e.g. freshly generated) or a
+    missing toolset grant does not block apply; the tool stays unavailable
+    at runtime until it is registered (deny-by-default resolution)."""
+    return [msg + "（宽松放行：工具运行期不可用，注册后自动生效）"
+            for msg in _tool_check_findings(pattern)]
+
+
+def validate_tools(pattern: Pattern, strict: bool = True) -> List[str]:
     """Validate the toolset authorization (plan-⑧ §4): every node's
     use_tools names must be registered and belong to an allowed toolset.
 
@@ -208,45 +256,32 @@ def validate_tools(pattern: Pattern) -> List[str]:
     available set" hallucination guard), keeping the designed
     ``allow_toolset=["mcp-<server>"]`` + ``use_tools=[MCP tool name]``
     usage bootable.
+
+    ``strict=False``（宽松模式，生成工作台装载路径）: 未注册/越集整体
+    降级为警告日志并放行——新生成的 pattern 可能引用尚未注册的新工具，
+    阻塞校验会让「生成 → 应用」必然失败；运行期仍由 deny-by-default
+    解析兜底。放行清单经 tool_check_notices 取（预览展示用）。
     """
-    from nexus.registry.tools import registry as tool_registry
-
-    errors: List[str] = []
-    pcode = getattr(pattern, "code", "?")
-    allowed_toolsets = set(getattr(pattern, "allow_toolset", None) or [])
-    allows_mcp = any(ts.startswith("mcp-") for ts in allowed_toolsets)
-
-    for node in pattern.nodes:
-        for name in (getattr(node, "use_tools", None) or []):
-            entry = tool_registry.get_entry(name) if name else None
-            if entry is None:
-                if allows_mcp:
-                    logger.warning(
-                        "[validation] pattern %r 节点 %r 的 use_tools 声明了"
-                        "未注册的工具 %r（pattern 允许 mcp-* 工具集，MCP 工具"
-                        "启动后异步注册，留待运行期解析）",
-                        pcode, node.code, name)
-                    continue
-                errors.append(
-                    f"pattern {pcode!r} 节点 {node.code!r} 的 use_tools 声明了"
-                    f"未注册的工具 {name!r}")
-                continue
-            if entry.toolset not in allowed_toolsets:
-                errors.append(
-                    f"pattern {pcode!r} 节点 {node.code!r} 的 use_tools 越集: "
-                    f"{name!r}（toolset={entry.toolset!r}，"
-                    f"allow_toolset={sorted(allowed_toolsets) or '空'}）")
-
-    return errors
+    findings = _tool_check_findings(pattern)
+    if strict:
+        return findings
+    for msg in findings:
+        logger.warning("[validation]（宽松模式放行）%s", msg)
+    return []
 
 
-def validate_pattern(pattern: Pattern) -> None:
+def validate_pattern(pattern: Pattern, strict_tools: bool = True) -> None:
     """Full validation: base info + plugin declarations + toolset
     authorization; collects ALL errors then raises one numbered ValueError
-    (empty list = valid, silent return)."""
+    (empty list = valid, silent return).
+
+    ``strict_tools=False``：工具面走宽松校验（见 validate_tools）——
+    生成工作台（studio 生成/发布/应用/托管目录重放）允许引用后补注册
+    的新工具；内置 pattern 装配与 CLI pattern-load 保持严格默认。
+    """
     errors = (validate_base_info(pattern)
               + validate_plugin_declarations(pattern)
-              + validate_tools(pattern))
+              + validate_tools(pattern, strict=strict_tools))
     if errors:
         numbered = "\n".join(f"  [{i + 1}] {e}" for i, e in enumerate(errors))
         raise ValueError(

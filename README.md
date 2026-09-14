@@ -22,7 +22,7 @@ host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
 | **插件中心** | `nexus/registry/plugins.py` | 引擎扩展点统一注册：executor（default_loop/default_fsm + app 自定义执行器）、stage、messages_builder、agent_hooks。字符串 (kind, code)，同名冲突 fail-fast，AST 自动发现（`atoms/executors/` 等） |
 | **二层声明式模型** | `nexus/model/` | Pattern → Node 两层（module 层已删），全字段 str/bool/list/dict。`pattern_type`（fsm/agent）是引擎分流键；stages 六槽骨架（FSM 专属，两层解析 node>骨架值）；`plugins` 槽位表（loop/fsm/messages_builder/agent_hooks/llm）；yml round-trip + 构造期编译校验 + 注册期收集式校验 |
 | **AGENT 图运行时** | `nexus/engine/chat.py` | 每条消息从 entry 跑全图（或从挂起节点恢复）：条件边 = `TurnResult.next` 路由输出；`max_steps` 预算防环；`wait_human` 挂起/恢复（graph_state 落盘，借鉴 langgraph interrupt/checkpointer）；FSM 则每轮推进一个节点（next_node） |
-| **默认流式** | `nexus/llm/` + `nexus/engine/streaming.py` | provider 层 LLMChunk 结构化流（非流式=聚合流式，双向桥兼容旧 provider）；引擎层 `chat_turn_stream` generator（delta/round/done 事件，乐观转发，done 权威）；SSE 调试端点 `POST /api/v1/chat/stream`（`NEXUS_STREAM_DEBUG=1`） |
+| **默认流式** | `nexus/llm/` + `nexus/engine/streaming.py` | provider 层 LLMChunk 结构化流（非流式=聚合流式，双向桥兼容旧 provider）；引擎层 `chat_turn_stream` generator（delta/round/trace/done 事件，乐观转发，done 权威）；SSE 流式端点 `POST /api/v1/chat/stream`（常驻，studio 模版测试的对话通道） |
 | **工具三层收口** | toolset → `allow_toolset` → `use_tools` | deny-by-default：工具注册带 toolset（knowledge / mcp-\<server\>）；pattern 授权工具集（空=无）；节点列具体工具（空=无）；注册期悬空/越集 fail-fast |
 | **hooks（保留待实现）** | `nexus/engine/agent_hooks.py` | 6 点位机制完整，默认 no-op 直通（受测契约）；恢复实现只需注册 kind="agent_hooks" 插件包 |
 
@@ -45,6 +45,7 @@ host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
 | `atoms/knowledge/` | SQLite 知识库 | `database/knowledge_store.py` |
 | `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器/prompt 资产）+ 渠道适配 | `dialogue/*_route.py`、`channel/xianyu.py` |
 | `ui/` | 运营配置台（ops-console，见 `docs/design/ops-console-prd.md`）：`api.py` 挂 `/api/v1/console/*`（P0 只读 pattern 视图 + 知识库 CRUD/试搜 + RAG 检索配置），`static/` 无构建前端挂 `/console` | 新增 |
+| `ui/studio/` | 编排工作台（nexus-studio）：`api.py` 挂 `/api/v1/studio/*`（pattern 发布/fork/删除 + agent 生成 SSE + AI 助手），`store.py` 托管目录装载器（`host/config/{plugins,patterns}/`，启动与 reload 后重放），`static/` 无构建前端挂 `/studio`（自动编排 / 流程编排 / 模版测试三页签） | 新增 |
 | `atoms/stages/rag_config.py` | RAG 声明式配置：yml → 召回管线装配（kb 通路接知识库）+ 重注册生效 + 离线试跑 | 新增 |
 | `host/` | main.py（含 SSE 调试端点）/ cli.py（含 pattern-export/load）/ governor.py / config/ | 根目录 `main.py`、`cli.py` |
 
@@ -85,7 +86,6 @@ export DASHSCOPE_API_KEY=sk-...
 | `NEXUS_CONFIG` | 自动探测 | local_config.yaml 路径覆盖（默认探测 `host/config/`、`config/`） |
 | `NEXUS_LOG` | `WARNING` | 根日志级别；排障时 `NEXUS_LOG=INFO` 可见轮次 / MCP / 工具分派日志 |
 | `NEXUS_API_KEY` | 未设置 | 核心 API 鉴权；**未设置时服务无认证**（启动时每分钟告警） |
-| `NEXUS_STREAM_DEBUG` | 未设置 | `=1` 挂载 SSE 流式调试端点 `POST /api/v1/chat/stream` |
 | `NEXUS_RAG_CONFIG` | `host/config/rag.yaml` | RAG 检索配置（clarify 召回管线声明式装配）路径；文件存在则启动时应用并在控制台保存后热生效 |
 
 ## 运行
@@ -99,7 +99,28 @@ uvicorn host.main:app --port 8000
 # 运营配置台（随服务挂载）：浏览器打开 http://localhost:8000/console/
 #   —— pattern 结构图/声明树/YAML（只读）、知识库管理与试搜台；
 #      设置 NEXUS_API_KEY 后在页面右上角填入同一密钥
-# 流式调试端点（可选）：NEXUS_STREAM_DEBUG=1 后 POST /api/v1/chat/stream（SSE）
+# 编排工作台（随服务挂载）：浏览器打开 http://localhost:8000/studio/
+#   —— 顶部三页签，默认停在「模版测试」：
+#      · 模版测试：选 pattern → 填 task_info（按应用预填默认值，手动编辑后
+#        不再覆盖）→ 发起会话多轮对话（SSE 流式：节点/工具/扇出等 trace
+#        事件在气泡内逐行持久打印，文本增量流式输出，工具轮文本折叠，
+#        每轮可展开审计轨迹）
+#      · 自动编排：填流程背景/功能/实现案例 → 本地 Claude Code 执行生成
+#        （claude -p，只读探索白名单 Read/Grep/Glob/LS，cwd = 当前项目路径，
+#        子进程无写权限——产物经围栏文本返回；工具调用/文本增量以
+#        SSE step/delta 事件实时回传）→ 解析出 pattern YAML 与自定义插件
+#        （临时导入验证）→ 预览（结构图/YAML/插件）→ 一键应用：插件与
+#        pattern 自动落盘注册（host/config/{plugins,patterns}/），立即可在
+#        模版测试选用；支持「校验通过自动应用」（需本机安装 claude CLI，
+#        可用 NEXUS_STUDIO_CLAUDE_BIN 覆盖二进制路径）
+#      · 流程编排：pattern 列表（code 只读可 Fork / console 可编辑）+ 节点表单 +
+#        YAML 双向编辑 + 校验/发布 + AI 助手（节点话术/回答范式/自定义执行器生成）
+#      · 系统插件：插件状态（kind/code/来源/归属模块）+ MCP server + 工具集；
+#        插件勾选热重载——studio 托管插件按文件重放，代码插件连其 consumer
+#        按依赖序重放并重绑会话；MCP 工具面一键重载（重读 mcp_servers 配置 →
+#        断开重连 → 重注册 mcp-* 工具，tools 跟随连接生命周期而非文件 mtime）
+#      AI 助手走服务配置 llm_default；自动编排走本机 claude CLI，页面不选模型
+# 流式对话端点（常驻）：POST /api/v1/chat/stream（SSE，delta/round/trace/done 事件）
 
 # CLI 调试（fire 子命令：chat / ask / list / sessions / pattern-export / pattern-load / knowledge-seed）
 python -m host.cli ask --pattern xianyu_agent --query "还在吗"

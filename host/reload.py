@@ -84,7 +84,7 @@ import logging
 import sys
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +332,57 @@ def reload_all() -> Dict[str, List[str]]:
     result = reload_changed()
     result["config"] = "invalidated"
     return result
+
+
+def reload_modules(selected: List[str]) -> Dict[str, Any]:
+    """Selective module reload (studio「系统插件」页): replay the selected
+    tracked modules **plus their tracked consumers**, in dependency order.
+
+    Consumers are pulled in because importlib.reload does not cascade — a
+    dependency's new objects (re-imported classes / constants) only bind
+    into a consumer when the consumer itself re-executes (the same
+    rationale as reload_changed's full replay). Baselines refresh for the
+    successfully replayed modules; failures keep theirs and retry on the
+    next reload.
+
+    Returns ``{"changed": selected, "reloaded": [...], "failed": [...],
+    "unknown": [...]}`` — unknown are the requested names outside the
+    tracked domain (not imported yet / kernel modules), skipped untouched.
+    """
+    tracked = _discover_module_names()
+    tracked_set = set(tracked)
+    sel = [n for n in selected if n in tracked_set]
+    unknown = [n for n in selected if n not in tracked_set]
+    # Reverse-import closure: every tracked module importing (transitively)
+    # a selected module replays too
+    rev: Dict[str, Set[str]] = {}
+    for name in tracked:
+        for dep in _module_imports(name, tracked_set):
+            rev.setdefault(dep, set()).add(name)
+    todo: Set[str] = set(sel)
+    stack = list(sel)
+    while stack:
+        for consumer in rev.get(stack.pop(), ()):
+            if consumer not in todo:
+                todo.add(consumer)
+                stack.append(consumer)
+    replay = [n for n in _replay_order(tracked) if n in todo]
+    reloaded: List[str] = []
+    failed: List[str] = []
+    with _ReplaceMode():
+        for name in replay:
+            if _reload_module(name):
+                reloaded.append(name)
+            else:
+                failed.append(name)
+    for name in reloaded:
+        path = _module_path(name)
+        if path is not None and path.exists():
+            _MODULE_MTIMES[name] = path.stat().st_mtime
+    logger.info("[reload] 选择性重载 %s（含 consumer 共 %d 个，失败 %s）",
+                sel, len(reloaded), failed or "无")
+    return {"changed": sel, "reloaded": reloaded, "failed": failed,
+            "unknown": unknown}
 
 
 def rebind_sessions(sessions: Dict, pattern_registry) -> int:

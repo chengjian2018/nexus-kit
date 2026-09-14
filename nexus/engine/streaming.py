@@ -94,6 +94,10 @@ TRACE_EVENT_NAMES = (
     "tool_call",         # agent loop: one tool invocation issued
     "tool_result",       # agent loop: one tool invocation returned
     "conversation_end",  # FSM reached a terminal node (is_end)
+    "turn_error",        # the turn failed with an exception (emitted before
+                         # the generic-text done; lets real-time consumers
+                         # flag the failure instead of string-matching the
+                         # done text — aggregation ignores it, per protocol)
 )
 
 

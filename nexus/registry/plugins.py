@@ -61,6 +61,11 @@ class PluginRegistry:
     def __init__(self):
         self._factories: Dict[tuple, Factory] = {}
         self._instances: Dict[tuple, Any] = {}
+        # Owner module per (kind, code) — the factory's defining module
+        # (``factory.__module__``). Observability metadata for the ops UI
+        # (studio「系统插件」页)：studio_plugin_<stem> → 托管插件；apps.* /
+        # atoms.executors.* → 代码模块（可选择性热重载）；nexus.* → 内核。
+        self._owners: Dict[tuple, str] = {}
         self._lock = threading.RLock()
         # Hot-reload window switch (held by host.reload._ReplaceMode): when
         # True, registering a same-name/different-factory plugin becomes
@@ -86,6 +91,7 @@ class PluginRegistry:
         if not callable(factory):
             raise ValueError(f"plugin factory 必须可调用: kind={kind!r}, code={code!r}")
         key = (kind, code)
+        owner = getattr(factory, "__module__", "") or ""
         with self._lock:
             existing = self._factories.get(key)
             if existing is not None and existing is not factory:
@@ -96,11 +102,13 @@ class PluginRegistry:
                     )
                 self._factories[key] = factory
                 self._instances.pop(key, None)
+                self._owners[key] = owner
                 logger.info("Replaced plugin (reload): kind=%s, code=%s", kind, code)
                 return
             if existing is factory:
                 return  # idempotent re-registration (module re-import)
             self._factories[key] = factory
+            self._owners[key] = owner
         logger.info("Registered plugin: kind=%s, code=%s", kind, code)
 
     def deregister(self, kind: str, code: str) -> None:
@@ -109,6 +117,7 @@ class PluginRegistry:
         with self._lock:
             self._factories.pop(key, None)
             self._instances.pop(key, None)
+            self._owners.pop(key, None)
 
     # ------------------------------------------------------------------
     # Resolution / queries
@@ -144,6 +153,11 @@ class PluginRegistry:
         """List registered codes of a kind (sorted)."""
         with self._lock:
             return sorted(code for (k, code) in self._factories if k == kind)
+
+    def owner_of(self, kind: str, code: str) -> str:
+        """The factory's defining module for (kind, code)（"" when unknown）."""
+        with self._lock:
+            return self._owners.get((kind, code), "")
 
     def default_executor_code(self, pattern_type_value: str) -> str:
         """The default executor code for a pattern type ("fsm"/"agent")."""

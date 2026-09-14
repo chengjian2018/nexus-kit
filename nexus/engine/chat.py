@@ -779,6 +779,10 @@ async def chat_turn_stream(
             response = result.content or ""
         except Exception:
             logger.exception("对话处理异常: session=%s", session_id)
+            # Real-time consumers (SSE / CLI events) flag the failed turn via
+            # this trace instead of string-matching the generic done text;
+            # aggregate consumers ignore it (done stays authoritative)
+            emitter.emit_trace("turn_error")
             # External sanitization: exception details may carry
             # path/config information — return a uniform message only
             response = "对话处理异常，请稍后重试"

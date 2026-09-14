@@ -60,6 +60,15 @@ discover_builtin_tools()
 discover_builtin_patterns()
 discover_builtin_plugins()
 
+# Studio console-managed artifacts (ui/studio): generated plugin modules +
+# console pattern YAMLs under host/config/{plugins,patterns}. Replayed after
+# the builtin discovery — plugins before patterns (pattern validation resolves
+# plugin codes), console patterns after code patterns (same-code console
+# version wins, the fork-to-edit semantics).
+from ui.studio.store import load_console_artifacts  # noqa: E402
+
+load_console_artifacts()
+
 # RAG retrieval config (ops-console): applied when host/config/rag.yaml
 # exists (declarative assembly of the clarify recall pipeline); a missing
 # file = builtin defaults, zero behavior change. A broken file only logs
@@ -267,7 +276,10 @@ class DialogueRequest(BaseModel):
     request_id: str = Field(max_length=128)
     session_id: str = Field(max_length=256)
     pattern_code: str = Field(max_length=128)
-    task_info: Dict[str, str]
+    # 值放宽为任意 JSON 标量/数组：install/repair 预约类应用的
+    # available_slots 是 "YYYY-MM-DD HH:MM-HH:MM" 字符串列表（纯字符串
+    # 值的应用不受影响；store 快照走 json.dumps 天然兼容）
+    task_info: Dict[str, Any]
 
 
 class DialogueResponse(BaseModel):
@@ -328,7 +340,7 @@ class SessionMessagesResponse(BaseModel):
 async def _launch_session_core(
     pattern_code: str,
     session_id: str,
-    task_info: Dict[str, str],
+    task_info: Dict[str, Any],
     request_id: str,
     exist_ok: bool = False,
 ) -> Tuple[Optional[Session], str, str]:
@@ -489,21 +501,27 @@ async def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
     )
 
 
-# func2b (debug-only, env-gated): streaming chat via SSE
+# func2b (streaming chat via SSE — the studio 模版测试 page's dialogue
+# channel; formerly a NEXUS_STREAM_DEBUG-gated debug tool, now first-class)
 async def _chat_dialogue_stream(chat_request: ChatRequest):
-    """SSE debug endpoint for the plan-⑤ streaming protocol (async since
-    the asyncio rewrite — an async generator driving the async engine core;
-    the per-session turn_lock is held across yields by design: same-session
-    requests queue as tasks while the loop keeps serving other sessions).
+    """SSE streaming chat: forwards the engine's chat_turn_stream events.
 
-    Mounted only when NEXUS_STREAM_DEBUG=1 — a debugging/observability tool,
-    not a production API.
+    Always mounted (the same NEXUS_API_KEY middleware covers it as any
+    /api/v1/* endpoint; ops-console-prd §6.8 anticipated this promotion).
+    An async generator driving the async engine core; the per-session
+    turn_lock is held across yields by design: same-session requests queue
+    as tasks while the loop keeps serving other sessions.
 
     Event stream (text/event-stream, one JSON payload per line):
         data: {"kind": "delta", "text": "..."}
-        data: {"kind": "round", "round_info": {...}}
-        data: {"kind": "trace", "trace": {"event": "...", ...}}
+        data: {"kind": "round", "round_info": {"outcome": "tool|final|...", "round_idx": n}}
+        data: {"kind": "trace", "trace": {"event": "node_start", "node_code": ...}}
         data: {"kind": "done", "result": {"text": "...", "actions": [...]}}
+
+    End-of-turn audit parity with /api/v1/chat (_run_chat_turn_core): the
+    state snapshot persists after the stream ends (success, error, or client
+    disconnect alike) — without it streaming turns would lose restart-restore
+    state while /api/v1/chat keeps it.
     """
     import json as _json
 
@@ -556,15 +574,28 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
             yield "data: " + _json.dumps({
                 "kind": "error", "message": "对话处理异常，请稍后重试",
             }, ensure_ascii=False) + "\n\n"
+        finally:
+            # Audit parity with _run_chat_turn_core: persist the end-of-turn
+            # snapshot whatever way the stream ended (done / error / client
+            # disconnect). The lock is already released here.
+            if store is not None:
+                try:
+                    await store.save_snapshot(session)
+                except Exception:
+                    logger.exception(
+                        "会话轮末快照失败: session=%s", session.session_id)
+                if session.cxt.sink_failure_count > 0:
+                    logger.warning(
+                        "session=%s 存在未落库消息（本进程内 sink 失败 %d 次，"
+                        "重启后该段对话将丢失）",
+                        session.session_id, session.cxt.sink_failure_count,
+                    )
 
     return fastapi.responses.StreamingResponse(
         _gen(), media_type="text/event-stream")
 
 
-if os.getenv("NEXUS_STREAM_DEBUG", "") == "1":
-    # Env-gated mount: the SSE debug endpoint exists only when explicitly
-    # requested (keep the production surface minimal)
-    app.post("/api/v1/chat/stream")(_chat_dialogue_stream)
+app.post("/api/v1/chat/stream")(_chat_dialogue_stream)
 
 
 # ----Channel wiring (external message sources -> engine ops)----
@@ -603,6 +634,25 @@ app.mount(
 
 
 # ---------------------------------------------------------------------------
+# Studio (ui/studio) — the orchestration workbench (自动编排 / 流程编排 /
+# 模版测试), a standalone page independent of the ops console above. API at
+# /api/v1/studio/* (same NEXUS_API_KEY middleware); build-less static
+# frontend at /studio. Its console-managed artifacts (hosted plugin modules
+# + pattern YAMLs) were loaded at import time above and are replayed by the
+# /api/v1/reload endpoint.
+# ---------------------------------------------------------------------------
+import ui.studio as _studio  # noqa: E402
+import ui.studio.api as _studio_api  # noqa: E402
+
+app.include_router(_studio_api.router)
+app.mount(
+    "/studio",
+    StaticFiles(directory=str(_studio.static_dir()), html=True),
+    name="studio",
+)
+
+
+# ---------------------------------------------------------------------------
 # Hot reload — llm config cache invalidation + reload of the
 # pattern/plugin/channel code modules. Coverage and boundaries: see the
 # host/reload.py module docstring (tools/MCP/providers are out of scope —
@@ -622,17 +672,184 @@ async def reload_modules() -> DialogueResponse:
     from host.reload import reload_all, rebind_sessions
 
     result = reload_all()
+    # Replay the studio hosted dirs: reload_all re-imports code modules and
+    # re-registers code patterns, which would silently overwrite the console
+    # versions — replay restores them (ops-console-prd risk R-2 mitigation).
+    from ui.studio.store import load_console_artifacts
+
+    studio_report = load_console_artifacts()
     rebound = rebind_sessions(governor.sessions, pattern_registry)
     changed = result.get("changed") or []
     failed = result.get("failed") or []
-    if failed:
+    studio_failed = (len(studio_report["plugins"]["failed"])
+                     + len(studio_report["patterns"]["failed"]))
+    if failed or studio_failed:
         message = (f"重载完成：变更 {len(changed)} 个，失败 {len(failed)} 个"
-                   f"（保持旧注册）: {failed}；会话重绑 {rebound} 个")
+                   f"（保持旧注册）: {failed}；studio 托管产物失败 "
+                   f"{studio_failed} 个；会话重绑 {rebound} 个")
     else:
         message = (f"重载完成：变更 {len(changed)} 个模块"
                    f"{'（无变更）' if not changed else ''}；会话重绑 {rebound} 个")
     logger.info("[reload] %s", message)
     return DialogueResponse(code="0", status=True, message=message)
+
+
+# ---------------------------------------------------------------------------
+# System hot-reload surface (studio「系统插件」页)——/api/v1/reload 之外的可
+# 视化选择性重载面。插件按归属模块重载：studio 托管插件按文件重放（自包含
+# 模块，store.import_plugin_module 自带 replace 窗口）；代码插件走
+# host.reload.reload_modules（所选模块 + 其 consumer 按依赖序重放）。MCP 工
+# 具跟随连接生命周期而非文件 mtime：reload = 重读配置 → shutdown（注销
+# mcp-* 工具）→ 按新配置重建连接重注册。
+# ---------------------------------------------------------------------------
+
+_system_reload_lock: Optional[asyncio.Lock] = None
+
+# 系统面展示 / 可选择重载的插件 kind（与 plugin_registry 的业务 kind 集合一致）
+_SYSTEM_PLUGIN_KINDS = ("executor", "stage", "messages_builder", "agent_hooks")
+
+
+def _plugin_source(owner: str) -> Tuple[str, str]:
+    """(source, module)：归属模块名 → 展示来源。
+
+    ``studio_plugin_<stem>`` → studio 托管（module = stem，按文件重放）；
+    ``apps.*`` / ``atoms.executors.*`` → code（module = 模块名，走依赖序
+    重放）；其余（nexus.* 内核默认实现）→ kernel，不可热重载。
+    """
+    if owner.startswith("studio_plugin_"):
+        return "studio", owner[len("studio_plugin_"):]
+    if owner.startswith(("apps.", "atoms.")):
+        return "code", owner
+    return "kernel", owner
+
+
+def _system_payload() -> Dict[str, Any]:
+    """系统面状态数据：插件（kind/code/来源/归属模块）+ MCP server 连接
+    列表 + ToolRegistry toolset 概览。"""
+    from atoms.mcp.manager import get_mcp_manager
+    from nexus.registry.plugins import registry as plugin_registry
+    from nexus.registry.tools import registry as tool_registry
+
+    plugins = []
+    for kind in _SYSTEM_PLUGIN_KINDS:
+        for code in plugin_registry.list_codes(kind):
+            source, module = _plugin_source(plugin_registry.owner_of(kind, code))
+            plugins.append({"kind": kind, "code": code,
+                            "source": source, "module": module})
+    return {"plugins": plugins,
+            "servers": get_mcp_manager().list_servers(),
+            "toolsets": tool_registry.get_available_toolsets()}
+
+
+@app.get("/api/v1/system/status")
+def system_status() -> Dict[str, Any]:
+    """系统面状态：插件（kind/code/来源/归属模块）+ MCP server 连接态 +
+    toolset 概览（studio「系统插件」页数据源）。"""
+    return {"code": "0", "status": True, "message": "success",
+            "data": _system_payload()}
+
+
+class SystemReloadIn(BaseModel):
+    # 勾选的插件引用列表（"kind:code" 形态，UI 复选框直接产出）
+    plugin_codes: List[str] = Field(default_factory=list, max_length=200)
+    mcp: bool = False
+
+
+@app.post("/api/v1/system/reload")
+async def system_reload(body: SystemReloadIn) -> Dict[str, Any]:
+    """选择性热重载：勾选的插件（按归属分流）+ 可选的 MCP 工具面。
+
+    - studio 托管插件：按 stem 从托管目录重放（自包含模块，重新 exec +
+      replace 窗口重注册）；
+    - 代码插件（apps.* / atoms.executors.*）：host.reload.reload_modules
+      依赖序重放所选模块及其 consumer，完成后重绑内存会话（与 /reload
+      语义一致：进行中的轮次持旧引用跑完）；
+    - mcp：重读 mcp_servers 配置 → 断开重连 → 重注册 mcp-* 工具。配置
+      先读后拆——非法配置在拆掉现有连接之前就失败，保持现状可用。
+    """
+    global _system_reload_lock
+    from host.reload import reload_modules, rebind_sessions
+    from nexus.registry.plugins import registry as plugin_registry
+    from ui.studio import store as studio_store
+
+    if not body.plugin_codes and not body.mcp:
+        return {"code": "400", "status": False, "message": "未选择任何重载目标"}
+
+    if _system_reload_lock is None:
+        _system_reload_lock = asyncio.Lock()
+    async with _system_reload_lock:
+        report: Dict[str, Any] = {}
+        studio_stems: List[str] = []
+        code_modules: set = set()
+        skipped: List[str] = []
+        for ref in body.plugin_codes:
+            kind, _, code = ref.partition(":")
+            owner = plugin_registry.owner_of(kind, code)
+            if owner.startswith("studio_plugin_"):
+                studio_stems.append(owner[len("studio_plugin_"):])
+            elif owner.startswith(("apps.", "atoms.")):
+                code_modules.add(owner)
+            else:
+                skipped.append(f"{ref}（未注册或内核实现，不可热重载）")
+
+        if studio_stems:
+            reloaded_stems, failed_stems = [], []
+            for stem in studio_stems:
+                path = studio_store.PLUGINS_DIR / f"{stem}.py"
+                try:
+                    studio_store.import_plugin_module(path)
+                    reloaded_stems.append(stem)
+                except Exception as e:  # noqa: BLE001 -- 单文件失败不拦其余
+                    logger.exception("studio 插件重放失败: %s", stem)
+                    failed_stems.append(f"{stem}: {e}")
+            report["studio_plugins"] = {"reloaded": reloaded_stems,
+                                        "failed": failed_stems}
+        if code_modules:
+            result = reload_modules(sorted(code_modules))
+            report["code_modules"] = dict(
+                result, sessions_rebound=rebind_sessions(
+                    governor.sessions, pattern_registry))
+        if skipped:
+            report["skipped"] = skipped
+
+        if body.mcp:
+            from atoms.mcp.manager import get_mcp_manager
+            from nexus.settings import get_mcp_servers, invalidate_config_cache
+
+            try:
+                invalidate_config_cache()
+                servers_cfg = get_mcp_servers()
+            except Exception as e:
+                return {"code": "400", "status": False,
+                        "message": f"mcp_servers 配置非法，工具面未重载"
+                                   f"（保持现状）: {e}"}
+            manager = get_mcp_manager()
+            await manager.shutdown()
+            manager.bootstrap(servers_cfg)
+            await manager.ensure_started()
+            await manager.wait_ready(timeout=30.0)
+            servers = manager.list_servers()
+            report["mcp"] = {"servers": servers,
+                             "ready": sum(1 for s in servers if s.get("ready"))}
+
+    parts: List[str] = []
+    sp = report.get("studio_plugins")
+    if sp:
+        parts.append(f"studio 插件重放 {len(sp['reloaded'])} 个"
+                     + (f"、失败 {len(sp['failed'])}" if sp["failed"] else ""))
+    cm = report.get("code_modules")
+    if cm:
+        parts.append(f"代码模块重放 {len(cm['reloaded'])} 个（会话重绑 "
+                     f"{cm['sessions_rebound']} 个）"
+                     + (f"、失败 {len(cm['failed'])}" if cm["failed"] else ""))
+    mc = report.get("mcp")
+    if mc:
+        parts.append(f"MCP {mc['ready']}/{len(mc['servers'])} 就绪")
+    if report.get("skipped"):
+        parts.append(f"跳过 {len(report['skipped'])} 项")
+    return {"code": "0", "status": True,
+            "message": "系统面重载完成：" + "；".join(parts),
+            "data": {"report": report, **_system_payload()}}
 
 
 @app.on_event("startup")

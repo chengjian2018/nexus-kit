@@ -303,7 +303,7 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|trace|done)──► �
 - **stage 层回复流式**：unified 单次调用用 `ReplyFieldTap` 增量提取
   reply 字段；已转发文本记录在 `current_streamed_reply` 供去重
 - **乐观转发 caveat**：done.result.text 是权威回复；聚合消费者零感知
-- **SSE 调试端点**：`POST /api/v1/chat/stream`（env `NEXUS_STREAM_DEBUG=1`）
+- **SSE 流式端点**：`POST /api/v1/chat/stream`（常驻；studio 模版测试的对话通道，轮末快照持久化与 `/api/v1/chat` 对齐）
 
 ## 会话持久化（计划⑧列变更）
 

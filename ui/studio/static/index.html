@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nexus-studio · 编排工作台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">nexus</span>
+    <span class="brand-sub">编排工作台</span>
+  </div>
+  <nav id="tabs" class="tabs">
+    <a href="#/auto" data-tab="auto">自动编排</a>
+    <a href="#/flow" data-tab="flow">流程编排</a>
+    <a href="#/test" data-tab="test">模版测试</a>
+    <a href="#/plugins" data-tab="plugins">系统插件</a>
+  </nav>
+  <div class="auth-box">
+    <span class="status-dot" id="api-status" title="API 连接状态"></span>
+    <input type="password" id="api-key" placeholder="NEXUS_API_KEY（服务未设密钥时留空）" autocomplete="off">
+    <button class="btn btn-ghost btn-sm" id="api-key-save">保存</button>
+  </div>
+</header>
+
+<main id="main">
+  <div class="panel loading">加载中…</div>
+</main>
+
+<div class="modal-mask" id="modal-mask" hidden>
+  <div class="modal" id="modal"></div>
+</div>
+
+<div id="toast-root"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

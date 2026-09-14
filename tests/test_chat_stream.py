@@ -1,6 +1,7 @@
 """Engine streaming protocol tests — chat_turn_stream event sequences, the
 aggregation-equivalence safety net (done.result == chat_turn return), round
-markers on the agent loop, and the env-gated SSE debug endpoint."""
+markers on the agent loop, and the always-mounted SSE endpoint (the studio
+模版测试 page's dialogue channel; formerly NEXUS_STREAM_DEBUG-gated)."""
 
 import json
 from unittest.mock import patch
@@ -122,6 +123,60 @@ def test_tool_round_marker_then_final_round():
     assert events[-1].result.text == "答案是42"
 
 
+def test_tool_call_and_result_traces_stream():
+    """The kernel dispatch's tool_call/tool_result traces reach the stream
+    with the shared data vocabulary (tool_name / args / result / synthetic)
+    — the same contract the private research dispatch mirrors."""
+    from nexus.engine.session import Session
+    from nexus.model.node import BaseNode
+    from nexus.model.pattern import Pattern
+    from nexus.registry.tools import registry as tool_registry
+
+    def _handler(args):
+        return json.dumps({"ok": True, "echo": args.get("q")},
+                          ensure_ascii=False)
+
+    tool_registry.register(
+        name="fake_stream_tool", toolset="fake_set",
+        schema={"name": "fake_stream_tool", "description": "测试工具",
+                "parameters": {"type": "object",
+                               "properties": {"q": {"type": "string"}}}},
+        handler=_handler)
+    try:
+        p = Pattern(code="sp_tool", name="t", description="t",
+                    allow_toolset=["fake_set"],
+                    nodes=[BaseNode(code="n1", name="主节点",
+                                    use_tools=["fake_stream_tool"])])
+        s = Session(session_id="ss2", pattern_code="sp_tool")
+        s.pattern = p
+        s.cxt.node_map = p.node_map
+        s.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
+        s.cxt.llm_config = {"code": "x", "model": "m"}
+
+        provider = _StreamProvider([
+            [("", [_tc(name="fake_stream_tool", args='{"q": "hi"}')],
+              "tool_calls")],
+            [("完成", [], "stop")],
+        ])
+        with patch("atoms.executors.loop_executor.build_provider",
+                   return_value=provider):
+            events = arun(_collect_events(
+                chat_turn_stream("q", "ss2", {"ss2": s})))
+    finally:
+        tool_registry.deregister("fake_stream_tool")
+
+    tool_traces = [e.trace for e in events if e.kind == "trace"
+                   and e.trace.event in ("tool_call", "tool_result")]
+    assert [t.event for t in tool_traces] == ["tool_call", "tool_result"]
+    assert tool_traces[0].node_code == "n1"
+    assert tool_traces[0].data["tool_name"] == "fake_stream_tool"
+    assert tool_traces[0].data["args"] == {"q": "hi"}
+    assert tool_traces[1].data["tool_name"] == "fake_stream_tool"
+    assert not tool_traces[1].data["synthetic"]
+    assert "hi" in tool_traces[1].data["result"]
+    assert events[-1].result.text == "完成"
+
+
 def test_aggregate_turn_helper():
     provider = _StreamProvider([[("ok", [], "stop")]])
     s = _stream_session()
@@ -162,14 +217,36 @@ def test_fallback_without_stream_method_still_works():
     assert events[-1].result.text == "legacy 答复"
 
 
+def test_turn_error_trace_before_generic_done():
+    """A failing turn emits the turn_error trace before the generic-text
+    done — real-time consumers flag failures without string-matching;
+    aggregation is unaffected (done stays the only authoritative result)."""
+
+    class _Boom:
+        async def achat_completion_stream(self, messages, model,
+                                          temperature=0.7, max_tokens=2048,
+                                          **kwargs):
+            raise RuntimeError("provider exploded")
+            yield  # pragma: no cover
+
+    s = _stream_session()
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=_Boom()):
+        events = arun(_collect_events(chat_turn_stream("q", "ss", {"ss": s})))
+    traces = [e.trace.event for e in events if e.kind == "trace"]
+    assert "turn_error" in traces
+    assert events[-1].kind == "done"
+    assert events[-1].result.text == "对话处理异常，请稍后重试"
+
+
 # ============================================================================
-# SSE debug endpoint (env-gated)
+# SSE endpoint (always mounted — the studio 模版测试 dialogue channel)
 # ============================================================================
 
-def test_sse_endpoint_streams_events(_stream_debug_env, monkeypatch):
+def test_sse_endpoint_streams_events(_host_main, monkeypatch):
     from fastapi.testclient import TestClient
 
-    host_main = _stream_debug_env
+    host_main = _host_main
     client = TestClient(host_main.app)
 
     provider = _StreamProvider([[("流式", [], ""), ("回复", [], "stop")]])
@@ -195,18 +272,15 @@ def test_sse_endpoint_streams_events(_stream_debug_env, monkeypatch):
 
 
 @pytest.fixture()
-def _stream_debug_env(monkeypatch):
-    monkeypatch.setenv("NEXUS_STREAM_DEBUG", "1")
-    # reload to re-evaluate the gated mount
-    import importlib
+def _host_main():
     import host.main as host_main
-    importlib.reload(host_main)
-    yield host_main
-    monkeypatch.delenv("NEXUS_STREAM_DEBUG", raising=False)
-    importlib.reload(host_main)  # restore the unmounted state
+    return host_main
 
 
-def test_sse_endpoint_absent_without_env(monkeypatch):
+def test_sse_endpoint_mounted_without_env(monkeypatch):
+    """The endpoint is first-class now (studio 模版测试 consumes it): mounted
+    with no NEXUS_STREAM_DEBUG set at all (unknown session → JSON 404, which
+    proves the route exists)."""
     monkeypatch.delenv("NEXUS_STREAM_DEBUG", raising=False)
     import host.main as host_main
     from fastapi.testclient import TestClient
@@ -215,4 +289,5 @@ def test_sse_endpoint_absent_without_env(monkeypatch):
     resp = client.post("/api/v1/chat/stream",
                        json={"request_id": "r1", "session_id": "x",
                              "query": "y"})
-    assert resp.status_code == 404  # not mounted without the env flag
+    assert resp.status_code == 404
+    assert resp.json()["status"] is False
