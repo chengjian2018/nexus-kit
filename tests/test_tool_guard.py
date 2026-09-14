@@ -66,11 +66,35 @@ def _rule_ids(tool, args):
     "rm -fr /tmp/build",
     "cd /tmp && rm -rf build",           # 分段后命中
     "rm -rvf data/",
+    "rm -r -f /tmp/build",               # 拆分旗标（旧正则失明）
+    "rm --recursive --force /tmp/build",  # 长旗标
+    "rm -Rf /tmp/build",                 # 大写 R
+    "rm /tmp/build -r -f",               # 旗标后置（GNU 形态）
+    "echo hi | xargs rm -rf",            # 管道分段 + 前缀命令
+    "time rm -r -f data",                # 前缀命令后置拆分旗标
 ])
 def test_bash_rm_rf_high(command):
     hits = _rule_ids("bash", {"command": command})
     f = hits.get("shell.rm-recursive-force")
     assert f is not None and f.severity == "high"
+
+
+@pytest.mark.parametrize("command", [
+    "rm -r /tmp/build",          # 只递归不强制
+    "rm -f note.txt",            # 只强制不递归
+    "rm /tmp/build/one.txt",     # 普通删除
+    "grep rm -r -f build.log",   # rm 是搜索词不是动词
+])
+def test_bash_rm_variants_not_flagged(command):
+    assert "shell.rm-recursive-force" not in _rule_ids(
+        "bash", {"command": command})
+
+
+def test_bash_rm_rf_deduped_single_finding():
+    # 组合旗标形态正则与结构化检测都能命中——按 rule_id 去重后只播报一次
+    hits = [f for f in scan_tool_call("bash", {"command": "rm -rf /data"})
+            if f.rule_id == "shell.rm-recursive-force"]
+    assert len(hits) == 1
 
 
 @pytest.mark.parametrize("command,rule_id", [

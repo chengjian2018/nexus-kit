@@ -41,6 +41,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import threading
 import time
 from collections import OrderedDict, deque
@@ -96,15 +97,21 @@ class GuardFinding:
 
 # --- bash：分段符。注意 "curl … | sh" 这类管道规则必须在整串上匹配，
 # --- 而 "rm -rf" 这类段子规则在分段后匹配——两张都跑，按 rule_id 去重。
+# --- rm 的递归+强制另走 _scan_rm_dangerous 结构化检测（正则对拆分旗标/
+# --- 长旗标/大写 -R 全部失明），同样按 rule_id 去重。
 _SHELL_SPLIT_RE = re.compile(r"\n|&&|\|\||;|\|")
+
+_RM_RF_RULE_ID = "shell.rm-recursive-force"
+_RM_RF_SUMMARY = "递归强制删除（rm -rf 族，误伤不可逆）"
+# 同一 token 内挤着 r 和 f 的组合旗标形态（-rf/-fr/-Rf/-rvf…）——结构化
+# 检测的 shlex 失败（引号不平衡）时的兜底层，正常路径先由它快速命中
+_RM_RF_RE = re.compile(r"\brm\b[^|;&\n]*\s-[a-zA-Z]*r[a-zA-Z]*f\b"
+                       r"|\brm\b[^|;&\n]*\s-[a-zA-Z]*f[a-zA-Z]*r\b")
 
 # (rule_id, severity, pattern, summary) —— 先整串后分段各试一次
 _SHELL_RULES: List[tuple] = [
     # ---- 高：破坏 / 提权执行面 / 远端历史改写 ----
-    ("shell.rm-recursive-force", SEV_HIGH,
-     re.compile(r"\brm\b[^|;&\n]*\s-[a-zA-Z]*r[a-zA-Z]*f\b"
-                r"|\brm\b[^|;&\n]*\s-[a-zA-Z]*f[a-zA-Z]*r\b"),
-     "递归强制删除（rm -rf 族，误伤不可逆）"),
+    (_RM_RF_RULE_ID, SEV_HIGH, _RM_RF_RE, _RM_RF_SUMMARY),
     ("shell.pipe-to-shell", SEV_HIGH,
      re.compile(r"\b(?:curl|wget|base64|openssl|echo|printf)\b[^|;&\n]*\|"
                 r"\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b"),
@@ -266,6 +273,63 @@ def _match_rules(rules: List[tuple], texts: List[str]) -> List[tuple]:
     return list(hits.values())
 
 
+# rm 动词之前允许出现的前缀命令（sudo rm / xargs -0 rm / nohup rm…）
+_RM_PREFIX_CMDS = frozenset({
+    "sudo", "env", "nohup", "xargs", "command", "nice", "time", "timeout"})
+
+
+def _rm_verb_index(tokens: List[str]) -> Optional[int]:
+    """定位段内 rm 动词位置：sudo/env/xargs 等前缀命令（及其自身旗标）
+    之后才可能是动词；遇到其他非旗标 token 即该段动词不是 rm（避免
+    ``grep rm -r -f log`` 这类把搜索词当动词的误报）。"""
+    for i, tok in enumerate(tokens):
+        name = os.path.basename(tok)
+        if name == "rm":
+            return i
+        if name not in _RM_PREFIX_CMDS and not (i > 0 and tok.startswith("-")):
+            return None
+    return None
+
+
+def _scan_rm_dangerous(command: str) -> Optional[tuple]:
+    """结构化检测 rm 的「递归 + 强制」组合（与 _SHELL_RULES 的
+    shell.rm-recursive-force 同 id，调用方按 id 去重）。
+
+    正则只认 r/f 挤在同一个 token 的形态，对 ``rm -r -f`` /
+    ``rm --recursive --force`` / ``rm -Rf`` 全部失明——这里按 shlex 分词
+    读选项集合，贴近 rm 自身的解析语义（含 ``rm dir -r -f`` 旗标后置）。
+    shlex 抛错（引号不平衡）的段退回 _RM_RF_RE 兜底。"""
+    for seg in _shell_segments(command):
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            m = _RM_RF_RE.search(seg)
+            if m:
+                return (_RM_RF_RULE_ID, SEV_HIGH, _RM_RF_SUMMARY,
+                        _clip(m.group(0)))
+            continue
+        idx = _rm_verb_index(tokens)
+        if idx is None:
+            continue
+        recursive = force = False
+        for tok in tokens[idx + 1:]:
+            if tok == "--":
+                break
+            if tok == "--recursive":
+                recursive = True
+            elif tok == "--force":
+                force = True
+            elif tok.startswith("-") and len(tok) > 1 and tok[1:].isalpha():
+                letters = set(tok[1:].lower())
+                if "r" in letters:
+                    recursive = True
+                if "f" in letters:
+                    force = True
+        if recursive and force:
+            return (_RM_RF_RULE_ID, SEV_HIGH, _RM_RF_SUMMARY, _clip(seg))
+    return None
+
+
 def _scan_write_path(raw_path: str) -> List[tuple]:
     """路径规则：原串与 expanduser 归一串各试一次（~/x 与 /Users/u/x 等价）。"""
     texts = [raw_path]
@@ -288,6 +352,9 @@ def scan_tool_call(tool_name: str, args: Dict[str, Any]) -> List[GuardFinding]:
         if not command:
             return []
         hits = _match_rules(_SHELL_RULES, [command] + _shell_segments(command))
+        rm = _scan_rm_dangerous(command)
+        if rm is not None and not any(h[0] == _RM_RF_RULE_ID for h in hits):
+            hits.append(rm)
     elif tool_name in _PY_TOOLS:
         code = str(args.get("code") or "")
         if not code:
