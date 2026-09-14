@@ -89,8 +89,7 @@ def test_delta_then_round_then_done_sequence():
                return_value=provider):
         events = arun(_collect_events(chat_turn_stream("q", "ss", {"ss": s})))
     kinds = [(e.kind, getattr(e.trace, "event", None)) for e in events]
-    # graph_compile opens every fresh run (plan-⑨ 补 plan-⑧ 欠账：编译形状
-    # 可观测), deltas arrive as streamed (inside the node execution, wrapped
+    # graph_compile opens every fresh run (编译形状可观测), deltas arrive as streamed (inside the node execution, wrapped
     # by the graph runtime's node_start/node_end/graph_done traces), then done
     assert kinds == [("trace", "graph_compile"),
                      ("trace", "node_start"),
@@ -212,7 +211,7 @@ def test_fallback_without_stream_method_still_works():
         events = arun(_collect_events(chat_turn_stream("q", "ss", {"ss": s})))
     kinds = [e.kind for e in events]
     # no deltas (non-streaming provider); only the round marker between the
-    # graph_compile opener (plan-⑨) and the node lifecycle traces and done
+    # graph_compile opener and the node lifecycle traces and done
     assert kinds == ["trace", "trace", "round", "trace", "trace", "done"]
     assert events[-1].result.text == "legacy 答复"
 
@@ -264,7 +263,7 @@ def test_sse_endpoint_streams_events(_host_main, monkeypatch):
     payloads = [json.loads(line[6:]) for line in resp.text.splitlines()
                 if line.startswith("data: ")]
     kinds = [p["kind"] for p in payloads]
-    # graph_compile opener (plan-⑨) + node lifecycle traces wrap the
+    # graph_compile opener + node lifecycle traces wrap the
     # streamed deltas / round marker
     assert kinds == ["trace", "trace", "delta", "delta", "round",
                      "trace", "trace", "done"]

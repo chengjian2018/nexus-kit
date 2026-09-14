@@ -1,4 +1,4 @@
-"""deep_research_agent — 结构化深度研究配方(四节点 AGENT 图,plan-⑧)。
+"""deep_research_agent — 结构化深度研究配方(四节点 AGENT 图)。
 
 图拓扑(route_multi.py):dr_preplan(预检索/初始化) → dr_plan(子问题规划)
 → dr_search(经 MCP 工具迭代检索,研究状态板反思) → dr_synthesize(带引用

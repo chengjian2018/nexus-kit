@@ -30,7 +30,7 @@
 
 ```
 repair_booking_agent (Pattern, pattern_type=fsm, entry: repair_greet)
-└── 14 节点单域 FSM（原单模块流程，plan-⑧ 节点/模块合并后直接挂 pattern）
+└── 14 节点单域 FSM（原单模块流程，节点/模块合并后直接挂 pattern）
 ```
 
 主流程：
@@ -89,10 +89,12 @@ available_slots`（师傅可约窗口）。
 ## 运行
 
 ```bash
-# CLI 调试；task_info（含 available_slots）经 --task-info 注入，同安装应用
-python -m host.cli ask --pattern repair_booking_agent --query "是的我，冰箱不制冷了" \
-  --task-info '{"product_name": "冰箱", "address": "XX路1号", "user_name": "李四",
-                "available_slots": ["2026-09-11 09:00-12:00"]}'
+# 对话调试：uvicorn 起服务后打开 studio「模版测试」页（/studio），选
+# repair_booking_agent；task_info（含 available_slots）在页面 task_info 框
+# 填入后生效（守卫 opt-in，同安装应用）：
+#   {"product_name": "冰箱", "address": "XX路1号", "user_name": "李四",
+#    "available_slots": ["2026-09-11 09:00-12:00"]}
+uvicorn host.main:app --port 8000
 ```
 
 守卫复用路径的验收测试随 `python -m pytest` 运行。

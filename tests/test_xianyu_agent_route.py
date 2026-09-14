@@ -1,4 +1,4 @@
-"""xianyu_agent（plan-⑧ AGENT 图形态）离线测试——复刻闲鱼自动回复的多轮
+"""xianyu_agent（AGENT 图形态）离线测试——复刻闲鱼自动回复的多轮
 对话管理。
 
 LLM 输出由脚本化 FakeProvider 模拟（无真实 API）。图结构：路由根节点

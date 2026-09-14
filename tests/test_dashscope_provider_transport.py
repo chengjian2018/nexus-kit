@@ -4,7 +4,7 @@ net).
 The repo's only real-network module previously had zero transport-layer
 tests. Scripted responses are injected via httpx.MockTransport — no real
 network requests are made. Note the public entry ``achat_completion`` routes
-uniformly to the streaming implementation and then aggregates (plan-⑤),
+uniformly to the streaming implementation and then aggregates,
 hence:
 
 - Streaming retry / 4xx fail-fast / exhaustion — verified through the public

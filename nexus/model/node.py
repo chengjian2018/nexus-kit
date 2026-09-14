@@ -1,4 +1,4 @@
-"""Node — the single dialogue unit of the two-layer model (plan-⑧).
+"""Node — the single dialogue unit of the two-layer model.
 
 The former three-layer structure (Pattern → Module → Node) collapsed into
 Pattern → Node: everything a module used to carry that still matters lives

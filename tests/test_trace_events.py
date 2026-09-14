@@ -1,7 +1,7 @@
-"""Trace-event streaming tests — graph / node / tool observability (plan-⑧).
+"""Trace-event streaming tests — graph / node / tool observability.
 
 chat_turn_stream emits kind="trace" events (nexus.engine.streaming.
-TraceEvent) at every state transition a CLI consumer wants to see live:
+TraceEvent) at every state transition a streaming consumer wants to see live:
 
 - FSM    : node_jump (only when the node moved) + conversation_end + the
            reply as a single delta (stages are one-shot, no token stream)
@@ -315,7 +315,7 @@ def test_max_steps_graph_done_reason():
 
 
 # ============================================================================
-# TraceEvent wire shape + CLI rendering (host.cli)
+# TraceEvent wire shape
 # ============================================================================
 
 def test_trace_event_to_dict_wire_shape():
@@ -329,77 +329,6 @@ def test_trace_event_to_dict_wire_shape():
     # node_code/data omitted when empty (compact wire form)
     assert TraceEvent("node_start", node_code="n1").to_dict() == {
         "event": "node_start", "module_code": "", "node_code": "n1"}
-
-
-def test_render_trace_event_lines():
-    from host.cli import render_trace_event
-    from nexus.engine.streaming import TraceEvent
-
-    renderings = {
-        "node_start": TraceEvent("node_start", node_code="n1",
-                                 data={"step": 0}),
-        "node_end": TraceEvent("node_end", node_code="n1",
-                               data={"step": 0}),
-        "node_jump": TraceEvent("node_jump", data={
-            "from_node": "n1", "to_node": "n2"}),
-        "graph_wait": TraceEvent("graph_wait", node_code="n1",
-                                 data={"step": 2}),
-        "graph_resume": TraceEvent("graph_resume", node_code="n1",
-                                   data={"step": 3}),
-        "graph_done": TraceEvent("graph_done", data={
-            "reason": "is_end", "step": 1}),
-        "tool_call": TraceEvent("tool_call", data={
-            "tool_name": "search", "args": {"q": "订单"}}),
-        "tool_result": TraceEvent("tool_result", data={
-            "tool_name": "search", "result": "找到了"}),
-        "conversation_end": TraceEvent("conversation_end", node_code="n9"),
-        "custom_thing": TraceEvent("custom_thing", node_code="x"),
-    }
-    lines = {k: render_trace_event(v) for k, v in renderings.items()}
-    assert "开始 n1（step 0）" in lines["node_start"]
-    assert "结束 n1（step 0）" in lines["node_end"]
-    assert "n1 → n2" in lines["node_jump"]
-    assert "挂起等待人工输入: n1（step 2）" in lines["graph_wait"]
-    assert "从挂起恢复: n1（step 3）" in lines["graph_resume"]
-    assert "图运行结束（终节点，step 1）" in lines["graph_done"]
-    assert "[tool_call] search" in lines["tool_call"]
-    assert "订单" in lines["tool_call"]
-    assert "[tool_result] search: 找到了" in lines["tool_result"]
-    assert "到达终节点 n9" in lines["conversation_end"]
-    # open set: unknown names render generically instead of raising
-    assert "[custom_thing] x" in lines["custom_thing"]
-
-
-def test_stream_event_printer_line_discipline():
-    from host.cli import StreamEventPrinter
-    from nexus.engine.streaming import ChatStreamEvent, TraceEvent
-
-    out = []
-    p = StreamEventPrinter(write=lambda t, nl=True: out.append((t, nl)))
-
-    p.handle(ChatStreamEvent(kind="delta", text="你"))
-    p.handle(ChatStreamEvent(kind="delta", text="好"))
-    p.handle(ChatStreamEvent(kind="trace", trace=TraceEvent(
-        "tool_call", data={"tool_name": "s"})))
-    p.handle(ChatStreamEvent(kind="round",
-                             round_info={"outcome": "tool", "round_idx": 0}))
-    p.handle(ChatStreamEvent(kind="delta", text="改口了"))
-
-    # while streaming, writes carry nl=False; a trace/round first closes the line
-    assert out[0] == ("助手: ", False)
-    assert ("", True) in out                      # line closed before the trace
-    assert ("  [tool_call] s {}", True) in out    # args rendered inline
-    assert ("  [round 0] tool", True) in out
-
-    p.close("最终答复")                            # differs from streamed → reprint
-    assert ("助手: 最终答复", True) in out
-
-    # identical stream: no reprint
-    out2 = []
-    p2 = StreamEventPrinter(write=lambda t, nl=True: out2.append((t, nl)))
-    p2.handle(ChatStreamEvent(kind="delta", text="一致"))
-    p2.close("一致")
-    assert not any(t.startswith("助手: 一致") and nl for t, nl in out2)
 
 
 # ============================================================================

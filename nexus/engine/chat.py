@@ -1,5 +1,5 @@
 """
-Dialogue processing — the turn orchestrator (plan-⑧: node+pattern 二层模型).
+Dialogue processing — the turn orchestrator (node+pattern 二层模型).
 
 Responsibility is narrowed to "orchestrating one turn": locate the session →
 cxt turn lifecycle → **dispatch by pattern_type** → produce a ChatResult.
@@ -15,7 +15,7 @@ cxt turn lifecycle → **dispatch by pattern_type** → produce a ChatResult.
     - conditional edges = the node executor's routing output
       (``TurnResult.next``, mapped back onto the node's sub_nodes);
     - runtime fan-out = the node executor's dispatch output
-      (``TurnResult.sends``, plan-⑨): N worker instances run
+      (``TurnResult.sends``): N worker instances run
       concurrently (asyncio.gather — same-loop interleaving, no locks),
       each targeting its OWN declared worker node (heterogeneous fan-out:
       a send names any declared sub_node), in a structurally isolated
@@ -58,7 +58,7 @@ Entries:
 - chat_turn_stream() : async generator (protocol entry), yields
   ChatStreamEvent and terminates on done
 - chat_turn() : aggregate of chat_turn_stream, returns ChatResult
-- chat()      : compat entry (main.py / cli.py), equivalent to
+- chat()      : compat entry (main.py), equivalent to
   chat_turn().text
 """
 
@@ -90,7 +90,7 @@ _lifecycle = TurnLifecycle()
 # node executors' workflow data)
 PAUSED_NODE_KEY = "__paused_node__"
 STEP_KEY = "__step__"
-# plan-⑨: the fan-out results board — rebuilt (overwritten) on every
+# The fan-out results board — rebuilt (overwritten) on every
 # fanout_start; join/later nodes read it until the graph terminates
 FANOUT_RESULTS_KEY = "__fanout_results__"
 
@@ -272,12 +272,12 @@ async def _handle_node(session: Session, node, force_close: bool = False,
 
 
 # ============================================================================
-# Runtime fan-out (plan-⑨: sends -> N worker instances -> barrier join;
+# Runtime fan-out (sends -> N worker instances -> barrier join;
 # heterogeneous targets, merge = common successor intersection)
 # ============================================================================
 
 def _branch_cxt(cxt, branch_input: Any):
-    """Structurally isolated worker context (plan-⑨ §2.3).
+    """Structurally isolated worker context.
 
     Shallow copy with the mutable channels replaced: a private messages
     workspace (own history; message_sink cut — branch rows never persist to
@@ -320,7 +320,7 @@ async def _run_fanout(session: Session, node, result: TurnResult,
 
     Concurrency: asyncio.gather on the turn's event loop — same-loop
     interleaving means the shared emitter queue and the board appends need
-    no locks (plan-⑨ decision #2's intent: no engine-wide concurrency
+    no locks (deliberate scope: no engine-wide concurrency
     rewrite; executors' async signatures unchanged).
 
     Failure semantics: a branch exception — including the forbidden
@@ -342,7 +342,7 @@ async def _run_fanout(session: Session, node, result: TurnResult,
     if result.next is not None:
         raise ValueError(
             f"节点 {node.code!r} 同时返回 next 与 sends"
-            f"（互斥，见 plan-⑨ §2.1）"
+            f"（二者互斥）"
         )
     # Declared-edge guard: every DISTINCT target must be a declared edge
     # of the dispatching node (hallucinated node codes terminate
@@ -412,7 +412,7 @@ async def _run_fanout(session: Session, node, result: TurnResult,
     if len(sends) > max_fanout:
         raise ValueError(
             f"节点 {node.code!r} 扇出宽度 {len(sends)} 超过 "
-            f"max_fanout={max_fanout}（plan-⑨ §3.3 宽度守卫）"
+            f"max_fanout={max_fanout}（扇出宽度守卫）"
         )
 
     # ---- dispatch: per-worker executor + LLM config, then gather -------
@@ -468,7 +468,7 @@ async def _run_fanout(session: Session, node, result: TurnResult,
                 # branch — the branch fails loudly, the run continues
                 raise ValueError(
                     f"扇出分支 {branch_id!r} 返回了 wait_human/sends"
-                    f"（v1 禁止分支内挂起/嵌套扇出，见 plan-⑨ §2.3）"
+                    f"（v1 禁止分支内挂起/嵌套扇出）"
                 )
             entry = {"branch_id": branch_id, "node_code": worker_code,
                      "ok": True, "content": bres.content or "",
@@ -667,7 +667,7 @@ async def _run_fsm_turn(session: Session, pattern, stream=None) -> TurnResult:
     result = await executor.execute(ec)
     if result.sends:
         raise ValueError(
-            "FSM 路径不支持扇出 sends（仅 AGENT 图运行时消费，见 plan-⑨）"
+            "FSM 路径不支持扇出 sends（仅 AGENT 图运行时消费）"
         )
     return result
 

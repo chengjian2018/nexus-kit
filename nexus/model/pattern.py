@@ -1,4 +1,4 @@
-"""Pattern — the top layer of the two-layer model (plan-⑧).
+"""Pattern — the top layer of the two-layer model.
 
 ``pattern_type`` is the engine's dispatch key:
 
@@ -12,8 +12,8 @@
   an AGENT graph: a root routing node + conditional edges.
 
 Hard cut (no compat layer): ``modules`` / ``entry_module_code`` /
-``max_hops`` and the whole module layer are gone (see
-docs/refactor-notes/plan-8-node-pattern-merge.md §5).
+``max_hops`` and the whole module layer are gone — whatever still matters
+lives on the Pattern and its nodes.
 
 ``config`` is the single source of truth: the explicit constructor params
 (stages / plugins / agent_hooks / allow_toolset / pattern_type /
@@ -39,8 +39,8 @@ DEFAULT_PATTERN_TYPE = "agent"
 # step — aligns with the loop executor's _MAX_TOOL_ROUNDS guard scale)
 DEFAULT_MAX_STEPS = 10
 
-# Runtime fan-out width default (config.max_fanout; plan-⑨ §3.3 — the
-# per-dimension guard bounding one sends' worker-instance count)
+# Runtime fan-out width default (config.max_fanout — the per-dimension
+# guard bounding one sends' worker-instance count)
 DEFAULT_MAX_FANOUT = 8
 
 
@@ -185,7 +185,8 @@ class Pattern:
             cfg["max_steps"] = DEFAULT_MAX_STEPS
 
         # max_fanout 钉进 config（缺省 DEFAULT_MAX_FANOUT；运行时扇出宽度
-        # 预算——同构实例数上限，plan-⑨ §3.3 三层守卫的宽度维度）
+        # 预算——同构实例数上限，max_steps/max_fanout/executor
+        # 内部轮次三层守卫中的宽度维度）
         if not isinstance(cfg.get("max_fanout"), int) or cfg["max_fanout"] < 1:
             cfg["max_fanout"] = DEFAULT_MAX_FANOUT
 
@@ -202,7 +203,7 @@ class Pattern:
 
     @property
     def max_fanout(self) -> int:
-        """运行时扇出宽度上限（一次 sends 的同构实例数，plan-⑨ §3.3）。"""
+        """运行时扇出宽度上限（一次 sends 的同构实例数）。"""
         return int(self.config.get("max_fanout", DEFAULT_MAX_FANOUT))
 
     @property

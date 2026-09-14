@@ -1,4 +1,4 @@
-"""LLM streaming chunk protocol (plan-⑤).
+"""LLM streaming chunk protocol.
 
 A provider's native streaming implementation yields LLMChunk objects — the
 structured unit the aggregator (llm/aggregate.py::collect_stream) reassembles

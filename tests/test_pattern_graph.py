@@ -1,4 +1,4 @@
-"""Tests for Pattern construction-time compilation (plan-⑧):
+"""Tests for Pattern construction-time compilation:
 node codes / sub_nodes edges / entry resolution / pattern_type dispatch
 semantics / config single-source folding / slots & stages FSM-only."""
 

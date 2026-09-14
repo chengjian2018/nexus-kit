@@ -1,6 +1,7 @@
 """bash / run_python — shell 命令与 Python 代码执行（toolset: shell）.
 
-高权限工具集：授权仍是 deny-by-default（plan-⑧ §4 三层收口）——
+高权限工具集：授权仍是 deny-by-default 三层收口（注册 toolset →
+pattern.allow_toolset → node.use_tools）——
 只有 pattern 显式 ``allow_toolset: [shell, ...]`` 且节点
 ``use_tools`` 点名的 agent 才能触达，注册即全局可用不等于默认暴露::
 

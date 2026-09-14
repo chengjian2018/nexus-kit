@@ -1,5 +1,5 @@
 """Integrated AGENT messages building — MessagesBuilder owns the system
-prompt plus the full list assembly (plan-⑧ node-based form).
+prompt plus the full list assembly (node-based form).
 
 - Two declaration levels: node.plugins["messages_builder"] >
   pattern.plugins["messages_builder"] > default build (pattern level suits

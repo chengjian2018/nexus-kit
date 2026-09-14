@@ -1,4 +1,4 @@
-"""Default AGENT node executor — the ReAct tool loop (plan-⑧ node form).
+"""Default AGENT node executor — the ReAct tool loop.
 
 The AGENT graph runtime dispatches each node here by default (plugin
 kind="executor" / code="default_loop"; resolution node.plugins["loop"] >

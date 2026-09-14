@@ -1,5 +1,5 @@
 """Tests for the plugins declaration field (nexus/model/plugins_field.py,
-plan-⑧ slot table).
+the shared slot table).
 
 - normalize_plugins: unknown slot / illegal value fail fast; values are
   str/None only (the callable transition window is closed)
@@ -42,7 +42,7 @@ def test_unknown_slot_raises():
 
 
 def test_callable_value_raises():
-    # the transitional callable window is closed (plan-⑧)
+    # the transitional callable window is closed
     with pytest.raises(ValueError, match="str/None"):
         normalize_plugins({"messages_builder": lambda n, c, e: []})
 

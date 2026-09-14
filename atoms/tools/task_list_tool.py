@@ -4,7 +4,8 @@ agent 执行多步工作时的自我进程跟踪（TodoWrite/TodoRead 等价物�
 前列计划、执行中勾状态，让"现在做到哪、还剩什么"在长任务里始终可查，
 也给用户侧一个稳定的观察面。
 
-授权（deny-by-default，plan-⑧ §4 三层收口）::
+授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
+node.use_tools）::
 
     pattern:
       allow_toolset: [tasks, filesystem]

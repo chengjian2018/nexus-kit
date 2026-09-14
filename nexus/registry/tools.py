@@ -379,7 +379,7 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
 
-        Tool authorization is toolset-based (plan-⑧ §4): every tool
+        Tool authorization is toolset-based: every tool
         carries its ``toolset`` tag here; the pattern-level
         ``allow_toolset`` list plus the node-level ``use_tools`` list (both
         deny-by-default) decide availability at resolution time — see
@@ -586,8 +586,8 @@ class ToolRegistry:
 
     def names_in_toolsets(self, toolsets) -> Set[str]:
         """Return the set of tool names belonging to any of the given
-        toolsets (the pattern-level allow_toolset gate's candidate pool —
-        plan-⑧ §4; the node-level use_tools intersects on top)."""
+        toolsets (the pattern-level allow_toolset gate's candidate pool;
+        the node-level use_tools intersects on top)."""
         wanted = set(toolsets or [])
         if not wanted:
             return set()

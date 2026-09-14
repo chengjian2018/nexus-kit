@@ -1,6 +1,6 @@
-"""Tests for the clarify slot declaration (the plan-② replacement of the
-enable_clarify flag; plan-⑧ moved the declaration from the module layer to
-node.stages) + the clarify-intent directive in the FSM NLU prompt."""
+"""Tests for the clarify slot declaration (``node.stages = {"clarify": code}``,
+the successor of the old module-level enable_clarify flag) + the
+clarify-intent directive in the FSM NLU prompt."""
 
 
 def test_default_off():

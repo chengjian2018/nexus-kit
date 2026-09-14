@@ -1,5 +1,5 @@
 """Framework wiring tests — skeleton insertion, NLG skip, slots not merged,
-node unchanged (plan-⑧ two-layer form: clarify is a skeleton slot declared
+node unchanged (two-layer form: clarify is a skeleton slot declared
 via node.stages ({"clarify": code}); the default skeleton keeps clarify=None
 (opt-in), the pattern skeleton must carry the slot for it to run).
 """
@@ -50,8 +50,8 @@ class TestBuildStages:
 
         nlu_code = register_stage_stub(_Noop)
         nlg_code = register_stage_stub(_Noop)
-        # the clarify declaration lives on the NODE (the plan-⑧ replacement
-        # of the module-level enable_clarify)
+        # the clarify declaration lives on the NODE (the successor of the
+        # old module-level enable_clarify)
         pattern = make_fsm_pattern(
             stages=[{"nlu": nlu_code}, {"clarify": None}, {"nlg": nlg_code}],
             node_stages={"clarify": cl_code},

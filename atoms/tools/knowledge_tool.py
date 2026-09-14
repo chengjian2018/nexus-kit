@@ -16,7 +16,7 @@ Differences from the original (degradation notes):
   goods_id must exist in the current scope's knowledge base, preventing LLM
   fabrication
 
-Permissions (plan-⑧ §4): toolset="knowledge" — the pattern grants via
+Permissions: toolset="knowledge" — the pattern grants via
 allow_toolset=["knowledge"], the node narrows via use_tools (both
 deny-by-default).
 authorization (customer_agent is the wholesale migration of Customer-Agent, see

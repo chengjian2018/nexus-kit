@@ -2,8 +2,7 @@
 
 Defines the contract that every LLM provider must implement:
 - ``BaseLLMProvider``: the core interface for chat-completion requests
-  (async — the asyncio rewrite; the legacy sync method names are temporary
-  bridges and will be removed in phase-③).
+  (fully async; the legacy sync method names are gone).
 - ``ProviderEntry``: metadata record for a registered provider.
 """
 
@@ -186,7 +185,7 @@ class BaseLLMProvider(ABC):
         stream: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Public entry point for chat-completion requests (plan-⑤: an
+        """Public entry point for chat-completion requests (an
         aggregated streaming call).
 
         Validates inputs, resolves the model, streams via
@@ -226,7 +225,7 @@ class BaseLLMProvider(ABC):
     ) -> Dict[str, Any]:
         """Provider-specific implementation of a NON-STREAMING call.
 
-        Plan-⑤ role: the fallback behind the default stream bridge (providers
+        Role: the fallback behind the default stream bridge (providers
         that do not override ``_achat_completion_stream_impl`` get their
         non-streaming result wrapped as a single-chunk stream). Must return a
         dict with at least ``{"content": str}``; may also include
@@ -235,8 +234,7 @@ class BaseLLMProvider(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # Streaming API (the native form since plan-⑤; async since the
-    # asyncio rewrite)
+    # Streaming API (the native form; async)
     # ------------------------------------------------------------------
 
     async def achat_completion_stream(

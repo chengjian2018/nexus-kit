@@ -14,9 +14,9 @@ Entry points:
     messages_builder / agent_hooks codes resolve in the plugin registry
     (``llm`` resolves via settings at refresh time — not checked here).
 - validate_tools(pattern): every node.use_tools name is registered AND its
-  toolset ∈ pattern.allow_toolset (deny-by-default 三层收口, plan-⑧ §4).
+  toolset ∈ pattern.allow_toolset (deny-by-default 三层收口).
 
-Callers: host/cli assembly validates every registered pattern; yml loading
+Callers: host/main startup validates every registered pattern; yml loading
 validates after construction. The structural graph checks (dangling
 sub_nodes edges / duplicate node codes / entry resolvability / slots on
 AGENT nodes) already run in Pattern.__init__ and are not duplicated here.
@@ -240,7 +240,7 @@ def tool_check_notices(pattern: Pattern) -> List[str]:
 
 
 def validate_tools(pattern: Pattern, strict: bool = True) -> List[str]:
-    """Validate the toolset authorization (plan-⑧ §4): every node's
+    """Validate the toolset authorization: every node's
     use_tools names must be registered and belong to an allowed toolset.
 
     Runs at registration time (tools discovered before patterns); patterns

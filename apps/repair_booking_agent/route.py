@@ -72,8 +72,9 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Nodes — in flow order (nodes[0] / entry_node_code is the entry)
 #
-# Every node carries two promotions of the pre-merge module-level wiring
-# (plan-⑧: the module layer is gone): stages={"clarify": "repair_clarify"}
+# Every node carries two pieces of the pre-merge module-level wiring
+# (the module layer is gone — the node is the only declaration face):
+# stages={"clarify": "repair_clarify"}
 # — the clarify admission switch (the unified stage admits "clarify" into
 # next_node's valid values only when the CURRENT node declares the slot) —
 # and base_nlu_prompt=REPAIR_UNIFIED_PROMPT (the module-level unified-stage
@@ -386,7 +387,7 @@ repair_end = BaseNode(
 # ============================================================================
 # Pattern registration — the whole flow is one FSM pattern (single business
 # domain; the pre-merge module layer collapsed into the pattern's node list,
-# its stages declaration promoted into the skeleton, plan-⑧)
+# its stages declaration promoted into the skeleton)
 # ============================================================================
 
 repair_booking_agent_pattern = Pattern(
@@ -417,7 +418,7 @@ repair_booking_agent_pattern = Pattern(
         repair_end,
     ],
     # Stages skeleton (the pre-merge pattern skeleton ⊕ the module-level
-    # stages declaration, merged by the plan-⑧ node/module merge): time
+    # stages declaration, folded into the pattern's node list): time
     # augmentation / the app-local guarded unified stage (install machinery
     # rebound to repair codes) / keyword-gated clarify / builtin
     # pass-through NLG — see the install app for the full rationale.

@@ -1,4 +1,4 @@
-"""Runtime fan-out contract tests (plan-⑨ + §9 异构修订): sends dispatch /
+"""Runtime fan-out contract tests (含异构扇出修订): sends dispatch /
 barrier join / results board (completion order) / branch workspace
 isolation / heterogeneous targets / merge 交集解析（离群 worker 忽略、
 不可唯一解析拒绝执行）/ guards (next+sends 互斥、宽度、未声明目标) /

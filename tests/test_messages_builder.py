@@ -1,4 +1,4 @@
-"""messages_builder integrated contract (plan-⑧ node form): default behavior /
+"""messages_builder integrated contract (node form): default behavior /
 full custom authority / two-level resolution / loop-executor wiring.
 
 Builder contract: ``(node, cxt, extra_blocks) -> messages`` — the builder

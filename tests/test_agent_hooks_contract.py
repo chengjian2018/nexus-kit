@@ -1,4 +1,4 @@
-"""Agent-hooks interface contract tests (plan-⑧ node form).
+"""Agent-hooks interface contract tests.
 
 The hooks machinery is retained (6 points — on_transfer went with the
 defer/transfer machinery — / event classes carrying node_code / declaration

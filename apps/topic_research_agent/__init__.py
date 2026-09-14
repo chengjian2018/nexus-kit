@@ -1,4 +1,4 @@
-"""topic_research_agent — 六站结构化深度研究配方(AGENT 图,plan-⑨ 扇出)。
+"""topic_research_agent — 六站结构化深度研究配方(AGENT 图,运行时扇出)。
 
 图拓扑(route.py):tr_preplan(预规划/预检索) → tr_plan(分主题规划,经
 ``TurnResult.sends`` 扇出) → tr_search ×N(一实例一主题,经 MCP 工具迭代

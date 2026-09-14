@@ -1,5 +1,5 @@
-"""Pipeline skeleton + two-layer resolution tests (plan-⑧ declarative
-stages; the module layer is gone).
+"""Pipeline skeleton + two-layer resolution tests (declarative
+string-code stages; the module layer is gone).
 
 Core contracts (direct counterpart of the pipeline.py design):
 - Skeleton: ordered list of single-key dicts ({slot: code-or-None}); the
@@ -207,8 +207,8 @@ def test_clarify_slot_declared_runs_between_nlu_and_nlg():
     cl_code = _marker_code("my_clarify")
     pattern = _fsm_pattern(
         stages=[{"nlu": None}, {"clarify": None}, {"nlg": None}])
-    # clarify declared at the NODE layer (the plan-⑧ replacement of the
-    # module-level enable_clarify)
+    # clarify declared at the NODE layer (the successor of the
+    # old module-level enable_clarify)
     pattern.nodes[0].stages = {"clarify": cl_code}
 
     from atoms.stages.nlu import FSMNLU

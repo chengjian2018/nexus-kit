@@ -64,7 +64,7 @@ def test_create_session_roundtrip(tmp_path):
     assert row["pattern_code"] == "xianyu_agent"
     assert row["request_id"] == "req-s1"
     assert json.loads(row["task_info"]) == {"caller": "pytest"}
-    assert "current_module_code" not in row.keys()  # plan-⑧: 模块列已删
+    assert "current_module_code" not in row.keys()  # 模块列已删
     assert row["current_node_code"] == "route_root"
     assert json.loads(row["graph_state"]) == {"__paused_node__": "n1", "custom": "v"}
     assert json.loads(row["filled_slots"]) == {"brand": "特斯拉"}

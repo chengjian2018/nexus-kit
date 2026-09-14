@@ -101,8 +101,8 @@ logger = logging.getLogger(__name__)
 # Nodes — the sketch's ovals + supplemented scenarios, in flow order
 # (nodes[0] / entry_node_code is the entry)
 #
-# Every node carries two promotions of the pre-merge module-level wiring
-# (plan-⑧: the module layer is gone):
+# Every node carries two pieces of the pre-merge module-level wiring
+# (the module layer is gone — the node is the only declaration face):
 # - stages={"clarify": "install_clarify"} — the clarify admission switch:
 #   the unified stage admits "clarify" into next_node's valid values only
 #   when the CURRENT node declares the slot, so the module-era "clarify
@@ -443,7 +443,7 @@ install_end = BaseNode(
 # ============================================================================
 # Pattern registration — the whole flow is one FSM pattern (single business
 # domain; the pre-merge module layer collapsed into the pattern's node list,
-# its stages declaration promoted into the skeleton, plan-⑧)
+# its stages declaration promoted into the skeleton)
 # ============================================================================
 
 install_booking_agent_pattern = Pattern(
@@ -476,7 +476,7 @@ install_booking_agent_pattern = Pattern(
         install_end,
     ],
     # Stages skeleton (the pre-merge pattern skeleton ⊕ the module-level
-    # stages declaration, merged by the plan-⑧ node/module merge): time
+    # stages declaration, folded into the pattern's node list): time
     # augmentation resolves relative visit times before the unified prompt
     # AND before the booking guard parses them; the app-local guarded
     # unified stage writes reply/next_node/slots in one call; the

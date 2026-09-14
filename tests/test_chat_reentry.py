@@ -1,4 +1,4 @@
-"""Chat-layer graph semantics (plan-⑧): the module hop loop is dead —
+"""Chat-layer graph semantics: the module hop loop is dead —
 same-turn handoff / cross-turn relay / budget close-out are all expressed by
 the AGENT graph runtime:
 

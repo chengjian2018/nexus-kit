@@ -1,6 +1,6 @@
 """Plugin registry tests — registration semantics, conflict policy,
 resolution caching, and the chat layer's AGENT node-executor resolution
-(plan-⑧: ``chat._resolve_node_executor_code`` — node.plugins["loop"] >
+(``chat._resolve_node_executor_code`` — node.plugins["loop"] >
 pattern.plugins["loop"] > default_loop)."""
 
 import pytest
@@ -118,7 +118,7 @@ def test_default_executors_registered():
 
 
 def test_default_executor_codes_cover_pattern_types():
-    # plan-⑧: the module types collapsed to pattern types — the route family
+    # the module types collapsed to pattern types — the route family
     # is gone with the module layer
     assert DEFAULT_EXECUTOR_CODES == {
         "agent": "default_loop",

@@ -1,6 +1,5 @@
 """The four-node graph variant of the deep-research executor — one node per
-research phase (plan-⑧ form; plan-⑨ migrates the SEARCH station to the
-engine's runtime fan-out):
+research phase (the SEARCH station runs on the engine's runtime fan-out):
 
     dr_preplan ──next──> dr_plan ──sends──> dr_search ×N ──join──> dr_synthesize
      pre-retrieval/init    plan sub-questions  one per sub-question   merge & report
@@ -17,7 +16,7 @@ Phase inventory (the shared phase methods on DeepResearchExecutor):
              failure degrades to [the original question]); then dispatches
              ONE worker instance per sub-question via ``TurnResult.sends``
              (capped at ``pattern.max_fanout``)
-    SEARCH   a fan-out WORKER (plan-⑨ §5): one instance researches ONE
+    SEARCH   a fan-out WORKER: one instance researches ONE
              sub-question in its own private workspace — a small tool-
              carrying ReAct loop (≤ _MAX_SEARCH_ROUNDS per instance) with a
              per-instance state board. Instance isolation structurally
@@ -29,7 +28,7 @@ Phase inventory (the shared phase methods on DeepResearchExecutor):
              then slims messages down and streams the report — the only
              phase that forwards text deltas to ec.stream
 
-Plan-⑨ adaptations over the plan-⑧ form:
+Fan-out adaptations over the static-relay form:
 
 - the same-turn relay is ``TurnResult(content="", next=...)`` for PREPLAN/
   SYNTHESIZE-degraded, ``TurnResult(content="", sends=[Send(dr_search,
@@ -109,7 +108,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Runaway protection budget (hard LLM call ceiling ≈ 1(pre-retrieval) + 1 +
-# 1(self-correct retry) + max_fanout × per-branch SEARCH + 1; plan-⑨ trades
+# 1(self-correct retry) + max_fanout × per-branch SEARCH + 1; the fan-out
 # the pre-fan-out single 12-round loop for N concurrent instances of a
 # tighter per-branch cap — width × depth, each dimension independently
 # bounded)
@@ -349,7 +348,7 @@ class DeepResearchExecutor(NodeExecutor):
         return plan
 
     # ------------------------------------------------------------------
-    # SEARCH（fan-out worker：一个实例一个子问题，plan-⑨ §5）
+    # SEARCH（fan-out worker：一个实例一个子问题）
     # ------------------------------------------------------------------
 
     async def _search_branch(self, provider, theme: str, sub_question: str,
@@ -725,7 +724,7 @@ class DrPreplanExecutor(DeepResearchExecutor):
 class DrPlanExecutor(DeepResearchExecutor):
     """dr_plan node: the PLAN phase (sub-question JSON, self-correcting
     retry, degradation fallback); dispatches one dr_search worker instance
-    per sub-question via ``TurnResult.sends`` (plan-⑨ runtime fan-out)."""
+    per sub-question via ``TurnResult.sends`` (runtime fan-out)."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -769,7 +768,7 @@ class DrPlanExecutor(DeepResearchExecutor):
 
 
 class DrSearchExecutor(DeepResearchExecutor):
-    """dr_search node — the fan-out WORKER (plan-⑨ §5): one instance
+    """dr_search node — the fan-out WORKER: one instance
     researches ONE sub-question (``ec.branch_input`` carries
     {"theme", "sub_question"}) in a private workspace; results travel back
     exclusively via TurnResult.extra, which the engine settles into the

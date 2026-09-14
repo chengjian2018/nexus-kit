@@ -95,14 +95,14 @@ class SessionStore:
 
     @staticmethod
     async def _migrate(conn) -> None:
-        """One-shot schema migration for pre-plan-⑧ databases: drop the
+        """One-shot schema migration for legacy databases: drop the
         module-layer column, add the graph_state column. Fresh databases
         already match _SCHEMA (both steps no-op)."""
         rows = await conn.execute_fetchall(
             "PRAGMA table_info(sessions)")
         cols = {r["name"] for r in rows}
         if "current_module_code" in cols:
-            # plan-⑧: the module cursor has no successor — dropped (the
+            # the module cursor has no successor — dropped (the
             # FSM node cursor lives on in current_node_code)
             try:
                 await conn.execute(

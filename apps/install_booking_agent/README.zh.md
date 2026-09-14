@@ -25,7 +25,7 @@
 
 ```
 install_booking_agent (Pattern, pattern_type=fsm, entry: install_greet)
-└── 16 节点单域 FSM（原单模块流程，plan-⑧ 节点/模块合并后直接挂 pattern）
+└── 16 节点单域 FSM（原单模块流程，节点/模块合并后直接挂 pattern）
 ```
 
 主流程（`nodes[0]` / entry_node_code 为入口）：
@@ -105,10 +105,12 @@ fallback 轨诚实告知稍后核实 + 拉回。电话节奏：每轮两句话�
 ## 运行
 
 ```bash
-# CLI 调试；守卫 opt-in——available_slots 经 --task-info 注入后生效
-python -m host.cli ask --pattern install_booking_agent --query "嗯我是本人，方便" \
-  --task-info '{"product_name": "衣柜", "address": "XX路1号", "user_name": "张三",
-                "available_slots": ["2026-09-11 09:00-12:00", "2026-09-12 14:00-17:00"]}'
+# 对话调试：uvicorn 起服务后打开 studio「模版测试」页（/studio），选
+# install_booking_agent；守卫 opt-in——available_slots 在页面 task_info 框
+# 填入后生效：
+#   {"product_name": "衣柜", "address": "XX路1号", "user_name": "张三",
+#    "available_slots": ["2026-09-11 09:00-12:00", "2026-09-12 14:00-17:00"]}
+uvicorn host.main:app --port 8000
 ```
 
 守卫/改道/裁定路径的验收测试随 `python -m pytest` 运行（测试经

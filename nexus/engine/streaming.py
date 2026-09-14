@@ -1,4 +1,4 @@
-"""Engine-level streaming protocol (plan-⑤).
+"""Engine-level streaming protocol.
 
 chat_turn_stream(...) is the generator form of chat_turn: it yields
 ChatStreamEvent objects while the turn is being processed, the final event
@@ -69,14 +69,14 @@ class ChatStreamEvent:
     trace: Optional["TraceEvent"] = None            # trace: transition event
     result: Optional[ChatResult] = None             # done: terminal ChatResult
     branch_id: str = ""                             # fan-out branch tag
-                                                   # ("" = main path; plan-⑨)
+                                                   # ("" = main path)
 
 
 # Canonical trace event names (all optional fields default to ""/{} —
 # consumers render what is present; unknown names pass through untouched).
-# plan-⑧: the module-jump family (module_jump / route_hit / route_root /
+# The module-jump family (module_jump / route_hit / route_root /
 # defer_switch / module_start) is gone with the module layer; the graph
-# runtime emits the node_* / graph_* family. plan-⑨ adds the fan-out family
+# runtime emits the node_* / graph_* family, plus the fan-out family
 # (worker instances of a runtime sends dispatch) + graph_compile.
 TRACE_EVENT_NAMES = (
     "node_start",        # an AGENT graph node's execution begins
@@ -87,10 +87,10 @@ TRACE_EVENT_NAMES = (
     "graph_resume",      # AGENT graph resumed from suspension
     "graph_done",        # AGENT graph run terminated (reason: terminal /
                          # is_end / max_steps / undeclared_edge)
-    "fanout_start",      # plan-⑨: a node dispatched N worker instances
-    "branch_start",      # plan-⑨: one worker instance began (branch_id)
-    "branch_end",        # plan-⑨: one worker instance settled (ok/error)
-    "fanout_join",       # plan-⑨: all instances settled, join node fires
+    "fanout_start",      # a node dispatched N worker instances
+    "branch_start",      # one worker instance began (branch_id)
+    "branch_end",        # one worker instance settled (ok/error)
+    "fanout_join",       # all instances settled, join node fires
     "tool_call",         # agent loop: one tool invocation issued
     "tool_result",       # agent loop: one tool invocation returned
     "conversation_end",  # FSM reached a terminal node (is_end)
@@ -185,8 +185,7 @@ class StreamEmitter:
 
 
 class BranchStreamEmitter:
-    """Tags every event of ONE fan-out branch with its branch_id (plan-⑨
-    §4.1).
+    """Tags every event of ONE fan-out branch with its branch_id.
 
     A worker instance receives this as ``ec.stream`` instead of the turn
     emitter — the executor keeps calling emit_delta / emit_round /

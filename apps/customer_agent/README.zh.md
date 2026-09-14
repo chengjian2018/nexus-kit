@@ -2,7 +2,7 @@
 
 电商店铺客服 pattern，整装迁移自兄弟项目 Customer-Agent：商品/售后知识检索、
 商品推荐卡片、超范围转人工。核心特点是**每轮商品目录预取**与**会话信息防编造**；
-plan-⑧ 后为**两节点 AGENT 图**——「AI 客服 → 人工交接」由条件边 + 回复末尾
+形态为**两节点 AGENT 图**——「AI 客服 → 人工交接」由条件边 + 回复末尾
 `[HANDOFF]` 标记同轮完成，取代旧 defer/底座切换通道。
 
 ## 应用组成
@@ -43,7 +43,7 @@ prompt 指示模型「需要人工时先把该说的话说完，回复末尾另�
 防御：customer_service 入口发现残留 flag 直接路由 handoff。已知取舍：真流式
 provider 下标记会短暂出现在实时 delta 流中（最终回复文本是干净的）。
 
-### 工具授权（plan-⑧ §4 三层收口）
+### 工具授权（deny-by-default 三层收口）
 
 4 个工具 toolset=`knowledge`；`pattern.allow_toolset=["knowledge"]` 是唯一
 授权面；`customer_service.use_tools` 收窄到 4 个工具名，`human_handoff`
@@ -70,12 +70,10 @@ provider 下标记会短暂出现在实时 delta 流中（最终回复文本是�
 
 ## 依赖与运行
 
-- 依赖 `atoms/tools/knowledge_tool.py`（知识工具组）；演示前需灌知识库：
-
-```bash
-python -m host.cli knowledge-seed                    # 前置：灌演示知识库
-python -m host.cli ask --pattern customer_agent --query "这个阅读器电池怎么样"
-```
+- 依赖 `atoms/tools/knowledge_tool.py`（知识工具组）；演示数据经运营配置台
+  「知识库」页录入（`/console`：商品/客服知识 CRUD + 试搜台）。
+- 对话调试：`uvicorn host.main:app` 起服务后打开 studio「模版测试」页
+  （`/studio`），选 `customer_agent` 发起多轮对话（SSE 流式，trace 逐行可见）。
 
 - 离线验收测试随 `python -m pytest` 运行（fake provider 打桩 LLM；
   含 [HANDOFF] 同轮转人工与下一轮回主线的回归用例）。

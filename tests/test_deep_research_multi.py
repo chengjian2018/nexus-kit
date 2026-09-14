@@ -1,4 +1,4 @@
-"""deep_research（plan-⑨ 扇出版四节点 AGENT 图）离线测试。
+"""deep_research（扇出版四节点 AGENT 图）离线测试。
 
 ScriptedProvider 与相位检测（请求特征锚点）自包含于本文件；图版机制覆盖：
 1. 图结构 + AST 自动发现 + 四相位 executor 插件注册 + validate_pattern

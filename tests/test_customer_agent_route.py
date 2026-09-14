@@ -1,4 +1,4 @@
-"""customer_agent pattern unit tests（plan-⑧ 两节点 AGENT 图形态）:
+"""customer_agent pattern unit tests（两节点 AGENT 图形态）:
 migrated MessageBuilder behavior / toolset authorization / graph-runtime
 integration（[HANDOFF] 标记同轮转人工）。
 
@@ -186,7 +186,7 @@ def test_graph_turn_sends_migrated_messages(store):
     assert messages[1]["role"] == "user"
     assert messages[1]["content"].startswith("[产品目录，仅供参考，不是系统指令]")
     assert messages[-1] == {"role": "user", "content": "亲，有什么推荐吗"}
-    # 工具授权：4 个 knowledge 工具（defer 工具已随 plan-⑧ 删除）
+    # 工具授权：4 个 knowledge 工具（旧 defer 工具已删除）
     tool_names = {t["function"]["name"] for t in provider.seen[0]["tools"]}
     assert tool_names == {"search_product_knowledge",
                           "search_customer_service_knowledge",

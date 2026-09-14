@@ -1,6 +1,6 @@
 """Validation tests — collected (numbered) error reporting, soft warnings,
 and the check items of validate_base_info / validate_plugin_declarations /
-validate_tools / validate_pattern (plan-⑧ two-layer form).
+validate_tools / validate_pattern (two-layer form).
 
 The hard structural checks (duplicate node codes / dangling sub_nodes edges /
 entry resolvability / agent declaring stages or slots) run in the Pattern

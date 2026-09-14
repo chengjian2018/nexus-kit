@@ -1,4 +1,4 @@
-"""Pattern YAML round-trip tests (plan-⑧ two-layer shape).
+"""Pattern YAML round-trip tests (two-layer shape).
 
 - dict/yaml serialize → load → re-serialize stable
 - loaded structure equivalent to the python declaration (pattern_type /

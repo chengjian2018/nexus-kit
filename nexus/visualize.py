@@ -1,7 +1,7 @@
 """
 Pattern visualization -- renders the structural relationships of a Pattern / Node as a diagram.
 
-Two-layer model (plan-⑧: the module layer is gone). ``pattern_type`` selects
+Two-layer model (Pattern → Node; no module layer). ``pattern_type`` selects
 the reading of the same fields:
 
 - FSM pattern   -> a state machine: ``sub_nodes`` are the next_node legal

@@ -1,5 +1,5 @@
 """LLM streaming protocol tests — chunk shape, aggregation equivalence
-(the plan-⑤ safety net), tool_call fragment merging, and the default
+(the aggregation safety net), tool_call fragment merging, and the default
 bridge (legacy non-streaming providers wrapped as single-chunk streams)."""
 
 from async_utils import arun
@@ -109,7 +109,7 @@ def test_mixed_text_and_tool_calls():
 
 # ============================================================================
 # Aggregation equivalence: streamed assembly == legacy non-streaming dict
-# (the plan-⑤ safety net — the engine keeps consuming the same shape)
+# (the aggregation safety net — the engine keeps consuming the same shape)
 # ============================================================================
 
 def test_aggregation_matches_legacy_shape():

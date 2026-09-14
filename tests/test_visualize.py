@@ -1,4 +1,4 @@
-"""Tests for the visualize module (plan-⑧ two-layer form) — fully offline,
+"""Tests for the visualize module (two-layer form) — fully offline,
 structural rendering assertions only, no LLM.
 
 Fixtures: an FSM pattern (node chain + slots + is_end) and an AGENT graph

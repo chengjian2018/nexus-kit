@@ -1,5 +1,5 @@
 """Unified stage (single call + structured output) offline tests — FSM-only
-form (plan-⑧: the ROUTE family is gone; the pattern is one FSM Pattern whose
+form (the ROUTE family is gone; the pattern is one FSM Pattern whose
 skeleton wires the unified stage + pass-through NLG; the clarify declaration
 lives on the node).
 

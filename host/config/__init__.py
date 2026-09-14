@@ -3,8 +3,8 @@ kernel settings (nexus.settings).
 
 Only the host knows where the yaml lives; nexus/atoms read everything through
 ``nexus.settings``. Importing this package has the side effect of pointing the
-kernel at ``host/config/local_config.yaml`` — host.main / host.cli import it
-first thing.
+kernel at ``host/config/local_config.yaml`` — host.main imports it first
+thing.
 """
 
 from pathlib import Path

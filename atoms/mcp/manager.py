@@ -440,7 +440,7 @@ class McpManager:
         - toolset = ``mcp-<server>`` (ownership and refresh granularity;
           cross-server name clashes are backstopped by ToolRegistry's
           mcp-→mcp- override exemption; ALSO the authorization unit —
-          plan-⑧ §4: a pattern grants itself this server's tools by
+          a pattern grants itself this server's tools by
           listing the toolset in ``pattern.allow_toolset``, the node
           narrows via ``use_tools``; the registration-time allowed_patterns
           ACL is gone)

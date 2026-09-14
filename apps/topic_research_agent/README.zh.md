@@ -1,7 +1,7 @@
 # topic_research_agent — 六站主题深度研究配方
 
 `deep_research` 的姊妹配方：把综合环节拆开为**合并 / 报告生成 / 格式美化**
-三个显式站点，形成一条更长的扇出流水线（plan-⑨ 运行时扇出）。
+三个显式站点，形成一条更长的扇出流水线（引擎运行时扇出）。
 
 ## 图拓扑
 
@@ -24,7 +24,7 @@ tr_preplan ──next──> tr_plan ──sends──> tr_search ×N ──join
 - **运行时扇出**：`tr_plan` 返回 `TurnResult.sends=[Send("tr_search",
   {"theme": 问题, "sub_question": 主题}), ...]`；引擎 `asyncio.gather`
   并发执行 N 个实例（检索延迟 = 最慢分支），全部落定后执行 join
-  （`tr_search` 的唯一后继 `tr_merge`，plan-⑨ §9 merge 交集解析）。
+  （`tr_search` 的唯一后继 `tr_merge`，扇出目标共同后继交集解析）。
 - **分支隔离**：worker 实例跑在私有工作区（空 history / message_sink
   切断 / `Send.input` 作显式查询），看不到站点间状态；结果仅经
   `TurnResult.extra` 落引擎结果板。分支失败 = error 条目，join 照常。
@@ -32,7 +32,7 @@ tr_preplan ──next──> tr_plan ──sends──> tr_search ×N ──join
   plan / merged findings / draft），图终止清空；终态 trace 落
   `cxt.metadata["topic_research"]`（phases / themes / per_theme /
   branches / sources / tool_stats / degraded）。
-- **预算三层**（plan-⑨ §3.3）：主循环 5 步（默认 `max_steps=10`；worker
+- **预算三层**：主循环 5 步（默认 `max_steps=10`；worker
   不占图步数）× `max_fanout=8` 宽度 × 每分支 `_MAX_SEARCH_ROUNDS=5`
   （每次真实查询后 sleep 5 秒限速）。
 - **相位复用**：PREPLAN/SEARCH 直接复用 `deep_research_agent.

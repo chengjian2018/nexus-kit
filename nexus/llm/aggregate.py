@@ -1,5 +1,5 @@
 """Stream aggregation — reassemble LLMChunks into the legacy non-streaming
-dict shape (plan-⑤: non-streaming calls are aggregated streaming calls).
+dict shape — non-streaming calls are aggregated streaming calls.
 
 Merging rules (OpenAI streaming semantics):
 - text: plain concatenation of all chunk texts

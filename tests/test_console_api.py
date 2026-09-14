@@ -65,7 +65,7 @@ def test_catalog_stage_and_executor(client):
     assert "fsm_unified" in stages and "nlg_pass_through" in stages
     executors = _ok_data(client.get("/api/v1/console/catalog/executor"))["codes"]
     assert {"default_loop", "default_fsm"} <= set(executors)
-    assert "default_route" not in executors  # plan-⑧: ROUTE executor 删除
+    assert "default_route" not in executors  # ROUTE executor 已删除
     assert "xianyu_router" in executors     # app 自有节点执行器可见
 
 

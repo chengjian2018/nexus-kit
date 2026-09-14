@@ -8,7 +8,7 @@ Importing this package does two registrations:
    runnable; host bootstrap and tests/conftest.py do it automatically);
 2. the named stages into the plugin registry (kind="stage") — the string
    codes that pattern/node ``stages`` declarations reference (FSM patterns
-   only — plan-⑧: AGENT nodes run via their loop executors):
+   only — AGENT nodes run via their loop executors and never touch stages):
 
    - ``fsm_nlu`` / ``fsm_nlg``       : FSM two-stage defaults
    - ``fsm_unified``                 : single-call unified stage

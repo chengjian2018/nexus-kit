@@ -1,4 +1,4 @@
-"""Loop main-flow tool guards (plan-⑧ node form): hallucinated-name
+"""Loop main-flow tool guards: hallucinated-name
 interception + protocol-paired replay of synthetic/ordinary tool rows +
 max-rounds forced termination. These behaviors belong to the loop's own
 validation/replay machinery — driven here through the AGENT graph runtime

@@ -2,9 +2,9 @@
 
 复刻 tmp_xianyu.XianyuReplyBot 的闲鱼卖家客服 pattern：对每条买家消息做
 **每轮独立的意图检测**（本地规则优先 + LLM 兜底），路由到议价/技术/通用
-菜单节点生成回复，附议价轮数控制、按意图调温与违禁词过滤。plan-⑧ 后为
+菜单节点生成回复，附议价轮数控制、按意图调温与违禁词过滤。形态为
 **AGENT 图**——路由节点条件边分发，每条消息从入口重跑（原 ROUTE「轮末回根」
-天然成立）。本应用独有的**渠道声明**（channel.py）使其可直连
+语义天然由「每轮从 entry 跑全图」表达）。本应用独有的**渠道声明**（channel.py）使其可直连
 xianyu-auto-reply 的默认回复 API。
 
 ## 应用组成
@@ -92,12 +92,11 @@ xianyu_agent (Pattern, entry: xy_route_root)
 ## 运行
 
 ```bash
-# CLI 调试
-python -m host.cli ask --pattern xianyu_agent --query "还在吗"
-python -m host.cli ask --pattern xianyu_agent --query "便宜50卖吗"
-
 # 服务端挂渠道（channel=xianyu 的 webhook 端点由内核通用装配提供）
 XIANYU_CHANNEL_PATTERN=xianyu_agent uvicorn host.main:app --port 8000
+
+# 对话调试：服务起来后打开 studio「模版测试」页（/studio），选 xianyu_agent
+# 多轮对话（如「还在吗」「便宜50卖吗」），SSE 流式输出
 ```
 
 意图路由 / 轮数控制 / 零 LLM 短路路径的验收测试随 `python -m pytest`

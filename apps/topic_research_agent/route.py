@@ -15,20 +15,20 @@ dispatch):
   station, this recipe keeps them as three explicit stations (merge is a
   zero-LLM structural fold; report writes the draft; polish owns the
   final streamed wording), demonstrating a longer fan-out pipeline on the
-  plan-⑨ runtime;
+  engine's runtime fan-out;
 - step budget: PREPLAN/PLAN/MERGE/REPORT/POLISH are 5 main-loop steps
   (default max_steps=10; the N search worker instances do NOT consume
-  graph steps — plan-⑨ §3.3: ``max_steps`` graph steps × ``max_fanout``
+  graph steps — three-layer guards: ``max_steps`` graph steps × ``max_fanout``
   width (default 8, the pattern caps PLAN's dispatch) × per-branch
   ``_MAX_SEARCH_ROUNDS``);
 - merge resolution: tr_search is the only dispatch target and its
   sub_nodes point at exactly one join (tr_merge) — the intersection is
-  unique (plan-⑨ §9 merge semantics);
+  unique (the engine's merge intersection semantics);
 - tr_plan also declares the tr_merge edge — the orphan bail-out (landing
   on tr_plan without in-flight state skips planning and jumps to the
   degraded merge), a legal control-flow edge the runtime's
   undeclared-edge guard must admit;
-- tools authorization (plan-⑧ §4 deny-by-default): the pattern grants the
+- tools authorization (deny-by-default three-layer authorization): the pattern grants the
   ``mcp-websearch`` toolset, the tool-carrying nodes narrow via
   ``use_tools`` (only the websearch server's ``web_search_prime``
   retrieval tool is listed; MCP tools register asynchronously after
@@ -36,7 +36,7 @@ dispatch):
   nexus/model/validation.py);
 - inter-station state (question / plan / merged findings / draft) travels
   via ``cxt.graph_state["topic_research_state"]``; the N search instances
-  see none of it (plan-⑨ branch isolation) — their results settle into
+  see none of it (branch isolation) — their results settle into
   the engine's ``__fanout_results__`` board, which tr_merge (the join)
   folds; the final trace goes to ``cxt.metadata["topic_research"]``;
 - the executors live in apps/topic_research_agent/executor.py (plugin
@@ -89,8 +89,8 @@ tr_search = BaseNode(
         "(私有工作区,每实例独立轮次守卫);结果经引擎结果板交给合并站"
     ),
     task_description="检索单个研究主题收集研究资料",
-    # exactly one successor = the join node (plan-⑨ §9 merge intersection
-    # over the fan-out targets resolves tr_merge uniquely)
+    # exactly one successor = the join node (the merge intersection over
+    # the fan-out targets resolves tr_merge uniquely)
     sub_nodes=["tr_merge"],
     plugins={"loop": "tr_search"},
     use_tools=["web_search_prime"],
@@ -144,7 +144,7 @@ topic_research_pattern = Pattern(
         "Topic research 图配方:PREPLAN/PLAN/SEARCH/MERGE/REPORT/POLISH "
         "各为一个 AGENT 节点;PLAN 按主题扇出 N 个 SEARCH 实例并行检索,"
         "MERGE 结构化合并,REPORT 生成草稿,POLISH 流式美化交付"
-        "(plan-⑨ 运行时扇出的长流水线配方)"
+        "(引擎运行时扇出的长流水线配方)"
     ),
     pattern_type="agent",
     entry_node_code="tr_preplan",

@@ -1,7 +1,7 @@
 # deep_research_agent — 深度研究助手
 
 结构化深度研究 pattern：规划子问题 → MCP 工具迭代检索 → 反思补搜 →
-综合带引用的研究报告。plan-⑧ 后为**四节点静态 AGENT 图**（相位即节点，
+综合带引用的研究报告。形态为**四节点静态 AGENT 图**（相位即节点，
 `TurnResult.next` 同轮接力），是「自定义节点执行器 + 声明式邻接组装
 agent 工作流」的示范应用。
 
@@ -15,7 +15,7 @@ agent 工作流」的示范应用。
 | `__init__.py` | 包标记 |
 
 > 历史注：单模块版（route.py / executor.py，四相位挤一个 execute）与
-> `deep_research_multi` 双配方注册已随 plan-⑧ 删除——图版即其声明式形态。
+> `deep_research_multi` 双配方注册已删除——图版即其声明式形态。
 
 ## 架构
 
@@ -34,7 +34,7 @@ deep_research (Pattern, entry: dr_preplan,
 ```
 
 - **静态邻接 = sub_nodes**：每条消息从 entry 跑全图，节点执行器返回
-  `TurnResult(content="", next=下一站)` 接力（plan-⑧ 条件边语义）；
+  `TurnResult(content="", next=下一站)` 接力（条件边语义）；
   `dr_plan → dr_synthesize` 是孤儿逃生边（挂起游标落在 dr_plan 且无在途
   状态时跳过规划直奔降级综合）；
 - **状态板 = `cxt.graph_state["deep_research_state"]`**：相位间共享的
@@ -67,7 +67,7 @@ DR_SYNTHESIZE 精简 messages 流式生成报告 —— 唯一转发 text delta 
 （超限中段截断最旧 tool 行）。孤儿防御：任一相位入口发现在途状态缺失 →
 标记 orphan_* 直奔综合，产出「证据不足」降级报告，流水线不卡死。
 
-### 工具授权（plan-⑧ §4 三层收口）
+### 工具授权（deny-by-default 三层收口）
 
 `pattern.allow_toolset=["mcp-websearch", "mcp-zai"]`（server 级工具集授权）；
 `dr_preplan / dr_search` 节点 `use_tools=["web_search_prime"]`（仓库内
@@ -97,7 +97,9 @@ executor 解析工具前 `await ensure_mcp_ready()` 等待 MCP 连接终态（�
 需在 `host/config/local_config.yaml` 配置 `mcp_servers:`（检索类 server）：
 
 ```bash
-python -m host.cli ask --pattern deep_research --query "2026年固态电池的产业化进展"
+uvicorn host.main:app --port 8000
+# 打开 studio「模版测试」页（/studio），选 deep_research，输入
+# 「2026年固态电池的产业化进展」发起研究（SSE 流式：扇出/工具 trace 可见）
 ```
 
 离线验收测试（`tests/test_deep_research_multi.py`：相位锚文本匹配、降级

@@ -14,7 +14,7 @@ Three things verified:
    name compatibility is already handled in atoms/mcp/manager.py)
 2. Offline registration: snapshot tools are registered into ToolRegistry via
    the same path as manager._register_server_tools (toolset=mcp-<server>);
-   the plan-⑧ toolset authorization (pattern.allow_toolset + node.use_tools)
+   the toolset authorization (pattern.allow_toolset + node.use_tools)
    verifies deep_research resolves the full set — precisely the regression
    anchor for the "web_search_prime not in this round's available set"
    interception
@@ -109,7 +109,7 @@ def test_snapshot_shape_and_openai_schema_convertible():
 # ============================================================================
 
 def test_offline_mcp_tools_visible_to_deep_research(offline_register):
-    """plan-⑧ toolset 授权：allow_toolset 列出 mcp-<server> + 节点 use_tools
+    """toolset 授权：allow_toolset 列出 mcp-<server> + 节点 use_tools
     列名 → 工具可用（正是「不在本轮可用集合」拦截的反面回归锚点）。"""
     from nexus.engine.loop import _resolve_tools
     from nexus.model.node import BaseNode

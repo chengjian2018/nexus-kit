@@ -1,6 +1,6 @@
 """Pipeline stages — the ordered slot skeleton + two-layer lazy resolution
-(node > pattern) at execution time. FSM patterns only (plan-⑧: AGENT nodes
-run via their loop executors, no stages pipeline).
+(node > pattern) at execution time. FSM patterns only — AGENT nodes
+run via their loop executors and have no stages pipeline.
 
 Declarative shape:
 

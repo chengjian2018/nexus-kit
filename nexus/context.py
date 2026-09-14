@@ -186,13 +186,13 @@ class DialogueContext:
     node_map: Dict[str, Any] = field(default_factory=dict)
     llm_config: Optional[Dict[str, Any]] = None
 
-    # AGENT graph state board (plan-⑧): turn-scoped workflow data + the
+    # AGENT graph state board: turn-scoped workflow data + the
     # suspension cursor. Reserved keys (engine-managed):
     #   "__paused_node__"     : code of the node whose executor returned
     #                           wait_human — the next user message resumes there
     #   "__step__"            : step counter surviving a suspension (max_steps
     #                           budget accounting across turns)
-    #   "__fanout_results__"  : plan-⑨ fan-out results board — rebuilt
+    #   "__fanout_results__"  : fan-out results board — rebuilt
     #                           (overwritten) on every fanout_start; the join
     #                           node reads entries {branch_id, node_code, ok,
     #                           content, extra, error?} in completion order

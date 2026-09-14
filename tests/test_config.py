@@ -128,7 +128,7 @@ def test_nested_nodes_rejected_with_warning(tmp_path, caplog):
 # ============================================================================
 
 def test_layered_merge_priority(tmp_path):
-    """node > pattern > global，逐层浅合并（plan-⑧：模块层随模块层删除）。"""
+    """node > pattern > global，逐层浅合并（模块子层已随模块层删除）。"""
     path = _write(tmp_path, _NEW_STRUCT + """\
   xianyu_agent2:
     model: qwen3.8-max

@@ -1,7 +1,7 @@
 """
 Xianyu seller customer service AGENT graph — replicates tmp_xianyu.XianyuReplyBot's
-agent dialogue management (plan-⑧: the ROUTE pattern migrated to a two-layer
-AGENT graph).
+agent dialogue management (the old ROUTE pattern, re-expressed as a
+two-layer AGENT graph).
 
 Replication source: the pre-migration dialogue/tmp_xianyu.py (XianyuReplyBot /
 IntentRouter / the three domain Agents); prompt templates come from the XIANYU_*

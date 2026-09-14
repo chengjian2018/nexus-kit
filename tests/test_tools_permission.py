@@ -1,4 +1,4 @@
-"""Toolset authorization tests (plan-⑧ §4 deny-by-default 三层收口).
+"""Toolset authorization tests (deny-by-default 三层收口).
 
 - _resolve_tools: node.use_tools 空 = 无工具；pattern.allow_toolset 空 =
   无工具集；生效集 = use_tools ∩ allowed-toolsets 的工具

@@ -2,7 +2,7 @@
 
 > 状态：**设计稿（未实现，本文档不含任何实现承诺）**｜日期：2026-09-10
 > 读者：运营（需求方）/ 研发（依赖方）/ 实现者
-> 关联：[ARCHITECTURE.md](../../ARCHITECTURE.md) · [introspect-skill.md](introspect-skill.md)（面向 agent 的第 2 方受众） · `docs/refactor-notes/plan-{1..7}.md`
+> 关联：[ARCHITECTURE.md](../../ARCHITECTURE.md) · [introspect-skill.md](introspect-skill.md)（面向 agent 的第 2 方受众）
 
 ---
 
@@ -33,7 +33,7 @@
 | 知识库内容 | 仅 `cli knowledge-seed` 演示种子，无增删改查界面 | `host/cli.py:1076-1091` |
 | 转人工时间 | `_BUSINESS_HOURS` 常量 | `apps/customer_agent/route.py:42` |
 
-而框架侧的声明式模型（plan-②/③）已把 pattern 的结构面完全数据化（node/module/pattern 全字段 str/bool/list/dict，yml round-trip，收集式校验）——**配置台要做的就是把这条已有的数据通路接到 UI 上，而不是发明新的配置体系**。
+而框架侧的声明式模型已把 pattern 的结构面完全数据化（node/pattern 全字段 str/bool/list/dict，yml round-trip，收集式校验）——**配置台要做的就是把这条已有的数据通路接到 UI 上，而不是发明新的配置体系**。
 
 ### 1.3 目标
 

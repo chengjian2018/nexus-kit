@@ -55,7 +55,8 @@ _CONNECTION_FIELDS = {
     "api_base", "api_key", "api_key_env", "timeout", "max_retries",
 }
 
-_PATTERN_LLM_SUBKEYS = {"nodes"}  # plan-⑧: the modules sub-key is gone
+_PATTERN_LLM_SUBKEYS = {"nodes"}  # only "nodes" — the legacy "modules"
+                                  # sub-key died with the module layer
 
 
 # ============================================================================
@@ -311,7 +312,7 @@ def _validate_llm_config(llm_config: Dict[str, Any]) -> None:
 
 
 def _convert_legacy_llm(llm_cfg: Dict[str, Any]):
-    """Legacy top-level llm: node → (llm_providers, llm_default) (spec §6)."""
+    """Legacy top-level llm: node → (llm_providers, llm_default)."""
     conn = {
         k: llm_cfg[k] for k in _CONNECTION_FIELDS
         if llm_cfg.get(k) not in (None, "")
@@ -356,7 +357,7 @@ def _validate_pattern_llm(pattern_llm: Dict[str, Any]) -> None:
 
 def _validate_llm_providers(providers: Dict[str, Any]) -> None:
     """Fields in each llm_providers section outside the connection vocabulary →
-    stripped after a warning (spec §3.4)."""
+    stripped after a warning (unknown keys are never authoritative)."""
     for code, conn in providers.items():
         if not isinstance(conn, dict):
             raise ValueError(f"llm_providers.{code} 应为字典")
@@ -651,8 +652,8 @@ def _merge_connection(orch: Dict[str, Any], providers: Dict[str, Any]) -> Dict[s
 
 def _resolve_layered(cfg: Dict[str, Any], pattern_code: str,
                      node_code: str) -> Dict[str, Any]:
-    """llm_default ⊕ pattern ⊕ node shallow-merged layer by layer (spec §3.2;
-    plan-⑧: the module sub-layer is gone with the module layer).
+    """llm_default ⊕ pattern ⊕ node shallow-merged layer by layer (node wins;
+    the module sub-layer is gone with the module layer).
 
     Unconfigured/unknown codes silently fall back to the shallower layer with a warning.
     """
@@ -680,7 +681,7 @@ def _resolve_layered(cfg: Dict[str, Any], pattern_code: str,
 def get_llm_config(pattern_code: str = "", node_code: str = "",
                    override: Optional[Dict[str, Any]] = None,
                    config_path: str = "") -> Dict[str, Any]:
-    """Resolve the LLM config for the current position (spec §3.3 / §4.1).
+    """Resolve the LLM config for the current position (layered merge).
 
     override not None (the plugins["llm"] declaration resolves as
     ``{"code": ...}`` here; the CLI's explicit pick wins): skip the layered

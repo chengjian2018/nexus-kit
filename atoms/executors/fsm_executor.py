@@ -1,4 +1,4 @@
-"""Default FSM-pattern executor (plan-⑧ two-layer form).
+"""Default FSM-pattern executor.
 
 Thin orchestration: node resolution → R3 LLM refresh → stages (two-layer
 node > pattern skeleton) → next_node transition. The kernel toolbox
@@ -38,8 +38,8 @@ class DefaultFSMExecutor(NodeExecutor):
         _resolve_entry_node(cxt, pattern)
         node = cxt.get_current_node()
 
-        # R3: after node resolution, refresh the LLM config by node
-        # (spec §4) — resolved through the chat namespace so the R3 patch
+        # R3: after node resolution, refresh the LLM config by node —
+        # resolved through the chat namespace so the R3 patch
         # anchor keeps working
         _refresh_llm_config_by_node(ec)
 

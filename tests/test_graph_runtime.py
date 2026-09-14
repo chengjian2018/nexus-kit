@@ -1,4 +1,4 @@
-"""AGENT graph runtime tests (plan-⑧): routing via TurnResult.next /
+"""AGENT graph runtime tests: routing via TurnResult.next /
 max_steps budget / wait_human suspend & resume / undeclared-edge
 termination / pattern_type dispatch (fsm vs agent).
 

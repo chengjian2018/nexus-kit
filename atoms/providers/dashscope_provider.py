@@ -184,7 +184,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         )
 
     # ------------------------------------------------------------------
-    # Streaming (native, plan-⑤: yields structured LLMChunks)
+    # Streaming (native: yields structured LLMChunks)
     # ------------------------------------------------------------------
 
     async def _achat_completion_stream_impl(

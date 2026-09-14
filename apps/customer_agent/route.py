@@ -1,5 +1,5 @@
 """customer_agent pattern -- full migration of the Customer-Agent (sibling
-project) shop customer service, in the plan-⑧ two-layer AGENT-graph form.
+project) shop customer service, in the two-layer AGENT-graph form.
 
 Graph (pattern_type="agent"; the whole graph runs from entry per user
 message):
@@ -11,13 +11,13 @@ message):
   the handoff decision rides a ``[HANDOFF]`` end-of-reply marker — the
   prompt instructs the model to append it when a human is needed, the
   executor detects it, strips it, sets ``cxt.metadata["handoff"]`` and
-  routes the same turn to ``human_handoff`` (the plan-⑧ replacement of the
-  old defer_to_module / DeferredModuleSwitch channel);
+  routes the same turn to ``human_handoff`` — the conditional edge replaces
+  the old defer_to_module / DeferredModuleSwitch channel;
 - ``human_handoff``: tool-less default loop (wrapped by
   ``human_handoff_reply``) generating the reassurance reply, clearing the
   handoff flag on wrap-up — the flag is a single-turn routing signal, the
   next turn re-enters at customer_service;
-- tools authorization (plan-⑧ §4 deny-by-default): the four knowledge
+- tools authorization (deny-by-default three-layer authorization): the four knowledge
   tools carry toolset="knowledge"; ``pattern.allow_toolset=["knowledge"]``
   is the only grant face, ``customer_service.use_tools`` narrows to the
   four names, ``human_handoff`` declares none.
@@ -285,7 +285,7 @@ customer_agent_pattern = Pattern(
     entry_node_code="customer_service",
     nodes=[customer_service, human_handoff],
     # the only authorization face for the knowledge toolset (the tools
-    # themselves no longer carry any registration-time ACL, plan-⑧ §4)
+    # themselves no longer carry any registration-time ACL)
     allow_toolset=["knowledge"],
 )
 
@@ -321,8 +321,8 @@ class CustomerServiceLoopExecutor(NodeExecutor):
         cxt = ec.cxt
         # Defensive short-circuit: a leftover flag (e.g. an aborted prior
         # turn between set and clear) routes straight to the handoff node —
-        # the conditional edge reads the cxt state, per the plan-⑧
-        # defer-semantics replacement
+        # the conditional edge reads the cxt state (this is the
+        # defer-semantics replacement)
         if cxt.metadata.get(_HANDOFF_FLAG):
             return TurnResult(content="", next="human_handoff")
 

@@ -18,25 +18,21 @@ Stage output split-writes:
 - ctx.nlg_result = {"content": reply}          — downstream reply extraction unchanged
 - ctx.metadata["unified"] = observability info (invalid_next_node / parse_failed etc.)
 
-Wiring (plan-② declarative form — string codes in module/node ``stages``,
+Wiring (declarative form — string codes in pattern/node ``stages``,
 resolved from the plugin registry at execution time):
-    FSMModule(stages={"nlu": "fsm_unified", "nlg": "nlg_pass_through"})
-    RouteModule(stages={"nlu": "route_unified", "nlg": "nlg_pass_through"})
-(node-level stages take priority over module-level, see pipeline.py; the unified
-stage writes both nlu_result and nlg_result — nlu/nlg may also share the unified
-code directly, the runner dedups to a single execution)
+    Pattern(stages={"nlu": "fsm_unified", "nlg": "nlg_pass_through"})
+(node.stages takes priority over the pattern-level skeleton value, see
+pipeline.py; the unified stage writes both nlu_result and nlg_result — nlu/nlg
+may also share the unified code directly, the runner dedups to a single
+execution)
 
-Combined with dual-track clarify (FSM modules declaring the clarify slot):
+Combined with dual-track clarify (a node declaring the clarify slot):
     The pipeline assembles as [unified stage, ClarifyStage, PassThroughNLG].
     The unified stage outputs next_node="clarify" per the off-topic special case in
     the template (admitted by the valid set); ClarifyStage overwrites nlg_result to
     generate the clarify reply; PassThroughNLG lets it through;
     a clarify turn costs 2 LLM calls (unified + clarify generation), on par with the
     two-stage + clarify setup; normal turns stay at 1.
-
-Under ROUTE modules the unified stage's reply already follows the chosen menu node's
-answer style; the subsequent route_advance / jump_module dispatch in the pipeline is
-unaffected.
 """
 
 from __future__ import annotations
@@ -155,7 +151,7 @@ class _UnifiedBaseNLU(BaseNLU):
         """Legal values for next_node: candidate node codes + empty string (stay on current node).
 
         When the node declares the clarify slot (a non-None ``clarify`` in
-        node.stages — the plan-② replacement of enable_clarify), "clarify" is
+        node.stages), "clarify" is
         additionally admitted: once triggered, ClarifyStage overwrites nlg_result to
         generate the clarify reply, and the node transition guard skips via
         metadata["clarify"], so it never actually jumps to a nonexistent node.
@@ -337,9 +333,10 @@ class FSMUnifiedNLU(_UnifiedBaseNLU):
 class PassThroughNLG(PipelineStage):
     """Placeholder NLG stage: preserves the nlg_result already written by the unified stage, skipping a second generation.
 
-    Usage (plan-② declarative form): ``module.stages = {"nlu": "fsm_unified"/"route_unified",
-    "nlg": PassThroughNLG()}`` (or the unified stage directly as the generate
-    single-stage form, where the nlg component guard auto no-ops), replacing the
+    Usage (declarative form): ``stages = {"nlu": "fsm_unified", "nlg": "pass_through"}``
+    on the pattern (the string code resolves from the plugin registry; PassThroughNLG
+    registers as ``nlg_pass_through``), or the unified stage directly as the
+    single-stage form (the nlg component guard auto no-ops), replacing the
     default NLG's second LLM call.
 
     When earlier stages such as clarify turns overwrite nlg_result, it is likewise

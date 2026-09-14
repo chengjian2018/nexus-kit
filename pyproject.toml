@@ -15,10 +15,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cli = [
-    "fire>=0.7",
-    "prompt-toolkit>=3.0",
-]
 dev = [
     "pytest>=8.0",
     "import-linter>=2.0",

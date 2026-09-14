@@ -7,7 +7,8 @@ find_files（toolset: filesystem）.
 护栏、无 shell 注入面），任意命令才走 bash。改局部内容优先 edit_file
 （精确替换、不误伤未提及部分），整文件生成/重写才用 write_text。
 
-授权（deny-by-default，plan-⑧ §4 三层收口）::
+授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
+node.use_tools）::
 
     pattern:
       allow_toolset: [filesystem, knowledge]

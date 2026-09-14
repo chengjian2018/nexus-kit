@@ -6,8 +6,9 @@ never imports atom implementations — this warm-up (at host bootstrap and
 tests/conftest.py) is what makes the chat layer's plugin dispatch runnable,
 mirroring atoms.stages' registration of default stage factories.
 
-plan-⑧: default_route is gone (the ROUTE module type is gone; routing apps
-declare an AGENT graph with routing node executors).
+There is deliberately no default_route executor (the ROUTE module type is
+gone; routing apps declare an AGENT graph whose routing nodes are plain
+loop executors).
 """
 
 from atoms.executors.loop_executor import DefaultLoopExecutor

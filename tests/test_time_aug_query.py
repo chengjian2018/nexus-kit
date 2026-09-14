@@ -7,8 +7,8 @@ Contract:
   fallback as the LLM version)
 - time_base comes from ctx.metadata["time_base"] (current time when not injected)
 - slot-mechanism compatible: passes is_valid_stage and is reachable through
-  the query slot's two-layer resolution (declared by string code since
-  plan-②; two-layer since plan-⑧)
+  the query slot's two-layer resolution (declared by string code,
+  resolved node > pattern)
 """
 
 import time as _time

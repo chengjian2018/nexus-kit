@@ -1,6 +1,6 @@
 """TurnLifecycle / ChatResult offline unit tests (no LLM dependency).
 
-plan-⑧ form: the module layer is gone (no current_module_code / module_map /
+Current form: the module layer is gone (no current_module_code / module_map /
 ModuleJumpEvent); graph_state (the AGENT graph state board) is PERSISTENT —
 begin_turn never touches it, the graph runtime itself clears/re-initializes
 it on termination / fresh runs.

@@ -40,7 +40,7 @@ def test_tools_registered():
 
 
 def test_toolset_authorization_grant_and_deny():
-    """plan-⑧ §4：授权 = pattern.allow_toolset ∩ node.use_tools（双双
+    """授权 = pattern.allow_toolset ∩ node.use_tools（双双
     deny-by-default）。"""
     from nexus.engine.loop import _resolve_tools
     from nexus.model.node import BaseNode

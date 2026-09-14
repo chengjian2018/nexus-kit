@@ -1,6 +1,6 @@
 """End-to-end integration test for the off-topic turn — FakeProvider + in-memory knowledge base.
 
-plan-⑧ form: the pattern is a single FSM Pattern; node codes/names follow the
+Current form: the pattern is a single FSM Pattern; node codes/names follow the
 fake_provider script conventions (unified stage: u_ask_brand / u_ask_budget /
 u_confirm). The clarify declaration lives on the node (u_ask_budget) with the
 pattern skeleton carrying the clarify slot.
@@ -71,7 +71,7 @@ def pattern():
                 sub_nodes=["u_ask_budget"],
             ),
             # the clarify declaration lives on the node where the off-topic
-            # turn can happen (the plan-⑧ replacement of module.stages)
+            # turn can happen (the node-level clarify declaration)
             BaseNode(
                 code="u_ask_budget",
                 name="询问预算",

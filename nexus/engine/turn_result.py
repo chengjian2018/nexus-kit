@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Union
 
 @dataclass
 class Send:
-    """One worker-instance dispatch of a runtime fan-out (plan-⑨, borrowed
+    """One worker-instance dispatch of a runtime fan-out (borrowed
     from langgraph's Send API).
 
     A node executor returns ``TurnResult.sends=[Send(...), ...]`` to spawn N
@@ -51,7 +51,7 @@ class TurnResult:
                    consumed serially) — runtime fan-out is declared via
                    ``sends`` instead. None = no explicit route (terminal if
                    the node has no successors / is_end).
-    - sends      : the fan-out output (plan-⑨) — N worker instances of
+    - sends      : the fan-out output — N worker instances of
                    declared nodes (heterogeneous targets allowed),
                    mutually exclusive with ``next`` (both set = contract
                    error). The engine runs the instances concurrently

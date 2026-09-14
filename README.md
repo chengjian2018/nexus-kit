@@ -1,134 +1,137 @@
 # nexus-kit
 
-积木式对话 / Agent 编排框架。
-按"目标形态"重组为四层，用一条可执行的分层契约（`tests/test_architecture.py`）钉死边界：
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![MCP](https://img.shields.io/badge/tools-MCP%20ready-5F5FFF)](#它能做什么)
+[![uv](https://img.shields.io/badge/uv-ready-DE5FE9)](https://docs.astral.sh/uv/)
+
+**nexus-kit** 是一个开源的大模型应用框架。它的信条是——**万物皆可流**：任何业务流程，不管是一个智能客服、一个研究报告生成器，还是一个预约下单系统，都能用这套框架拟合出来。拟合完之后，它就只剩两样东西：
+
+- **一份数据**：这个应用有哪几步、每步说什么话、下一步跳到哪，全写在一份配置文件里。想改流程？改文件就行，不用动代码。
+- **一堆插件**：模型怎么调、有哪些工具可用、知识库怎么查……每种能力都是一块积木，要用就插上，不用就拔掉。
+
+同一套框架，对三类人都友好：
+
+- 🤖 **Agent**（Claude Code 这类 AI 编程助手）：项目自带一份"说明书"技能，AI 看完就能摸清项目家底，还能直接动手生成新应用；
+- 🧑‍💼 **不懂代码的人**：打开浏览器，填表单、改配置、发消息测试，全程不用写一行代码；
+- 👨‍💻 **程序员**：用 Python 写新的积木和应用，放进去自动生效，还有测试帮你守住代码边界。
+
+## 它能做什么？
+
+**6 个装好就能玩的应用**
+
+- **闲鱼卖家客服**（`xianyu_agent`）：替闲鱼卖家自动回买家消息——每条消息先判断来意（议价、问技术还是闲聊），再按卖家的规矩回话；议价能设轮数上限，回复自带违禁词过滤
+- **店铺客服**（`customer_agent`）：电商店铺的售前售后客服，回答前先查商品和售后资料、不瞎编，还能推商品卡片；聊到超出范围的事，自动转人工
+- **深度研究**（`deep_research_agent`）：给一个题目，先把大问题拆成几个小问题，多路同时去搜，查完还会反思要不要补搜，最后汇总成一份带引用来源的研究报告
+- **主题研究**（`topic_research_agent`）：深度研究的加长版——拆主题、多路同时查、合并资料、写报告草稿、最后再润色一遍，一条流水线走完
+- **安装预约**（`install_booking_agent`）：客服主动打电话给刚买了家具/电器的客户，约师傅上门安装——核对地址、确认到货、协商时间、确认改约一步不落；时间有严格把关，绝不会约出排班上不存在的档期
+- **维修预约**（`repair_booking_agent`）：同款玩法的报修版——商品坏了主动联系客户约师傅上门维修；约完时间还会追问故障情况，好让师傅带对配件工具
+
+**搭自己的应用**
+
+- 两种玩法都支持：一种是"放手型"，AI 自己决定下一步干什么、调什么工具；另一种是"流程型"，按你定的步骤一步步走，该问什么就问什么
+- 流程可以中途停下来等人（比如等人确认），人回复后接着往下走，服务重启了也不会丢
+- 一个活儿能拆成几份同时干，干完自动合并——比如同时查 5 个子问题，总耗时只等最慢的那个
+- 回复像打字机一样逐字输出；走到哪个节点、调了哪个工具，全程有记录可查
+
+**工具和知识**
+
+- 能接外部工具：支持 MCP 标准（业界通用的工具接口），配置几行就能接一个工具服务
+- 自带一批趁手工具：执行命令、读写文件、任务清单、定时任务、派"子助手"分身干活、按固定套路跑流程
+- 自带知识库：资料导进去，回答时先查资料再说话；查资料的策略也写在配置里，改完就生效
+- 默认安全：工具不声明就不能用；危险操作（比如跑命令）执行前会先播报一声
+
+**可视化界面**
+
+- `/studio` 编排工作台：挑个应用发消息试试；或者用一句话描述需求，让 AI 帮你把新应用生成出来；也可以用表单或配置文件手动编排
+- `/console` 运营台：查看每个应用长什么样、管理知识库、调整检索配置
+- 改配置、改流程基本不用重启，下一轮对话就生效
+
+**接模型**
+
+- 开箱支持阿里云百炼和 z.ai（GLM）；其他兼容 OpenAI 接口的服务，改个地址就能用
+- 可以整体指定用哪个模型，也可以只给某个应用、甚至某个步骤单独换
+
+## 系统架构
 
 ```
-host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
- └─> apps (2)  组合层：业务 pattern（apps/ 下 5 个：xianyu_agent / customer_agent /
-      │        deep_research_agent / install_booking_agent / repair_booking_agent）+ 各自 prompt 资产
-      └─> atoms (1)  原子积木：executors / stages / tools / providers / knowledge / augmentation
-           └─> nexus (0)  内核：context / model / pipeline / engine / registry / llm / settings
+host   (3)  组装根 ─ FastAPI 入口 / 配置装载 / 会话治理 / 热重载 / UI 宿主
+ └─> apps  (2)  组合层 ─ 业务 pattern（6 个开箱应用）+ prompt 资产 + 渠道适配
+      └─> atoms (1)  原子层 ─ executors / stages / tools / hooks / providers / knowledge / mcp
+           └─> nexus (0)  内核 ─ context / model / pipeline / engine / registry / llm / settings
 ```
 
-架构详情（插件中心 / 声明式模型 / AGENT 图运行时 / 流式协议）见
-**[ARCHITECTURE.md](ARCHITECTURE.md)**；各重构计划的改动清单与避坑记录见
-`docs/refactor-notes/plan-{1..8}.md`。
-
-## 核心机制一览
-
-| 机制 | 入口 | 说明 |
+| 层 | 职责 | 核心特点 |
 |---|---|---|
-| **插件中心** | `nexus/registry/plugins.py` | 引擎扩展点统一注册：executor（default_loop/default_fsm + app 自定义执行器）、stage、messages_builder、agent_hooks。字符串 (kind, code)，同名冲突 fail-fast，AST 自动发现（`atoms/executors/` 等） |
-| **二层声明式模型** | `nexus/model/` | Pattern → Node 两层（module 层已删），全字段 str/bool/list/dict。`pattern_type`（fsm/agent）是引擎分流键；stages 六槽骨架（FSM 专属，两层解析 node>骨架值）；`plugins` 槽位表（loop/fsm/messages_builder/agent_hooks/llm）；yml round-trip + 构造期编译校验 + 注册期收集式校验 |
-| **AGENT 图运行时** | `nexus/engine/chat.py` | 每条消息从 entry 跑全图（或从挂起节点恢复）：条件边 = `TurnResult.next` 路由输出；`max_steps` 预算防环；`wait_human` 挂起/恢复（graph_state 落盘，借鉴 langgraph interrupt/checkpointer）；FSM 则每轮推进一个节点（next_node） |
-| **默认流式** | `nexus/llm/` + `nexus/engine/streaming.py` | provider 层 LLMChunk 结构化流（非流式=聚合流式，双向桥兼容旧 provider）；引擎层 `chat_turn_stream` generator（delta/round/trace/done 事件，乐观转发，done 权威）；SSE 流式端点 `POST /api/v1/chat/stream`（常驻，studio 模版测试的对话通道） |
-| **工具三层收口** | toolset → `allow_toolset` → `use_tools` | deny-by-default：工具注册带 toolset（knowledge / mcp-\<server\>）；pattern 授权工具集（空=无）；节点列具体工具（空=无）；注册期悬空/越集 fail-fast |
-| **hooks（保留待实现）** | `nexus/engine/agent_hooks.py` | 6 点位机制完整，默认 no-op 直通（受测契约）；恢复实现只需注册 kind="agent_hooks" 插件包 |
+| **host** | 组装根 | ① FastAPI 服务 + SSE 流式端点（`/api/v1/chat/stream`）+ `/console` `/studio` 双 UI 挂载；② 配置装载、会话治理、四类热重载（配置 mtime 指纹缓存 / pattern·插件按依赖序重放重绑） |
+| **apps** | 组合层 | ① 声明式业务配方：Pattern → Node 二层模型、YAML round-trip、注册期收集式校验；② 6 个开箱 pattern（客服 / 深度研究 / 主题研究 / 预约），自带 prompt 资产与渠道适配 |
+| **atoms** | 原子积木 | ① 引擎扩展点统一经插件中心注册（executor / stage / messages_builder / agent_hooks），AST 自动发现；② 内置工具六件套 + MCP 网关（stdio / sse / streamable_http）+ SQLite 知识库，toolset 即授权单元 |
+| **nexus** | 内核 | ① AGENT 图运行时（条件边路由 / `wait_human` 挂起恢复 / `sends` 扇出 map-reduce）+ FSM 双引擎，底层默认流式（LLMChunk → ChatStreamEvent → SSE）；② 零业务依赖——nexus 永不 import atoms，默认实现由 atoms 在 import 时反向注册进内核 |
 
-## 布局
+依赖方向严格单向向下（host → apps → atoms → nexus），由 `tests/test_architecture.py` 在每次
+pytest 时强制（import-linter 配置见 `pyproject.toml`，作为本地人工审计工具）。架构详情
+（核心执行流 / 插件中心 / 声明式模型 / 流式协议 / 会话持久化 / 热重载）见
+**[ARCHITECTURE.md](ARCHITECTURE.md)**。
 
-| 包 | 职责 | 来源（旧路径） |
-|---|---|---|
-| `nexus/context.py` | DialogueContext（current_node_code + graph_state）/ SessionMessage / PipelineStage | `dialogue/base.py` |
-| `nexus/model/` | Pattern + BaseNode 二层声明式模型 + plugins 字段 + serialization（yml round-trip）+ validation（构造期编译 + 注册期收集式校验） | `dialogue/{module,node,pattern}.py` |
-| `nexus/pipeline.py` | stages 有序骨架 + 两层延迟解析 + unified 去重（FSM 专属）；兜底 stage 经插件中心注入 | `dialogue/stage_slots.py` |
-| `nexus/engine/` | chat（pattern_type 分流 + 图运行时 + 流式 generator）/ execution（NodeExecutor 契约）/ turn_result / loop（工具箱）/ streaming / hooks / messages / 压缩 / 持久化 | `chat/*` |
-| `nexus/registry/` | discovery（共享 AST 扫描）/ plugins（插件中心）/ patterns / tools / providers / channels | `dialogue|tools|llm|channel /register.py` |
-| `nexus/llm/` | Provider 抽象 + 聚合流式 + LLMChunk 协议 + 解析 | `llm/{provider,resolve}.py` |
-| `nexus/settings.py` | 运行时设置（LLM 分层配置 llm_default ⊕ pattern_llm ⊕ nodes、压缩、DB 路径） | `config/config.py` |
-| `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 | `channel/{base,webhooks.py}` |
-| `atoms/executors/` | 两默认执行器插件（default_loop / default_fsm） | 新增（重构计划①） |
-| `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt（具名 stage codes 注册进插件中心） | `stages/` |
-| `atoms/tools/` | knowledge / mcp 工具（MCP 经 `mcp_servers:` 配置动态注册 toolset `mcp-*`，toolset 即授权单元） | `tools/*_tool.py` |
-| `atoms/providers/` | OpenAICompatible Provider（原生 LLMChunk 流） | `llm/openai_provider.py` |
-| `atoms/knowledge/` | SQLite 知识库 | `database/knowledge_store.py` |
-| `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器/prompt 资产）+ 渠道适配 | `dialogue/*_route.py`、`channel/xianyu.py` |
-| `ui/` | 运营配置台（ops-console，见 `docs/design/ops-console-prd.md`）：`api.py` 挂 `/api/v1/console/*`（P0 只读 pattern 视图 + 知识库 CRUD/试搜 + RAG 检索配置），`static/` 无构建前端挂 `/console` | 新增 |
-| `ui/studio/` | 编排工作台（nexus-studio）：`api.py` 挂 `/api/v1/studio/*`（pattern 发布/fork/删除 + agent 生成 SSE + AI 助手），`store.py` 托管目录装载器（`host/config/{plugins,patterns}/`，启动与 reload 后重放），`static/` 无构建前端挂 `/studio`（自动编排 / 流程编排 / 模版测试三页签） | 新增 |
-| `atoms/stages/rag_config.py` | RAG 声明式配置：yml → 召回管线装配（kb 通路接知识库）+ 重注册生效 + 离线试跑 | 新增 |
-| `host/` | main.py（含 SSE 调试端点）/ cli.py（含 pattern-export/load）/ governor.py / config/ | 根目录 `main.py`、`cli.py` |
+## 快速开始
 
-
-## 安装
-
-要求 Python ≥ 3.11，推荐 [uv](https://docs.astral.sh/uv/)：
+### 1. 克隆项目
 
 ```bash
-git clone <repo> && cd nexus-kit
-uv sync --extra cli --extra dev     # 或 pip install -e ".[cli,dev]"
+git clone https://github.com/chengjian2018/nexus-kit.git
+cd nexus-kit
 ```
 
-可选依赖组：`cli`（fire / prompt-toolkit，CLI 与交互式 REPL 需要）、
-`dev`（pytest / import-linter）。服务端依赖（fastapi/uvicorn 等）在主依赖中。
+### 2. 装环境
 
-## 配置
+Python 3.11 及以上，推荐 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-# 1. 从模板创建本地配置（该文件含密钥，已被 .gitignore 忽略、绝不入库）
+uv sync --extra dev     # 或者 pip install -e ".[dev]"
+```
+
+### 3. 配一个模型 Key
+
+```bash
+# 先复制一份本地配置（这个文件存密钥，已在 .gitignore 里，不会被传上 git）
 cp host/config/local_config.example.yaml host/config/local_config.yaml
 
-# 2. 按需修改 llm_default / llm_providers（模板内有逐节注释）
-
-# 3. 导出 API key（默认 provider 经 DashScope 兼容模式调用，从该环境变量取 key）
+# 三选一：
+# ① 用阿里云百炼（默认）
 export DASHSCOPE_API_KEY=sk-...
+
+# ② 用 z.ai（GLM）——还要把 local_config.yaml 里的 llm_default.code 改成 zai
+export ZAI_API_KEY=...
+
+# ③ 接自己的模型：
+#    兼容 OpenAI 接口的服务 —— 在 llm_providers 里加一节、改个地址就行；
+#    完全自定义 —— 照着 atoms/providers/dashscope_provider.py 写一个，放进去自动生效。
 ```
 
-最小可用配置 = 模板原样 + `DASHSCOPE_API_KEY`。pattern 级模型覆盖
-（`pattern_llm`）、MCP 工具网关（`mcp_servers`）、DB 路径与压缩阈值均见
-模板注释；完整 schema 见 `nexus/settings.py`。
+配置模板原样不动，加上一个 Key 就能跑。接外部工具、知识库、各种上限怎么调，
+配置文件里每一节都有注释；全部配置项见 `nexus/settings.py`。
 
-### 环境变量
-
-| 变量 | 默认 | 用途 |
-|---|---|---|
-| `DASHSCOPE_API_KEY` | — | 默认 provider（dashscope，DashScope 兼容模式）的 API key |
-| `NEXUS_CONFIG` | 自动探测 | local_config.yaml 路径覆盖（默认探测 `host/config/`、`config/`） |
-| `NEXUS_LOG` | `WARNING` | 根日志级别；排障时 `NEXUS_LOG=INFO` 可见轮次 / MCP / 工具分派日志 |
-| `NEXUS_API_KEY` | 未设置 | 核心 API 鉴权；**未设置时服务无认证**（启动时每分钟告警） |
-| `NEXUS_RAG_CONFIG` | `host/config/rag.yaml` | RAG 检索配置（clarify 召回管线声明式装配）路径；文件存在则启动时应用并在控制台保存后热生效 |
-
-## 运行
+### 4. 启动服务
 
 ```bash
-# 测试（离线，fake provider 打桩 LLM；含分层契约与各业务 pattern 验收）
-python -m pytest        # uv 环境：uv run python -m pytest
-
-# 服务（需要 host/config/local_config.yaml）
 uvicorn host.main:app --port 8000
-# 运营配置台（随服务挂载）：浏览器打开 http://localhost:8000/console/
-#   —— pattern 结构图/声明树/YAML（只读）、知识库管理与试搜台；
-#      设置 NEXUS_API_KEY 后在页面右上角填入同一密钥
-# 编排工作台（随服务挂载）：浏览器打开 http://localhost:8000/studio/
-#   —— 顶部三页签，默认停在「模版测试」：
-#      · 模版测试：选 pattern → 填 task_info（按应用预填默认值，手动编辑后
-#        不再覆盖）→ 发起会话多轮对话（SSE 流式：节点/工具/扇出等 trace
-#        事件在气泡内逐行持久打印，文本增量流式输出，工具轮文本折叠，
-#        每轮可展开审计轨迹）
-#      · 自动编排：填流程背景/功能/实现案例 → 本地 Claude Code 执行生成
-#        （claude -p，只读探索白名单 Read/Grep/Glob/LS，cwd = 当前项目路径，
-#        子进程无写权限——产物经围栏文本返回；工具调用/文本增量以
-#        SSE step/delta 事件实时回传）→ 解析出 pattern YAML 与自定义插件
-#        （临时导入验证）→ 预览（结构图/YAML/插件）→ 一键应用：插件与
-#        pattern 自动落盘注册（host/config/{plugins,patterns}/），立即可在
-#        模版测试选用；支持「校验通过自动应用」（需本机安装 claude CLI，
-#        可用 NEXUS_STUDIO_CLAUDE_BIN 覆盖二进制路径）
-#      · 流程编排：pattern 列表（code 只读可 Fork / console 可编辑）+ 节点表单 +
-#        YAML 双向编辑 + 校验/发布 + AI 助手（节点话术/回答范式/自定义执行器生成）
-#      · 系统插件：插件状态（kind/code/来源/归属模块）+ MCP server + 工具集；
-#        插件勾选热重载——studio 托管插件按文件重放，代码插件连其 consumer
-#        按依赖序重放并重绑会话；MCP 工具面一键重载（重读 mcp_servers 配置 →
-#        断开重连 → 重注册 mcp-* 工具，tools 跟随连接生命周期而非文件 mtime）
-#      AI 助手走服务配置 llm_default；自动编排走本机 claude CLI，页面不选模型
-# 流式对话端点（常驻）：POST /api/v1/chat/stream（SSE，delta/round/trace/done 事件）
-
-# CLI 调试（fire 子命令：chat / ask / list / sessions / pattern-export / pattern-load / knowledge-seed）
-python -m host.cli ask --pattern xianyu_agent --query "还在吗"
-python -m host.cli pattern-export xianyu_agent --out xianyu.yml   # yml round-trip
-python -m host.cli pattern-load xianyu.yml                        # 构造+校验+注册
-python -m host.cli knowledge-seed                                 # customer_agent 演示前置：灌知识库
 ```
 
-分层契约：`tests/test_architecture.py` 在每次 pytest 时强制
-`host → apps → atoms → nexus` 单向依赖，并禁止任何旧扁平包名回流。
-本地人工审计可再跑 `lint-imports`（配置在 `pyproject.toml [tool.importlinter]`）。
+想先跑一遍测试也行（不用联网，模型是假的）：
+
+```bash
+python -m pytest        # uv 环境：uv run python -m pytest
+```
+
+### 5. 打开浏览器玩
+
+- **编排工作台** <http://localhost:8000/studio/> —— 默认停在「模版测试」页签：挑个应用、
+  发条消息就能聊，回复逐字输出，每一步的过程都能展开看。「自动编排」页签能用一句话需求
+  生成新应用（需要本机装了 claude 命令行）；「流程编排」页签能用表单和配置文件手动改、校验、发布。
+- **运营配置台** <http://localhost:8000/console/> —— 看应用结构、管知识库、调检索配置。
+  （如果设置了 `NEXUS_API_KEY`，在页面右上角填同一个。）
+
+## Author
+
+[chengjian2018](https://github.com/chengjian2018)

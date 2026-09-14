@@ -1,5 +1,5 @@
 """plugins declaration field — the plugin declaration dict shared by
-Pattern and BaseNode (plan-⑧ node/module merge).
+Pattern and BaseNode.
 
 One ``plugins: Dict[str, str]`` per layer (pattern / node), the same dict
 shape as stages: slot name → plugin code, purely declarative, serializable,

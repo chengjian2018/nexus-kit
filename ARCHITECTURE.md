@@ -1,14 +1,14 @@
 # nexus-kit 架构
 
-> 本文档是架构的**权威描述**，随每个重构计划更新（变更记录见
-> `docs/refactor-notes/plan-N.md`）。README 只保留概览与运行说明。
+> 本文档是架构的**权威描述**，随代码演进更新。README 只保留概览与运行说明。
 
 ## 四层分层
 
 ```
-host  (3)  组装根：FastAPI 入口 / CLI / 配置装载 / 会话治理
- └─> apps (2)  组合层：业务 pattern（xianyu_agent、customer_agent）+ 各自 prompt 资产
-      └─> atoms (1)  原子积木：executors / stages / tools / providers / knowledge / augmentation
+host  (3)  组装根：FastAPI 入口 / 配置装载 / 会话治理
+ └─> apps (2)  组合层：业务 pattern（xianyu_agent / customer_agent / deep_research_agent /
+      │        topic_research_agent / install_booking_agent / repair_booking_agent）+ 各自 prompt 资产
+      └─> atoms (1)  原子积木：executors / stages / tools / hooks / providers / knowledge / augmentation
            └─> nexus (0)  内核：context / model / pipeline / engine / registry / llm / settings
 ```
 
@@ -41,17 +41,17 @@ host POST /api/v1/chat
       5. end_turn → build_chat_result（text + actions 快照）
 ```
 
-## AGENT 图运行时（计划⑧；计划⑨扩展运行时扇出）
+## AGENT 图运行时
 
 自研轻量图运行时（零第三方依赖，借鉴 langgraph 的概念：编译期静态图 /
-条件边 / interrupt-checkpointer / Send 式扇出），取代计划⑥-⑦时代的事件接力机制
+条件边 / interrupt-checkpointer / Send 式扇出），取代早期的事件接力机制
 （ModuleJumpEvent / hop 循环 / DeferredModuleSwitch 全部删除）：
 
 - **图 = 静态邻接**：`node.sub_nodes` 一个字段两种编译期语义——FSM =
   next_node 合法转移集，AGENT = 图邻接边。条件边不在边上挂函数，而在
   **节点执行契约的路由输出**（`TurnResult.next`，单值映射 sub_nodes；
   list 形态为遗留容忍——串行消费首个，扇出改用 `sends` 声明）。
-- **运行时扇出（计划⑨，map-reduce）**：`TurnResult.sends=[Send(node,
+- **运行时扇出（map-reduce）**：`TurnResult.sends=[Send(node,
   input), ...]` 派发 N 个 worker 实例（**异构扇出**：每个 send 指向自己的
   已声明 sub_node，同一节点多实例 = 同构特例，"子 agent"零新概念）——
   `asyncio.gather` 并发执行（同事件循环交错，
@@ -79,8 +79,9 @@ host POST /api/v1/chat
 - **跨轮状态**：挂起游标走 graph_state；业务状态走 cxt 既有字段
   （metadata / filled_slots / history），无图级持久状态。
 
-### In-repo 实例：`deep_research`（四节点图 + 引擎级扇出，计划⑨验收）
+### In-repo 实例
 
+- **`deep_research`（四节点图 + 引擎级扇出）**：
 `apps/deep_research_agent/route_multi.py`——preplan→plan→search→synthesize
 四个节点：plan 站产出子问题后 `sends=[Send(dr_search, …) × N]` 引擎级扇出
 （宽度受 max_fanout 截断），search 站是 worker（一实例一子问题、私有工作区、
@@ -88,8 +89,11 @@ host POST /api/v1/chat
 站是 join（合并预检索资料与全部分支成果，失败分支降级不阻塞）——检索延迟
 从"子问题之和"降为"最慢分支"。相位间状态走 `cxt.graph_state`（图终止自动
 清空）。单模块版 executor 已删除（图版即其声明式形态）。
+- **`topic_research`（六站长流水线变体）**：`apps/topic_research_agent/`——
+同一扇出机制上把 merge / report / polish 拆成显式站点（merge 零 LLM 结构化
+折叠、report 写草稿、polish 流式定稿），演示更长的扇出流水线。
 
-## 插件中心（计划①引入）
+## 插件中心
 
 `nexus/registry/plugins.py::PluginRegistry`——引擎扩展点的统一存放处，
 字符串 kind（新扩展点无需改 API）：
@@ -129,11 +133,11 @@ registry.default_executor_code(pattern_type)  # "agent"→"default_loop"、"fsm"
   `default_loop / default_fsm`。内核无兜底 executor——注册表未预热时
   fail-fast，报错指引 import atoms.executors。
 - AST 自动发现：`discover_builtin_plugins()` 扫 `atoms/executors/*.py` 的
-  模块级 `registry.register(...)`（host/main.py 与 host/cli.py 装配时调用；
+  模块级 `registry.register(...)`（host/main.py 装配时调用；
   tests/conftest.py 预热）。app 自有执行器（xianyu 路由器、dr_* 相位）同法
   注册。
 
-## 声明式模型（计划⑧：node + pattern 二层）
+## 声明式模型（Pattern → Node 二层）
 
 Pattern → Node 两层（module 层已删）。所有字段均为常见值类型
 （str/bool/list/dict），**无对象引用**——yml 序列化与配置化直达。
@@ -253,18 +257,19 @@ patterns / tools / providers / channels 四个领域注册中心**保持独立**
 | `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 |
 | `atoms/executors/` | 两默认 executor（default_loop / default_fsm） |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt |
-| `atoms/tools/` | knowledge / mcp 工具（toolset 标签授权单元） |
+| `atoms/tools/` | knowledge / mcp 工具 + 内置工具原子六件套（shell / file / tasks / cron / subagent / workflow，toolset 标签授权单元） |
+| `atoms/hooks/` | agent_hooks 插件包：tool_guard（工具执行前危险操作播报） |
 | `atoms/providers/` | OpenAICompatible Provider（dashscope / zai） |
 | `atoms/knowledge/` | SQLite 知识库 |
 | `atoms/mcp/` | MCP 连接管理器（工具动态注册 toolset `mcp-<server>`） |
 | `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器）+ prompt 资产 + 渠道适配 |
-| `host/` | main.py / cli.py / governor.py / config/ |
+| `host/` | main.py / governor.py / config/ |
 
 ## Agent hooks（机制在用：in-repo 包 tool_guard）
 
-6 个点位（P1 on_agent_start / P2 on_llm_call / P3 on_llm_response /
-P4 on_tool_call / P5 on_tool_result / P6 on_agent_end；on_transfer 随
-defer 机制删除）在默认 loop executor 中照常调用；事件类字段携带
+6 个点位在用（P1 on_agent_start / P2 on_llm_call / P3 on_llm_response /
+P4 on_tool_call / P5 on_tool_result / P7 on_agent_end；P6 位随 defer/transfer
+机制删除而空缺）在默认 loop executor 中照常调用；事件类字段携带
 `node_code`；声明解析读 `plugins["agent_hooks"]`（node 层压 pattern 层）。
 无声明时所有点位零开销直通（`tests/test_agent_hooks_contract.py`）。
 错误语义：hook 异常一律吞掉记日志保原值，对话永不阻塞。
@@ -273,7 +278,7 @@ defer 机制删除）在默认 loop executor 中照常调用；事件类字段�
 v1 只播报不干预；subagent/workflow 子循环不经 P4，结构免检；
 配置节 `tool_guard`，测试见 `tests/test_tool_guard.py`）。
 
-## 流式协议（计划⑤引入）
+## 流式协议
 
 **底层默认流式，非流式 = 聚合流式。** 全链路：
 
@@ -296,7 +301,7 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|trace|done)──► �
 - **引擎层**（`nexus/engine/streaming.py`）：`ChatStreamEvent(kind:
   delta|round|trace|done)` + `StreamEmitter`（executor 经 `ec.stream`）+
   `aggregate_turn`
-- **trace 事件**（计划⑧新表）：`node_start / node_end`（图节点步进，带
+- **trace 事件**：`node_start / node_end`（图节点步进，带
   step）/ `node_jump`（FSM 轮末跳转）/ `graph_wait / graph_resume`（挂起
   与恢复）/ `graph_done`（终止，reason: terminal/is_end/max_steps/
   undeclared_edge）/ `tool_call + tool_result` / `conversation_end`。
@@ -309,14 +314,14 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|trace|done)──► �
 - **乐观转发 caveat**：done.result.text 是权威回复；聚合消费者零感知
 - **SSE 流式端点**：`POST /api/v1/chat/stream`（常驻；studio 模版测试的对话通道，轮末快照持久化与 `/api/v1/chat` 对齐）
 
-## 会话持久化（计划⑧列变更）
+## 会话持久化
 
 sessions 表：`current_node_code`（FSM 游标 / AGENT 图位置镜像）+
 `graph_state`（JSON 状态板，含挂起游标——进程重启后恢复续跑）。打开旧库
 时一次性迁移（drop `current_module_code`、add `graph_state`）。messages
 表零 schema（工具轨迹走 content/metadata payload）。
 
-## 热重载（2026-09-10）
+## 热重载
 
 不改代码结构的前提下，四类东西的运行时重载机制（`host/reload.py` 是
 代码侧的装配点，`nexus/settings.py` 是数据侧的）：
@@ -343,27 +348,3 @@ R1 刷新（`get_llm_config`）只 **stat** 不读文件；指纹变了才重新
 
 - `POST /api/v1/reload`：config 缓存失效 + 代码重载 + 会话重绑
 - CLI `/reload` slash 命令；`NEXUS_RELOAD_WATCH=1` 后台轮询（默认关）
-
-## 变更记录
-
-- 计划①（2026-09-09）：插件中心 + executor 插件化 + discovery 统一。
-- 计划②（2026-09-09）：模型声明式重构（stages 体系 + callable 字段 str 化）。
-- 计划③（2026-09-09）：pattern yml round-trip + 校验体系。
-- 计划④（2026-09-09）：hooks 清理 + 默认置空。
-- 计划⑤（2026-09-09）：LLM 默认流式 + 引擎流式协议。
-- 计划⑥（2026-09-09）：跳转/投影重构（transfer 删除 + enable_project +
-  DeferredModuleSwitch）。
-- 热重载（2026-09-10）：llm config mtime 指纹缓存 + pattern/plugin/
-  channel 的 mtime re-import。
-- plugins 合并字段 + pattern→module 转换（2026-09-10）：plugins dict 统一
-  声明；`pattern_to_module` 转换。
-- 计划⑦（2026-09-10 设计稿，**作废归档**）：一对多分发机制
-  （ModuleDispatchEvent / GraphState / BranchFrame）——目标场景由计划⑧
-  的图运行时接管。
-- **计划⑧（2026-09-12）：node/module 合并**——三层塌缩为 Pattern → Node
-  二层；`pattern_type`（fsm/agent）成为分流键；AGENT 图运行时（条件边 =
-  TurnResult.next、max_steps 预算、wait_human 挂起/恢复借鉴 langgraph
-  interrupt/checkpointer）；tools 三层收口（toolset → allow_toolset →
-  use_tools，deny-by-default）；删除 module 全家 / ModuleJumpEvent /
-  DeferredModuleSwitch / defer / ROUTE 类型 / max_hops / convert.py。
-  详见 `docs/refactor-notes/plan-8-node-pattern-merge.md`。

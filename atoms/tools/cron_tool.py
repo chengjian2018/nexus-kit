@@ -6,7 +6,8 @@ delegate 式子代理执行（内核在 atoms/tools/_cron_core.py，与
 delegate_task 同一原语），适合每日简报、定期巡检、周期性数据整理等
 "无需人守着"的周期工作。
 
-授权（deny-by-default，plan-⑧ §4 三层收口）::
+授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
+node.use_tools）::
 
     pattern:
       allow_toolset: [cron, filesystem, knowledge]

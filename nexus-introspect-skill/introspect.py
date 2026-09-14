@@ -67,7 +67,7 @@ from nexus.registry.plugins import registry as plugin_registry  # noqa: E402
 APPS_DIR = REPO_ROOT / "apps"
 
 # pattern_type -> executor slot (mirrors chat._resolve_node_executor_code;
-# plan-⑧: FSM resolves at the pattern level, AGENT per node)
+# FSM resolves at the pattern level, AGENT per node)
 TYPE_SLOT = {"fsm": "fsm", "agent": "loop"}
 
 

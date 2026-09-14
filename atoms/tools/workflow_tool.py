@@ -12,7 +12,8 @@ atoms/tools/_subagent_core.py），"裁判"步骤（分类器/审校者/评委/�
     运行时才决定   → 本 tool（LLM tool-call 驱动的节点内临时编排）
     单个子任务     → delegate_task
 
-授权（deny-by-default，同 plan-⑧ §4）::
+授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
+node.use_tools）::
 
     pattern:
       allow_toolset: [workflow, knowledge]   # 叶子池 = knowledge 工具集

@@ -1,5 +1,5 @@
 """R1/R3/R4 injection refresh: per-turn resolution by current position +
-override priority (spec §4; plan-⑧ node form — ``get_llm_config(pattern_code,
+override priority (``get_llm_config(pattern_code,
 node_code, override)``, the patch anchor stays "nexus.engine.chat.get_llm_config").
 
 - R1: turn-level refresh (empty node_code before the position is known)

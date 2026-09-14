@@ -1,5 +1,5 @@
 """Pattern serialization — to_dict/from_dict + to_yaml/from_yaml round-trip
-(plan-⑧ two-layer shape).
+(two-layer shape).
 
 The declarative model (all fields are str/bool/list/dict) makes a pattern
 fully serializable. The dict/yml shape mirrors the constructor kwargs;

@@ -13,7 +13,7 @@ module keeps:
   one-directional (atoms → nexus) and existing import anchors hold
 - framework-enforced prompt items (force-close suffix, prompt-length warning)
 
-Tool authorization (plan-⑧ §4, deny-by-default 三层收口):
+Tool authorization (deny-by-default 三层收口):
 
 1. toolset 标签 — every registered tool carries one (builtin: knowledge /
    mcp; MCP servers register under ``mcp-<server>``)
@@ -213,7 +213,7 @@ warn_prompt_length = _warn_prompt_length
 
 
 # ---------------------------------------------------------------------------
-# Tool resolution and filtering (plan-⑧ §4 deny-by-default)
+# Tool resolution and filtering (deny-by-default)
 # ---------------------------------------------------------------------------
 
 def _resolve_tools(node, pattern=None) -> List[Dict[str, Any]]:

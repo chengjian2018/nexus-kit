@@ -168,7 +168,7 @@ async def _restore_sessions() -> int:
 
 
 def _cross_check_pattern_llm(config_path: str = "") -> None:
-    """Cross-check that pattern_llm codes exist (spec §5): unknown ones only warn, never block."""
+    """Cross-check that pattern_llm codes exist: unknown ones only warn, never block."""
     try:
         pattern_llm = load_config(config_path).get("pattern_llm", {})
     except Exception:
@@ -199,7 +199,7 @@ async def _init_store() -> None:
 
 
 def _validate_registered_patterns() -> None:
-    """Assembly-time validation (plan-③): every registered pattern passes
+    """Assembly-time validation: every registered pattern passes
     base-info + plugin-declaration checks. Runs after the discovery warm-ups
     so plugin codes resolvable; a failure is a declaration bug, fail loudly
     (startup refuses to serve a mis-declared pattern set)."""

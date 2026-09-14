@@ -1,6 +1,6 @@
 """Test helper: register inline stub stages into the plugin registry.
 
-Post-plan-②, stages declarations are string codes resolved from the plugin
+Stages declarations are string codes resolved from the plugin
 registry; tests that used to attach inline stub stage objects now register
 the stub class under a unique code (kind="stage") and declare that code.
 ``register_stage_stub`` returns the code. Registrations are process-global

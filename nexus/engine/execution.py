@@ -1,4 +1,4 @@
-"""Executor contract — how one node's single execution runs (plan-⑧).
+"""Executor contract — how one node's single execution runs.
 
 The engine resolves a NodeExecutor per node (AGENT graph) or per pattern
 (FSM pipeline) — plugin registry kind="executor"; resolution order
@@ -47,7 +47,7 @@ class ExecutionContext:
             observability)
         branch_id: fan-out branch identifier ("{node}#{seq}", e.g.
             "dr_search#3") — non-None ONLY inside a worker instance
-            (plan-⑨); None on every main-path execution
+            (a runtime fan-out worker); None on every main-path execution
         branch_input: the Send.input payload of this worker instance
             (None on every main-path execution). Together with branch_id
             these are the instance's dispatch coordinates
@@ -77,5 +77,5 @@ class NodeExecutor:
         raise NotImplementedError
 
 
-# Pre-merge name kept as an alias (import anchor during the plan-⑧ migration)
+# Pre-merge name kept as a compatibility alias for old imports
 ModuleExecutor = NodeExecutor

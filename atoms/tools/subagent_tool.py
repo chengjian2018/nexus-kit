@@ -4,7 +4,8 @@
 system prompt 与受限工具集，跑完把最终结论作为 tool result 返回主循环。
 v1 深度=1：子代理不可再委托，也不可在 workflow 叶子里被调用。
 
-授权（deny-by-default，顺着 plan-⑧ §4 的体系）::
+授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
+node.use_tools）::
 
     pattern:
       allow_toolset: [subagent, knowledge]   # 子代理池 = knowledge 工具集

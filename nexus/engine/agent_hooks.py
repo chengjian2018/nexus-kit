@@ -20,15 +20,15 @@ P3    on_llm_response  observe: after each LLM response
 P4    on_tool_call     mutate: returns Optional[RewriteToolCall]
                         (name/args rewrite, guarded by allowed_names)
 P5    on_tool_result   mutate: returns Optional[str] (result rewrite)
-P6    (removed)        plan-⑧: the defer/transfer machinery is gone
+P6    (removed)        the defer/transfer machinery is gone with the module
+                        layer — deliberately no hook point
 P7    on_agent_end     observe: exits (reply / max_rounds)
 ===== ================ =====================================================
 
-Declaration (pattern level; a module-level declaration replaces it
-wholesale, no merge — same semantics as the stage slots). Forms: a plugin
-code string (kind="agent_hooks", resolving to the map or a zero-arg factory
-of it — the plan-② declarative form), a zero-arg callable returning the
-map, or the inline legacy dict::
+Declaration (pattern level, node level overriding it wholesale — the same
+precedence as the other plugin slots). Forms: a plugin code string
+(kind="agent_hooks", resolving to the map or a zero-arg factory of it), a
+zero-arg callable returning the map, or the inline legacy dict::
 
     pattern.agent_hooks = "my_hooks_pkg"
     # or inline: {"on_tool_call": [fix_tool_alias], ...}
@@ -162,7 +162,7 @@ def resolve_agent_hooks(node: Any, pattern: Any = None) -> HookMap:
     (node.plugins["agent_hooks"]) replaces wholesale, else the pattern level
     (pattern.plugins["agent_hooks"]).
 
-    Since plan-② the declaration is a **string code** (plugin registry
+    The declaration is a **string code** (plugin registry
     kind="agent_hooks") resolving to a hooks package (a callable returning
     the {point: [hook,...]} dict, or the dict itself). The legacy dict form
     is still accepted inline (transitional). Defensive validation (same
