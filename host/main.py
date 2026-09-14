@@ -246,6 +246,13 @@ async def _startup_persistence() -> None:
         await get_mcp_manager().ensure_started()
     except Exception:
         logger.exception("MCP 连接启动失败（首轮对话会重试）")
+    # Cron scheduler: restore persisted jobs + start the tick loop on the
+    # host loop (no-op under NEXUS_CRON_DISABLED=1)
+    try:
+        from atoms.tools._cron_core import ensure_scheduler
+        await ensure_scheduler()
+    except Exception:
+        logger.exception("cron 调度器启动失败（create_cron 仍可用，但不会自动触发）")
 
 
 @app.on_event("shutdown")
@@ -270,6 +277,13 @@ async def _shutdown_stores() -> None:
         await get_mcp_manager().shutdown()
     except Exception:
         logger.exception("关闭 MCP 连接失败")
+    # Cron scheduler: cancel the tick loop (in-flight fires finish their
+    # current record write; persisted next_fire_at re-arms on next boot)
+    try:
+        from atoms.tools._cron_core import stop_scheduler
+        await stop_scheduler()
+    except Exception:
+        logger.exception("关闭 cron 调度器失败")
 
 
 class DialogueRequest(BaseModel):

@@ -13,6 +13,14 @@ from pathlib import Path
 # each dialogue round by tens of seconds). Must be set before any
 # atoms.tools import.
 os.environ.setdefault("NEXUS_MCP_DISABLED", "1")
+# Same isolation for the cron scheduler: a real data/cron_jobs.json on the
+# dev machine must never be loaded (let alone fired) by a test process.
+# Must be set before any atoms.tools import.
+os.environ.setdefault("NEXUS_CRON_DISABLED", "1")
+# Same isolation for the tool guard's LLM side-channel: a test process must
+# never fire background judge-model calls at a real provider. The rule layer
+# stays active (pure regex); only the LLM fallback thread is silenced.
+os.environ.setdefault("NEXUS_TOOL_GUARD_LLM_DISABLED", "1")
 
 TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:

@@ -31,6 +31,7 @@ from nexus.engine.loop import (
     warn_prompt_length,
 )
 from nexus.engine.messages import build_agent_messages
+from nexus.engine.tool_context import tool_call_context
 from nexus.llm.resolve import build_provider
 
 logger = logging.getLogger(__name__)
@@ -96,53 +97,60 @@ class DefaultLoopExecutor(NodeExecutor):
         temperature = llm_config.get("temperature", 0.7)
         max_tokens = llm_config.get("max_tokens", 2048)
 
-        for round_idx in range(_MAX_TOOL_ROUNDS):
-            logger.info(
-                "Agent loop 第 %d 轮: session=%s, node=%s, tools=%d",
-                round_idx + 1, cxt.session_id, node.code, len(tools),
-            )
+        # Context-bound tools (delegate_task / read_tasks) inherit this
+        # loop's llm_config, the pattern's toolset grant, and the session id
+        # (task-list scoping) via the ambient contextvar; custom loops that
+        # skip this leave those tools on their fallback path
+        with tool_call_context(
+                llm_config, getattr(pattern, "allow_toolset", None) or [],
+                session_id=cxt.session_id):
+            for round_idx in range(_MAX_TOOL_ROUNDS):
+                logger.info(
+                    "Agent loop 第 %d 轮: session=%s, node=%s, tools=%d",
+                    round_idx + 1, cxt.session_id, node.code, len(tools),
+                )
 
-            # P2 on_llm_call: before each LLM call (messages passed by reference,
-            # read-only discipline)
-            if hooks:
-                fire(hooks, "on_llm_call", LLMCallEvent(
-                    session_id=cxt.session_id, node_code=node.code,
-                    round_idx=round_idx, messages=messages, model=model))
-
-            result = await _stream_round(
-                provider, messages, model, temperature, max_tokens,
-                ec.stream, tools=tools if tools else None,
-            )
-
-            content = result.get("content", "") or ""
-            tool_calls = result.get("tool_calls", []) or []
-
-            # P3 on_llm_response: after each LLM response
-            if hooks:
-                fire(hooks, "on_llm_response", LLMResponseEvent(
-                    session_id=cxt.session_id, node_code=node.code,
-                    round_idx=round_idx, content=content,
-                    tool_calls=tool_calls))
-
-            # No tool calls -> direct answer
-            if not tool_calls:
-                logger.info("Agent loop 完成，共 %d 轮", round_idx + 1)
-                _emit_round(ec.stream, "final", round_idx)
-                # P7 on_agent_end: direct-answer exit
+                # P2 on_llm_call: before each LLM call (messages passed by reference,
+                # read-only discipline)
                 if hooks:
-                    fire(hooks, "on_agent_end", AgentEndEvent(
-                        session_id=cxt.session_id,
-                        node_code=node.code,
-                        rounds=round_idx + 1, outcome="reply", reply=content))
-                return TurnResult(content=content)
+                    fire(hooks, "on_llm_call", LLMCallEvent(
+                        session_id=cxt.session_id, node_code=node.code,
+                        round_idx=round_idx, messages=messages, model=model))
 
-            # Ordinary tool calls: P4 rewrite -> main-flow validation -> execute
-            # -> P5 rewrite -> append to history
-            await _dispatch_tool_calls(
-                cxt, node, messages, content, tool_calls,
-                hooks, allowed_names, round_idx,
-                stream=ec.stream)
-            _emit_round(ec.stream, "tool", round_idx)
+                result = await _stream_round(
+                    provider, messages, model, temperature, max_tokens,
+                    ec.stream, tools=tools if tools else None,
+                )
+
+                content = result.get("content", "") or ""
+                tool_calls = result.get("tool_calls", []) or []
+
+                # P3 on_llm_response: after each LLM response
+                if hooks:
+                    fire(hooks, "on_llm_response", LLMResponseEvent(
+                        session_id=cxt.session_id, node_code=node.code,
+                        round_idx=round_idx, content=content,
+                        tool_calls=tool_calls))
+
+                # No tool calls -> direct answer
+                if not tool_calls:
+                    logger.info("Agent loop 完成，共 %d 轮", round_idx + 1)
+                    _emit_round(ec.stream, "final", round_idx)
+                    # P7 on_agent_end: direct-answer exit
+                    if hooks:
+                        fire(hooks, "on_agent_end", AgentEndEvent(
+                            session_id=cxt.session_id,
+                            node_code=node.code,
+                            rounds=round_idx + 1, outcome="reply", reply=content))
+                    return TurnResult(content=content)
+
+                # Ordinary tool calls: P4 rewrite -> main-flow validation -> execute
+                # -> P5 rewrite -> append to history
+                await _dispatch_tool_calls(
+                    cxt, node, messages, content, tool_calls,
+                    hooks, allowed_names, round_idx,
+                    stream=ec.stream)
+                _emit_round(ec.stream, "tool", round_idx)
 
         logger.warning(
             "Agent loop 达到最大轮次 %d，强制终止: session=%s",

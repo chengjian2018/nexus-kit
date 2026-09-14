@@ -1,0 +1,104 @@
+"""Tool-call context — contextvar injection for tool handlers.
+
+Tool handlers receive only ``args`` (``nexus/registry/tools.py::dispatch``):
+no DialogueContext, no node, no pattern. That minimal contract is right for
+the vast majority of tools, but context-bound tools (currently
+``delegate_task``) need two things from the caller: which llm_config to use,
+and which toolsets the executing pattern authorized. The default loop
+executor publishes an immutable snapshot here around its tool rounds; the
+handler side reads it with ``current_tool_context()`` — None when the call
+arrived outside an agent loop, in which case the caller must carry its own
+fallback.
+"""
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from typing import Any, Dict, FrozenSet, Iterator, Optional
+
+
+@dataclass(frozen=True)
+class ToolCallContext:
+    """Immutable snapshot of the calling agent loop's position.
+
+    llm_config:     the executing node's ``cxt.llm_config`` (provider code /
+                    model / temperature / max_tokens / ...).
+    allow_toolsets: the executing pattern's ``allow_toolset`` — the
+                    authorization boundary a sub-agent inherits.
+    in_subagent:    True while a delegate_task sub-loop is running (recursion
+                    guard; v1 depth = 1 — sub-agents cannot delegate).
+    in_workflow:    True while a run_workflow topology is running — its leaf
+                    sub-agents can neither delegate nor start workflows.
+    session_id:     the executing session — the scoping key for session-bound
+                    tools (read_tasks/write_tasks). Empty string = detached
+                    call (direct dispatch outside an agent loop); sub-agents
+                    and workflow leaves inherit the parent session's id via
+                    replace(), so they share one task list per session.
+    """
+
+    llm_config: Dict[str, Any]
+    allow_toolsets: FrozenSet[str]
+    in_subagent: bool = False
+    in_workflow: bool = False
+    session_id: str = ""
+
+
+_CURRENT: ContextVar[Optional[ToolCallContext]] = ContextVar(
+    "nexus_tool_call_context", default=None)
+
+
+def current_tool_context() -> Optional[ToolCallContext]:
+    """Return the ambient ToolCallContext, or None outside an agent loop."""
+    return _CURRENT.get()
+
+
+@contextmanager
+def tool_call_context(llm_config, allow_toolsets, session_id: str = ""
+                      ) -> Iterator[ToolCallContext]:
+    """Publish the caller's position for the duration of the block.
+
+    Values are copied into a fresh frozen snapshot, so later mutation of the
+    caller's llm_config dict cannot leak into handlers mid-block.
+    """
+    ctx = ToolCallContext(
+        llm_config=dict(llm_config or {}),
+        allow_toolsets=frozenset(allow_toolsets or []),
+        session_id=str(session_id or ""),
+    )
+    token = _CURRENT.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _CURRENT.reset(token)
+
+
+@contextmanager
+def subagent_scope(base: ToolCallContext) -> Iterator[None]:
+    """Mark the ambient context as inside a delegate_task sub-loop.
+
+    Inner tool dispatches then observe ``in_subagent=True``; a nested
+    delegate_task call refuses immediately (structural exclusion of the
+    ``subagent`` toolset from the sub-agent pool is the first line of
+    defense — this is the second).
+    """
+    token = _CURRENT.set(replace(base, in_subagent=True))
+    try:
+        yield
+    finally:
+        _CURRENT.reset(token)
+
+
+@contextmanager
+def workflow_scope(base: ToolCallContext) -> Iterator[None]:
+    """Mark the ambient context as inside a run_workflow topology.
+
+    Leaf sub-agents dispatched within observe both flags set; delegate_task
+    and run_workflow both refuse to nest (v1 depth = 1). Pool-level
+    exclusion of the ``subagent``/``workflow`` toolsets is the first line
+    of defense — this is the second.
+    """
+    token = _CURRENT.set(replace(base, in_subagent=True, in_workflow=True))
+    try:
+        yield
+    finally:
+        _CURRENT.reset(token)

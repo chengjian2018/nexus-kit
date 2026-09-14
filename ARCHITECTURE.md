@@ -100,7 +100,7 @@ host POST /api/v1/chat
 | `stage` | 具名 stage（stages 声明引用的字符串 code；FSM 专属） | `atoms/stages/__init__` + app 自有 stage |
 | `stage_factory` | 内置兜底 stage 工厂（`pipeline.register_default_*` 的内部存储） | `atoms/stages/__init__` |
 | `messages_builder` | AGENT 消息构建器（内核注册 `default`） | apps（customer_agent 等） |
-| `agent_hooks` | hooks 包（机制保留，默认 no-op） | 计划④定案 |
+| `agent_hooks` | hooks 包 | `atoms/hooks/`（tool_guard）+ app 自有包 |
 
 ### API
 
@@ -260,7 +260,7 @@ patterns / tools / providers / channels 四个领域注册中心**保持独立**
 | `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器）+ prompt 资产 + 渠道适配 |
 | `host/` | main.py / cli.py / governor.py / config/ |
 
-## Agent hooks（计划④后状态：机制保留，默认 no-op）
+## Agent hooks（机制在用：in-repo 包 tool_guard）
 
 6 个点位（P1 on_agent_start / P2 on_llm_call / P3 on_llm_response /
 P4 on_tool_call / P5 on_tool_result / P6 on_agent_end；on_transfer 随
@@ -268,6 +268,10 @@ defer 机制删除）在默认 loop executor 中照常调用；事件类字段�
 `node_code`；声明解析读 `plugins["agent_hooks"]`（node 层压 pattern 层）。
 无声明时所有点位零开销直通（`tests/test_agent_hooks_contract.py`）。
 错误语义：hook 异常一律吞掉记日志保原值，对话永不阻塞。
+首个 in-repo 包：`atoms/hooks/tool_guard.py`（code="tool_guard"，P4
+工具执行前危险操作播报——规则层正则 + 可疑命令旁路小模型判读，
+v1 只播报不干预；subagent/workflow 子循环不经 P4，结构免检；
+配置节 `tool_guard`，测试见 `tests/test_tool_guard.py`）。
 
 ## 流式协议（计划⑤引入）
 

@@ -154,6 +154,76 @@ DEFAULT_KNOWLEDGE_DB_PATH = "data/knowledge.db"
 # (CJK×2 + others×0.25, +4 per message), not an exact tokenizer
 DEFAULT_SESSION_COMPRESS_TOKEN_THRESHOLD = 6000
 
+# delegate_task sub-agent guardrails (config ``subagent_tool`` section, all
+# optional). timeout caps the WHOLE sub ReAct loop (asyncio.wait_for), max_
+# rounds caps its tool rounds, max_result_chars truncates the final content
+# carried back into the parent agent's context.
+DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 120
+DEFAULT_SUBAGENT_MAX_ROUNDS = 8
+DEFAULT_SUBAGENT_MAX_RESULT_CHARS = 8000
+
+# run_workflow guardrails (config ``workflow_tool`` section, all optional).
+# timeout caps the WHOLE topology (all leaves + judge calls); max_rounds caps
+# each leaf sub-loop; max_width caps parallel fan-out width (aligned with
+# graph fanout's DEFAULT_MAX_FANOUT); max_cycles / max_iterations cap the
+# adversarial / loop-until-done iteration counts; max_result_chars truncates
+# the final content; trace_cap caps the returned steps list.
+DEFAULT_WORKFLOW_TIMEOUT_SECONDS = 300
+DEFAULT_WORKFLOW_MAX_ROUNDS = 8
+DEFAULT_WORKFLOW_MAX_WIDTH = 8
+DEFAULT_WORKFLOW_MAX_CYCLES = 3
+DEFAULT_WORKFLOW_MAX_ITERATIONS = 5
+DEFAULT_WORKFLOW_MAX_RESULT_CHARS = 8000
+DEFAULT_WORKFLOW_TRACE_CAP = 32
+
+# bash / run_python guardrails (config ``shell_tool`` section, all optional).
+# timeout caps ONE command / script run (args may only lower it); max_output_
+# chars truncates stdout and stderr each before the payload returns to the
+# model's context.
+DEFAULT_SHELL_TIMEOUT_SECONDS = 60
+DEFAULT_SHELL_MAX_OUTPUT_CHARS = 20000
+
+# File tool guardrails (config ``file_tool`` section, all optional).
+# max_read_chars caps a read_text payload; max_write_chars rejects oversized
+# write_text content; max_list_entries caps list_dir entries; max_matches
+# caps search_files hits (args may only lower it); max_edit_chars caps the
+# file size edit_file will touch; max_find_results caps find_files output.
+DEFAULT_FILE_MAX_READ_CHARS = 50000
+DEFAULT_FILE_MAX_WRITE_CHARS = 200000
+DEFAULT_FILE_MAX_LIST_ENTRIES = 500
+DEFAULT_FILE_MAX_MATCHES = 100
+DEFAULT_FILE_MAX_EDIT_CHARS = 200000
+DEFAULT_FILE_MAX_FIND_RESULTS = 500
+
+# Session task-list guardrails (config ``tasks_tool`` section, all optional).
+DEFAULT_TASKS_MAX_TASKS = 50
+DEFAULT_TASKS_MAX_TASK_CHARS = 500
+
+# Cron scheduler guardrails (config ``cron_tool`` section, all optional).
+# fire_timeout caps ONE fire's sub-agent run (create args may only lower it);
+# tick_seconds is the scheduler loop cadence; jobs_path is the JSON store
+# (atomic write, survives restarts; missed fires while down are not replayed).
+DEFAULT_CRON_MAX_JOBS = 20
+DEFAULT_CRON_FIRE_TIMEOUT_SECONDS = 300
+DEFAULT_CRON_MAX_ROUNDS = 8
+DEFAULT_CRON_HISTORY_CAP = 10
+DEFAULT_CRON_MAX_INPUT_CHARS = 8000
+DEFAULT_CRON_MAX_RESULT_CHARS = 4000
+DEFAULT_CRON_JOBS_PATH = "data/cron_jobs.json"
+DEFAULT_CRON_TICK_SECONDS = 20
+
+# Tool guard（config ``tool_guard`` 节，P4 工具执行前危险操作播报——
+# atoms/hooks/tool_guard.py）。enabled 总开关；llm_fallback 控制旁路的
+# 轻量 LLM 判读（规则未命中高危但信号可疑时送审）；llm_max_input_chars
+# 截断送审参数；llm_max_queue 有界队列（满则丢弃新条）；llm_timeout_
+# seconds 单次判读超时；llm 为叠加在 ambient 连接之上的 judge 模型
+# 覆盖（code/model/max_tokens/...，推荐指向便宜小模型）。
+DEFAULT_TOOL_GUARD_ENABLED = True
+DEFAULT_TOOL_GUARD_LLM_FALLBACK = True
+DEFAULT_TOOL_GUARD_LLM_MAX_INPUT_CHARS = 2000
+DEFAULT_TOOL_GUARD_LLM_MAX_QUEUE = 64
+DEFAULT_TOOL_GUARD_LLM_TIMEOUT_SECONDS = 15.0
+
 # Number of recent messages kept after compression (tool rows included)
 DEFAULT_SESSION_COMPRESS_RETAIN_COUNT = 12
 
@@ -425,6 +495,37 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
         raise ValueError("pattern_llm 应为字典")
     _validate_pattern_llm(pattern_llm)
 
+    subagent_tool = raw.get("subagent_tool") or {}
+    if not isinstance(subagent_tool, dict):
+        raise ValueError("subagent_tool 应为字典")
+
+    workflow_tool = raw.get("workflow_tool") or {}
+    if not isinstance(workflow_tool, dict):
+        raise ValueError("workflow_tool 应为字典")
+
+    shell_tool = raw.get("shell_tool") or {}
+    if not isinstance(shell_tool, dict):
+        raise ValueError("shell_tool 应为字典")
+
+    file_tool = raw.get("file_tool") or {}
+    if not isinstance(file_tool, dict):
+        raise ValueError("file_tool 应为字典")
+
+    tasks_tool = raw.get("tasks_tool") or {}
+    if not isinstance(tasks_tool, dict):
+        raise ValueError("tasks_tool 应为字典")
+
+    cron_tool = raw.get("cron_tool") or {}
+    if not isinstance(cron_tool, dict):
+        raise ValueError("cron_tool 应为字典")
+
+    tool_guard = raw.get("tool_guard") or {}
+    if not isinstance(tool_guard, dict):
+        raise ValueError("tool_guard 应为字典")
+    tool_guard_llm = tool_guard.get("llm") or {}
+    if not isinstance(tool_guard_llm, dict):
+        raise ValueError("tool_guard.llm 应为字典")
+
     return {
         "llm_providers": llm_providers,
         "llm_default": llm_default,
@@ -444,6 +545,100 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
         "session_compress_retain_count": int(raw.get(
             "session_compress_retain_count",
             DEFAULT_SESSION_COMPRESS_RETAIN_COUNT)),
+        # delegate_task sub-agent guardrails (optional; defaults see
+        # DEFAULT_SUBAGENT_* constants)
+        "subagent_tool": {
+            "timeout_seconds": int(subagent_tool.get(
+                "timeout_seconds", DEFAULT_SUBAGENT_TIMEOUT_SECONDS)),
+            "max_rounds": int(subagent_tool.get(
+                "max_rounds", DEFAULT_SUBAGENT_MAX_ROUNDS)),
+            "max_result_chars": int(subagent_tool.get(
+                "max_result_chars", DEFAULT_SUBAGENT_MAX_RESULT_CHARS)),
+        },
+        # run_workflow topology guardrails (optional; defaults see
+        # DEFAULT_WORKFLOW_* constants)
+        "workflow_tool": {
+            "timeout_seconds": int(workflow_tool.get(
+                "timeout_seconds", DEFAULT_WORKFLOW_TIMEOUT_SECONDS)),
+            "max_rounds": int(workflow_tool.get(
+                "max_rounds", DEFAULT_WORKFLOW_MAX_ROUNDS)),
+            "max_width": int(workflow_tool.get(
+                "max_width", DEFAULT_WORKFLOW_MAX_WIDTH)),
+            "max_cycles": int(workflow_tool.get(
+                "max_cycles", DEFAULT_WORKFLOW_MAX_CYCLES)),
+            "max_iterations": int(workflow_tool.get(
+                "max_iterations", DEFAULT_WORKFLOW_MAX_ITERATIONS)),
+            "max_result_chars": int(workflow_tool.get(
+                "max_result_chars", DEFAULT_WORKFLOW_MAX_RESULT_CHARS)),
+            "trace_cap": int(workflow_tool.get(
+                "trace_cap", DEFAULT_WORKFLOW_TRACE_CAP)),
+        },
+        # bash / run_python guardrails (optional; defaults see
+        # DEFAULT_SHELL_* constants)
+        "shell_tool": {
+            "timeout_seconds": int(shell_tool.get(
+                "timeout_seconds", DEFAULT_SHELL_TIMEOUT_SECONDS)),
+            "max_output_chars": int(shell_tool.get(
+                "max_output_chars", DEFAULT_SHELL_MAX_OUTPUT_CHARS)),
+        },
+        # read_text / write_text / list_dir / search_files / edit_file /
+        # find_files guardrails (optional; defaults see DEFAULT_FILE_* consts)
+        "file_tool": {
+            "max_read_chars": int(file_tool.get(
+                "max_read_chars", DEFAULT_FILE_MAX_READ_CHARS)),
+            "max_write_chars": int(file_tool.get(
+                "max_write_chars", DEFAULT_FILE_MAX_WRITE_CHARS)),
+            "max_list_entries": int(file_tool.get(
+                "max_list_entries", DEFAULT_FILE_MAX_LIST_ENTRIES)),
+            "max_matches": int(file_tool.get(
+                "max_matches", DEFAULT_FILE_MAX_MATCHES)),
+            "max_edit_chars": int(file_tool.get(
+                "max_edit_chars", DEFAULT_FILE_MAX_EDIT_CHARS)),
+            "max_find_results": int(file_tool.get(
+                "max_find_results", DEFAULT_FILE_MAX_FIND_RESULTS)),
+        },
+        # read_tasks / write_tasks guardrails (optional; defaults see
+        # DEFAULT_TASKS_* constants)
+        "tasks_tool": {
+            "max_tasks": int(tasks_tool.get(
+                "max_tasks", DEFAULT_TASKS_MAX_TASKS)),
+            "max_task_chars": int(tasks_tool.get(
+                "max_task_chars", DEFAULT_TASKS_MAX_TASK_CHARS)),
+        },
+        # cron scheduler guardrails (optional; defaults see DEFAULT_CRON_*
+        # constants)
+        "cron_tool": {
+            "max_jobs": int(cron_tool.get(
+                "max_jobs", DEFAULT_CRON_MAX_JOBS)),
+            "fire_timeout_seconds": int(cron_tool.get(
+                "fire_timeout_seconds", DEFAULT_CRON_FIRE_TIMEOUT_SECONDS)),
+            "max_rounds": int(cron_tool.get(
+                "max_rounds", DEFAULT_CRON_MAX_ROUNDS)),
+            "history_cap": int(cron_tool.get(
+                "history_cap", DEFAULT_CRON_HISTORY_CAP)),
+            "max_input_chars": int(cron_tool.get(
+                "max_input_chars", DEFAULT_CRON_MAX_INPUT_CHARS)),
+            "max_result_chars": int(cron_tool.get(
+                "max_result_chars", DEFAULT_CRON_MAX_RESULT_CHARS)),
+            "jobs_path": str(cron_tool.get(
+                "jobs_path", DEFAULT_CRON_JOBS_PATH)),
+            "tick_seconds": int(cron_tool.get(
+                "tick_seconds", DEFAULT_CRON_TICK_SECONDS)),
+        },
+        # tool guard（可选；defaults see DEFAULT_TOOL_GUARD_* constants）
+        "tool_guard": {
+            "enabled": bool(tool_guard.get(
+                "enabled", DEFAULT_TOOL_GUARD_ENABLED)),
+            "llm_fallback": bool(tool_guard.get(
+                "llm_fallback", DEFAULT_TOOL_GUARD_LLM_FALLBACK)),
+            "llm_max_input_chars": int(tool_guard.get(
+                "llm_max_input_chars", DEFAULT_TOOL_GUARD_LLM_MAX_INPUT_CHARS)),
+            "llm_max_queue": int(tool_guard.get(
+                "llm_max_queue", DEFAULT_TOOL_GUARD_LLM_MAX_QUEUE)),
+            "llm_timeout_seconds": float(tool_guard.get(
+                "llm_timeout_seconds", DEFAULT_TOOL_GUARD_LLM_TIMEOUT_SECONDS)),
+            "llm": dict(tool_guard_llm),
+        },
         # More top-level nodes may be added later, e.g. "dialogue", "logging", "storage"
     }
 
@@ -555,3 +750,78 @@ def get_session_compress_config(config_path: str = "") -> tuple:
         cfg["session_compress_token_threshold"],
         cfg["session_compress_retain_count"],
     )
+
+
+def get_subagent_tool_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the ``delegate_task`` sub-agent guardrails.
+
+    Equivalent to ``load_config(config_path)["subagent_tool"]`` —
+    ``{"timeout_seconds", "max_rounds", "max_result_chars"}``, all optional
+    in the config file (defaults see the DEFAULT_SUBAGENT_* constants).
+    """
+    return load_config(config_path)["subagent_tool"]
+
+
+def get_workflow_tool_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the ``run_workflow`` topology guardrails.
+
+    Equivalent to ``load_config(config_path)["workflow_tool"]`` —
+    ``{"timeout_seconds", "max_rounds", "max_width", "max_cycles",
+    "max_iterations", "max_result_chars", "trace_cap"}``, all optional in
+    the config file (defaults see the DEFAULT_WORKFLOW_* constants).
+    """
+    return load_config(config_path)["workflow_tool"]
+
+
+def get_shell_tool_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the ``bash`` / ``run_python`` guardrails.
+
+    Equivalent to ``load_config(config_path)["shell_tool"]`` —
+    ``{"timeout_seconds", "max_output_chars"}``, all optional in the
+    config file (defaults see the DEFAULT_SHELL_* constants).
+    """
+    return load_config(config_path)["shell_tool"]
+
+
+def get_file_tool_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the file tools guardrails.
+
+    Equivalent to ``load_config(config_path)["file_tool"]`` —
+    ``{"max_read_chars", "max_write_chars", "max_list_entries",
+    "max_matches", "max_edit_chars", "max_find_results"}``, all optional
+    in the config file (defaults see the DEFAULT_FILE_* constants).
+    """
+    return load_config(config_path)["file_tool"]
+
+
+def get_tasks_tool_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the session task-list guardrails.
+
+    Equivalent to ``load_config(config_path)["tasks_tool"]`` —
+    ``{"max_tasks", "max_task_chars"}``, all optional in the config file
+    (defaults see the DEFAULT_TASKS_* constants).
+    """
+    return load_config(config_path)["tasks_tool"]
+
+
+def get_cron_tool_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the cron scheduler guardrails.
+
+    Equivalent to ``load_config(config_path)["cron_tool"]`` —
+    ``{"max_jobs", "fire_timeout_seconds", "max_rounds", "history_cap",
+    "max_input_chars", "max_result_chars", "jobs_path", "tick_seconds"}``,
+    all optional in the config file (defaults see DEFAULT_CRON_* constants).
+    """
+    return load_config(config_path)["cron_tool"]
+
+
+def get_tool_guard_config(config_path: str = "") -> Dict[str, Any]:
+    """Return the tool guard config (P4 危险操作播报).
+
+    Equivalent to ``load_config(config_path)["tool_guard"]`` —
+    ``{"enabled", "llm_fallback", "llm_max_input_chars", "llm_max_queue",
+    "llm_timeout_seconds", "llm"}``, all optional in the config file
+    (defaults see DEFAULT_TOOL_GUARD_* constants). ``llm`` is a passthrough
+    dict of judge-model overrides merged over the ambient connection.
+    """
+    return load_config(config_path)["tool_guard"]

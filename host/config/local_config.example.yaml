@@ -98,3 +98,119 @@ mcp_servers: {}
 # session_compress_token_threshold: 6000
 # 压缩后保留的最近消息条数（含 tool 行）
 # session_compress_retain_count: 12
+
+# ============================================================================
+# delegate_task 子代理护栏（可选，以下即默认值；atoms/tools/subagent_tool.py）
+# ============================================================================
+# 使用方式（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["subagent", "knowledge"], nodes=[
+#       BaseNode(code="main", use_tools=["delegate_task"], ...)])
+#   子代理工具池 = allow_toolset 各工具集 − subagent 自身（防递归提权）。
+
+# subagent_tool:
+#   timeout_seconds: 120   # 子 ReAct 循环整体超时（args 只能调小）
+#   max_rounds: 8          # 子循环轮次上限
+#   max_result_chars: 8000 # 最终结论回填主上下文的截断长度
+
+# ============================================================================
+# run_workflow 六拓扑护栏（可选，以下即默认值；atoms/tools/workflow_tool.py）
+# ============================================================================
+# 使用方式（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["workflow", "knowledge"], nodes=[
+#       BaseNode(code="main", use_tools=["run_workflow"], ...)])
+#   叶子工具池 = allow_toolset 各工具集 − subagent/workflow 自身（防递归）。
+
+# workflow_tool:
+#   timeout_seconds: 300   # 整趟 workflow（全部叶子+裁判）整体超时，args 只能调小
+#   max_rounds: 8          # 每个叶子子循环的轮次上限
+#   max_width: 8           # 并行宽度上限（subtasks/angles/候选数，对齐图级 fanout）
+#   max_cycles: 3          # adversarial_verification 生成-审校循环上限
+#   max_iterations: 5      # loop_until_done 迭代上限
+#   max_result_chars: 8000 # 最终结论回填主上下文的截断长度
+#   trace_cap: 32          # 返回 steps 列表的上限条数
+
+# ============================================================================
+# bash / run_python 护栏（可选，以下即默认值；atoms/tools/shell_tool.py）
+# ============================================================================
+# 使用方式（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["shell", "filesystem"], nodes=[
+#       BaseNode(code="main", use_tools=["bash", "run_python"], ...)])
+# 高权限工具集：授权收口在 pattern.allow_toolset + node.use_tools（三层
+# deny-by-default），本节只管资源护栏，不做命令黑名单 / 路径沙箱。
+
+# shell_tool:
+#   timeout_seconds: 60     # 单条命令/脚本超时（超时 SIGKILL 整个进程组），args 只能调小
+#   max_output_chars: 20000 # stdout / stderr 各自的截断长度
+
+# ============================================================================
+# 文件工具护栏（可选，以下即默认值；atoms/tools/file_tool.py）
+# ============================================================================
+# 使用方式（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["filesystem"], nodes=[
+#       BaseNode(code="main", use_tools=["read_text", "write_text",
+#               "edit_file", "list_dir", "search_files", "find_files"], ...)])
+
+# file_tool:
+#   max_read_chars: 50000    # read_text 单次内容截断长度
+#   max_write_chars: 200000  # write_text 超过即拒绝（防上下文巨物写盘）
+#   max_edit_chars: 200000   # edit_file 可编辑的文件大小上限
+#   max_list_entries: 500    # list_dir 条目截断
+#   max_matches: 100         # search_files 命中截断（args 只能调小）
+#   max_find_results: 500    # find_files 返回条数截断（args 只能调小）
+
+# ============================================================================
+# 会话任务清单护栏（可选，以下即默认值；atoms/tools/task_list_tool.py）
+# ============================================================================
+# 使用方式（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["tasks"], nodes=[
+#       BaseNode(code="main", use_tools=["read_tasks", "write_tasks"], ...)])
+#   清单按 session_id 隔离（内存态，重启清空），子代理与父会话共享。
+
+# tasks_tool:
+#   max_tasks: 50       # 单会话任务条数上限
+#   max_task_chars: 500 # 单条任务描述长度上限（超限拒绝）
+
+# ============================================================================
+# cron 定时调度护栏（可选，以下即默认值；atoms/tools/_cron_core.py + cron_tool.py）
+# ============================================================================
+# 使用方式（pattern 声明，非本文件）：
+#   Pattern(..., allow_toolset=["cron", "knowledge"], nodes=[
+#       BaseNode(code="main", use_tools=["create_cron", "list_crons",
+#               "update_cron", "delete_cron"], ...)])
+#   作业权限 = 创建时刻 pattern 授权的冻结快照（自动剔除 subagent/
+#   workflow/cron 编排工具集）；触发 = 授权池上的 delegate 式子代理执行。
+#   作业持久化到 jobs_path，重启后继续；停机期间错过的触发不补跑。
+#   环境变量 NEXUS_CRON_DISABLED=1 可整体停用（测试隔离用）。
+
+# cron_tool:
+#   max_jobs: 20                # 作业数上限
+#   fire_timeout_seconds: 300   # 单次触发超时（create args 只能调小）
+#   max_rounds: 8               # 触发子代理的轮次上限
+#   history_cap: 10             # 每作业保留的历史条数
+#   max_input_chars: 8000       # 作业任务描述长度上限
+#   max_result_chars: 4000      # 单次触发结果截断长度
+#   jobs_path: data/cron_jobs.json  # 持久化文件（相对启动目录）
+#   tick_seconds: 20            # 调度循环拍长（分钟级 cron 足够）
+
+# ============================================================================
+# 工具执行前危险操作播报（可选，以下即默认值；atoms/hooks/tool_guard.py）
+# ============================================================================
+# 使用方式（pattern 级声明，谁授了 shell/filesystem 谁挂 guard）：
+#   Pattern(..., plugins={"agent_hooks": "tool_guard"},
+#           allow_toolset=["shell", "filesystem", ...], ...)
+# v1 只播报不干预：规则命中 → 日志 + 内存 ledger；规则未命中高危但命令
+# 带可疑信号（网络动词/管道/命令替换/隐匿编码）→ 旁路小模型判读
+# （后台线程，绝不阻塞主循环）。subagent / workflow 运行期不校验
+# （P4 hook 点不在子循环路径上，结构免检）。
+# 环境变量 NEXUS_TOOL_GUARD_LLM_DISABLED=1 可单独停用 LLM 判读（测试隔离用）。
+
+# tool_guard:
+#   enabled: true               # 总开关（false = hook 直接返回）
+#   llm_fallback: true          # 可疑但规则未定的调用是否送小模型判读
+#   llm_max_input_chars: 2000   # 送审参数 JSON 截断长度
+#   llm_max_queue: 64           # 判读队列上限（满则丢弃新条）
+#   llm_timeout_seconds: 15     # 单次判读超时
+#   llm:                        # judge 模型覆盖（叠加在 ambient 连接之上，
+#                               # 推荐指向便宜小模型；省略 = 用节点同款）
+#     model: qwen-flash
+#     max_tokens: 256

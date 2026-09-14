@@ -17,9 +17,9 @@ registry API changes):
                        atoms/stages/__init__ and app-owned stages.
 - ``messages_builder``: AGENT messages builders (the kernel registers the
                        "default" builder; apps may register their own).
-- ``agent_hooks``     : hooks packages (no in-repo package today; the
-                       machinery in nexus/engine/agent_hooks.py stays
-                       no-op until one is registered).
+- ``agent_hooks``     : hooks packages (atoms/hooks/tool_guard.py is the
+                       in-repo package — P4 危险操作播报; further packages
+                       register the same way).
 
 Registration idiom (same as the four domain registries, discovered by the
 shared AST scanner in nexus/registry/discovery.py):
@@ -181,21 +181,24 @@ registry = PluginRegistry()
 # ---------------------------------------------------------------------------
 
 def discover_builtin_plugins(plugins_dir: Optional[Path] = None) -> List[str]:
-    """Import self-registering plugin modules under atoms/executors/ and return their names.
+    """Import self-registering plugin modules under atoms/executors/ and
+    atoms/hooks/ and return their names.
 
     A file is imported iff it carries a top-level ``registry.register(...)``
     call (shared AST scanner); atoms/executors/__init__.py registers the
-    three default executors, and custom executor files self-register the
-    same way.
+    three default executors, and custom executor / hooks files self-register
+    the same way. ``plugins_dir`` (compat) narrows the scan to that single
+    directory instead of the two builtin ones.
     """
-    plugins_path = (
-        Path(plugins_dir) if plugins_dir is not None
-        else Path(__file__).resolve().parents[2] / "atoms" / "executors"
-    )
-    module_names = [
-        f"atoms.executors.{path.stem}"
-        for path in sorted(plugins_path.glob("*.py"))
-        if path.name != "__init__.py"
-        and module_registers(path)
-    ]
+    if plugins_dir is not None:
+        search_dirs = [Path(plugins_dir)]
+    else:
+        atoms_base = Path(__file__).resolve().parents[2] / "atoms"
+        search_dirs = [atoms_base / "executors", atoms_base / "hooks"]
+    module_names = []
+    for directory in search_dirs:
+        package = f"atoms.{directory.name}"
+        for path in sorted(directory.glob("*.py")):
+            if path.name != "__init__.py" and module_registers(path):
+                module_names.append(f"{package}.{path.stem}")
     return import_modules(module_names, what="plugin module")

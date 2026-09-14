@@ -11,6 +11,10 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 * { box-sizing: border-box; }
+/* 关键守卫：类选择器里的 display（如 .modal-mask 的 flex）会压过 UA 对
+ * hidden 属性的 display:none —— 不加这句，未打开的空弹窗会以白条+全屏遮罩
+ * 渲染并拦截整页点击（与 studio/static/style.css 同款守卫） */
+[hidden] { display: none !important; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;

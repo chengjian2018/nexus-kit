@@ -1,13 +1,12 @@
 """Agent loop hooks — hook-point events + declaration parsing + dispatcher.
 
-**Status (plan-④): mechanism retained, default no-op.** The 7 loop points
-stay wired (see atoms/executors/loop_executor.py) and this module keeps the
-event classes, the dispatcher signatures, and the declaration resolution —
-but no hooks package ships in-repo and the tested contract is exactly
-"declared nothing → every point is a zero-overhead pass-through". Reviving
-the implementation later only needs hooks packages registered under
-kind="agent_hooks" (plus behavioral tests — the pre-plan-④ behavioral suite
-lives in git history).
+**Status: mechanism live with one in-repo package.** The 7 loop points
+stay wired (see atoms/executors/loop_executor.py); ``atoms/hooks/
+tool_guard.py`` is the first shipped hooks package (kind="agent_hooks",
+code="tool_guard" — P4 危险操作播报, observe-only). A pattern declares it
+via ``plugins={"agent_hooks": "tool_guard"}``; with no declaration every
+point remains a zero-overhead pass-through (the tested contract in
+tests/test_agent_hooks_contract.py).
 
 Point inventory (P1-P7, consumed at the loop's hook points):
 
