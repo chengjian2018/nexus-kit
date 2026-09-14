@@ -34,6 +34,14 @@ from apps.topic_research_agent.prompts import (
 # Fixtures / helpers
 # ============================================================================
 
+@pytest.fixture(autouse=True)
+def _no_query_interval(monkeypatch):
+    """查询限速归零：复用的 _dispatch_research_round 每次真实查询后的
+    sleep 只在生产生效，离线测试不等待。"""
+    from apps.deep_research_agent import executor_multi
+    monkeypatch.setattr(executor_multi, "_QUERY_INTERVAL_SECONDS", 0.0)
+
+
 @pytest.fixture(scope="module")
 def pattern():
     from nexus.registry.patterns import discover_builtin_patterns, registry

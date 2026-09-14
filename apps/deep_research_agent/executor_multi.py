@@ -61,6 +61,7 @@ anyway); each execute() does only "load state → run one phase → save
 state → return the routing/dispatch output".
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -114,15 +115,29 @@ logger = logging.getLogger(__name__)
 # bounded)
 # ---------------------------------------------------------------------------
 
-_MAX_SEARCH_ROUNDS = 6         # per-branch SEARCH round ceiling (plan-⑨:
-                               # one sub-question per instance needs fewer
-                               # rounds than the old shared 12)
+_MAX_SEARCH_ROUNDS = 5         # per-branch SEARCH round ceiling — the
+                               # research-query budget (深度研究相关应用最多
+                               # 调用 5 轮查询，覆盖 deep_research 与复用
+                               # _search_branch 的 topic_research)
+_QUERY_INTERVAL_SECONDS = 5.0  # pause after EVERY executed research query
+                               # (rate limit; read at call time so tests can
+                               # zero it via monkeypatch)
 _PLAN_RETRIES = 1              # PLAN JSON parse-failure retry count
 _PER_RESULT_CHARS = 4000       # per-tool-result truncation (workspace / findings)
 _MAX_FINDINGS = 30             # findings entry ceiling (join-side FIFO across
                                # ALL branches + pre-retrieval)
 _WORKSPACE_CHAR_BUDGET = 60000 # per-branch SEARCH workspace char budget (over
                                # budget: middle-truncate the oldest tool rows)
+
+# Model-generalized tool name → canonical name normalization table (empirically verified:
+# qwen3.8-flash writes web_search_prime as the generic name web_search). Flash-tier models have
+# limited schema-name compliance; rather than wasting a round on "intercept → feed back correct name → self-correct",
+# it's better to normalize in place before the hooks/guard — and since the assistant payload (history) keeps
+# the canonical name, the model learns the correct name along the way. Only effective when the normalized
+# result is actually in allowed_names; otherwise the interception guard proceeds as before.
+_TOOL_NAME_ALIASES = {
+    "web_search": "web_search_prime",
+}
 
 # State-board marks
 _DONE_MARK = "✓"
@@ -143,6 +158,21 @@ DR_SYNTHESIZE_CODE = "dr_synthesize"
 # at graph termination); the final trace keeps the "deep_research" key
 _STATE_KEY = "deep_research_state"
 _TRACE_KEY = "deep_research"
+
+
+def _normalize_tool_name(name: str, allowed_names: set) -> Tuple[str, bool]:
+    """Generic tool name normalization: returns (canonical name, whether normalized).
+
+    Returns as-is when the original name is available or the alias doesn't hit — misses
+    still go through the interception guard, so genuinely nonexistent names won't be
+    swallowed by mistake.
+    """
+    if name in allowed_names:
+        return name, False
+    mapped = _TOOL_NAME_ALIASES.get(name, "")
+    if mapped and mapped in allowed_names:
+        return mapped, True
+    return name, False
 
 
 def _load_state(cxt) -> Optional[Dict[str, Any]]:
@@ -241,7 +271,7 @@ class DeepResearchExecutor(NodeExecutor):
             # distinguishing it from SEARCH rounds)
             findings = await self._dispatch_research_round(
                 messages, tool_calls, hooks, allowed_names, -1,
-                cxt, node, findings, tool_stats)
+                cxt, node, findings, tool_stats, stream=ec.stream)
             _truncate_workspace(messages)
             trace["phases"].append("preplan_search")
             _emit_round(ec.stream, "preplan", 0)
@@ -424,7 +454,7 @@ class DeepResearchExecutor(NodeExecutor):
 
             new_findings = await self._dispatch_research_round(
                 workspace, tool_calls, hooks, allowed_names, round_idx,
-                cxt, node, findings, tool_stats)
+                cxt, node, findings, tool_stats, stream=ec.stream)
             findings.extend(new_findings)
             if len(findings) > _MAX_FINDINGS:
                 findings = findings[len(findings) - _MAX_FINDINGS:]
@@ -445,7 +475,7 @@ class DeepResearchExecutor(NodeExecutor):
             self, messages: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]],
             hooks, allowed_names: set, round_idx: int,
             cxt, node, findings: List[Dict[str, Any]],
-            tool_stats: Dict[str, int]) -> List[Dict[str, Any]]:
+            tool_stats: Dict[str, int], stream=None) -> List[Dict[str, Any]]:
         """Tool dispatch of a research round (the private-workspace version
         of _dispatch_tool_calls).
 
@@ -454,17 +484,30 @@ class DeepResearchExecutor(NodeExecutor):
         back) → _execute_tool → P5 rewrite), but it **only appends to the
         executor's private messages, never writes cxt.history**; successful
         tool results are also collected into findings (truncated + query
-        recorded).
+        recorded). Each issued / returned call is forwarded as trace events
+        (tool_call / tool_result, same vocabulary/data keys as the kernel
+        path) — inside a fan-out branch the engine hands a
+        BranchStreamEmitter, so emissions carry the branch_id automatically.
 
         Returns: the findings entries added this round.
         """
         session_id = cxt.session_id
         node_code = node.code
+        _emit = getattr(stream, "emit_trace", None)
 
         # P4 chained rewrite (applied back to tc, single source of truth)
         rewrite_audits = {}
         for idx, tc in enumerate(tool_calls):
             name = tc.get("function", {}).get("name", "")
+            # Generic-name normalization comes before hooks/guard: the tc and the
+            # assistant payload both keep the canonical name, so the history also "teaches" the
+            # model the correct name (hooks observe the name that is actually dispatched)
+            canonical, aliased = _normalize_tool_name(name, allowed_names)
+            if aliased:
+                logger.info("[deep_research] Tool name normalized: %s → %s",
+                            name, canonical)
+                tc["function"]["name"] = canonical
+                name = canonical
             parsed_args = _parse_args(tc)
             if hooks:
                 event = ToolCallEvent(
@@ -496,9 +539,15 @@ class DeepResearchExecutor(NodeExecutor):
             call_id = tc.get("id", "")
             parsed_args = _parse_args(tc)
 
+            if _emit is not None:
+                _emit("tool_call", node_code=node_code, call_id=call_id,
+                      tool_name=name, args=parsed_args, round_idx=round_idx)
+
+            synthetic = False
             if name not in allowed_names:
                 logger.warning(
                     "[deep_research] 工具 '%s' 不在本轮可用集合,拦截不执行", name)
+                synthetic = True
                 result_content = json.dumps({
                     "error": (f"工具 '{name}' 不存在或本轮不可用。"
                               f"可用工具:{sorted(allowed_names)}。")
@@ -515,7 +564,8 @@ class DeepResearchExecutor(NodeExecutor):
 
                 # findings collection (success path; error JSON never enters findings)
                 if not result_content.lstrip().startswith("{\"error"):
-                    query = (parsed_args.get("query")
+                    query = (parsed_args.get("search_query")
+                             or parsed_args.get("query")
                              or parsed_args.get("q")
                              or parsed_args.get("url")
                              or json.dumps(parsed_args, ensure_ascii=False))
@@ -527,8 +577,20 @@ class DeepResearchExecutor(NodeExecutor):
                     })
                     tool_stats[name] = tool_stats.get(name, 0) + 1
 
+            if _emit is not None:
+                _emit("tool_result", node_code=node_code, call_id=call_id,
+                      tool_name=name, result=result_content,
+                      round_idx=round_idx, synthetic=synthetic)
+
             messages.append({"role": "tool", "tool_call_id": call_id,
                              "content": result_content})
+
+            # Query rate limit: pause after every actually-executed research
+            # query (synthetic error feedback is not a query; concurrent
+            # branches each pause their own queries, so the wall-clock gap
+            # per branch stays _QUERY_INTERVAL_SECONDS)
+            if not synthetic:
+                await asyncio.sleep(_QUERY_INTERVAL_SECONDS)
 
         return new_findings
 

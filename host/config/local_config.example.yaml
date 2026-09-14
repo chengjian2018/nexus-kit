@@ -77,10 +77,14 @@ mcp_servers: {}
 # 使用方（pattern 声明，非本文件）：
 #   Pattern(..., allow_toolset=["mcp-websearch"], nodes=[
 #       BaseNode(code="search", use_tools=["web_search"], ...)])
-# 示例（远程 SSE 端点）：
+# 示例（远程 HTTP 端点——优先 streamable_http；旧 SSE 传输与 mcp sdk
+# 2.2.0 组合存在 tools/call 写阻塞挂起问题，z.ai 等服务方以 /mcp 端点
+# + Bearer 头的 streamable_http 为实测可用形态）：
 #   remote_search:
-#     transport: sse
-#     url: "https://<host>/api/mcp/sse?Authorization=<your-token>"
+#     transport: streamable_http
+#     url: "https://<host>/api/mcp/web_search_prime/mcp"
+#     headers:
+#       Authorization: "Bearer <your-token>"
 
 # ============================================================================
 # 存储与压缩（可选，以下即默认值）

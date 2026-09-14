@@ -52,7 +52,8 @@ DR_PREPLAN    一次带工具 LLM 调用：模型自行决定是否先检索一�
 DR_PLAN       一次无工具调用 → {"sub_questions": [...]}
               （JSON 容错提取；失败把坏输出+错误回填让模型自纠重试，
                 再失败降级为 [原问题]，标记 degraded）
-DR_SEARCH     带工具 ReAct 循环（≤12 轮）：每轮把「研究状态板」重写进 system
+DR_SEARCH     带工具 ReAct 循环（≤5 轮查询，每次查询后限速暂停 5 秒）：
+              每轮把「研究状态板」重写进 system
               （子问题勾选进度/剩余轮次/命中统计），无 tool_calls 即收工信号
 DR_SYNTHESIZE 精简 messages 流式生成报告 —— 唯一转发 text delta 的相位
 ```
@@ -61,9 +62,9 @@ DR_SYNTHESIZE 精简 messages 流式生成报告 —— 唯一转发 text delta 
 （几十条 tool 行进历史会撑爆下一轮 prompt）；对话历史只留
 「用户问题 → 研究报告」的 Q/A 对。
 
-防失控预算：SEARCH ≤12 轮、PLAN 重试 1 次、单条结果截 4000 字符、
-findings ≤30 条（FIFO）、工作区 ≤60000 字符（超限中段截断最旧 tool 行），
-总 LLM 调用硬上限 ≈16。孤儿防御：任一相位入口发现在途状态缺失 →
+防失控预算：SEARCH ≤5 轮查询（每次真实查询后 sleep 5 秒限速）、PLAN 重试
+1 次、单条结果截 4000 字符、findings ≤30 条（FIFO）、工作区 ≤60000 字符
+（超限中段截断最旧 tool 行）。孤儿防御：任一相位入口发现在途状态缺失 →
 标记 orphan_* 直奔综合，产出「证据不足」降级报告，流水线不卡死。
 
 ### 工具授权（plan-⑧ §4 三层收口）
@@ -74,6 +75,13 @@ findings ≤30 条（FIFO）、工作区 ≤60000 字符（超限中段截断最
 executor 解析工具前 `await ensure_mcp_ready()` 等待 MCP 连接终态（防首轮
 抢跑冻结空工具集）。注册期校验对 MCP 异步注册的工具名降级为 warning
 （运行期三层收口仍生效）。
+
+**工具名别名归一**（executor_multi `_TOOL_NAME_ALIASES`）：flash 级模型常把
+`web_search_prime` 写成泛化名 `web_search`，分派护栏前就地归一（hooks/
+拦截之前改写 tc 与 assistant 载荷，history 留规范名让模型顺带学会），
+省掉「拦截 → 回喂可用清单 → 自纠」的一轮浪费；别名目标不在本轮
+`allowed_names` 时不生效，未知名照旧走拦截护栏。topic_research 的执行器
+继承自此，同样覆盖。
 
 > 跟进项：若要启用 zai 视觉工具（analyze_image 等 8 个，运行时由 server
 > 动态上报名字），需把具体工具名补进对应节点 `use_tools`。

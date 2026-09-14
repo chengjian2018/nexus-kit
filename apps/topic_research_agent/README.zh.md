@@ -14,7 +14,7 @@ tr_preplan ──next──> tr_plan ──sends──> tr_search ×N ──join
 |---|---|---|---|
 | `tr_preplan` | 研究状态初始化 + 可选预检索（模型自行决定是否先检索补背景） | 1 次带工具调用 | `web_search_prime` |
 | `tr_plan` | 把问题拆为 3-5 个研究主题（JSON，自纠重试，降级为原问题单主题），按主题 `sends` 扇出 | 1 次（+1 重试） | 无 |
-| `tr_search` | 扇出 worker：一个实例研究一个主题，私有工作区 ReAct 检索（每实例独立轮次守卫） | ≤6 轮/实例 | `web_search_prime` |
+| `tr_search` | 扇出 worker：一个实例研究一个主题，私有工作区 ReAct 检索（每实例独立轮次守卫 + 查询限速） | ≤5 轮/实例（每查询后 sleep 5s） | `web_search_prime` |
 | `tr_merge` | join：把 `__fanout_results__` 结果板折叠进状态板（统一 [S1..Sn] 编号、FIFO 上限、失败分支计数不阻塞） | **0 次（纯结构合并）** | 无 |
 | `tr_report` | 基于合并资料撰写报告草稿（执行摘要/分主题分析/结论与不确定性/参考来源） | 1 次 | 无 |
 | `tr_polish` | 格式美化并流式交付最终报告（标题层级/重点加粗/来源列表对齐；不改事实与引用），写终态 trace | 1 次（流式） | 无 |
@@ -33,7 +33,8 @@ tr_preplan ──next──> tr_plan ──sends──> tr_search ×N ──join
   `cxt.metadata["topic_research"]`（phases / themes / per_theme /
   branches / sources / tool_stats / degraded）。
 - **预算三层**（plan-⑨ §3.3）：主循环 5 步（默认 `max_steps=10`；worker
-  不占图步数）× `max_fanout=8` 宽度 × 每分支 `_MAX_SEARCH_ROUNDS=6`。
+  不占图步数）× `max_fanout=8` 宽度 × 每分支 `_MAX_SEARCH_ROUNDS=5`
+  （每次真实查询后 sleep 5 秒限速）。
 - **相位复用**：PREPLAN/SEARCH 直接复用 `deep_research_agent.
   executor_multi.DeepResearchExecutor` 的无状态相位方法；分主题规划、
   结构化合并、报告草稿、格式美化为本应用自有站点。

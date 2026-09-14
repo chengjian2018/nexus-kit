@@ -852,3 +852,29 @@ def test_callback_vague_or_missing_falls_back_to_default(pattern, sessions):
     chat(sessions, "s1", "嗯没问题")
     assert session.cxt.current_node_code == "install_end"
     assert end_actions(session.cxt)
+
+
+def test_available_slots_string_shapes_normalized():
+    """parse_available_slots 的值形态容忍：除标准字符串列表外，JSON 数组
+    串与分隔符串也归一（渠道/表单路径可能以 Dict[str, str] 传入）。"""
+    from apps.install_booking_agent.slots import parse_available_slots
+
+    canonical = parse_available_slots(
+        {"available_slots": ["2026-09-10 09:00-12:00", "2026-09-11 14:00-17:00"]})
+    assert [s[2] for s in canonical] == [
+        "2026-09-10 09:00-12:00", "2026-09-11 14:00-17:00"]
+
+    json_str = parse_available_slots(
+        {"available_slots": '["2026-09-10 09:00-12:00", "2026-09-11 14:00-17:00"]'})
+    assert [s[2] for s in json_str] == [s[2] for s in canonical]
+
+    joined = parse_available_slots(
+        {"available_slots": "2026-09-10 09:00-12:00；2026-09-11 14:00-17:00"})
+    assert [s[2] for s in joined] == [s[2] for s in canonical]
+
+    assert parse_available_slots({"available_slots": ""}) == []
+    assert parse_available_slots({}) == []
+    # 非法条目跳过不阻塞
+    assert parse_available_slots(
+        {"available_slots": ["not a slot", "2026-09-10 09:00-12:00"]}) == [
+        canonical[0]]

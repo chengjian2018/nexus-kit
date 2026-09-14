@@ -413,12 +413,18 @@ class McpManager:
             return sse_client(url=str(cfg["url"]),
                               headers=cfg.get("headers") or None)
         if transport == "streamable_http":
-            # mcp 2.2+: headers go through a pre-configured httpx.AsyncClient
+            # mcp 2.2+: headers go through a pre-configured httpx client
             # (the client factory no longer takes a headers kwarg); pass the
             # client even with empty headers to keep timeout behavior
             # consistent. The AsyncClient now naturally lives on the
-            # caller's loop.
-            import httpx as _httpx
+            # caller's loop. NOTE: the sdk (mcp 2.2) vendors on the httpx2
+            # fork — an httpx 0.x AsyncClient passed here wedges the
+            # transport (requests never leave the client), so import httpx2
+            # when present and only fall back to httpx for older sdks.
+            try:
+                import httpx2 as _httpx
+            except ImportError:  # pragma: no cover -- older sdk without the fork
+                import httpx as _httpx
             from mcp.client.streamable_http import streamable_http_client
             client = _httpx.AsyncClient(
                 headers=cfg.get("headers") or None, timeout=_DEFAULT_CALL_TIMEOUT)

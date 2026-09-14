@@ -11,6 +11,7 @@ Data sources:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime
@@ -39,9 +40,29 @@ _ANNOTATION_RE = re.compile(
 def parse_available_slots(task_info: dict) -> List[Slot]:
     """Parse task_info["available_slots"] ("YYYY-MM-DD HH:MM-HH:MM" strings)
     into (start, end, original) windows, start-sorted; malformed entries are
-    skipped with a warning (a bad schedule never blocks the dialogue)."""
+    skipped with a warning (a bad schedule never blocks the dialogue).
+
+    Value shape tolerance: the canonical form is a list of strings, but some
+    entry paths (channel/webhook models) declare task_info as Dict[str, str]
+    and deliver a JSON-encoded array or a separator-joined string — both are
+    normalized here so the booking guard sees the real schedule either way.
+    """
+    raw_slots = (task_info or {}).get("available_slots") or []
+    if isinstance(raw_slots, str):
+        text = raw_slots.strip()
+        if not text:
+            raw_slots = []
+        elif text.startswith("["):
+            try:
+                raw_slots = json.loads(text)
+            except ValueError:
+                logger.warning(
+                    "[install_booking] available_slots JSON 数组解析失败: %.120s", text)
+                raw_slots = []
+        else:
+            raw_slots = [s.strip() for s in re.split(r"[;；，,、\n]+", text) if s.strip()]
     slots: List[Slot] = []
-    for raw in (task_info or {}).get("available_slots") or []:
+    for raw in raw_slots:
         try:
             day, clocks = str(raw).split(" ", 1)
             c_start, c_end = clocks.split("-", 1)

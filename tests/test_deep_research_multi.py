@@ -33,6 +33,13 @@ from apps.deep_research_agent.prompts import PLAN_ANCHOR, PREPLAN_ANCHOR
 # Fixtures / helpers
 # ============================================================================
 
+@pytest.fixture(autouse=True)
+def _no_query_interval(monkeypatch):
+    """查询限速归零：_dispatch_research_round 每次真实查询后的 sleep 只在
+    生产生效，离线测试不等待。"""
+    monkeypatch.setattr(executor_multi, "_QUERY_INTERVAL_SECONDS", 0.0)
+
+
 @pytest.fixture(scope="module")
 def pattern():
     from nexus.registry.patterns import discover_builtin_patterns, registry
@@ -74,6 +81,51 @@ def fake_mcp_tools():
     calls["n"], calls["queries"] = 0, []
 
 
+def test_query_budget_and_rate_limit(monkeypatch):
+    """查询预算与限速契约：SEARCH 轮次封顶 5；每次真实执行的查询后
+    sleep _QUERY_INTERVAL_SECONDS（synthetic 错误回填不算查询，不睡）。"""
+    import asyncio as _asyncio
+
+    import apps.deep_research_agent.executor_multi as em
+
+    assert em._MAX_SEARCH_ROUNDS == 5
+
+    sleeps = []
+
+    async def _fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def _fake_execute_tool(name, args):
+        return json.dumps({"results": [{"title": "r", "snippet": "s"}]},
+                          ensure_ascii=False)
+
+    monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(em, "_execute_tool", _fake_execute_tool)
+    # 本测试关心的就是生产间隔值——抵消 autouse 的归零 fixture
+    monkeypatch.setattr(em, "_QUERY_INTERVAL_SECONDS", 5.0)
+
+    class _Cxt:
+        session_id = "s-rate-limit"
+
+    class _Node:
+        code = "dr_search"
+
+    messages = []
+    tool_calls = [
+        {"id": "c1", "function": {"name": "web_search_prime",
+                                  "arguments": '{"query": "真实查询"}'}},
+        {"id": "c2", "function": {"name": "ghost_tool",
+                                  "arguments": "{}"}},  # 拦截回填，不睡
+    ]
+    findings = arun(em.DeepResearchExecutor()._dispatch_research_round(
+        messages, tool_calls, hooks=None,
+        allowed_names={"web_search_prime"}, round_idx=0,
+        cxt=_Cxt(), node=_Node(), findings=[], tool_stats={}, stream=None))
+
+    assert len(findings) == 1            # 只有真实查询进 findings
+    assert sleeps == [5.0]               # 一次真实查询 → 一次限速暂停
+
+
 class DeepResearchScriptedProvider:
     """按相位特征脚本化的 provider(记录调用与请求特征供断言)。
 
@@ -87,7 +139,7 @@ class DeepResearchScriptedProvider:
 
     def __init__(self, plan_json=None, search_rounds=1, report="# 研究报告",
                  preplan_rounds=0, plan_fail_first=False,
-                 fail_sub_question=None):
+                 fail_sub_question=None, tool_name="web_search_prime"):
         self.plan_json = plan_json or json.dumps(
             {"sub_questions": ["子问题A", "子问题B"],
              "notes": "测试计划"}, ensure_ascii=False)
@@ -96,6 +148,8 @@ class DeepResearchScriptedProvider:
         self.preplan_rounds = preplan_rounds
         self.plan_fail_first = plan_fail_first
         self.fail_sub_question = fail_sub_question
+        # 模型输出的工具名（可故意写成泛化名 web_search，测分派前归一）
+        self.tool_name = tool_name
         self.call_count = 0
         self.search_calls = 0
         self.search_branches = {}   # 子问题 -> {"tool_rounds", "calls"}
@@ -126,7 +180,7 @@ class DeepResearchScriptedProvider:
         if self.preplan_calls <= self.preplan_rounds:
             return {"content": None, "tool_calls": [{
                 "id": f"p{self.preplan_calls}", "type": "function",
-                "function": {"name": "web_search_prime",
+                "function": {"name": self.tool_name,
                              "arguments": json.dumps(
                                  {"query": f"预检索查询{self.preplan_calls}"},
                                  ensure_ascii=False)},
@@ -168,7 +222,7 @@ class DeepResearchScriptedProvider:
                 st["tool_rounds"] += 1
                 return {"content": None, "tool_calls": [{
                     "id": f"c{self.search_calls}", "type": "function",
-                    "function": {"name": "web_search_prime",
+                    "function": {"name": self.tool_name,
                                  "arguments": json.dumps(
                                      {"query": f"测试查询{st['calls']}"},
                                      ensure_ascii=False)},
@@ -221,7 +275,7 @@ class DeepResearchScriptedProvider:
         if st["tool_rounds"] < self.search_rounds:
             st["tool_rounds"] += 1
             tc = {"index": 0, "id": f"c{self.search_calls}", "type": "function",
-                  "function": {"name": "web_search_prime",
+                  "function": {"name": self.tool_name,
                                "arguments": json.dumps(
                                    {"query": f"测试查询{st['calls']}"},
                                    ensure_ascii=False)}}
@@ -296,6 +350,41 @@ def test_phase_executor_plugins_registered():
 
     for code in ("dr_preplan", "dr_plan", "dr_search", "dr_synthesize"):
         assert plugins.has("executor", code), f"executor 插件 {code} 未注册"
+
+
+# ============================================================================
+# 1b. Tool-name alias normalization（flash 级模型的泛化名护栏前归一）
+# ============================================================================
+
+def test_normalize_tool_name_unit():
+    from apps.deep_research_agent.executor_multi import _normalize_tool_name
+
+    allowed = {"web_search_prime"}
+    # 原名可用 / 别名命中
+    assert _normalize_tool_name("web_search_prime", allowed) == \
+        ("web_search_prime", False)
+    assert _normalize_tool_name("web_search", allowed) == \
+        ("web_search_prime", True)
+    # 未命中别名、或别名目标不在本轮集合 → 原样返回（仍走拦截护栏）
+    assert _normalize_tool_name("no_such_tool", allowed) == ("no_such_tool", False)
+    assert _normalize_tool_name("web_search", {"other"}) == ("web_search", False)
+
+
+def test_tool_name_alias_dispatches_canonical_tool(pattern, fake_mcp_tools):
+    """模型全程把 web_search_prime 写成泛化名 web_search：分派前就地归一，
+    工具真实执行、findings/统计落在规范名下——不再浪费「拦截→回喂→自纠」
+    一轮（归一失效时会表现为 fake 工具零调用、研究降级）。"""
+    provider = DeepResearchScriptedProvider(
+        report="# 研究报告\n归一检索生效 [S1]。",
+        tool_name="web_search")            # 模型每轮都叫错名字
+    session, reply = run_research(pattern, provider)
+
+    assert "研究报告" in reply
+    assert fake_mcp_tools["n"] >= 2         # 假工具被真实分派（每分支 ≥1 次）
+    trace = session.cxt.metadata["deep_research"]
+    assert trace["tool_stats"].get("web_search_prime") == 2   # 统计在规范名下
+    assert trace["sources"][0]["tool"] == "web_search_prime"
+    assert not trace["degraded"]
 
 
 # ============================================================================
@@ -390,6 +479,19 @@ def test_streaming_relay_traces(pattern, fake_mcp_tools):
     joins = [t for t in traces if t.event == "fanout_join"]
     assert len(joins) == 1
     assert joins[0].data == {"total": 2, "failed": 0}
+
+    # tool_call / tool_result stream per dispatch (kernel vocabulary, same
+    # data keys): 1 tool round per branch → 2+2, branch-tagged, canonical
+    # tool name, real (non-synthetic) results carrying the fake MCP content
+    tc_traces = [t for t in traces if t.event == "tool_call"]
+    tr_traces = [t for t in traces if t.event == "tool_result"]
+    assert len(tc_traces) == 2 and len(tr_traces) == 2
+    assert all(t.data["tool_name"] == "web_search_prime" for t in tc_traces)
+    assert all(t.data["args"].get("query") for t in tc_traces)
+    assert all(t.branch_id.startswith("dr_search#") for t in tc_traces)
+    assert all(t.data["tool_name"] == "web_search_prime"
+               and not t.data["synthetic"] for t in tr_traces)
+    assert all("测试检索内容" in t.data["result"] for t in tr_traces)
 
     # all deltas come from the report: plan/search intermediate text does not leak
     deltas = "".join(e.text for e in events if e.kind == "delta")
