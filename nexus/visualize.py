@@ -54,10 +54,18 @@ def _sanitize_id(raw: Any, prefix: str) -> str:
 
 
 def _escape_label(text: Any) -> str:
-    """Escape special characters in mermaid labels (quotes / backslashes / newlines)."""
+    """Escape special characters in mermaid labels: backslash / quotes /
+    newlines for mermaid syntax, plus HTML-significant characters (& < >) —
+    labels are node codes/names that may carry arbitrary text, and every
+    renderer in play (studio's in-app mermaid render, the standalone HTML
+    export which initializes mermaid with securityLevel=loose) inserts them
+    into live DOM; the <br/> newline join must happen after escaping."""
     return (
         str(text or "")
         .replace("\\", "\\\\")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
         .replace('"', "#quot;")
         .replace("\n", "<br/>")
     )

@@ -111,6 +111,28 @@ class TestMermaid:
         assert visualize._escape_label("a\nb") == "a<br/>b"
         assert visualize._escape_label(None) == ""
 
+    def test_escape_label_html(self):
+        # HTML 显著字符必须转义：标签文本会进入宽松模式的 SVG 渲染与
+        # HTML 导出，未转义的 <img onerror=...> 即存储型脚本
+        assert visualize._escape_label(
+            '<img src=x onerror="alert(1)">') == \
+            "&lt;img src=x onerror=#quot;alert(1)#quot;&gt;"
+        assert visualize._escape_label("AT&T") == "AT&amp;T"
+        assert visualize._escape_label("<script>") == "&lt;script&gt;"
+
+    def test_label_html_never_reaches_output_raw(self):
+        # 节点名携带任意文本（LLM 生成的 pattern 同理）：mermaid 输出里
+        # 不允许出现未转义的标签起始
+        evil = Pattern(
+            code="vis_evil", name="xss", description="d", pattern_type="fsm",
+            entry_node_code="n_evil",
+            nodes=[BaseNode(code="n_evil",
+                            name='<img src=x onerror="fetch(\'//evil/\')">',
+                            sub_nodes=[])])
+        m = visualize.pattern_to_mermaid(evil)
+        assert "<img" not in m
+        assert "&lt;img" in m
+
     def test_agent_graph_edges(self, agent_demo):
         m = visualize.pattern_to_mermaid(agent_demo)
         assert "n_vis_root --> n_vis_worker" in m

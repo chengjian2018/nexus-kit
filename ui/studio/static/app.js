@@ -141,7 +141,7 @@ function loadMermaid() {
         script.src = sources[i++];
         script.onload = () => {
           try {
-            window.mermaid.initialize({ startOnLoad: false, securityLevel: "loose" });
+            window.mermaid.initialize({ startOnLoad: false });
             resolve(window.mermaid);
           } catch (e) { resolve(null); }
         };
