@@ -417,12 +417,19 @@ def _handle_edit_file(args: Dict[str, Any]) -> str:
     data = path.read_bytes()
     if b"\x00" in data[:4096]:
         return tool_error(f"疑似二进制文件，无法按文本编辑: {path}")
-    if len(data) > size_cap:
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # 严格解码拒绝：errors=replace 的替换结果一旦回写，整个文件（而
+        # 非仅编辑区）都会被 U+FFFD 固化——GBK 等编码文件就此不可逆损坏
         return tool_error(
-            f"文件 {len(data)} 字符超过编辑上限 {size_cap}；超大文件请用 "
+            f"文件不是 UTF-8 文本（可能是 GBK 等其他编码），拒绝编辑以"
+            f"避免整文件乱码回写。请先转码（如 iconv -f GBK -t UTF-8）"
+            f"后再试: {path}")
+    if len(content) > size_cap:
+        return tool_error(
+            f"文件 {len(content)} 字符超过编辑上限 {size_cap}；超大文件请用 "
             "bash 里的 sed/awk 或分片处理")
-
-    content = data.decode("utf-8", errors="replace")
     count = content.count(old_str)
     if count == 0:
         return tool_error(

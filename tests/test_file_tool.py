@@ -283,6 +283,29 @@ def test_edit_file_guards(tmp_path):
     assert "二进制" in r["error"]
 
 
+def test_edit_file_rejects_non_utf8_without_corrupting(tmp_path):
+    # 非 UTF-8（GBK 等）严格解码拒绝，且文件字节原样保留——errors=replace
+    # 回写会把整个文件固化成 U+FFFD 乱码，不可逆
+    target = tmp_path / "gbk.txt"
+    raw = "姓名:张三\nkeep me here\n".encode("gbk")
+    target.write_bytes(raw)
+    r = _run("edit_file", {"path": str(target), "old_str": "keep me",
+                           "new_str": "keep us"})
+    assert "UTF-8" in r["error"]
+    assert target.read_bytes() == raw       # 未被写坏
+
+
+def test_edit_file_cap_counts_chars_not_bytes(tmp_path):
+    # 上限按解码后的字符数计：8 个字符的 CJK 文件占 12+ 字节，字节口径
+    # 会在约 1/3 阈值处误拒
+    target = tmp_path / "cjk.txt"
+    target.write_text("中文内容abcd", encoding="utf-8")   # 8 字符 / 12 字节
+    r = _run("edit_file", {"path": str(target), "old_str": "abcd",
+                           "new_str": "ABC"},
+             guard={**_GUARD, "max_edit_chars": 10})
+    assert "path" in r and target.read_text(encoding="utf-8") == "中文内容ABC"
+
+
 # ---------------------------------------------------------------------------
 # find_files
 # ---------------------------------------------------------------------------
