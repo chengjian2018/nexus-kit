@@ -1,5 +1,6 @@
 /* nexus-console P0 前端（无构建、无框架）
  * 路由：#/ 总览 | #/patterns 应用列表 | #/patterns/{code} 详情 | #/knowledge 知识库
+ *       | #/sessions 会话审查 | #/sessions/{id} 会话时间线
  * 约定：所有数据经 /api/v1/console/*（响应包裹 {code,message,status,data}）；
  *       鉴权复用 NEXUS_API_KEY（X-API-Key 头，密钥存 localStorage）。
  */
@@ -31,9 +32,12 @@ function toast(message, ok) {
 
 /* ============================== API 封装 ============================== */
 
+/* 运营台默认空间：进入知识库页即选中（host 启动时会向该空间种子演示数据） */
+const DEFAULT_SCOPE = "seller:001";
+
 const state = {
   key: localStorage.getItem("nexus_console_key") || "",
-  scope: localStorage.getItem("nexus_console_scope") || "",
+  scope: localStorage.getItem("nexus_console_scope") || DEFAULT_SCOPE,
   scopes: [],
 };
 
@@ -221,6 +225,8 @@ const views = {
   patternDetail: renderPatternDetail,
   knowledge: renderKnowledge,
   rag: renderRag,
+  sessions: renderSessions,
+  sessionDetail: renderSessionDetail,
 };
 
 function route() {
@@ -231,14 +237,18 @@ function route() {
   else if (parts[0] === "patterns") view = "patterns";
   else if (parts[0] === "knowledge") view = "knowledge";
   else if (parts[0] === "rag") view = "rag";
+  else if (parts[0] === "sessions" && parts[1]) { view = "sessionDetail"; arg = decodeURIComponent(parts[1]); }
+  else if (parts[0] === "sessions") view = "sessions";
 
   $$("#nav a").forEach((a) =>
     a.classList.toggle("active", a.dataset.nav === view
-      || (view === "patternDetail" && a.dataset.nav === "patterns")));
+      || (view === "patternDetail" && a.dataset.nav === "patterns")
+      || (view === "sessionDetail" && a.dataset.nav === "sessions")));
   $("#page-title").textContent = {
     dashboard: "总览", patterns: "应用（Pattern）",
     patternDetail: `应用详情 · ${arg}`, knowledge: "知识库",
     rag: "RAG 检索配置",
+    sessions: "会话审查", sessionDetail: `会话审查 · ${arg}`,
   }[view];
 
   const main = $("#main");
@@ -506,13 +516,14 @@ async function renderKnowledge(main) {
       <div class="tabs" id="kb-tabs">
         <button data-tab="products" class="active">商品知识</button>
         <button data-tab="cs">客服知识</button>
+        <button data-tab="collections">自定义知识库</button>
         <button data-tab="search">试搜台</button>
       </div>
       <div id="kb-body"></div>
     </div>`;
 
+  if (!state.scope) state.scope = DEFAULT_SCOPE;  // 兜底：初始 state 已默认 seller:001
   await refreshScopes();
-  if (!state.scope && state.scopes.length) setScope(state.scopes[0].scope);
 
   $("#scope-apply").onclick = () => {
     const val = $("#scope-input").value.trim() || $("#scope-sel").value;
@@ -523,18 +534,19 @@ async function renderKnowledge(main) {
   $("#scope-clear").onclick = () => {
     if (!state.scope) return;
     confirmDialog(
-      `将删除空间 ${state.scope} 下的全部商品与客服知识，不可恢复。确认继续？`,
+      `将删除空间 ${state.scope} 下的全部商品、客服知识与自定义知识库（含记录），不可恢复。确认继续？`,
       async () => {
         const data = await api("/api/v1/console/knowledge/clear-scope",
           { method: "POST", body: { scope: state.scope } });
-        toast(`已清空：商品 ${data.products_deleted} 条，客服知识 ${data.cs_deleted} 条`, true);
+        toast(`已清空：商品 ${data.products_deleted} 条，客服 ${data.cs_deleted} 条，自定义库 ${data.collections_deleted} 个`, true);
         await refreshScopes();
         activateKbTab(currentKbTab);
       });
   };
 
   let currentKbTab = "products";
-  const kbTabs = { products: renderKbProducts, cs: renderKbCs, search: renderKbSearch };
+  const kbTabs = { products: renderKbProducts, cs: renderKbCs,
+                   collections: renderKbCollections, search: renderKbSearch };
   function activateKbTab(name) {
     currentKbTab = name;
     $$("#kb-tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
@@ -556,7 +568,7 @@ async function renderKnowledge(main) {
   function renderScopeCounts() {
     const s = state.scopes.find((x) => x.scope === state.scope);
     $("#scope-counts").textContent = s
-      ? `商品 ${s.product_count} 条 · 客服 ${s.cs_count} 条 · 更新于 ${fmtTime(s.updated_at)}`
+      ? `商品 ${s.product_count} 条 · 客服 ${s.cs_count} 条 · 自定义库 ${s.collection_count} 个 · 更新于 ${fmtTime(s.updated_at)}`
       : (state.scope ? "（新空间，暂无内容）" : "");
   }
   function setScope(scope) {
@@ -870,6 +882,291 @@ async function renderKbSearch(body) {
   }
 }
 
+/* ---------- 知识库：自定义知识库（运营台自建，表字段可定义） ---------- */
+
+const KB_FIELD_TYPES = [
+  { type: "text", label: "单行文本" },
+  { type: "textarea", label: "多行文本" },
+  { type: "number", label: "数字" },
+];
+
+function kbBodyError(body) {
+  return (err) => { body.innerHTML = `<div class="panel error">${esc(err.message)}</div>`; };
+}
+
+async function renderKbCollections(body) {
+  if (!state.scope) { body.innerHTML = '<div class="empty">请先选择或输入一个空间（scope）</div>'; return; }
+  const data = await api("/api/v1/console/knowledge/collections",
+    { params: { scope: state.scope } });
+  const cols = data.collections || [];
+  body.innerHTML = `
+    <div class="row spread" style="margin-bottom:10px">
+      <span class="muted" style="font-size:12.5px">自定义知识库按空间隔离；仅运营台管理，暂不参与 agent 检索</span>
+      <button class="btn btn-primary btn-sm" id="coll-add">新建知识库</button>
+    </div>
+    ${cols.length ? `
+    <table class="tbl">
+      <thead><tr><th>名称</th><th>描述</th><th>字段数</th><th>记录数</th><th>更新时间</th><th style="width:200px"></th></tr></thead>
+      <tbody>${cols.map((c) => `
+        <tr>
+          <td><b>${esc(c.name)}</b></td>
+          <td class="muted"><span class="clip">${esc(c.description || "-")}</span></td>
+          <td class="num">${(c.fields || []).length}</td>
+          <td class="num">${c.record_count}</td>
+          <td class="muted">${fmtTime(c.updated_at)}</td>
+          <td><button class="btn btn-sm" data-open="${c.id}">进入</button>
+              <button class="btn btn-sm" data-edit="${c.id}">编辑字段</button>
+              <button class="btn btn-sm btn-danger" data-del="${c.id}">删除</button></td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : '<div class="empty">本空间暂无自定义知识库——点右上角「新建知识库」创建。</div>'}`;
+
+  $("#coll-add").onclick = () => renderCollectionForm(body, null);
+  $$("[data-open]", body).forEach((b) => b.onclick = () =>
+    renderCollectionDetail(body, Number(b.dataset.open)).catch(kbBodyError(body)));
+  $$("[data-edit]", body).forEach((b) => b.onclick = () =>
+    renderCollectionForm(body, cols.find((c) => String(c.id) === b.dataset.edit)));
+  $$("[data-del]", body).forEach((b) => b.onclick = () => {
+    const c = cols.find((x) => String(x.id) === b.dataset.del);
+    confirmDialog(`删除知识库「${c ? c.name : b.dataset.del}」及其全部记录？不可恢复。`, async () => {
+      await api(`/api/v1/console/knowledge/collections/${b.dataset.del}`, { method: "DELETE" });
+      toast("已删除", true);
+      renderKbCollections(body).catch(kbBodyError(body));
+    });
+  });
+}
+
+function fieldRowHtml(f) {
+  f = f || {};
+  return `
+    <tr class="field-row">
+      <td><input type="text" class="cell-input f-name" maxlength="64" placeholder="如 buyer_issue" value="${esc(f.name || "")}"></td>
+      <td><input type="text" class="cell-input f-label" maxlength="64" placeholder="显示名（可选）" value="${esc(f.label || "")}"></td>
+      <td><select class="cell-select f-type">${KB_FIELD_TYPES.map((t) =>
+        `<option value="${t.type}" ${t.type === (f.type || "text") ? "selected" : ""}>${t.label}</option>`).join("")}</select></td>
+      <td style="text-align:center"><input type="checkbox" class="f-required" ${f.required ? "checked" : ""}></td>
+      <td><button type="button" class="btn btn-sm btn-danger field-del">×</button></td>
+    </tr>`;
+}
+
+function collectFieldDefs() {
+  const defs = [];
+  for (const tr of $$("#field-editor .field-row")) {
+    const name = $(".f-name", tr).value.trim();
+    const label = $(".f-label", tr).value.trim();
+    const type = $(".f-type", tr).value;
+    const required = $(".f-required", tr).checked;
+    if (!name && !label && !required) continue;  // 整行空白忽略
+    if (!name) throw new Error("有字段行未填「字段名」");
+    defs.push({ name, label: label || null, type, required });
+  }
+  if (!defs.length) throw new Error("至少需要 1 个字段");
+  const names = defs.map((d) => d.name);
+  if (new Set(names).size !== names.length) throw new Error("字段名重复，请检查");
+  for (const n of names) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(n))
+      throw new Error(`字段名 ${n} 非法（需字母开头，仅限字母/数字/下划线）`);
+  }
+  return defs;
+}
+
+function renderCollectionForm(body, existing) {
+  const isEdit = !!existing;
+  const fields = isEdit
+    ? (existing.fields || []).map((f) => Object.assign({}, f))
+    : [{ name: "", label: "", type: "text", required: false },
+       { name: "", label: "", type: "textarea", required: false }];
+  const back = () => (isEdit
+    ? renderCollectionDetail(body, existing.id).catch(kbBodyError(body))
+    : renderKbCollections(body).catch(kbBodyError(body)));
+  body.innerHTML = `
+    <div class="subview-head">
+      <button class="btn btn-sm" id="coll-back">← 返回</button>
+      <b>${isEdit ? `编辑知识库 · ${esc(existing.name)}` : "新建知识库"}</b>
+      <span class="muted" style="font-size:12.5px">定义表字段——保存后即可按字段录入记录</span>
+    </div>
+    <div class="form-row"><label class="req">库名</label>
+      <input type="text" id="coll-name" maxlength="64" placeholder="如 售后案例库" value="${esc(isEdit ? existing.name : "")}" style="
+        border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px;width:340px">
+      <div class="form-hint">同空间内唯一；${isEdit ? "改名不可与其他库重名" : "创建后可直接录入记录"}。</div></div>
+    <div class="form-row"><label>描述</label>
+      <input type="text" id="coll-desc" maxlength="512" value="${esc(isEdit ? existing.description || "" : "")}" style="
+        border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px;width:480px"></div>
+    <div class="form-row"><label class="req">表字段</label>
+      <table class="tbl" id="field-editor">
+        <thead><tr><th style="width:220px">字段名（英文标识）</th><th style="width:170px">显示名</th>
+          <th style="width:110px">类型</th><th style="width:52px">必填</th><th style="width:44px"></th></tr></thead>
+        <tbody>${fields.map(fieldRowHtml).join("")}</tbody>
+      </table>
+      <div style="margin-top:8px"><button type="button" class="btn btn-sm" id="field-add">＋ 添加字段</button></div>
+      <div class="form-hint">字段名作为记录的键（字母开头，仅限字母/数字/下划线）；保存后仍可增删字段，被删字段的旧值会被清理。</div></div>
+    <div class="form-error" id="coll-form-error"></div>
+    <div class="form-actions">
+      <button type="button" class="btn" id="coll-cancel">取消</button>
+      <button type="button" class="btn btn-primary" id="coll-save">${isEdit ? "保存修改" : "保存并创建"}</button>
+    </div>`;
+
+  $("#coll-back").onclick = back;
+  $("#coll-cancel").onclick = back;
+  $("#field-add").onclick = () =>
+    $("#field-editor tbody").insertAdjacentHTML("beforeend", fieldRowHtml({}));
+  $("#field-editor").onclick = (e) => {
+    const btn = e.target.closest(".field-del");
+    if (btn) btn.closest("tr").remove();
+  };
+  $("#coll-save").onclick = async () => {
+    const name = $("#coll-name").value.trim();
+    const desc = $("#coll-desc").value.trim() || null;
+    const errBox = $("#coll-form-error");
+    errBox.textContent = "";
+    try {
+      if (!name) throw new Error("库名不能为空");
+      const defs = collectFieldDefs();
+      let id = existing ? existing.id : null;
+      if (isEdit) {
+        await api(`/api/v1/console/knowledge/collections/${existing.id}`, {
+          method: "PUT", body: { name, description: desc, fields: defs } });
+        toast("已保存（字段与记录检索已同步）", true);
+      } else {
+        id = (await api("/api/v1/console/knowledge/collections", {
+          method: "POST",
+          body: { scope: state.scope, name, description: desc, fields: defs } })).id;
+        toast("知识库已创建", true);
+      }
+      renderCollectionDetail(body, id).catch(kbBodyError(body));
+    } catch (e) {
+      errBox.textContent = e.message || String(e);
+    }
+  };
+}
+
+async function renderCollectionDetail(body, collId) {
+  const data = await api(`/api/v1/console/knowledge/collections/${collId}/records`,
+    { params: { limit: 100 } });
+  const coll = data.collection;
+  const fields = coll.fields || [];
+  let currentRows = data.rows || [];
+
+  const cell = (v) => {
+    if (v == null) return '<span class="muted">-</span>';
+    const text = String(v);
+    return `<span class="clip" title="${esc(text)}">${esc(
+      text.length > 60 ? text.slice(0, 60) + "…" : text)}</span>`;
+  };
+  const bindRowButtons = () => {
+    $$("#rec-tbody [data-edit]").forEach((b) => b.onclick = () => {
+      const row = currentRows.find((r) => String(r.id) === b.dataset.edit);
+      if (row) recordForm(coll, row, reload);
+    });
+    $$("#rec-tbody [data-del]").forEach((b) => b.onclick = () =>
+      confirmDialog("删除该条记录？", async () => {
+        await api(`/api/v1/console/knowledge/collections/${collId}/records/${b.dataset.del}`,
+          { method: "DELETE" });
+        toast("已删除", true);
+        reload();
+      }));
+  };
+  const renderTbody = () => {
+    const tb = $("#rec-tbody");
+    if (!tb) return;
+    tb.innerHTML = currentRows.map((r) => `
+      <tr>${fields.map((f) => `<td>${cell(r.data[f.name])}</td>`).join("")}
+        <td class="muted">${fmtTime(r.updated_at)}</td>
+        <td><button class="btn btn-sm" data-edit="${r.id}">编辑</button>
+            <button class="btn btn-sm btn-danger" data-del="${r.id}">删除</button></td></tr>`).join("")
+      || `<tr><td colspan="${fields.length + 2}" class="empty">${
+           $("#rec-query") && $("#rec-query").value.trim()
+             ? "无命中（关键词分词后按 AND 匹配全部字段值）" : "暂无记录——点右上角「新增记录」录入"}</td></tr>`;
+    bindRowButtons();
+  };
+  const reload = () => renderCollectionDetail(body, collId).catch(kbBodyError(body));
+
+  body.innerHTML = `
+    <div class="subview-head">
+      <button class="btn btn-sm" id="coll-back">← 返回列表</button>
+      <b>${esc(coll.name)}</b>
+      ${coll.description ? `<span class="muted clip">${esc(coll.description)}</span>` : ""}
+      <span class="muted" style="font-size:12.5px">${fields.length} 个字段 · ${coll.record_count} 条记录</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-sm" id="coll-edit">编辑字段</button>
+      <button class="btn btn-sm btn-danger" id="coll-del">删除库</button>
+    </div>
+    <div class="row spread" style="margin-bottom:10px">
+      <input type="text" id="rec-query" placeholder="按关键词过滤（分词 AND 匹配全部字段值）" style="
+        border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px;width:320px">
+      <button class="btn btn-primary btn-sm" id="rec-add">新增记录</button>
+    </div>
+    <table class="tbl">
+      <thead><tr>${fields.map((f) => `<th>${esc(f.label || f.name)}${f.required ? ' <span class="muted">*</span>' : ""}</th>`).join("")}
+        <th>更新时间</th><th style="width:130px"></th></tr></thead>
+      <tbody id="rec-tbody"></tbody>
+    </table>
+    <div class="muted" style="font-size:12px;margin-top:8px">展示最近 100 条；列头 * 为必填字段。</div>`;
+  renderTbody();
+
+  $("#coll-back").onclick = () => renderKbCollections(body).catch(kbBodyError(body));
+  $("#coll-edit").onclick = () => renderCollectionForm(body, coll);
+  $("#coll-del").onclick = () =>
+    confirmDialog(`删除知识库「${coll.name}」及其全部记录？不可恢复。`, async () => {
+      await api(`/api/v1/console/knowledge/collections/${collId}`, { method: "DELETE" });
+      toast("已删除", true);
+      renderKbCollections(body).catch(kbBodyError(body));
+    });
+  $("#rec-add").onclick = () => recordForm(coll, null, reload);
+  $("#rec-query").oninput = debounce(async (e) => {
+    const d = await api(`/api/v1/console/knowledge/collections/${collId}/records`,
+      { params: { query: e.target.value.trim(), limit: 100 } });
+    currentRows = d.rows || [];
+    renderTbody();
+  }, 350);
+}
+
+function recordForm(coll, row, reload) {
+  const fields = coll.fields || [];
+  const isEdit = !!row;
+  openModal({
+    title: isEdit ? "编辑记录" : `新增记录 · ${coll.name}`,
+    body: fields.map((f) => {
+      const val = isEdit ? row.data[f.name] : null;
+      let control;
+      if (f.type === "textarea") {
+        control = `<textarea name="${esc(f.name)}" ${f.required ? "required" : ""}>${esc(val == null ? "" : String(val))}</textarea>`;
+      } else if (f.type === "number") {
+        control = `<input type="number" step="any" name="${esc(f.name)}" ${f.required ? "required" : ""} value="${val == null ? "" : val}">`;
+      } else {
+        control = `<input type="text" maxlength="2000" name="${esc(f.name)}" ${f.required ? "required" : ""} value="${esc(val == null ? "" : String(val))}">`;
+      }
+      return `<div class="form-row"><label class="${f.required ? "req" : ""}">${esc(f.label || f.name)}</label>${control}</div>`;
+    }).join(""),
+    submitText: isEdit ? "保存修改" : "创建",
+    onSubmit: async (v) => {
+      const data = {};
+      for (const f of fields) {
+        const raw = v[f.name];
+        if (f.type === "number") {
+          if (raw === "" || raw == null) data[f.name] = null;
+          else {
+            const n = Number(raw);
+            if (!Number.isFinite(n)) throw new Error(`${f.label || f.name} 不是合法数字`);
+            data[f.name] = n;
+          }
+        } else {
+          data[f.name] = (raw === "" || raw == null) ? null : String(raw);
+        }
+      }
+      if (isEdit) {
+        await api(`/api/v1/console/knowledge/collections/${coll.id}/records/${row.id}`,
+          { method: "PUT", body: { data } });
+      } else {
+        await api(`/api/v1/console/knowledge/collections/${coll.id}/records`,
+          { method: "POST", body: { data } });
+      }
+      toast(isEdit ? "已保存" : "已新增", true);
+      reload();
+    },
+  });
+}
+
 /* ============================== 视图：RAG 检索配置 ============================== */
 
 /* 配置对象 = clarify 召回管线的声明式装配（保存后重注册 stage，下一轮生效）。
@@ -1091,6 +1388,274 @@ async function renderRag(main) {
       box.innerHTML = `<div class="panel error">${esc(e.message)}</div>`;
     }
   }
+}
+
+/* ============================== 视图：会话审查（列表） ============================== */
+
+async function renderSessions(main) {
+  const patternsData = await api("/api/v1/console/patterns");
+  const patterns = patternsData.patterns || [];
+  const filters = { pattern: "", q: "", offset: 0, limit: 50 };
+
+  main.innerHTML = `
+    <div class="panel">
+      <div class="scope-bar">
+        <select id="sess-pattern">
+          <option value="">全部 pattern</option>
+          ${patterns.map((p) => `<option value="${esc(p.code)}">${esc(p.code)}${p.name ? `（${esc(p.name)}）` : ""}</option>`).join("")}
+        </select>
+        <input type="text" id="sess-q" placeholder="按 session_id 模糊搜索（回车）…" style="width:250px">
+        <button class="btn btn-sm" id="sess-refresh">刷新</button>
+        <span class="muted" style="font-size:12px">只读审计面 · 数据来自会话存储（SQLite）</span>
+      </div>
+      <div id="sess-table"><div class="empty">加载中…</div></div>
+      <div class="row spread" style="margin-top:12px">
+        <span class="muted" id="sess-pageinfo"></span>
+        <div class="row">
+          <button class="btn btn-sm" id="sess-prev">上一页</button>
+          <button class="btn btn-sm" id="sess-next">下一页</button>
+        </div>
+      </div>
+    </div>`;
+
+  async function load() {
+    const box = $("#sess-table");
+    box.innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      const data = await api("/api/v1/console/sessions", {
+        params: {
+          pattern_code: filters.pattern, q: filters.q,
+          limit: filters.limit, offset: filters.offset,
+        },
+      });
+      const sessions = data.sessions || [];
+      if (!sessions.length) {
+        box.innerHTML = '<div class="empty">暂无会话（未启用会话存储或还没有对话记录）</div>';
+      } else {
+        box.innerHTML = `<table class="tbl">
+          <thead><tr><th>session_id</th><th>pattern</th><th>代次</th><th>消息数</th>
+            <th>状态</th><th>当前节点</th><th>创建时间</th><th>最近活跃</th><th></th></tr></thead>
+          <tbody>${sessions.map((s) => `
+            <tr>
+              <td class="num"><a href="#/sessions/${encodeURIComponent(s.session_id)}">${esc(s.session_id)}</a></td>
+              <td class="num">${esc(s.pattern_code || "-")}</td>
+              <td class="num">e${s.launch_epoch}</td>
+              <td class="num">${s.message_count}</td>
+              <td>${s.turn_running ? '<span class="badge agent">运行中</span>' : '<span class="badge">空闲</span>'}</td>
+              <td class="num">${esc(s.current_node_code || "-")}</td>
+              <td class="num">${fmtTime(s.created_at)}</td>
+              <td class="num">${fmtTime(s.last_active_at)}</td>
+              <td><a class="btn btn-sm" href="#/sessions/${encodeURIComponent(s.session_id)}">审查</a></td>
+            </tr>`).join("")}</tbody></table>`;
+      }
+      $("#sess-pageinfo").textContent =
+        `第 ${filters.offset + 1}–${filters.offset + sessions.length} 条${data.has_more ? "（还有更多）" : ""}`;
+      $("#sess-prev").disabled = filters.offset <= 0;
+      $("#sess-next").disabled = !data.has_more;
+    } catch (e) {
+      box.innerHTML = `<div class="panel error">${esc(e.message)}</div>`;
+    }
+  }
+  $("#sess-pattern").onchange = (e) => { filters.pattern = e.target.value; filters.offset = 0; load(); };
+  $("#sess-q").onkeydown = (e) => {
+    if (e.key === "Enter") { filters.q = e.target.value.trim(); filters.offset = 0; load(); }
+  };
+  $("#sess-refresh").onclick = load;
+  $("#sess-prev").onclick = () => { filters.offset = Math.max(0, filters.offset - filters.limit); load(); };
+  $("#sess-next").onclick = () => { filters.offset += filters.limit; load(); };
+  await load();
+}
+
+/* ============================== 视图：会话审查（详情时间线） ============================== */
+
+const TL_ROLE_CLASS = {
+  user: "tl-badge-user", assistant: "tl-badge-assistant",
+  tool: "tl-badge-tool", summary: "tl-badge-summary", system: "tl-badge-system",
+};
+/* trace kind → 徽标类别（节点蓝 / 工具青 / 分支紫 / 终止绿 / 异常红 / app 灰） */
+const TL_KIND_CLASS = {
+  node_start: "tl-kind-node", node_end: "tl-kind-node", node_jump: "tl-kind-node",
+  graph_compile: "tl-kind-node", graph_wait: "tl-kind-node", graph_resume: "tl-kind-node",
+  tool_call: "tl-kind-tool", tool_result: "tl-kind-tool",
+  fanout_start: "tl-kind-branch", branch_start: "tl-kind-branch",
+  branch_end: "tl-kind-branch", fanout_join: "tl-kind-branch",
+  conversation_end: "tl-kind-done", turn_error: "tl-kind-error",
+  app_trace: "tl-kind-app", graph_done: "tl-kind-done",
+};
+
+function tlIsTraceError(it) {
+  const p = it.payload || {};
+  if (it.kind === "turn_error") return true;
+  if (it.kind === "branch_end" && p.ok === false) return true;
+  // graph_done 正常终止为 terminal / is_end；max_steps / undeclared_edge 视为异常
+  if (it.kind === "graph_done" && typeof p.reason === "string"
+    && !["terminal", "is_end"].includes(p.reason)) return true;
+  return false;
+}
+
+function tlIsItemError(it) {
+  if (it.item_type === "message")
+    return !!(it.flags && (it.flags.synthetic || it.flags.rewritten));
+  return tlIsTraceError(it);
+}
+
+function tlJsonPre(obj) {
+  return `<details class="sec"><summary>JSON 数据</summary>
+    <pre class="code" style="max-height:320px">${esc(JSON.stringify(obj, null, 2))}</pre></details>`;
+}
+
+function tlRenderMessage(it) {
+  const flags = [];
+  if (it.flags && it.flags.synthetic) flags.push('<span class="badge" style="background:#fef2f2;color:#b91c1c;border-color:#fca5a5">synthetic · 幻觉拦截回填</span>');
+  if (it.flags && it.flags.rewritten) flags.push('<span class="badge" style="background:#fffbeb;color:#b45309;border-color:#fcd34d">rewritten · hook 改写</span>');
+  let body;
+  if (it.role === "assistant" && it.tool_calls && it.tool_calls.length) {
+    const calls = it.tool_calls.map((c, i) => {
+      const fn = c.function || c;
+      return `<div class="tl-call">
+        <span class="chip tok">${esc(fn.name || `call_${i + 1}`)}</span>
+        ${tlJsonPre(fn.arguments != null ? fn.arguments : c)}
+      </div>`;
+    }).join("");
+    body = `${it.content ? `<div class="tl-body">${esc(it.content)}</div>` : ""}
+      <div class="tl-calls">${calls}</div>`;
+  } else if (it.role === "tool") {
+    const text = String(it.content || "");
+    body = text.length > 300
+      ? `<div class="tl-body muted">${esc(text.slice(0, 300))}…${tlJsonPre(text)}</div>`
+      : `<div class="tl-body muted">${esc(text)}</div>`;
+    const toolName = it.metadata && it.metadata.tool_name;
+    if (toolName) flags.push(`<span class="badge">tool: ${esc(toolName)}</span>`);
+  } else {
+    body = `<div class="tl-body">${esc(it.content)}</div>`;
+  }
+  return `
+    <div class="tl-meta">
+      <span class="badge ${TL_ROLE_CLASS[it.role] || "tl-badge-system"}">${esc(it.role)}</span>
+      ${it.stage ? `<span class="chip">${esc(it.stage)}</span>` : ""}
+      <span class="badge">e${it.launch_epoch}</span>
+      ${flags.join("")}
+      <span class="muted" style="margin-left:auto">${fmtTime(it.created_at)}</span>
+    </div>
+    ${body}
+    ${(it.metadata && Object.keys(it.metadata).length) ? tlJsonPre(it.metadata) : ""}`;
+}
+
+function tlRenderTrace(it) {
+  const p = it.payload || {};
+  const label = p.node_code ? `${it.kind} · ${p.node_code}` : it.kind;
+  let brief = "";
+  if (it.kind === "tool_call" && p.tool_name) {
+    brief = `<div class="tl-body"><span class="chip tok">${esc(p.tool_name)}</span>
+      ${p.call_id ? `<span class="mono">${esc(p.call_id)}</span>` : ""}
+      ${p.round_idx != null ? `<span class="badge">round ${p.round_idx}</span>` : ""}</div>`;
+  } else if (it.kind === "tool_result" && p.tool_name) {
+    const text = typeof p.result === "string" ? p.result : JSON.stringify(p.result);
+    brief = `<div class="tl-body"><span class="chip tok">${esc(p.tool_name)}</span>
+      ${p.synthetic ? '<span class="badge" style="background:#fef2f2;color:#b91c1c;border-color:#fca5a5">synthetic</span>' : ""}
+      <span class="muted">${esc(String(text || "").slice(0, 200))}${String(text || "").length > 200 ? "…" : ""}</span></div>`;
+  } else if (it.kind === "graph_done" && p.reason) {
+    brief = `<div class="tl-body muted">终止原因：${esc(p.reason)}</div>`;
+  } else if (it.kind === "branch_end" && p.error) {
+    brief = `<div class="tl-body" style="color:var(--danger)">分支失败：${esc(p.error)}</div>`;
+  } else if (it.kind === "turn_error" && (p.error || p.data)) {
+    brief = `<div class="tl-body" style="color:var(--danger)">${esc(typeof p.error === "string" ? p.error : JSON.stringify(p.error || p.data))}</div>`;
+  }
+  return `
+    <div class="tl-meta">
+      <span class="badge ${TL_KIND_CLASS[it.kind] || ""}">trace · ${esc(label)}</span>
+      <span class="badge">e${it.launch_epoch}</span>
+      ${it.turn_id ? `<span class="mono" title="${esc(it.turn_id)}">turn ${esc(String(it.turn_id).slice(0, 8))}</span>` : ""}
+      ${it.truncated ? '<span class="badge" style="background:#fffbeb;color:#b45309;border-color:#fcd34d">truncated</span>' : ""}
+      <span class="muted" style="margin-left:auto">${fmtTime(it.created_at)}</span>
+    </div>
+    ${brief}
+    ${tlJsonPre(p)}`;
+}
+
+async function renderSessionDetail(main, sessionId) {
+  const data = await api(`/api/v1/console/sessions/${encodeURIComponent(sessionId)}/timeline`);
+  const session = data.session || {};
+  const items = data.items || [];
+
+  main.innerHTML = `
+    <div class="panel">
+      <div class="row spread">
+        <div>
+          <div class="row" style="gap:8px"><a href="#/sessions">← 返回列表</a>
+            <b class="mono">${esc(sessionId)}</b>
+            ${session.turn_running ? '<span class="badge agent">运行中</span>' : '<span class="badge">空闲</span>'}
+            <span class="badge">${esc(session.pattern_code || "-")}</span>
+            <span class="badge">代次 e${session.launch_epoch}</span>
+            <span class="badge">消息 ${session.message_count}</span>
+          </div>
+          <div class="muted" style="font-size:12.5px;margin-top:6px">
+            创建 ${fmtTime(session.created_at)} · 最近活跃 ${fmtTime(session.last_active_at)}
+            · 当前节点 <span class="mono">${esc(session.current_node_code || "-")}</span>
+            · request_id <span class="mono">${esc(session.request_id || "-")}</span>
+          </div>
+        </div>
+        <button class="btn btn-sm" id="tld-refresh">刷新</button>
+      </div>
+      ${(session.task_info && Object.keys(session.task_info).length)
+        || (session.graph_state && Object.keys(session.graph_state).length)
+        || (session.filled_slots && Object.keys(session.filled_slots).length)
+        ? `<div class="row" style="margin-top:8px">
+        ${(session.task_info && Object.keys(session.task_info).length) ? `<details class="sec" style="margin:0"><summary>task_info</summary><pre class="code" style="max-height:200px">${esc(JSON.stringify(session.task_info, null, 2))}</pre></details>` : ""}
+        ${(session.graph_state && Object.keys(session.graph_state).length) ? `<details class="sec" style="margin:0"><summary>graph_state</summary><pre class="code" style="max-height:200px">${esc(JSON.stringify(session.graph_state, null, 2))}</pre></details>` : ""}
+        ${(session.filled_slots && Object.keys(session.filled_slots).length) ? `<details class="sec" style="margin:0"><summary>filled_slots</summary><pre class="code" style="max-height:200px">${esc(JSON.stringify(session.filled_slots, null, 2))}</pre></details>` : ""}
+      </div>` : ""}
+    </div>
+    ${data.trace_truncated ? '<div class="notice">trace 事件超过单次拉取上限（1000），仅展示最早一段；更早/更晚事件可用 /api/v1/sessions/{id}/trace 的 after_id 游标翻页。</div>' : ""}
+    <div class="panel">
+      <div class="scope-bar">
+        <select id="tld-turn">
+          <option value="">全部轮次（${(data.turns || []).length}）</option>
+          ${(data.turns || []).map((t) =>
+            `<option value="${esc(t.turn_id)}">turn ${esc(String(t.turn_id).slice(0, 8))}（${t.count} 事件）</option>`).join("")}
+        </select>
+        <input type="text" id="tld-q" placeholder="按内容 / payload 过滤…" style="width:220px">
+        <label class="row" style="gap:5px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="tld-err"> 只看异常
+        </label>
+        <span class="muted" id="tld-count" style="font-size:12px"></span>
+      </div>
+      <div class="timeline" id="tld-list"></div>
+    </div>`;
+
+  function draw() {
+    const turn = $("#tld-turn").value;
+    const kw = $("#tld-q").value.trim().toLowerCase();
+    const onlyErr = $("#tld-err").checked;
+    const shown = items.filter((it) => {
+      if (turn && (it.item_type !== "trace" || it.turn_id !== turn)) return false;
+      if (onlyErr && !tlIsItemError(it)) return false;
+      if (kw) {
+        const hay = it.item_type === "message"
+          ? String(it.content || "") + JSON.stringify(it.tool_calls || [])
+          : JSON.stringify(it.payload || {});
+        if (!hay.toLowerCase().includes(kw)) return false;
+      }
+      return true;
+    });
+    let lastEpoch = null;
+    $("#tld-list").innerHTML = shown.length ? shown.map((it) => {
+      const divider = it.launch_epoch !== lastEpoch
+        ? `<div class="tl-divider">launch_epoch ${it.launch_epoch}${it.launch_epoch > 1 ? "（重新发起会话，历史代次保留审计）" : ""}</div>`
+        : "";
+      lastEpoch = it.launch_epoch;
+      const cls = tlIsItemError(it) ? " tl-error" : "";
+      const inner = it.item_type === "message" ? tlRenderMessage(it) : tlRenderTrace(it);
+      return `${divider}<div class="tl-item${cls}">${inner}</div>`;
+    }).join("") : '<div class="empty">无匹配的时间线条目</div>';
+    $("#tld-count").textContent = `${shown.length} / ${items.length} 条`;
+  }
+
+  $("#tld-turn").onchange = draw;
+  $("#tld-q").oninput = draw;
+  $("#tld-err").onchange = draw;
+  $("#tld-refresh").onclick = () => { route(); };
+  draw();
 }
 
 

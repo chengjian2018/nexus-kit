@@ -276,7 +276,7 @@ _GENERATE_SYSTEM_PROMPT = """你是 nexus-kit 的 pattern / 插件生成 agent�
 - entry_node_code: 入口节点 code
 - nodes: 节点列表（inline dict）
 - allow_toolset: 工具集授权（deny-by-default；不用工具则省略）
-- plugins: {loop/fsm/messages_builder/agent_hooks/llm: code}（可省略，落默认执行器）
+- plugins: {loop/fsm/messages_builder/agent_hooks: code}（可省略，落默认执行器；LLM 选择不经 plugins，由配置层 llm_default/app config 决定）
 - max_steps: agent 图每轮最大步数（默认 10，可省略）
 节点字段：
 - code / name / description（场景描述，喂 NLG）/ task_description（待办描述，喂 NLU）

@@ -312,6 +312,9 @@ install_booking [fsm, 16 nodes]
 #### 6.4.1 空间（scope）管理
 
 - 空间 = `"{channel}:{account_id}"`（如 `xianyu:demo`），列表显示两表条目数与最近更新。
+- **默认空间 `seller:001`**（2026-09-15）：前端进入知识库页即预选（`localStorage` 未存过时），
+  host 启动预热时向该空间幂等种子演示数据（商品 8 + 客服 6 + 1 个示例自定义库；
+  `kb_meta` 标记守卫——运营在台里「清空空间」后重启**不会复活**）。
 - 新建空间 = 输入 channel + account_id（格式校验）；删除空间 = 软确认 + 二次输入 code 确认（级联删除需后端支持，P0 可先只允许清空空间）。
 - 页面常驻提示：知识工具当前 ACL 仅授权 `customer_agent`（`atoms/tools/knowledge_tool.py:246-255`）——"此处改动影响该应用的检索结果"。
 
@@ -338,7 +341,22 @@ install_booking [fsm, 16 nodes]
 - 输出：命中的商品与客服条目 + **命中解释**：展示 jieba 分词结果（`cut_for_search`，词长≥2，多词 AND、字段间 OR——`store.py:75-80`）、每条命中命中的字段与词。
 - 目的：让运营在发布前验证"这句话能不能搜到我要的条目"，并对**关键词匹配**（非语义检索）建立正确预期；`<untrusted_knowledge>` 包裹等注入防护细节不暴露，仅在帮助文档说明。
 
-### 6.4.6 RAG 检索配置（v1 已实现，2026-09-10）
+### 6.4.6 自定义知识库（2026-09-15）
+
+> 状态：已实现。运营台自建的动态表——**表字段是数据不是 DDL**。
+
+- **存储**：`kb_collection`（scope + name 唯一，`fields` 存 JSON：`[{name, label?, type,
+  required}]`，type ∈ text/textarea/number）+ `kb_record`（记录以 JSON 存 `data`，
+  写入时把全部字段值拼接为 `search_text`）。无动态建表/迁移。
+- **检索**：与内置库同款——jieba 分词、`search_text LIKE`、多词 AND；仅运营台管理，
+  **不接入 agent 工具集**（试搜台仍只覆盖商品/客服）。
+- **UI**（知识库页第 4 个 tab）：列表（库名/描述/字段数/记录数/进入/编辑字段/删除）→
+  「新建知识库」整页表单（库名 + 描述 + 字段编辑器：字段名/显示名/类型/必填/删行）→
+  保存即建库并进入库详情（动态列表格、关键词过滤、行的新增/编辑/删除）。
+- **一致性**：改字段后后端重算该库记录的 `search_text` 并清理被删字段的旧值；
+  记录 PUT 为全量替换（表单始终提交所有字段）；「清空空间」级联删自定义库及记录。
+
+### 6.4.7 RAG 检索配置（v1 已实现，2026-09-10）
 
 > 状态：**已随 P0 一并实现**（原规划 P2「检索参数可调」提前）。实现：
 > `atoms/stages/rag_config.py`（声明式装配 + 重注册 + 离线试跑）、
@@ -388,11 +406,29 @@ customer_agent 的工具检索不经此配置；pattern 级绑定随 P1 编辑�
 
 全局变更流：时间 / 操作者 / 变更类型（pattern 发布 / 回滚 / 知识 CRUD / 导入 / FAQ / 模型参数）/ 对象 / 说明 / 结果（成功/校验失败）。可按类型与 pattern 筛选。数据即审计日志（§7.4）。
 
-### 6.8 会话与调试（P2，仅设计预留）
+### 6.8 会话审查（只读审计面，v1 已实现 2026-09-15；对话调试仍为 P2 预留）
 
-- 会话列表 / 消息查看：直接包装既有 `GET /api/v1/sessions`、`GET /sessions/{id}/messages`。
-- 对话调试：挂接 SSE 端点（需将 `NEXUS_STREAM_DEBUG` 的 debug 定位升级为 console 鉴权下的正式端点——研发依赖项，P2）。
-- 与配置台的价值闭环：从某条"答非所问"的消息一键跳到对应 pattern 的节点/prompt 编辑入口。
+> 状态：**列表 + 详情时间线已实现**。实现：`ui/api.py` §Session review
+> （`/api/v1/console/sessions*`）、`nexus/engine/store.py`（`get_session` /
+> `list_sessions(session_id_contains=)`）、控制台侧边栏「会话审查」页。
+
+- **会话列表**（`#/sessions`）：pattern 下拉 + session_id 子串过滤
+  （LIKE 通配符按字面处理）+ offset 翻页；列：session_id / pattern / 代次 /
+  消息数 / 运行状态（`turn_registry.has_running`）/ 当前节点 / 创建与最近活跃。
+- **会话详情**（`#/sessions/{id}`）：元数据卡（task_info / graph_state /
+  filled_slots 折叠展示；JSON TEXT 列服务端解码、坏载荷降级为空 dict 不 500）
+  + **合并时间线**——messages 与 trace_events 按 `created_at` 主序穿插
+  （两表自增 id 无全局序，同刻消息优先，属近似穿插）；轮次下拉 / 文本过滤 /
+  「只看异常」均为前端本地过滤。
+- **异常高亮口径**：`turn_error` 事件、`branch_end ok=false`、`graph_done`
+  失败原因（max_steps / undeclared_edge）、消息 flags（`synthetic` 幻觉拦截
+  回填 / `rewritten` hook 改写）→ 红边条目；代次（launch_epoch）变化处插
+  分隔条（审计跨代 trail）。
+- **数据边界**：纯只读，无任何写操作；trace 单次拉取上限 1000 条，触顶时
+  前端明示（更早事件走 `GET /api/v1/sessions/{id}/trace` 的 after_id 游标）。
+  依赖经 `_session_deps()` 惰性取 host.main 的 store / turn_registry。
+- **P2 预留（未实现）**：对话调试（挂接 SSE 端点，需 `NEXUS_STREAM_DEBUG`
+  升级为 console 鉴权下的正式端点）；从"答非所问"消息一键跳 pattern 编辑入口。
 
 ---
 
@@ -444,6 +480,7 @@ customer_agent 的工具检索不经此配置；pattern 级绑定随 P1 编辑�
 | GET `/console/catalog/stages` / `executors` / `messages-builders` / `tools` | 注册码目录（下拉数据源） | 复用 `plugins.list_codes` / `get_available_toolsets` |
 | GET `/console/patterns/{code}/resolved` | 生效装配 | 与 introspect 共建 `resolve_declared_stages` |
 | GET/POST `/console/knowledge/scopes`；DELETE `.../scopes/{scope}` | 空间管理 | 新增 |
+| GET/POST/PUT/DELETE `/console/knowledge/collections`（+ `/{id}/records`） | 自定义知识库（动态表字段）与记录 CRUD | 新增（2026-09-15，§6.4.6） |
 | GET/POST/PUT/DELETE `/console/knowledge/products?scope=` | 商品 CRUD | 复用 + 新增（update/delete） |
 | GET/POST/PUT/DELETE `/console/knowledge/cs-entries?scope=` | 客服 CRUD + enabled | 复用 + 新增 |
 | POST `/console/knowledge/search-test` | 试搜（含分词与命中解释） | 复用 `search_*` + 分词中间结果 |

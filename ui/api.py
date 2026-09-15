@@ -5,8 +5,9 @@
 - 响应沿用 host 的 ``{code, message, status, data}`` 包裹（code "0" 成功）；
 - 路径挂在 /api/v1/ 下，天然被 host.main 的 NEXUS_API_KEY 中间件覆盖
   （channel 除外的那条规则不影响 console）；
-- 端点全部同步 def（FastAPI 丢线程池执行）——知识库是 sqlite3 同步连接
-  （自带锁），pattern 序列化也是纯 CPU；
+- 端点同步 def（FastAPI 丢线程池执行）——知识库是 sqlite3 同步连接
+  （自带锁），pattern 序列化也是纯 CPU；例外是会话审查段（§Session
+  review），走 aiosqlite 的 SessionStore，因此为 async def；
 - 事实源口径：pattern 一律来自注册表（当前全部 code-managed，PRD D-1
   的 fork-to-edit 属 P1）；知识库写操作经 atoms.knowledge.store 的管理
   CRUD（update 语义 = 出现的键才更新，None 显式清空）。
@@ -14,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -25,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from atoms.knowledge.store import _cut_query, get_knowledge_store
 from atoms.stages import rag_config
+from nexus.context import decode_tool_call_content
 from nexus.model.serialization import pattern_to_dict, pattern_to_yaml
 from nexus.registry.patterns import (
     discover_builtin_patterns,
@@ -216,6 +219,34 @@ class ClearScopeIn(BaseModel):
     scope: str = Field(max_length=128)
 
 
+class FieldDef(BaseModel):
+    """自定义知识库的一个字段定义（name 为记录 JSON 的键）。"""
+    name: str = Field(min_length=1, max_length=64,
+                      pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    label: Optional[str] = Field(default=None, max_length=64)
+    type: str = Field(default="text", pattern=r"^(text|textarea|number)$")
+    required: bool = False
+
+
+class CollectionIn(BaseModel):
+    scope: str = Field(max_length=128)
+    name: str = Field(min_length=1, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=512)
+    fields: List[FieldDef] = Field(min_length=1, max_length=50)
+
+
+class CollectionPatch(BaseModel):
+    """PUT 语义与内置库一致：缺席 = 不修改；fields 变更会重算记录检索文本
+    并清理被删字段的值（store.update_collection）。"""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=512)
+    fields: Optional[List[FieldDef]] = None
+
+
+class RecordIn(BaseModel):
+    data: Dict[str, Any]
+
+
 class RagConfigIn(BaseModel):
     config: Dict[str, Any]
 
@@ -379,6 +410,115 @@ def knowledge_clear_scope(body: ClearScopeIn):
 
 
 # ---------------------------------------------------------------------------
+# Custom knowledge collections (ops-console: user-defined tables; scope
+# isolated like the built-ins, console-managed only — not in the agent
+# toolset, so the search sandbox is unaffected)
+# ---------------------------------------------------------------------------
+
+@router.get("/knowledge/collections")
+def knowledge_collections(scope: str):
+    bad = _bad_scope(scope)
+    if bad is not None:
+        return bad
+    return _ok({"scope": scope,
+                "collections": get_knowledge_store().list_collections(scope)})
+
+
+@router.post("/knowledge/collections")
+def knowledge_collection_create(body: CollectionIn):
+    bad = _bad_scope(body.scope)
+    if bad is not None:
+        return bad
+    try:
+        cid = get_knowledge_store().create_collection(
+            body.scope, body.name, body.description,
+            [f.model_dump() for f in body.fields])
+    except ValueError as e:
+        return _fail(400, "400", str(e))
+    return _ok({"id": cid, "scope": body.scope}, message="知识库已创建")
+
+
+@router.get("/knowledge/collections/{collection_id}")
+def knowledge_collection_get(collection_id: int):
+    coll = get_knowledge_store().get_collection(collection_id)
+    if coll is None:
+        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    return _ok({"collection": coll})
+
+
+@router.put("/knowledge/collections/{collection_id}")
+def knowledge_collection_update(collection_id: int, body: CollectionPatch):
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        return _fail(400, "400", "没有可更新的字段")
+    try:
+        exists = get_knowledge_store().update_collection(collection_id, patch)
+    except ValueError as e:
+        return _fail(400, "400", str(e))
+    if not exists:
+        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    return _ok({"id": collection_id, "updated_fields": sorted(patch)})
+
+
+@router.delete("/knowledge/collections/{collection_id}")
+def knowledge_collection_delete(collection_id: int):
+    if not get_knowledge_store().delete_collection(collection_id):
+        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    return _ok({"id": collection_id}, message="已删除（含全部记录）")
+
+
+@router.get("/knowledge/collections/{collection_id}/records")
+def knowledge_collection_records(
+    collection_id: int, query: str = "", limit: int = 100, offset: int = 0,
+):
+    """记录列表（响应带 collection 字段定义——前端据此渲染动态列）。"""
+    store = get_knowledge_store()
+    coll = store.get_collection(collection_id)
+    if coll is None:
+        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    limit = max(1, min(limit, 200))
+    rows = store.list_records(collection_id, query=query or None,
+                              limit=limit, offset=offset)
+    return _ok({"collection": coll, "rows": rows, "limit": limit})
+
+
+@router.post("/knowledge/collections/{collection_id}/records")
+def knowledge_record_create(collection_id: int, body: RecordIn):
+    store = get_knowledge_store()
+    if store.get_collection(collection_id) is None:
+        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    try:
+        rid = store.add_record(collection_id, body.data)
+    except ValueError as e:
+        return _fail(400, "400", str(e))
+    return _ok({"id": rid}, message="已新增")
+
+
+@router.put("/knowledge/collections/{collection_id}/records/{record_id}")
+def knowledge_record_update(collection_id: int, record_id: int, body: RecordIn):
+    """全量替换该记录（表单始终提交所有字段；校验按当前字段定义）。"""
+    store = get_knowledge_store()
+    if store.get_collection(collection_id) is None:
+        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    try:
+        exists = store.update_record(collection_id, record_id, body.data)
+    except ValueError as e:
+        return _fail(400, "400", str(e))
+    if not exists:
+        return _fail(404, "404",
+                     f"记录不存在: id={record_id}（collection={collection_id}）")
+    return _ok({"id": record_id}, message="已保存")
+
+
+@router.delete("/knowledge/collections/{collection_id}/records/{record_id}")
+def knowledge_record_delete(collection_id: int, record_id: int):
+    if not get_knowledge_store().delete_record(collection_id, record_id):
+        return _fail(404, "404",
+                     f"记录不存在: id={record_id}（collection={collection_id}）")
+    return _ok({"id": record_id}, message="已删除")
+
+
+# ---------------------------------------------------------------------------
 # RAG retrieval config (clarify recall pipeline; see the atoms/stages/rag_config.py module docstring)
 # ---------------------------------------------------------------------------
 
@@ -454,6 +594,146 @@ def rag_test_run(body: RagTestRunIn):
     result = asyncio.run(rag_config.test_run_rag(
         cfg, body.query, topic=body.topic, keywords=body.keywords))
     return _ok(result)
+
+
+# ---------------------------------------------------------------------------
+# Session review (read-only audit) — 会话审查：列表 / 详情 / 合并时间线
+#
+# 只读审计面：数据全部来自 SessionStore（sessions / messages / trace_events
+# 三张表），无任何写操作。SessionStore 是 aiosqlite，故本段端点为 async def。
+# 依赖经 _session_deps 惰性取自 host.main（延迟 import 避免环）；
+# 测试 monkeypatch 该函数注入临时 store。
+# ---------------------------------------------------------------------------
+
+_TRACE_LIMIT = 1000  # 单会话 trace 拉取上限（store 侧同值封顶）
+
+
+def _session_deps():
+    """(store, turn_registry) —— host.main 装配后的会话审计读依赖。"""
+    import host.main as host_main
+    return host_main.store, host_main.turn_registry
+
+
+def _json_field(value: Any, default: Any) -> Any:
+    """JSON TEXT 列解码；坏载荷降级为默认值（口径同 host.main 的
+    /api/v1/sessions：降级永不 500）。"""
+    if isinstance(value, str):
+        try:
+            return json.loads(value) if value else default
+        except ValueError:
+            return default
+    return value if value is not None else default
+
+
+def _decode_session_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    for key, default in (("graph_state", {}), ("filled_slots", {}),
+                         ("task_info", {})):
+        if key in row:
+            row[key] = _json_field(row[key], default)
+    return row
+
+
+@router.get("/sessions")
+async def console_list_sessions(
+    pattern_code: str = "", q: str = "", limit: int = 50, offset: int = 0,
+) -> Dict[str, Any]:
+    store, turn_registry = _session_deps()
+    if store is None:
+        return _fail(500, "500", "会话存储未启用")
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    try:
+        rows = await store.list_sessions(
+            pattern_code=pattern_code or None,
+            limit=limit + 1, offset=offset,
+            session_id_contains=q or None,
+        )
+    except Exception:
+        logger.exception("会话审查：查询会话列表失败")
+        return _fail(500, "500", "查询会话列表失败，请稍后重试")
+    has_more = len(rows) > limit
+    sessions = [_decode_session_row(r) for r in rows[:limit]]
+    for s in sessions:
+        s["turn_running"] = turn_registry.has_running(s["session_id"])
+    return _ok({"sessions": sessions, "has_more": has_more,
+                "limit": limit, "offset": offset})
+
+
+@router.get("/sessions/{session_id}")
+async def console_session_detail(session_id: str) -> Dict[str, Any]:
+    store, turn_registry = _session_deps()
+    if store is None:
+        return _fail(500, "500", "会话存储未启用")
+    try:
+        row = await store.get_session(session_id)
+    except Exception:
+        logger.exception("会话审查：查询会话详情失败")
+        return _fail(500, "500", "查询会话详情失败，请稍后重试")
+    if row is None:
+        return _fail(404, "404", f"session_id '{session_id}' 不存在")
+    _decode_session_row(row)
+    row["turn_running"] = turn_registry.has_running(session_id)
+    return _ok({"session": row})
+
+
+@router.get("/sessions/{session_id}/timeline")
+async def console_session_timeline(session_id: str) -> Dict[str, Any]:
+    """messages + trace_events 合并审计时间线。
+
+    两表自增 id 各自成序、无全局序，合并为近似穿插：created_at（微秒
+    epoch）为主序，同刻消息优先（item_type 字典序）作稳定次序。
+    """
+    store, _ = _session_deps()
+    if store is None:
+        return _fail(500, "500", "会话存储未启用")
+    try:
+        session_row = await store.get_session(session_id)
+        messages = await store.get_messages(session_id)
+        trace = await store.get_trace_events(session_id, limit=_TRACE_LIMIT)
+    except Exception:
+        logger.exception("会话审查：查询会话时间线失败")
+        return _fail(500, "500", "查询会话时间线失败，请稍后重试")
+    if session_row is None or messages is None or trace is None:
+        return _fail(404, "404", f"session_id '{session_id}' 不存在")
+
+    items: List[Dict[str, Any]] = []
+    for m in messages:
+        item = dict(m)
+        item["item_type"] = "message"
+        meta = item.get("metadata") or {}
+        # 审计关注位提前：synthetic=幻觉拦截回填 / rewritten=hook 改写
+        item["flags"] = {k: meta[k] for k in ("synthetic", "rewritten")
+                         if meta.get(k)}
+        if item.get("role") == "assistant":
+            decoded = decode_tool_call_content(item.get("content") or "")
+            if decoded is not None:
+                item["content"], item["tool_calls"] = decoded
+        items.append(item)
+    for e in trace:
+        item = dict(e)
+        item["item_type"] = "trace"
+        items.append(item)
+    items.sort(key=lambda it: (it.get("created_at") or 0, it["item_type"]))
+
+    turns: List[Dict[str, Any]] = []  # trace 侧按首轮出现序聚合轮次
+    by_turn: Dict[str, Dict[str, Any]] = {}
+    for e in trace:
+        tid = e.get("turn_id") or ""
+        if not tid:
+            continue
+        entry = by_turn.get(tid)
+        if entry is None:
+            entry = {"turn_id": tid, "count": 0}
+            by_turn[tid] = entry
+            turns.append(entry)
+        entry["count"] += 1
+
+    return _ok({
+        "session": _decode_session_row(session_row),
+        "items": items,
+        "turns": turns,
+        "trace_truncated": len(trace) >= _TRACE_LIMIT,
+    })
 
 
 # ---------------------------------------------------------------------------

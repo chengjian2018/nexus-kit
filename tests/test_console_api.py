@@ -147,14 +147,93 @@ def test_scopes_listing_and_clear(client):
         "scope": "xianyu:a", "goods_id": 1, "goods_name": "商品"})
     client.post("/api/v1/console/knowledge/cs-entries", json={
         "scope": "xianyu:a", "title": "政策", "content": "内容"})
+    _ok_data(client.post("/api/v1/console/knowledge/collections", json={
+        "scope": "xianyu:a", "name": "案例库",
+        "fields": [{"name": "case_no", "type": "text", "required": True}]}))
     scopes = _ok_data(client.get("/api/v1/console/knowledge/scopes"))["scopes"]
     by_scope = {s["scope"]: s for s in scopes}
     assert by_scope["xianyu:a"]["product_count"] == 1
     assert by_scope["xianyu:a"]["cs_count"] == 1
+    assert by_scope["xianyu:a"]["collection_count"] == 1
 
     data = _ok_data(client.post("/api/v1/console/knowledge/clear-scope",
                                 json={"scope": "xianyu:a"}))
-    assert data == {"products_deleted": 1, "cs_deleted": 1}
+    assert data == {"products_deleted": 1, "cs_deleted": 1,
+                    "collections_deleted": 1, "records_deleted": 0}
+
+
+def test_custom_collections_and_records_crud(client):
+    base = "/api/v1/console/knowledge/collections"
+    cid = _ok_data(client.post(base, json={
+        "scope": "xianyu:c1", "name": "售后案例库", "description": "案例",
+        "fields": [
+            {"name": "case_no", "label": "案例编号", "type": "text", "required": True},
+            {"name": "refund", "label": "退款", "type": "number"},
+        ]}))["id"]
+
+    # 同 scope 重名 -> 400（store 层校验）
+    resp = client.post(base, json={
+        "scope": "xianyu:c1", "name": "售后案例库",
+        "fields": [{"name": "a"}]})
+    assert resp.status_code == 400
+    # 坏字段名 -> 422（pydantic pattern）
+    resp = client.post(base, json={
+        "scope": "xianyu:c1", "name": "库2", "fields": [{"name": "1bad"}]})
+    assert resp.status_code == 422
+
+    colls = _ok_data(client.get(base, params={"scope": "xianyu:c1"}))["collections"]
+    assert [c["name"] for c in colls] == ["售后案例库"]
+    assert colls[0]["fields"][0]["label"] == "案例编号"
+
+    # 记录：新增（数字字符串 coercion）/ 列表 / 检索
+    rid = _ok_data(client.post(f"{base}/{cid}/records",
+                               json={"data": {"case_no": "A-1", "refund": "99"}}))["id"]
+    rows = _ok_data(client.get(f"{base}/{cid}/records"))["rows"]
+    assert rows[0]["data"] == {"case_no": "A-1", "refund": 99}
+
+    resp = client.post(f"{base}/{cid}/records",
+                       json={"data": {"case_no": "A-2", "bogus": 1}})
+    assert resp.status_code == 400  # 未知字段
+    resp = client.post(f"{base}/{cid}/records", json={"data": {"refund": 1}})
+    assert resp.status_code == 400  # 缺必填
+    resp = client.post(f"{base}/{cid}/records",
+                       json={"data": {"case_no": "A-3", "refund": "abc"}})
+    assert resp.status_code == 400  # number 非法
+
+    hits = _ok_data(client.get(f"{base}/{cid}/records",
+                               params={"query": "A-1"}))["rows"]
+    assert [r["id"] for r in hits] == [rid]
+
+    # 全量替换记录（可选字段显式清空）
+    _ok_data(client.put(f"{base}/{cid}/records/{rid}",
+                        json={"data": {"case_no": "A-1x", "refund": None}}))
+    rows = _ok_data(client.get(f"{base}/{cid}/records"))["rows"]
+    assert rows[0]["data"] == {"case_no": "A-1x", "refund": None}
+
+    # 改字段定义：被删字段的值从记录里清理
+    _ok_data(client.put(f"{base}/{cid}", json={
+        "fields": [{"name": "case_no", "type": "text", "required": True}]}))
+    rows = _ok_data(client.get(f"{base}/{cid}/records"))["rows"]
+    assert rows[0]["data"] == {"case_no": "A-1x"}
+
+    # 404 路径
+    assert client.get(f"{base}/999").status_code == 404
+    assert client.delete(f"{base}/999").status_code == 404
+    assert client.get(f"{base}/999/records").status_code == 404
+    assert client.delete(f"{base}/{cid}/records/999").status_code == 404
+
+    # 删库（级联删记录）
+    _ok_data(client.delete(f"{base}/{cid}"))
+    assert client.get(f"{base}/{cid}").status_code == 404
+    assert client.get(f"{base}/{cid}/records").status_code == 404
+
+
+def test_collections_bad_scope_rejected(client):
+    resp = client.get("/api/v1/console/knowledge/collections",
+                      params={"scope": "no-colon"})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert "{channel}:{account_id}" in body["message"]
 
 
 def test_search_test_tokens_and_match_explanation(client):

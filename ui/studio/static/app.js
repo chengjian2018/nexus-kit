@@ -341,7 +341,7 @@ const testState = {
   log: [],              // 聊天记录模型：切页签只重建 DOM 不丢数据（新会话清空）
 };
 
-const CHAT_HINT = "发起会话后开始多轮对话测试；事件逐行打印（节点/工具/扇出），回复文本流式输出。";
+const CHAT_HINT = "发起会话后开始多轮对话测试；事件逐行打印（节点结果/工具/扇出），思考与回复文本流式输出。";
 
 function resetChatLog() {
   testState.log = [{ kind: "system", text: CHAT_HINT }];
@@ -527,9 +527,21 @@ function traceLabel(t) {
   const d = t.data || {};
   const n = t.node_code ? ` · ${t.node_code}` : "";
   const b = t.branch_id ? `（${t.branch_id}）` : "";
+  const brief = (v, cap) => {
+    const s = String(v || "");
+    return s.length > cap ? s.slice(0, cap) + "…" : s;
+  };
   switch (t.event) {
     case "node_start": return `▶ 执行节点${n}`;
-    case "node_end": return `✓ 节点完成${n}`;
+    case "node_end": {
+      // 引擎在 data 里带结果摘要（content/next/wait_human/sends，缺席键不显示）
+      let s = `✓ 节点完成${n}`;
+      if (d.wait_human) s += "（等待用户输入）";
+      if (d.sends) s += `（扇出 ${d.sends} 实例）`;
+      if (d.next) s += ` → ${Array.isArray(d.next) ? d.next[0] : d.next}`;
+      if (d.content) s += `：${brief(d.content, 80)}`;
+      return s;
+    }
     case "node_jump": return `→ 节点跳转 ${d.from_node || "?"} ⇒ ${t.node_code}`;
     case "graph_compile": return "图运行开始";
     case "graph_wait": return `⏸ 等待用户输入${n}`;
@@ -537,16 +549,21 @@ function traceLabel(t) {
     case "graph_done": return `图结束（${d.reason || ""}）`;
     case "fanout_start": return `⑂ 扇出 ${Array.isArray(d.branch_ids) ? d.branch_ids.length : ""} 实例${n}`;
     case "branch_start": return `⑂ 分支执行 ${t.branch_id}`;
-    case "branch_end": return `⑂ 分支完成 ${t.branch_id}`;
+    case "branch_end": {
+      let s = `⑂ 分支完成 ${t.branch_id}`;
+      if (d.ok === false) s += `（失败：${brief(d.error, 80)}）`;
+      else if (d.content) s += `：${brief(d.content, 80)}`;
+      return s;
+    }
     case "fanout_join": return `⑂ 汇聚${n}`;
     case "tool_call": {
       const args = d.args ? JSON.stringify(d.args) : "";
-      const short = args.length > 60 ? args.slice(0, 60) + "…" : args;
+      const short = args.length > 120 ? args.slice(0, 120) + "…" : args;
       return `🔧 调用工具 ${d.tool_name || ""}${b} ${short}`.trim();
     }
     case "tool_result": {
       const r = String(d.result || "");
-      const shown = r.length > 80 ? r.slice(0, 80) + "…" : r;
+      const shown = r.length > 200 ? r.slice(0, 200) + "…" : r;
       return `🔧 ${d.tool_name || ""}${d.synthetic ? "（拦截回填）" : ""}${b} → ${shown}`;
     }
     case "conversation_end": return "会话结束（终态节点）";
@@ -564,17 +581,33 @@ async function sendChat() {
   box.value = "";
   appendMsg("user", query);
 
-  // 模型化的流式助手条目：事件逐行 + 文本流式 + 过程轮折叠都写入
-  // testState.log（切页签重渲染后仍能续画，聊天记录不丢）
-  const entry = { kind: "assistant", text: "", events: [], rounds: [],
+  // 模型化的流式助手条目：items 是中间区有序块（事件行/过程段混排，按流式
+  // 时序追加）+ 文本流式 + 思考写入 testState.log（切页签重渲染后仍能续画）
+  const entry = { kind: "assistant", text: "", thinking: "", items: [],
                   streaming: true, error: false };
   testState.log.push(entry);
   chatEntryEl(entry);
-  chatScroll();
+  chatScroll(true);  // 用户刚发出消息 → 无条件钉底
 
   let buf = "";        // 当前轮乐观转发的累计 delta（done 时被权威文本替换）
   let roundIdx = 0;
   let sawError = false;
+  let prevNode = "";   // 最近完成的节点 code（节点边界折叠时标注产出归属）
+
+  // 把 buf 折叠成一条过程段（轮次边界/节点边界共用），正文区清空等待后续流。
+  // 与事件行同一点位插入（正文之前）→ DOM 顺序即流式时序
+  const foldBuf = (label) => {
+    entry.items.push({ kind: "round", label });
+    const el = chatEntryEl(entry);
+    const seg = document.createElement("div");
+    seg.className = "msg-round";
+    seg.textContent = label;
+    el.insertBefore(seg, el.querySelector(".msg-text"));
+    buf = "";
+    entry.text = "";
+    setChatText(entry, "");
+  };
+
   try {
     await streamSse("/api/v1/chat/stream", {
       request_id: uuid(), session_id: testState.session.id, query,
@@ -583,44 +616,54 @@ async function sendChat() {
         buf += ev.text || "";
         entry.text = buf;
         setChatText(entry, buf);
+      } else if (ev.kind === "thinking") {
+        // 思考模型（enable_thinking）的推理增量：独立暗色块流式呈现，不混入回复正文
+        entry.thinking += ev.text || "";
+        setChatThinking(entry);
       } else if (ev.kind === "round") {
         // 乐观转发语义：非最终轮的文本属于过程（如工具调用轮），有内容才
         // 折叠成段——空轮不刷屏（工具活动由事件区的 trace 行呈现）
         const ri = ev.round_info || {};
         if (ri.outcome && ri.outcome !== "final" && buf) {
-          roundIdx += 1;
-          const label = `⟨过程 · 第 ${roundIdx} 轮（${ri.outcome}）⟩ ${buf}`;
-          entry.rounds.push(label);
-          const el = chatEntryEl(entry);
-          const seg = document.createElement("div");
-          seg.className = "msg-round";
-          seg.textContent = label;
-          el.insertBefore(seg, el.querySelector(".msg-text"));
-          buf = "";
-          entry.text = "";
-          setChatText(entry, "");
+          foldBuf(`⟨过程 · 第 ${++roundIdx} 轮（${ri.outcome}）⟩ ${buf}`);
         }
       } else if (ev.kind === "trace") {
         // 事件依次打印（持久）：每条 trace 一行，工具调用/返回突出显示
         const trace = ev.trace || {};
+        // 节点边界即正文分段：刚完成节点的流式产出折叠成过程段（多节点图
+        // 里中间节点的回复否则会被 done 的权威文本整体冲掉）
+        if (trace.event === "node_start" && buf) {
+          foldBuf(`⟨节点 ${prevNode || "?"} 中间产出⟩ ${buf}`);
+        }
+        if (trace.event === "node_end") prevNode = trace.node_code || "";
+        // 节点/工具边界即思考分段：已结束过程的思考不再累积显示，
+        // 下一轮推理增量到来时重建思考块（与正文 foldBuf 分段语义对齐；
+        // 最终轮的思考保留到 done，作为对最终回复的推理记录）
+        if ((trace.event === "node_start" || trace.event === "tool_call")
+            && entry.thinking) {
+          const log = $("#chat-log");
+          const stick = !log || nearBottom(log);
+          entry.thinking = "";
+          const think = chatEntryEl(entry).querySelector(".msg-thinking");
+          if (think) think.remove();
+          if (log && stick) log.scrollTop = log.scrollHeight;
+        }
         const label = traceLabel(trace);
         if (label) {
           const cls = "ev"
             + (trace.event === "tool_call" || trace.event === "tool_result"
               ? " ev-tool" : "")
             + (trace.event === "turn_error" ? " ev-err" : "");
-          entry.events.push({ cls, text: label });
+          entry.items.push({ kind: "event", cls, text: label });
           const el = chatEntryEl(entry);
-          const eventsBox = el.querySelector(".msg-events");
-          if (eventsBox) {
-            const line = document.createElement("div");
-            line.className = cls;
-            line.textContent = label;
-            line.title = label;
-            eventsBox.appendChild(line);
-            eventsBox.scrollTop = eventsBox.scrollHeight;
-          }
-          chatScroll();
+          const log = $("#chat-log");
+          const stick = !log || nearBottom(log);
+          const line = document.createElement("div");
+          line.className = cls;
+          line.textContent = label;
+          line.title = label;
+          el.insertBefore(line, el.querySelector(".msg-text"));
+          if (log && stick) log.scrollTop = log.scrollHeight;
           if (trace.event === "turn_error") sawError = true;
         }
       } else if (ev.kind === "done") {
@@ -677,21 +720,25 @@ function buildChatEntryEl(entry) {
   wrap.className = "msg assistant"
     + (entry.streaming ? " streaming" : "")
     + (entry.error ? " error" : "");
-  const eventsBox = document.createElement("div");
-  eventsBox.className = "msg-events";
-  for (const e of entry.events) {
+  // 中间区按流式时序重放：事件行/过程段交错，其后是幸存的思考块
+  // （边界清空保证必属最后一轮），最后是正文——与实时视图 DOM 顺序一致
+  for (const item of entry.items) {
     const line = document.createElement("div");
-    line.className = e.cls;
-    line.textContent = e.text;
-    line.title = e.text;
-    eventsBox.appendChild(line);
+    if (item.kind === "round") {
+      line.className = "msg-round";
+      line.textContent = item.label;
+    } else {
+      line.className = item.cls;
+      line.textContent = item.text;
+      line.title = item.text;
+    }
+    wrap.appendChild(line);
   }
-  wrap.appendChild(eventsBox);
-  for (const label of entry.rounds) {
-    const seg = document.createElement("div");
-    seg.className = "msg-round";
-    seg.textContent = label;
-    wrap.appendChild(seg);
+  if (entry.thinking) {
+    const think = document.createElement("div");
+    think.className = "msg-thinking";
+    think.textContent = entry.thinking;
+    wrap.appendChild(think);
   }
   const textEl = document.createElement("div");
   textEl.className = "msg-text";
@@ -719,16 +766,46 @@ function renderChatLog() {
   log.scrollTop = log.scrollHeight;
 }
 
-function chatScroll() {
+/* 距底 ≤48px 视为用户停在底部：流式增量只在贴底时跟随钉底，用户上翻
+ * 阅读历史时不被拽回，翻回底部自动恢复跟随。热路径（文本/思考/事件增量）
+ * 在写入前取样贴底判断——单条大增量会把更新后的距离撑过阈值，
+ * 更新后再判断会导致跟随意外中断 */
+function nearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= 48;
+}
+
+function chatScroll(force) {
   const log = $("#chat-log");
-  if (log) log.scrollTop = log.scrollHeight;
+  if (log && (force || nearBottom(log))) log.scrollTop = log.scrollHeight;
 }
 
 function setChatText(entry, text) {
   const el = chatEntryEl(entry);
+  const log = $("#chat-log");
+  const stick = !log || nearBottom(log);
   const textEl = el.querySelector(".msg-text");
   if (textEl) textEl.textContent = text;
-  chatScroll();
+  if (log && stick) log.scrollTop = log.scrollHeight;
+}
+
+/** 思考块流式追加：无则就地创建（插在正文之前，与 foldBuf 同一插入点——
+ * 两者都往中间区末尾追加，DOM 顺序即流式时序，过程段与思考按轮次交错）。
+ * 内层思考块与外层日志都只在贴底时跟随，写入前取样。 */
+function setChatThinking(entry) {
+  if (!entry.thinking) return;
+  const el = chatEntryEl(entry);
+  let think = el.querySelector(".msg-thinking");
+  if (!think) {
+    think = document.createElement("div");
+    think.className = "msg-thinking";
+    el.insertBefore(think, el.querySelector(".msg-text"));
+  }
+  const thinkStick = nearBottom(think);
+  const log = $("#chat-log");
+  const logStick = !log || nearBottom(log);
+  think.textContent = entry.thinking;
+  if (thinkStick) think.scrollTop = think.scrollHeight;
+  if (log && logStick) log.scrollTop = log.scrollHeight;
 }
 
 /** 状态变化（done/error）后整体重画该条目。 */
@@ -747,7 +824,7 @@ function appendMsg(role, text) {
   const entry = { kind: role === "user" ? "user" : "system", text };
   testState.log.push(entry);
   chatEntryEl(entry);
-  chatScroll();
+  chatScroll(true);  // 用户主动发消息 → 无条件钉底
   return entry;
 }
 

@@ -103,6 +103,7 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
 .tbl th { color: var(--muted); font-weight: 500; white-space: nowrap; background: #f8fafc; }
 .tbl tr:hover td { background: #fafcff; }
 .tbl .num { font-family: var(--mono); }
+.tbl td .btn { white-space: nowrap; }
 
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
 .tabs button {
@@ -200,3 +201,59 @@ details.sec summary { cursor: pointer; color: var(--muted); }
 }
 .notice { background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
   border-radius: 8px; padding: 8px 12px; font-size: 12.5px; margin: 10px 0; }
+
+/* ---- 知识库子视图（自定义知识库：列表 -> 新建/编辑 -> 库详情） ---- */
+.subview-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.clip {
+  display: inline-block; max-width: 320px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+}
+.tbl input.cell-input, .tbl select.cell-select {
+  width: 100%; border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 8px; font-size: 12.5px; background: #fff; font-family: inherit;
+}
+
+/* ---- 会话审查（合并时间线：消息 + trace 穿插，异常红边高亮） ---- */
+.timeline { position: relative; margin: 4px 0 0; padding-left: 20px; }
+.timeline::before {
+  content: ""; position: absolute; left: 5px; top: 8px; bottom: 8px;
+  width: 2px; background: var(--border); border-radius: 2px;
+}
+.tl-item {
+  position: relative; background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 14px; margin: 0 0 10px;
+}
+.tl-item::before {
+  content: ""; position: absolute; left: -20px; top: 16px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #94a3b8; border: 2px solid #fff; box-sizing: content-box;
+  margin-left: -5px;
+}
+.tl-item.tl-error { border-color: #fca5a5; background: #fff8f8; }
+.tl-item.tl-error::before { background: var(--danger); }
+.tl-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: var(--muted);
+}
+.tl-body { margin-top: 6px; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+.tl-body.muted { color: var(--muted); }
+.tl-call { margin: 8px 0 2px; }
+.tl-item pre.code { margin: 6px 0 0; max-height: 320px; }
+.tl-divider {
+  position: relative; margin: 16px 0 12px; font-size: 12px; color: var(--muted);
+  display: flex; align-items: center; gap: 10px;
+}
+.tl-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+/* 消息 role 徽标：user 蓝 / assistant 绿 / tool 灰 / summary 紫（复用页面配色变量） */
+.badge.tl-badge-user { background: var(--route-bg); color: var(--route-fg); border-color: var(--route-bd); }
+.badge.tl-badge-assistant { background: var(--fsm-bg); color: var(--fsm-fg); border-color: var(--fsm-bd); }
+.badge.tl-badge-tool { background: #f1f5f9; color: #475569; }
+.badge.tl-badge-summary { background: var(--end-bg); color: var(--end-fg); border-color: var(--end-bd); }
+.badge.tl-badge-system { background: #f8fafc; color: var(--muted); }
+/* trace kind 徽标：节点蓝 / 工具青 / 分支紫 / 终止绿 / 异常红 / app 灰 */
+.badge.tl-kind-node { background: var(--route-bg); color: var(--route-fg); border-color: var(--route-bd); }
+.badge.tl-kind-tool { background: #ecfeff; color: #0e7490; border-color: #67e8f9; }
+.badge.tl-kind-branch { background: var(--end-bg); color: var(--end-fg); border-color: var(--end-bd); }
+.badge.tl-kind-done { background: #f0fdf4; color: var(--fsm-fg); border-color: var(--fsm-bd); }
+.badge.tl-kind-error { background: #fef2f2; color: #b91c1c; border-color: #fca5a5; }
+.badge.tl-kind-app { background: #f8fafc; color: var(--muted); }

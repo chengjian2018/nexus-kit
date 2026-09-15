@@ -177,32 +177,34 @@ pre.code, .codeblock {
 .chat-log { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 2px; display: flex; flex-direction: column; gap: 10px; }
 .msg { max-width: 86%; padding: 9px 13px; border-radius: 10px; font-size: 13.5px; white-space: pre-wrap; word-break: break-word; }
 .msg.user { align-self: flex-end; background: var(--brand); color: #fff; border-bottom-right-radius: 3px; }
-.msg.assistant { align-self: flex-start; background: #f0f2f5; border-bottom-left-radius: 3px; }
+.msg.assistant { align-self: flex-start; max-width: 100%; background: #f0f2f5; border-bottom-left-radius: 3px; }
 .msg.system { align-self: center; background: transparent; color: var(--ink-3); font-size: 12px; }
 .msg.error { align-self: flex-start; background: var(--err-weak); color: var(--err); font-family: var(--mono); font-size: 12px; }
 .msg .msg-role { font-size: 11px; opacity: .7; margin-bottom: 3px; }
-.msg .msg-events {
-  display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px;
-  max-height: 200px; overflow-y: auto;
-}
-.msg .msg-events:empty { display: none; }
-.msg .msg-events .ev {
-  flex: none;  /* overflow:hidden 会让 flex 项 min-height 归零——事件超量时
-                  行被压扁、文字互相叠印；禁止收缩，让容器滚动 */
-  font-size: 11.5px; color: var(--ink-3); font-family: var(--mono);
+/* 事件行不设独立滚动容器，按时序直接插入消息流（与过程段/思考交错） */
+.msg .ev {
+  font-size: 12.5px; color: var(--ink-3); font-family: var(--mono);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 2px;
 }
-.msg .msg-events .ev-tool { color: var(--ink-2); }
-.msg .msg-events .ev-err { color: var(--err); }
+.msg .ev-tool { color: var(--ink-2); }
+.msg .ev-err { color: var(--err); }
 .msg.streaming .msg-text::after {
   content: "▌"; animation: blink 1s step-end infinite; margin-left: 2px;
 }
 @keyframes blink { 50% { opacity: 0; } }
 .msg .msg-round {
-  font-size: 11.5px; color: var(--ink-3); background: #e9ebef;
+  font-size: 12.5px; color: var(--ink-3); background: #e9ebef;
   border-radius: 6px; padding: 4px 8px; margin-bottom: 6px;
-  max-height: 60px; overflow-y: auto;
+  max-height: 120px; overflow-y: auto;
 }
+.msg .msg-thinking {
+  font-size: 12.5px; color: var(--ink-3); font-family: var(--mono);
+  white-space: pre-wrap; word-break: break-word;
+  border-left: 2px solid var(--line); padding: 2px 0 2px 8px;
+  margin-bottom: 6px; max-height: 320px; overflow-y: auto;
+}
+.msg .msg-thinking::before { content: "💭 思考\A"; opacity: .75; }
 .msg.assistant.error { background: var(--err-weak); color: var(--err); }
 
 .trace { align-self: stretch; font-size: 12px; border: 1px dashed var(--line);
@@ -251,7 +253,8 @@ pre.code, .codeblock {
 }
 .gen-steps:empty { display: none; }
 .step-card {
-  flex: none;  /* 同 .msg-events .ev：overflow:hidden + flex 收缩会压扁卡片 */
+  flex: none;  /* flex 容器里 overflow:hidden 的子项 min-height 会归零：
+                  内容超量时被压扁叠印；禁止收缩，让容器滚动 */
   border: 1px solid var(--line); border-left: 3px solid var(--brand);
   border-radius: 7px; background: var(--panel); overflow: hidden;
   font-family: var(--mono); font-size: 11.5px;
