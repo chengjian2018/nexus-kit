@@ -26,7 +26,7 @@ stage）由 atoms 在 import 时反向注册进内核（见"插件中心"节）�
 host POST /api/v1/chat
   → chat_turn (nexus/engine/chat.py)
       1. begin_turn（context_lifecycle 重置每轮字段；graph_state 不清——挂起游标跨轮）
-      2. R1 刷新 llm_config（plugins["llm"] > settings 分层 > llm_override）
+      2. R1 刷新 llm_config（llm_override > app 分层链 > llm_default，见"配置"节）
       3. maybe_compress（历史压缩）→ 记录 user 消息
       4. 按 pattern.pattern_type 分流：
          "fsm"   → FSM executor（plugins["fsm"] > default_fsm）：
@@ -70,10 +70,11 @@ host POST /api/v1/chat
   `cxt.graph_state`（sessions 表落盘，进程重启可续）；下一轮用户消息作为
   `ec.resume_input` 送达，**恢复时该节点重新执行**——副作用（工具调用）
   幂等责任在节点执行器（v1 文档化责任，不做事重放）。
-- **预算三层守卫（各管各维度）**：`config.max_steps`（默认 10）限主循环
+- **预算三层守卫（各管各维度）**：`max_steps`（默认 10）限主循环
   节点执行次数（扇出节点 + join 各占 1 步，**worker 实例不占图步数**；
-  挂起续跑跨轮延续记账）；`config.max_fanout`（默认 8）限一次 sends 的
-  实例宽度；executor 内部守卫（`_MAX_TOOL_ROUNDS` 等）限分支内轮次。
+  挂起续跑跨轮延续记账）；`max_fanout`（默认 8）限一次 sends 的
+  实例宽度；executor 轮次守卫（`get_loop_limits`）限分支内轮次。
+  图级两项与轮次的 app 级覆盖见"配置"节。
   耗尽 → force-close 兜底话术。环因此是合法语义。FSM 无预算——每轮恰好
   一个节点，也不收 sends。
 - **跨轮状态**：挂起游标走 graph_state；业务状态走 cxt 既有字段
@@ -191,7 +192,6 @@ jump_module / max_hops）全部删除。
 | `fsm` | executor | FSM 执行器 |
 | `messages_builder` | messages_builder | AGENT 消息构建器 |
 | `agent_hooks` | agent_hooks | 循环 hooks 包 |
-| `llm` | llm_providers code | LLM provider 声明（settings 解析，不内联密钥） |
 
 ### 工具授权（deny-by-default 三层收口）
 
@@ -228,13 +228,78 @@ patterns / tools / providers / channels 四个领域注册中心**保持独立**
 中心只承接引擎扩展点。共享 AST 扫描在 `nexus/registry/discovery.py`，
 注册习惯（模块级 `registry.register()`，无装饰器）不变。
 
+## 配置（双层载体 + 显式绑定）
+
+运行时配置 = 两层 yaml + 代码声明：全局 `host/config/local_config.yaml`
+（gitignored，含密钥）承担连接与全局默认；`apps/<name>/config.yaml`
+（入库，无密钥）按 pattern 覆盖；`pattern.config` 代码声明只当默认值
+（app yaml 赢）。两层都**每轮对话现读**（mtime 指纹缓存，见"热重载"节）。
+
+### 全局 local_config.yaml
+
+| 段 | 职责 |
+|---|---|
+| `llm_providers` | 连接层：api_base / api_key_env / timeout / max_retries 按 provider code 声明——**密钥只出现在这一层** |
+| `llm_default` | 全局兜底：默认 code / model / temperature / max_tokens / enable_thinking |
+| `loop` | 循环预算全局默认：max_tool_rounds（默认 10） |
+| `mcp_servers` | MCP server 声明（连接/传输；按应用拆分是显式非目标） |
+| `session_db_path` / `knowledge_db_path` / `session_compress_*` | 存储与压缩 |
+| `subagent_tool` / `workflow_tool` / `shell_tool` / `file_tool` / `tasks_tool` / `cron_tool` | 六个工具护栏全局段（`skills` / `tool_guard` 同为全局节） |
+
+### apps/<name>/config.yaml（应用层八段）
+
+顶层 `pattern: <code>` **显式绑定**（目录名 ≠ pattern code，绑定出错
+早爆；两份文件绑同一 pattern fail-fast）。八段词表：
+
+| 键 | 内容 |
+|---|---|
+| `pattern` | 必填，绑定 pattern code |
+| `llm` | pattern 级 LLM 默认（全体节点继承，字段级覆盖 llm_default） |
+| `nodes` | node 级细化：只开放 `llm` 与 `loop.max_tool_rounds` |
+| `loop` | pattern 级循环预算：max_tool_rounds / max_steps / max_fanout |
+| `compression` | threshold / retain_count（字段级覆盖全局 `session_compress_*`） |
+| `guardrails` | 键名与全局六护栏段同名，字段级合并（可放宽也可收紧） |
+| `skills` | dir：覆盖全局扫描根 |
+| `config` | 自由 bag：执行器自定义参数的家（如 archify 的 author_rounds） |
+
+连接字段（api_base / api_key / api_key_env）在 app 文件出现即 fail-fast
+——app 文件入库，密钥只允许在全局 `llm_providers`。未知键 warn + 忽略；
+无文件 = 全默认（应用零改动照跑）。完整示例：host/config/
+local_config.example.yaml 与 docs/design/app-config.md。
+
+### 优先级链（字段级覆盖，缺项继承浅层）
+
+- **LLM 编排**：`llm_default ⊕ app.llm ⊕ app.nodes.<node>.llm ⊕
+  cxt.metadata["llm_override"]`（末层是 CLI/测试 seam，整体压过前三层）；
+  合并后再叠加 `llm_providers[code]` 连接层（`_merge_connection`）。
+  换 provider 时 code 与 model 必须一起写。
+- **工具轮次**（`get_loop_limits`）：全局 `loop.max_tool_rounds`（默认
+  10）→ app pattern 级 → app `nodes.<node>.loop.max_tool_rounds`。
+- **图级预算**（`resolve_max_steps` / `resolve_max_fanout`）：pattern
+  代码声明（`pattern.config`）为默认，app `loop.max_steps` / `max_fanout`
+  赢。
+- **护栏**：app `guardrails.<段>` 字段级压过全局同名段——方向自由
+  （app config 是部署者意志的表达），安全边界在工具授权三层收口与
+  args-only-lower 不变式，不在护栏数值。
+- **skills 根 / config bag**：app `skills.dir` > pattern
+  `config.skills_dir`（代码默认）> 全局 `skills.dir`；`config` bag
+  （`get_pattern_custom_config`）刻意不与 `pattern.config` 合并——代码
+  默认值留在执行器 `.get()` 回退。
+
+### 启动期 cross-check
+
+`_cross_check_app_configs`（host/main.py 装配时）：对每份 app 配置校验
+`pattern` 键已注册、`nodes` 键存在于该 pattern 节点集、`guardrails`
+段名合法——仅 warning 不 SystemExit（兼容 studio reload 时序）。
+
 ## 引擎内核工具箱（executor 可复用）
 
 留在 `nexus/engine/chat.py` / `loop.py`、被 atoms executor 反向 import 的
 内核助手（合法方向：atoms→nexus）：
 
-- `chat.py`：`_refresh_llm_config`（R1 轮级 / R3 FSM 节点 / R4 AGENT 节点，
-  统一读 plugins["llm"] 声明）、`_resolve_entry_node`、`_run_stages`
+- `chat.py`：`_refresh_llm_config`（R1 轮级 / R3 FSM 节点 / R4 AGENT 节点；
+  metadata llm_override > app 分层链 > llm_default，见"配置"节）、
+  `_resolve_entry_node`、`_run_stages`
   （两层解析）、`_fsm_node_transition`、`_handle_node`、图运行时
   `_run_agent_graph`。**R1-R4 patch 锚**：这些函数在 chat 命名空间解析
   `get_llm_config`（tests patch `nexus.engine.chat.get_llm_config`），
@@ -252,18 +317,58 @@ patterns / tools / providers / channels 四个领域注册中心**保持独立**
 | `nexus/pipeline.py` | 槽位骨架 + 两层延迟解析（FSM 专属）；兜底 stage 工厂经插件中心存储 |
 | `nexus/engine/` | chat（分流 + 图运行时）/ execution（NodeExecutor 契约）/ turn_result / loop（工具箱）/ agent_hooks / messages / streaming / 压缩 / 持久化 |
 | `nexus/registry/` | discovery（共享 AST 扫描）/ plugins（插件中心）/ patterns / tools / providers / channels |
+| `nexus/skills.py` | 技能资产扫描（mtime 指纹缓存，无注册表）+ 双层声明解析 + L0 元数据块 |
 | `nexus/llm/` | Provider 抽象 + 解析 |
-| `nexus/settings.py` | 运行时设置（LLM 分层配置 llm_default ⊕ pattern_llm ⊕ pattern_llm.nodes、压缩、DB 路径） |
+| `nexus/settings.py` | 运行时设置（双层配置解析：全局 local_config.yaml + apps/*/config.yaml 覆盖层；LLM 分层 llm_default ⊕ app.llm ⊕ app.nodes.llm、循环预算、护栏、压缩、DB 路径） |
 | `nexus/channels/` | ChannelSpec 协议 + 通用 webhook 装配 |
 | `atoms/executors/` | 两默认 executor（default_loop / default_fsm） |
 | `atoms/stages/` | nlu / nlg / unified / query / recaller / clarify + 默认 prompt |
-| `atoms/tools/` | knowledge / mcp 工具 + 内置工具原子六件套（shell / file / tasks / cron / subagent / workflow，toolset 标签授权单元） |
+| `atoms/tools/` | knowledge / mcp 工具 + 内置工具原子七件套（shell / file / tasks / cron / subagent / workflow / skill，toolset 标签授权单元；skill 工具随技能启用自动授予，不走 use_tools 声明） |
 | `atoms/hooks/` | agent_hooks 插件包：tool_guard（工具执行前危险操作播报） |
 | `atoms/providers/` | OpenAICompatible Provider（dashscope / zai） |
 | `atoms/knowledge/` | SQLite 知识库 |
 | `atoms/mcp/` | MCP 连接管理器（工具动态注册 toolset `mcp-<server>`） |
-| `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器）+ prompt 资产 + 渠道适配 |
+| `apps/<name>/` | 业务 pattern（route.py：节点图 + 执行器）+ 可选 config.yaml（应用级配置覆盖层）+ prompt 资产 + 渠道适配 |
 | `host/` | main.py / governor.py / config/ |
+
+## 技能资产（skills）
+
+skill 是**数据资产**而非代码：扫描根下一个目录 + `SKILL.md`（frontmatter：
+name / description / requires_toolsets + 自由 metadata）+ 可选参考文件。
+目录名即技能名。**无注册表、无 reload**——`nexus/skills.py` 按 mtime
+指纹（根目录 + 各 `*/SKILL.md` stat）缓存扫描结果，目录放进扫描根下一轮
+对话自动生效；扫描根解析（深者赢，见"配置"节）：app 配置 `skills.dir` >
+pattern `config.skills_dir`（代码级默认）> 全局 settings `skills.dir`
+（默认 `skills/`），根不存在 = 技能链整体
+静默（镜像 `mcp_servers: {}`）。
+
+- **双层 deny-by-default**：pattern `allow_skills`（池）∩ node
+  `use_skills`（启用），都空 = 无技能；语义对齐工具的 `allow_toolset`
+  × `use_tools` 收口。
+- **L0 元数据注入**：`skill_prompt_block` 生成的区块（每技能一行
+  name: description）经 default_loop 的 `extra_blocks` 进 system
+  prompt——MessagesBuilder 契约要求携带 extra_blocks，自定义 builder
+  无感知即携带。描述即触发器。
+- **知识工具自动授予**：生效集非空时 default_loop 把
+  `load_skill` / `read_skill_file`（`atoms/tools/skill_tool.py`，只读）
+  追加进本轮工具列表——技能声明即授权，声明方无需写 use_tools；handler
+  侧经 `ToolCallContext` 新增的 `skills_dir` / `enabled_skills` 字段拦截
+  越权名（错误回填供模型自纠），`read_skill_file` 的 rel_path 越出技能
+  目录即拒绝。
+- **红线：技能给知识不给权限**——手册指引下的脚本执行/文件读写仍走
+  bash 等执行面工具的三层收口；skill 内容来自 operator 配置的扫描根
+  （与 base_prompt 同级信任，可进 system role），运行期绝不接受路径
+  入参（两个工具只收技能名）。
+- **校验**：`validate_skills`（注册期，双模式）——声明名缺失/越权
+  use_skills/`requires_toolsets ⊄ allow_toolset` fail-fast；扫描根不存在
+  整体延后运行期（部署本地根如 ~/.claude/skills 不阻塞便携启动）。
+- 消费档位：**说明书式**（任意 AGENT 节点 `use_skills`，零定制代码，
+  in-repo 样例 `apps/archify_skill_agent/`——单 default_loop 节点跑
+  archify 技能，与九节点编译式 `archify` workflow 版互相独立）；
+  **编译式**（把 skill 纪律转译成图闸门，如 `apps/archify_agent/`，
+  其感知评审站 `af_percept` 以 zai 视觉模型 `glm-5.3-flash` 读
+  visual-check 截图侧车做图像能力评审——`nexus/llm/vision.py` 提供
+  多模态 parts 组装与注册表 `vision_models` 能力查询）。
 
 ## Agent hooks（机制在用：in-repo 包 tool_guard）
 
@@ -326,11 +431,15 @@ sessions 表：`current_node_code`（FSM 游标 / AGENT 图位置镜像）+
 不改代码结构的前提下，四类东西的运行时重载机制（`host/reload.py` 是
 代码侧的装配点，`nexus/settings.py` 是数据侧的）：
 
-### llm config — mtime 指纹缓存（`nexus/settings.py`）
+### 配置 yaml — mtime 指纹缓存（`nexus/settings.py`）
 
-`load_config` 按 resolved path 记 `(mtime_ns, size)` 指纹：每轮对话的
-R1 刷新（`get_llm_config`）只 **stat** 不读文件；指纹变了才重新
-读→校验→规范化。**无需任何显式 reload**——改 yaml 下一轮自动生效。
+双层配置同一策略：全局 `local_config.yaml` 按 resolved path 记
+`(mtime_ns, size)` 指纹，app 配置表（`apps/*/config.yaml`）记全部文件的
+整体指纹（文件数 ≤ 8，文件集合本身编进指纹——删/换文件必然失效）。每轮
+对话的 accessor 读取（`get_llm_config` 等）只 **stat** 不读文件；指纹变了
+才重新 读→校验→规范化。**无需任何显式 reload**——改 yaml 下一轮自动
+生效；`invalidate_config_cache` 一并清两张表（`/api/v1/system/reload`
+与 `host/reload.py::reload_all` 的既有失效点自动覆盖两层）。
 
 ### pattern / plugin / channel — mtime re-import（`host/reload.py`）
 

@@ -39,13 +39,14 @@
 
 - 能接外部工具：支持 MCP 标准（业界通用的工具接口），配置几行就能接一个工具服务
 - 自带一批趁手工具：执行命令、读写文件、任务清单、定时任务、派"子助手"分身干活、按固定套路跑流程
+- 能装"技能"：把一份带手册的技能目录放进 skills/ 扫描根，节点声明 `use_skills` 即可按需装载——流程纪律写在 SKILL.md 里，改手册不用改代码（兼容 Claude Code 技能目录布局）
 - 自带知识库：资料导进去，回答时先查资料再说话；查资料的策略也写在配置里，改完就生效
 - 默认安全：工具不声明就不能用；危险操作（比如跑命令）执行前会先播报一声
 
 **可视化界面**
 
 - `/studio` 编排工作台：挑个应用发消息试试；或者用一句话描述需求，让 AI 帮你把新应用生成出来；也可以用表单或配置文件手动编排
-- `/console` 运营台：查看每个应用长什么样、管理知识库、调整检索配置
+- `/console` 运营台：查看每个应用长什么样、管理知识库、调整检索配置、审查会话记录（消息与过程轨迹合并时间线）
 - 改配置、改流程基本不用重启，下一轮对话就生效
 
 **接模型**
@@ -54,6 +55,14 @@
 - 可以整体指定用哪个模型，也可以只给某个应用、甚至某个步骤单独换
 
 ## 系统架构
+
+**运行时全景**——一次请求的完整旅程：浏览器 / 渠道回调 → FastAPI 宿主（入口校验·会话治理）→ chat_turn 引擎（配置·压缩·分流）→ 图运行时（AGENT / FSM）→ 节点执行器 → 工具箱 / MCP 网关 / LLM 云服务，落库走 SQLite 会话库与知识库：
+
+![nexus-kit 运行时全景图](img/nexus-kit.png)
+
+> 🖱️ 交互式版本：[diagrams/runtime-architecture.html](diagrams/runtime-architecture.html) —— 可探索的独立 HTML 图（点选节点查看细节、明暗主题切换）。
+
+**静态分层**——四层单向依赖：
 
 ```
 host   (3)  组装根 ─ FastAPI 入口 / 配置装载 / 会话治理 / 热重载 / UI 宿主
@@ -102,7 +111,7 @@ cp host/config/local_config.example.yaml host/config/local_config.yaml
 export DASHSCOPE_API_KEY=sk-...
 
 # ② 用 z.ai（GLM）——还要把 local_config.yaml 里的 llm_default.code 改成 zai
-export ZAI_API_KEY=...
+export Z_AI_API_KEY=...
 
 # ③ 接自己的模型：
 #    兼容 OpenAI 接口的服务 —— 在 llm_providers 里加一节、改个地址就行；
@@ -129,7 +138,9 @@ python -m pytest        # uv 环境：uv run python -m pytest
 - **编排工作台** <http://localhost:8000/studio/> —— 默认停在「模版测试」页签：挑个应用、
   发条消息就能聊，回复逐字输出，每一步的过程都能展开看。「自动编排」页签能用一句话需求
   生成新应用（需要本机装了 claude 命令行）；「流程编排」页签能用表单和配置文件手动改、校验、发布。
-- **运营配置台** <http://localhost:8000/console/> —— 看应用结构、管知识库、调检索配置。
+- **运营配置台** <http://localhost:8000/console/> —— 看应用结构、管知识库、调检索配置；
+  「会话审查」页能按 pattern / session_id 过滤历史会话，进详情看消息与节点·工具轨迹的
+  合并时间线（异常轮次、工具幻觉拦截等会红边高亮）。
   （如果设置了 `NEXUS_API_KEY`，在页面右上角填同一个。）
 
 ## Author
