@@ -30,7 +30,7 @@
 | 闲鱼意图关键词 / 议价规则 / 违禁词 | `TECH_KEYWORDS` / `DEFAULT_BARGAIN_SETTINGS` / `BLOCKED_PHRASES` 常量 | `apps/xianyu_agent/route.py:78-111,316-322` |
 | 任何话术 prompt | `apps/*/prompts.py` 字符串常量（customer_agent 甚至内联在 route.py） | `apps/*/prompts.py`、`apps/customer_agent/route.py:147-230` |
 | 节点话术 / 槽位 / 跳转 | `route.py` 里节点构造参数 | `apps/install_booking_agent/route.py:104-395` |
-| 知识库内容 | 仅 `cli knowledge-seed` 演示种子，无增删改查界面 | `host/cli.py:1076-1091` |
+| 知识库内容 | 仅 `cli knowledge-seed` 演示种子，无增删改查界面 | （原 host/cli.py 通道已移除，暂无等价入口） |
 | 转人工时间 | `_BUSINESS_HOURS` 常量 | `apps/customer_agent/route.py:42` |
 
 而框架侧的声明式模型已把 pattern 的结构面完全数据化（node/pattern 全字段 str/bool/list/dict，yml round-trip，收集式校验）——**配置台要做的就是把这条已有的数据通路接到 UI 上，而不是发明新的配置体系**。
@@ -88,7 +88,7 @@ P0/P1 阶段不建账号体系，全体共用服务级鉴权（§10）；角色�
 | yml round-trip | `nexus/model/serialization.py:118,124`（`pattern_to_yaml` / `pattern_from_yaml`） | 草稿与版本快照的存储格式，零新造 |
 | 收集式校验 | `nexus/model/validation.py:53,130,246`（`validate_pattern` 汇总所有错误一次性抛出） | 发布闸门的错误展示直接复用其编号清单格式 |
 | 注册期图校验（悬空边/自环/lend_tools 越权） | `nexus/model/pattern.py:69-105` | 前端即时校验的规则来源（§9） |
-| pattern 运行时注册/替换（generation 计数） | `nexus/registry/patterns.py:70-149`；CLI `pattern-load` 已走"构造+校验+注册" | 发布 = 同一条通路的 HTTP 化 |
+| pattern 运行时注册/替换（generation 计数） | `nexus/registry/patterns.py:70-149`；`pattern-load`（原 host/cli.py 通道已移除，现行等价入口：studio 控制台发布/应用）已走"构造+校验+注册" | 发布 = 同一条通路的 HTTP 化 |
 | **结构图渲染** | `nexus/visualize.py:86`（`pattern_to_mermaid`；模块 subgraph 按类型着色、sub_nodes 实线 / jump_module 虚线 / 投影·defer 与跳转目标双样式、终态高亮） | pattern 详情页的图视图**整体复用**，含图例语义 |
 | 热重载 | `host/reload.py:238-272`（`POST /api/v1/reload` 全量重放；运行中会话持旧引用跑完，`rebind_sessions` 重绑） | 发布后的生效机制；其语义决定发布确认文案（§6.3.6） |
 | 知识库 SQLite（WAL，scope 隔离） | `atoms/knowledge/store.py`：`product_knowledge` / `customer_service_knowledge` 两表（:28-56），`upsert_product` / `add_cs` / `search_products` / `search_cs`（:106-273），进程级单例（:355-379） | 知识库页的数据层已存在，缺 update/delete/enabled 切换 API 与 HTTP 面 |
@@ -100,7 +100,7 @@ P0/P1 阶段不建账号体系，全体共用服务级鉴权（§10）；角色�
 
 | # | 缺口 | 现状证据 | 需要什么 |
 |---|---|---|---|
-| G-1 | pattern 无 HTTP 管理面 | export/load 仅 CLI（`host/cli.py:1094,1115`）；无列表/详情/草稿/发布端点 | §8 的 `/console/patterns*` API 族 |
+| G-1 | pattern 无 HTTP 管理面 | export/load 仅 CLI（原 host/cli.py 通道已移除，现行等价入口：studio 控制台 API）；无列表/详情/草稿/发布端点 | §8 的 `/console/patterns*` API 族 |
 | G-2 | 知识库无 update/delete/enabled | `store.py` 仅 upsert/add/seed；`enabled` 列存在但无 set 方法 | store 层补 API + HTTP 化 |
 | G-3 | 知识库无 HTTP 面 | 仅 CLI seed | §8 的 `/console/knowledge*` |
 | G-4 | FAQ 硬编码在代码 | `apps/*/faq.py` 的 `FAQ_ENTRIES` | 数据化迁移（§7.3）后才有 FAQ 页 |
@@ -140,7 +140,7 @@ P0/P1 阶段不建账号体系，全体共用服务级鉴权（§10）；角色�
   → 回滚（= 以历史快照内容重新走发布）
 ```
 
-发布语义对齐 `host/cli.py pattern-load`：构造 → 校验 → 注册；生效语义对齐 `host/reload.py`：**运行中会话持旧引用跑完当前轮，新会话用新版本**（发布确认文案必须如实告知，§6.3.6）。
+发布语义对齐 `pattern-load`（原 host/cli.py 通道已移除，现行等价入口：studio 控制台发布/应用）：构造 → 校验 → 注册；生效语义对齐 `host/reload.py`：**运行中会话持旧引用跑完当前轮，新会话用新版本**（发布确认文案必须如实告知，§6.3.6）。
 
 ### 4.4 运营红线（可见不可改 / 不可见）
 
@@ -402,7 +402,7 @@ customer_agent 的工具检索不经此配置；pattern 级绑定随 P1 编辑�
 
 - 目录：`host/config/patterns/*.yml`（一个文件一个 pattern，文件名 = pattern code；该目录是否入 git 为开放问题 Q-1）。
 - 加载时机：① 服务启动，在代码 pattern AST 发现**之后**统一加载（同 code 后注册者生效，使 fork 语义成立）；② 每次 `POST /api/v1/reload` 重放完成后**重放一遍 console 目录**（否则全量 reload 会把 console pattern 冲掉——集成风险 R-2 的缓解）。
-- 加载路径复用 CLI `pattern-load` 的三段式：`pattern_from_yaml` → `validate_pattern` → `registry.register`。
+- 加载路径复用 `pattern-load` 的三段式（原 host/cli.py 通道已移除，现行等价入口：studio 控制台发布/应用）：`pattern_from_yaml` → `validate_pattern` → `registry.register`。
 - 草稿与版本快照：`data/console.db`（SQLite）：
   - `pattern_drafts(pattern_code PK, content_yaml, version, updated_by, updated_at)` —— 乐观锁用 version；
   - `pattern_versions(id, pattern_code, content_yaml, comment, published_by, published_at)` —— 不可变；
@@ -491,7 +491,7 @@ customer_agent 的工具检索不经此配置；pattern 级绑定随 P1 编辑�
 
 - **并发**：草稿乐观锁（version 不匹配返回 409 + 双方 diff 供合并）；同一 pattern 发布互斥（进程内锁；多实例部署见 Q-3）；知识写操作走 SQLite WAL 既有并发语义。
 - **性能**：知识列表分页 + 服务端筛选；试搜台直接复用生产检索路径（保证预演=生产）；pattern 详情接口一次返回 yml+mermaid+树（mermaid 渲染放前端，图节点 >200 时提示改用列表导航）。
-- **兼容**：CLI（`pattern-export/load`）与 console 读写同一格式，互为逃生通道；导出文件可被 `pattern-load` 直接消费。
+- **兼容**：yml 导出/装载（原 host/cli.py 通道已移除，现行等价入口：studio 控制台发布/应用）与 console 读写同一格式，互为逃生通道；导出文件可直接走发布/应用通路。
 - **可观测**：发布/回滚/校验失败均结构化落审计；console 自身错误不吞（沿用 `{code,message,status}` 包裹）。
 
 ---

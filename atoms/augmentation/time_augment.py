@@ -19,7 +19,7 @@ from typing import List, Optional
 
 # jionlp prints a WeChat official-account ad to stdout at import time; the
 # redirect must wrap the import itself — wrapping only the extract_time
-# call is not enough (every CLI subcommand's first stdout line would be
+# call is not enough (the host HTTP service's startup stdout would be
 # polluted otherwise).
 with contextlib.redirect_stdout(io.StringIO()):
     from jionlp.algorithm.ner import extract_time

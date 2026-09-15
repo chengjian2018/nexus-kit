@@ -213,14 +213,14 @@ jump_module / max_hops）全部删除。
   `validate_base_info`（含 AGENT 节点 stages 报错、不可达节点软警告）/
   `validate_plugin_declarations`（str code 可解析、stages 槽位属骨架、
   unified 唯一合法重复）/ `validate_tools`（悬空/越集）。调用时机：host
-  startup `_validate_registered_patterns`（失败 SystemExit）+ CLI
-  pattern-load
+  startup `_validate_registered_patterns`（失败 SystemExit）+ studio
+  发布/应用（三段式通路）
 
 ### yml round-trip（`nexus/model/serialization.py`）
 
 `pattern_to_dict/from_dict/to_yaml/from_yaml`——节点 inline（完整字段
 dict 列表），无 node 注册表；`from_*` 走完整构造路径（编译期校验照跑），
-加载后校验是调用方责任。CLI：`pattern-export <code>` / `pattern-load`。
+加载后校验是调用方责任。装载入口：studio 控制台 API（发布/应用，三段式通路）。
 
 ### 与四个领域 registry 的关系
 
@@ -305,8 +305,8 @@ chat_turn_stream ──yield ChatStreamEvent(delta|round|trace|done)──► �
   step）/ `node_jump`（FSM 轮末跳转）/ `graph_wait / graph_resume`（挂起
   与恢复）/ `graph_done`（终止，reason: terminal/is_end/max_steps/
   undeclared_edge）/ `tool_call + tool_result` / `conversation_end`。
-  仅在状态真实变化时发射；`aggregate_turn` 忽略 trace。消费者：CLI
-  events 模式与 SSE 调试端点、ops-console
+  仅在状态真实变化时发射；`aggregate_turn` 忽略 trace。消费者：SSE
+  流式端点（`POST /api/v1/chat/stream`）客户端与 studio 模版测试
 - **实时桥**：整轮编排放后台 task，emit 即时入队转发；task 异常有兜底
   done，消费端提前关闭会 cancel task
 - **stage 层回复流式**：unified 单次调用用 `ReplyFieldTap` 增量提取
@@ -347,4 +347,5 @@ R1 刷新（`get_llm_config`）只 **stat** 不读文件；指纹变了才重新
 ### 宿主挂点
 
 - `POST /api/v1/reload`：config 缓存失效 + 代码重载 + 会话重绑
-- CLI `/reload` slash 命令；`NEXUS_RELOAD_WATCH=1` 后台轮询（默认关）
+- `NEXUS_RELOAD_WATCH=1` 后台轮询（默认关）；studio「系统插件」页提供
+  可视化选择性重载面

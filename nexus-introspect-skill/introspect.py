@@ -28,8 +28,8 @@ Usage (repo root, project venv)::
     python nexus-introspect-skill/introspect.py who-uses stage install_unified
 
 All subcommands support ``--json``. Read-only, no LLM/DB dependency (import
-side effects are pure registration, same source as the host CLI's
-``_ensure_discovery``). For usage and semantics see SKILL.md in the same
+side effects are pure registration, same source as the host HTTP service's
+startup discovery). For usage and semantics see SKILL.md in the same
 directory.
 """
 

@@ -23,7 +23,7 @@ agent 在本仓库工作时的四个高频问题，目前都只能靠全仓 grep
 
 ```
 暴露层  .claude/skills/nexus-introspect/SKILL.md（用例→命令表，极薄）
-          └─ CLI: python -m host.cli inspect <子命令> [--json]
+          └─ CLI: python nexus-introspect-skill/introspect.py <子命令> [--json]
 查询层  nexus/introspect.py（新，纯函数、只读）
           list_apps / describe_pattern / describe_plugin
           plugin_graph / who_uses / list_plugins
@@ -165,15 +165,15 @@ module.executor / pattern.stages / messages_builder）收集引用。
 
 ## 6. 暴露层
 
-### 6.1 CLI 子命令（host/cli.py 的 fire dict 扩展）
+### 6.1 CLI 子命令（原设计为 host/cli.py 的 fire dict 扩展；该通道已移除，现行实现：独立脚本 nexus-introspect-skill/introspect.py）
 
 ```bash
-python -m host.cli inspect apps                            # 应用总览
-python -m host.cli inspect plugins --kind stage            # 插件总览
-python -m host.cli inspect pattern install_booking_agent --view resolved
-python -m host.cli inspect plugin stage install_unified   # 含源码纯文本
-python -m host.cli inspect graph deep_research_multi       # 装配图
-python -m host.cli inspect who-uses stage install_unified  # 反向索引
+python nexus-introspect-skill/introspect.py apps                            # 应用总览
+python nexus-introspect-skill/introspect.py plugins --kind stage            # 插件总览
+python nexus-introspect-skill/introspect.py pattern install_booking_agent --view resolved
+python nexus-introspect-skill/introspect.py plugin stage install_unified   # 含源码纯文本
+python nexus-introspect-skill/introspect.py graph deep_research_multi       # 装配图（设计子命令，现行脚本未实现）
+python nexus-introspect-skill/introspect.py who-uses stage install_unified  # 反向索引
 ```
 
 默认 text（人读），`--json` 供 agent/程序消费。与既有
