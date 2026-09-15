@@ -13,6 +13,10 @@ into the legacy non-streaming dict shape. Fields:
 - finish_reason: carried by the final content chunk ("" until then)
 - usage: carried by the usage-only tail chunk (stream_options.include_usage;
   note that chunk's ``choices`` is an empty array)
+- reasoning: thinking-model delta (``delta.reasoning_content`` — GLM/Qwen
+  thinking mode); NOT aggregated into the legacy dict (aggregation keeps the
+  non-streaming shape byte-stable), streamed consumers forward it as
+  thinking events
 """
 
 from dataclasses import dataclass, field
@@ -27,3 +31,4 @@ class LLMChunk:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     finish_reason: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
+    reasoning: str = ""

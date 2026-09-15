@@ -106,16 +106,16 @@ def test_payload_keeps_stream_options(monkeypatch):
 
 
 # ============================================================================
-# Auth — Bearer key resolved from ZAI_API_KEY
+# Auth — Bearer key resolved from Z_AI_API_KEY
 # ============================================================================
 
 def test_api_key_resolved_from_env(monkeypatch):
-    for var in ("ZAI_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"):
+    for var in ("Z_AI_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("ZAI_API_KEY", "sk-zai")
+    monkeypatch.setenv("Z_AI_API_KEY", "sk-zai")
     body, url, headers = {}, {}, {}
     _install(monkeypatch, _capture(body, url, headers))
-    arun(_provider(api_key="", api_key_env="ZAI_API_KEY").achat_completion(MESSAGES))
+    arun(_provider(api_key="", api_key_env="Z_AI_API_KEY").achat_completion(MESSAGES))
     assert headers["auth"] == "Bearer sk-zai"
 
 
@@ -128,6 +128,41 @@ def test_registry_entry():
     assert entry is not None
     assert entry.provider_class is ZaiProvider
     assert entry.api_base == CODING_BASE
-    assert entry.api_key_env == "ZAI_API_KEY"
-    assert entry.default_model == "glm-5.3"
+    assert entry.api_key_env == "Z_AI_API_KEY"
+    assert entry.default_model == "glm-5.3-flash"
     assert entry.default_model in entry.models
+
+
+def test_registry_declares_vision_models():
+    """glm-5.3-flash 是视觉模型(注册表声明):supports_vision 三态语义,
+    glm-5.3 不在视觉名单(未声明视觉能力的模型绝不收到图像)。"""
+    entry = registry.get("zai")
+    assert entry.vision_models == ["glm-5.3-flash"]
+    assert entry.supports_vision("glm-5.3-flash") is True
+    assert entry.supports_vision("glm-5.3") is False
+    # 未声明 vision_models 的 provider → None(未知,调用方自行尝试)
+    from nexus.llm.provider import ProviderEntry
+
+    class _P:
+        pass
+
+    bare = ProviderEntry(code="b", name="b", description="",
+                         provider_class=_P, models=["m1"])
+    assert bare.supports_vision("m1") is None
+
+
+def test_payload_carries_multimodal_content_parts_verbatim(monkeypatch):
+    """视觉消息透传:OpenAI 风格 content parts 数组(text + image_url
+    data URL)原样进请求体,thinking 翻译不影响多模态消息。"""
+    body, url, headers = {}, {}, {}
+    _install(monkeypatch, _capture(body, url, headers))
+    messages = [{
+        "role": "user",
+        "content": [{"type": "text", "text": "评审这张图"},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:image/png;base64,aGVsbG8="}}],
+    }]
+    arun(_provider(default_model="glm-5.3-flash").achat_completion(messages))
+    assert body["model"] == "glm-5.3-flash"
+    assert body["messages"] == messages          # 字节级透传
+    assert body["thinking"] == {"type": "disabled"}  # 翻译不碰消息

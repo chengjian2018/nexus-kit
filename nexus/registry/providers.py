@@ -69,6 +69,7 @@ class LLMProviderRegistry:
         provider_class: type,
         default_model: str = "",
         models: Optional[List[str]] = None,
+        vision_models: Optional[List[str]] = None,
         api_base: str = "",
         api_key: str = "",
         api_key_env: str = "",
@@ -92,6 +93,9 @@ class LLMProviderRegistry:
             Default model name when none is specified at call time.
         models:
             List of model names this provider supports.
+        vision_models:
+            Subset of *models* that accept image input (undeclared = unknown;
+            queried via ``supports_vision``).
         api_base:
             Base URL for the provider's API endpoint.
         api_key_env:
@@ -112,6 +116,7 @@ class LLMProviderRegistry:
                 provider_class=provider_class,
                 default_model=default_model,
                 models=models,
+                vision_models=vision_models,
                 api_base=api_base,
                 api_key=api_key,
                 api_key_env=api_key_env,

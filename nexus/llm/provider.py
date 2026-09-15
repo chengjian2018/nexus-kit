@@ -26,6 +26,7 @@ class ProviderEntry:
         "provider_class",
         "default_model",
         "models",
+        "vision_models",
         "api_base",
         "api_key",
         "api_key_env",
@@ -40,6 +41,7 @@ class ProviderEntry:
         provider_class: type,
         default_model: str = "",
         models: Optional[List[str]] = None,
+        vision_models: Optional[List[str]] = None,
         api_base: str = "",
         api_key: str = "",
         api_key_env: str = "",
@@ -51,10 +53,22 @@ class ProviderEntry:
         self.provider_class = provider_class
         self.default_model = default_model
         self.models = models or []
+        self.vision_models = vision_models or []
         self.api_base = api_base
         self.api_key = api_key
         self.api_key_env = api_key_env
         self.extra_config = extra_config or {}
+
+    def supports_vision(self, model: str) -> Optional[bool]:
+        """Whether *model* accepts image input.
+
+        ``None`` when this provider declares no ``vision_models`` list
+        (capability unknown — callers may attempt); ``True``/``False`` when
+        declared.
+        """
+        if not self.vision_models:
+            return None
+        return model in self.vision_models
 
     def instantiate(self, **overrides) -> "BaseLLMProvider":
         """Create an instance of the provider with optional config overrides."""
@@ -64,6 +78,7 @@ class ProviderEntry:
             "api_key_env": self.api_key_env,
             "default_model": self.default_model,
             "models": list(self.models),
+            "vision_models": list(self.vision_models),
             **self.extra_config,
             **overrides,
         }
@@ -139,6 +154,7 @@ class BaseLLMProvider(ABC):
         api_key_env: str = "",
         default_model: str = "",
         models: Optional[List[str]] = None,
+        vision_models: Optional[List[str]] = None,
         **kwargs,
     ):
         self.code = code
@@ -147,6 +163,7 @@ class BaseLLMProvider(ABC):
         self.api_key_env = api_key_env
         self.default_model = default_model
         self.models = models or []
+        self.vision_models = vision_models or []
         self.extra = kwargs
 
     def resolve_api_key(self) -> str:
@@ -379,6 +396,12 @@ class BaseLLMProvider(ABC):
     def supports_model(self, model: str) -> bool:
         """Check whether *model* is in the advertised model list."""
         return model in self.models
+
+    def supports_vision(self, model: str) -> Optional[bool]:
+        """Whether *model* accepts image input (``None`` = undeclared)."""
+        if not self.vision_models:
+            return None
+        return model in self.vision_models
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} code={self.code!r} model={self.default_model!r}>"

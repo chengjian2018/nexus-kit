@@ -214,6 +214,8 @@ def test_impl_retry_exhausted(monkeypatch):
 
 SSE_BODY = "\n".join([
     ": keepalive comment",                                     # non-data line → skipped
+    'data: {"choices":[{"delta":{"reasoning_content":"让我"}}]}',   # thinking delta
+    'data: {"choices":[{"delta":{"reasoning_content":"想想"}}]}',   # thinking delta
     'data: {"choices":[{"delta":{"content":"你"}}]}',
     'data: {"choices":[{"delta":{"content":"好"}}]}',
     "data: {broken json",                                      # broken JSON line → skipped
@@ -240,6 +242,11 @@ def test_sse_stream_parsing(monkeypatch):
 
     texts = [c.text for c in chunks if c.text]
     assert texts == ["你", "好"]
+
+    # thinking-model deltas land in .reasoning, never folded into .text
+    reasonings = [c.reasoning for c in chunks if c.reasoning]
+    assert reasonings == ["让我", "想想"]
+    assert all(not c.reasoning for c in chunks if c.text)
 
     tool_chunks = [c for c in chunks if c.tool_calls]
     assert len(tool_chunks) == 2

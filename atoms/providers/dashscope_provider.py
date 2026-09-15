@@ -196,7 +196,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         **kwargs,
     ) -> AsyncGenerator["LLMChunk", None]:
         """Stream chat-completion response via SSE, yielding LLMChunk
-        objects (text deltas / tool_call fragments / finish_reason / usage).
+        objects (text deltas / tool_call fragments / finish_reason / usage /
+        thinking-model reasoning deltas).
 
         Wire quirks handled:
         - ``stream_options.include_usage``: the usage arrives as a final
@@ -205,6 +206,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         - ``delta.tool_calls``: id/name appear on the first fragment of a
           slot, arguments arrive as string fragments — passed through
           as-is; merging is the aggregator's job (llm/aggregate.py)
+        - ``delta.reasoning_content``: GLM/Qwen thinking-mode deltas —
+          surfaced as ``LLMChunk.reasoning``, never merged into ``text``
         - ``[DONE]`` sentinel terminates the stream
 
         Retry policy: transport errors and retryable statuses (408/429/5xx)
@@ -264,10 +267,16 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                             text = delta.get("content", "") or ""
                             tool_calls = delta.get("tool_calls", []) or []
                             finish_reason = choice.get("finish_reason", "") or ""
-                            if text or tool_calls or finish_reason:
+                            # thinking-model deltas (GLM/Qwen thinking mode):
+                            # reasoning text travels in its own field and must
+                            # NOT be folded into content
+                            reasoning = (delta.get("reasoning_content", "") or ""
+                                         or delta.get("reasoning", "") or "")
+                            if text or tool_calls or finish_reason or reasoning:
                                 streamed_any = True
                                 yield LLMChunk(text=text, tool_calls=tool_calls,
-                                               finish_reason=finish_reason)
+                                               finish_reason=finish_reason,
+                                               reasoning=reasoning)
                             elif usage:
                                 streamed_any = True
                                 yield LLMChunk(usage=usage)

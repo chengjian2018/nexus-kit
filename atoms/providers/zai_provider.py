@@ -19,6 +19,13 @@ Wire difference vs the dashscope provider: GLM has no DashScope
 ``thinking.type`` switch instead (``disabled`` by default, matching the
 dashscope provider's default).
 
+glm-5.3-flash is a vision model: messages whose ``content`` is an
+OpenAI-style parts array (``[{"type": "text", ...}, {"type": "image_url",
+"image_url": {"url": "data:image/png;base64, ..."}}, ...]``) pass through
+to the API verbatim — the chat-completions body carries content parts
+untouched, so no payload translation is needed here (see
+nexus/llm/vision.py for part builders).
+
 Register pattern: call ``registry.register(...)`` at module level so
 ``discover_builtin_providers()`` picks it up automatically.
 """
@@ -67,8 +74,9 @@ registry.register(
     name="Z.ai GLM (Coding Plan)",
     description="Zhipu GLM Coding Plan via the OpenAI-compatible protocol",
     provider_class=ZaiProvider,
-    default_model="glm-5.3",
+    default_model="glm-5.3-flash",
     models=["glm-5.3", "glm-5.3-flash"],
+    vision_models=["glm-5.3-flash"],
     api_base="https://open.bigmodel.cn/api/coding/paas/v4",
-    api_key_env="ZAI_API_KEY",
+    api_key_env="Z_AI_API_KEY",
 )
