@@ -26,9 +26,13 @@ node.use_tools）::
 ``nexus.engine.tool_context`` 注入（与父节点同模型）；脱离 agent loop
 直接 dispatch 时回退 ``get_llm_config()`` 且叶子无工具。
 
-裁判容错（Q8a）：verdict JSON 解析失败 → 带错误提示重问 1 次 → 仍失败走
-保守默认并标 ``verdict_parsed: false``（adversarial 判 pass、loop 判未完
-成、tournament 前者胜）。
+裁判容错（Q8a）：verdict JSON 解析失败或布尔/winner 字段类型非法（模型
+给了 ``"pass": "false"`` 字符串等）→ 带错误提示重问 1 次 → 仍失败走保守
+默认并标 ``verdict_parsed: false``。解析失败走原保守默认（adversarial 判
+pass、loop 判未完成、tournament 前者胜）；字段非法走 fail-closed（pass/
+done 一律按 false，tournament 仍前者胜，绝不映射到 B），payload 附
+``note`` 说明。synthesize/add/filter 阶段 LLM 异常就地降级：直接拼接/
+透传超集（status=partial，附 note），已完成步骤不丢弃。
 
 护栏（config ``workflow_tool`` 节可调）：整体超时默认 300s（args 只能调
 小）、叶子轮次上限 8、并行宽度 ≤8、adversarial/loop 迭代上限 3/5、最终
@@ -42,7 +46,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from atoms.tools._subagent_core import (
     _DEFAULT_SYSTEM_PROMPT,
@@ -259,6 +263,26 @@ def _parse_json_object(text: str) -> Optional[dict]:
     return None
 
 
+def _strict_bool(value: Any) -> Optional[bool]:
+    """严格布尔化：仅真 bool（及 int 0/1）放行，其余一律 None——模型给的
+    JSON 不能做 truthy 强转（字符串 "false" 为真值，会让 adversarial
+    内容蒙混过关、loop 谎报完成）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _norm_winner(value: Any) -> Optional[str]:
+    """winner 归一：仅 "A"/"B" 放行（strip + 忽略大小写），其余（None/
+    "NONE"/"候选A"）一律 None——非法值绝不能映射到 B。"""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized if normalized in ("A", "B") else None
+
+
 async def _llm_once(rt: Dict[str, Any], system_prompt: str,
                     user_prompt: str) -> Tuple[str, Dict[str, Any]]:
     """One plain LLM call (judges / synthesize / add / filter), no tools."""
@@ -270,16 +294,23 @@ async def _llm_once(rt: Dict[str, Any], system_prompt: str,
 
 
 async def _judge(rt: Dict[str, Any], system_prompt: str,
-                 user_prompt: str) -> Tuple[Optional[dict], bool, Dict[str, int]]:
+                 user_prompt: str, validate: Optional[
+                     Callable[[dict], Optional[str]]] = None,
+                 ) -> Tuple[Optional[dict], bool, Dict[str, int], str]:
     """Judge call: JSON verdict with one repair retry.
 
-    Returns (verdict, parsed, usage). Unparseable twice (or provider errors
-    twice) → (None, False, usage) — the caller applies its conservative
-    default and marks verdict_parsed=False in the payload.
+    ``validate(verdict)`` does field-level strict typing (bool / winner);
+    a failure goes through the SAME repair retry as unparseable JSON.
+    Returns (verdict, parsed, usage, note). Unparseable twice (or provider
+    errors twice) → (None, False, usage, "") — the caller applies its
+    conservative default and marks verdict_parsed=False. A non-empty note
+    means the JSON parsed but a field was invalid: the caller fails closed
+    for that field (never truthy-coerced) and records a note.
     """
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}]
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    note = ""
     for attempt in range(2):
         try:
             result = await rt["provider"].achat_completion(
@@ -292,15 +323,59 @@ async def _judge(rt: Dict[str, Any], system_prompt: str,
         text = result.get("content", "") or ""
         _accumulate_usage(usage, result.get("usage"))
         verdict = _parse_json_object(text)
-        if verdict is not None:
-            return verdict, True, usage
+        field_err = validate(verdict) if (verdict is not None
+                                          and validate is not None) else None
+        if verdict is not None and field_err is None:
+            return verdict, True, usage, ""
+        if field_err is not None:
+            note = field_err   # 字段非法（粘性）：最终失败按 fail-closed 语义
+            repair = (f"上一次输出的 JSON 字段类型无效：{field_err}。"
+                      "请重新输出 JSON，对应字段使用要求的类型，"
+                      "不要包含任何其他文字。")
+        else:
+            repair = ("上一次输出无法解析为 JSON 对象。请只输出一个 JSON 对象，"
+                      "不要包含任何其他文字或代码块标记。")
         messages = messages + [
             {"role": "assistant", "content": text},
-            {"role": "user", "content": (
-                "上一次输出无法解析为 JSON 对象。请只输出一个 JSON 对象，"
-                "不要包含任何其他文字或代码块标记。")},
+            {"role": "user", "content": repair},
         ]
-    return None, False, usage
+    return None, False, usage, note
+
+
+def _validate_pass(verdict: dict) -> Optional[str]:
+    """审校 verdict 校验：pass 必须是严格布尔。"""
+    if _strict_bool(verdict.get("pass")) is None:
+        return 'The "pass" field must be a boolean true/false'
+    return None
+
+
+def _validate_done(verdict: dict) -> Optional[str]:
+    """完成检查 verdict 校验：done 必须是严格布尔。"""
+    if _strict_bool(verdict.get("done")) is None:
+        return 'The "done" field must be a boolean true/false'
+    return None
+
+
+def _validate_winner(verdict: dict) -> Optional[str]:
+    """评委 verdict 校验：winner 只认 "A"/"B"。"""
+    if _norm_winner(verdict.get("winner")) is None:
+        return 'The "winner" field must be "A" or "B"'
+    return None
+
+
+async def _llm_stage(rt: Dict[str, Any], step: str, system_prompt: str,
+                     user_prompt: str) -> Tuple[str, bool]:
+    """synthesize/add/filter 阶段调用：异常就地降级（步骤记 failed）而非
+    冒泡到整体 error 路径丢弃已完成工作——由调用方按拓扑拼接/透传并标
+    partial。返回 (文本, 是否成功)。"""
+    try:
+        content, usage = await _llm_once(rt, system_prompt, user_prompt)
+    except Exception as e:
+        logger.warning("[run_workflow] %s 阶段调用失败: %s", step, e)
+        rt["steps"].add(step, "failed", rounds=1)
+        return "", False
+    rt["steps"].add(step, "ok", rounds=1, usage=usage)
+    return content, True
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +450,18 @@ def _all_failed(items: List[Dict[str, Any]]) -> bool:
     return all(not item["ok"] for item in items)
 
 
+def _add_note(rt: Dict[str, Any], text: str) -> None:
+    """降级/无效说明（去重），payload 组装时并入 note 字段。"""
+    if text not in rt["notes"]:
+        rt["notes"].append(text)
+
+
+def _concat_ok(items: List[Dict[str, Any]]) -> str:
+    """拼接成功候选（synthesize/add 阶段失败时的降级正文）。"""
+    return "\n\n".join(it["text"] for it in items
+                       if it["ok"] and it["text"].strip())
+
+
 # ---------------------------------------------------------------------------
 # 六种拓扑
 # ---------------------------------------------------------------------------
@@ -383,7 +470,7 @@ async def _wf_classify_and_act(rt, parsed) -> Dict[str, Any]:
     categories = parsed["_categories"]
     listing = "\n".join(
         f"- {c['name']}：{c['instruction']}" for c in categories)
-    verdict, parsed_ok, usage = await _judge(
+    verdict, parsed_ok, usage, _ = await _judge(
         rt, CLASSIFY_SYSTEM_PROMPT,
         f"任务：{rt['task']}\n\n可选类别：\n{listing}")
     rt["steps"].add("classify", "ok", rounds=1, usage=usage)
@@ -415,10 +502,14 @@ async def _wf_fanout_and_synthesize(rt, parsed) -> Dict[str, Any]:
         *[_one(i, st) for i, st in enumerate(subtasks)]))
     if _all_failed(items):
         return {"status": "error", "error": "全部子任务失败"}
-    content, usage = await _llm_once(
-        rt, SYNTHESIZE_SYSTEM_PROMPT,
+    content, synth_ok = await _llm_stage(
+        rt, "synthesize", SYNTHESIZE_SYSTEM_PROMPT,
         f"任务：{rt['task']}\n\n各子任务结果：\n{_render_candidates(items)}")
-    rt["steps"].add("synthesize", "ok", rounds=1, usage=usage)
+    if not synth_ok:
+        # 降级：汇总调用失败 → 直接拼接子任务结果，不丢弃已完成工作
+        rt["content"] = _concat_ok(items)
+        _add_note(rt, "synthesize 阶段失败，已直接拼接子任务结果")
+        return {"status": "partial"}
     rt["content"] = content
     return {"status": "partial" if any(not it["ok"] for it in items) else "ok"}
 
@@ -437,17 +528,24 @@ async def _wf_adversarial_verification(rt, parsed) -> Dict[str, Any]:
         if payload.get("status") == "error":
             return {"status": "error", "error": payload.get("error", "生成叶子失败")}
         draft = rt["content"]
-        verdict, parsed_ok, usage = await _judge(
+        verdict, parsed_ok, usage, note = await _judge(
             rt, system,
             f"任务：{rt['task']}\n\n待审产出：\n"
-            f"{_truncate(draft, _PER_SYNTH_CHARS, '产出')}")
+            f"{_truncate(draft, _PER_SYNTH_CHARS, '产出')}",
+            validate=_validate_pass)
         rt["steps"].add(f"cycle#{cycle}:verify", "ok", rounds=1, usage=usage)
         rt["verdict_parsed"] = parsed_ok
         if not parsed_ok:
+            if note:
+                # 字段类型非法：fail-closed（判不过），绝不因 truthy 强转放行
+                rt["verdict"] = {"pass": False}
+                _add_note(rt, f"审校 verdict 无效（{note}），按未通过兜底")
+                issues_text = f"-（verdict 字段无效：{note}）"
+                continue
             rt["verdict"] = {"pass": True}   # 保守默认：判 pass，避免无意义循环
             return {"status": "ok"}
         rt["verdict"] = verdict
-        if bool(verdict.get("pass")):
+        if _strict_bool(verdict.get("pass")):
             return {"status": "ok"}
         issues = verdict.get("issues") or []
         issues_text = ("\n".join(f"- {i}" for i in issues)
@@ -459,19 +557,28 @@ async def _wf_generate_add_filter(rt, parsed) -> Dict[str, Any]:
     items = await _gen_candidates(rt, parsed)
     if _all_failed(items):
         return {"status": "error", "error": "全部候选生成失败"}
-    superset, usage = await _llm_once(
-        rt, ADD_SYSTEM_PROMPT,
+    superset, add_ok = await _llm_stage(
+        rt, "add", ADD_SYSTEM_PROMPT,
         f"任务：{rt['task']}\n\n各候选：\n{_render_candidates(items)}")
-    rt["steps"].add("add", "ok", rounds=1, usage=usage)
+    add_degraded = not add_ok
+    if add_degraded:
+        # 降级：累积失败 → 拼接候选充当草案，筛选阶段照常进行
+        superset = _concat_ok(items)
+        _add_note(rt, "add 阶段失败，已直接拼接候选充当草案")
     criteria = parsed.get("criteria", "")
-    final, usage2 = await _llm_once(
-        rt, FILTER_SYSTEM_PROMPT.format(
+    final, filter_ok = await _llm_stage(
+        rt, "filter", FILTER_SYSTEM_PROMPT.format(
             criteria=criteria or "去弱留强，保留最有价值、最相关的部分，控制篇幅"),
         f"任务：{rt['task']}\n\n超集草案：\n"
         f"{_truncate(superset, _PER_SYNTH_CHARS * 2, '草案')}")
-    rt["steps"].add("filter", "ok", rounds=1, usage=usage2)
+    if not filter_ok:
+        # 降级：筛选失败 → 透传超集（未过滤），候选不丢弃
+        rt["content"] = superset
+        _add_note(rt, "filter 阶段失败未过滤")
+        return {"status": "partial"}
     rt["content"] = final
-    return {"status": "partial" if any(not it["ok"] for it in items) else "ok"}
+    degraded = add_degraded or any(not it["ok"] for it in items)
+    return {"status": "partial" if degraded else "ok"}
 
 
 async def _wf_tournament(rt, parsed) -> Dict[str, Any]:
@@ -487,15 +594,18 @@ async def _wf_tournament(rt, parsed) -> Dict[str, Any]:
         for i in range(0, len(live) - 1, 2):
             a, b = live[i], live[i + 1]
             match_idx += 1
-            verdict, parsed_ok, usage = await _judge(
+            verdict, parsed_ok, usage, note = await _judge(
                 rt, JUDGE_SYSTEM_PROMPT,
-                f"任务：{rt['task']}\n\n{_render_candidates([a, b])}")
+                f"任务：{rt['task']}\n\n{_render_candidates([a, b])}",
+                validate=_validate_winner)
             rt["steps"].add(f"match:r{round_no}#{match_idx}", "ok",
                             rounds=1, usage=usage)
             winner_is_a = True   # 保守默认：解析失败前者胜
-            if parsed_ok and str(verdict.get("winner", "A")).strip().upper() \
-                    not in ("A", "1"):
+            if parsed_ok and _norm_winner(verdict.get("winner")) == "B":
                 winner_is_a = False
+            if not parsed_ok and note:
+                # winner 非法：降级到裁判失败同款兜底（前者胜），绝不映射到 B
+                _add_note(rt, f"比赛 verdict 无效（{note}），按前者胜兜底")
             nxt.append(a if winner_is_a else b)
         if len(live) % 2:
             nxt.append(live[-1])   # 奇数轮空：末位直接晋级
@@ -516,18 +626,23 @@ async def _wf_loop_until_done(rt, parsed) -> Dict[str, Any]:
         rt["content"] = payload.get("content") or rt["content"]
         if payload.get("status") == "error":
             return {"status": "error", "error": payload.get("error", "工作叶子失败")}
-        verdict, parsed_ok, usage = await _judge(
+        verdict, parsed_ok, usage, note = await _judge(
             rt, DONE_SYSTEM_PROMPT,
             f"完成条件：\n{criteria}\n\n当前产出：\n"
-            f"{_truncate(rt['content'], _PER_SYNTH_CHARS, '产出')}")
+            f"{_truncate(rt['content'], _PER_SYNTH_CHARS, '产出')}",
+            validate=_validate_done)
         rt["steps"].add(f"iteration#{iteration}:check", "ok",
                         rounds=1, usage=usage)
         rt["verdict_parsed"] = parsed_ok
         if not parsed_ok:
             rt["verdict"] = {"done": False}   # 保守默认：未完成，继续迭代
+            if note:
+                # 类型非法：同样 fail-closed（判未完成），附 note 说明
+                _add_note(rt, f"完成 verdict 无效（{note}），按未完成兜底")
+                missing_text = f"-（verdict 字段无效：{note}）"
             continue
         rt["verdict"] = verdict
-        if bool(verdict.get("done")):
+        if _strict_bool(verdict.get("done")):
             return {"status": "ok"}
         missing = verdict.get("missing") or []
         missing_text = ("\n".join(f"- {m}" for m in missing)
@@ -721,6 +836,7 @@ async def _handle_run_workflow(args: Dict[str, Any]) -> str:
         or _DEFAULT_SYSTEM_PROMPT,
         "steps": _Steps(), "content": "",
         "verdict": None, "verdict_parsed": True,
+        "notes": [],
     }
     logger.info("[run_workflow] 开始: workflow=%s, tools=%s, timeout=%.0fs, "
                 "task=%r", wf, sorted(granted), timeout, task[:80])
@@ -760,6 +876,8 @@ async def _handle_run_workflow(args: Dict[str, Any]) -> str:
     }
     if outcome.get("error"):
         payload["error"] = outcome["error"]
+    if rt["notes"]:
+        payload["note"] = "; ".join(rt["notes"])   # 降级/verdict 无效说明
     if wf in ("adversarial_verification", "loop_until_done"):
         payload["verdict"] = rt["verdict"]
         payload["verdict_parsed"] = rt["verdict_parsed"]

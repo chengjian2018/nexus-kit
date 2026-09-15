@@ -633,3 +633,185 @@ def test_loop_executor_injects_context_e2e():
     # 主循环侧：节点只暴露 run_workflow
     assert {t["function"]["name"]
             for t in parent.seen[0]["tools"]} == {"run_workflow"}
+
+
+# ---------------------------------------------------------------------------
+# 裁判字段严格类型 / winner 校验 / LLM 阶段异常降级
+# ---------------------------------------------------------------------------
+
+def test_adversarial_pass_string_fails_closed():
+    """pass 给字符串 "false"（truthy）→ 类型非法 → 修复重试仍非法 →
+    fail-closed 判不过（adversarial 内容被拒），轮次耗尽 partial。"""
+    calls = {"n": 0}
+
+    def fn(snap):
+        if snap["tools"] is None:
+            calls["n"] += 1
+            return {"content": '{"pass": "false", "issues": ["假值字符串"]}'}
+        return {"content": "草稿"}
+
+    payload = _run_workflow({
+        "workflow": "adversarial_verification", "task": "t",
+    }, FuncProvider(fn))
+
+    assert payload["status"] == "partial"            # 不是 ok：被判不过
+    assert payload["verdict"]["pass"] is False       # fail-closed
+    assert payload["verdict_parsed"] is False
+    assert "无效" in payload["note"]
+    # 每轮审校各带一次类型修复重试（2 次调用），3 轮全部耗尽
+    assert calls["n"] == _GUARD["max_cycles"] * 2
+
+
+def test_loop_done_string_invalid_until_valid_bool():
+    def fn(snap):
+        if snap["tools"] is None:
+            return {"content": '{"done": "true", "missing": []}'}  # 字符串真值
+        return {"content": "草稿"}
+
+    payload = _run_workflow({
+        "workflow": "loop_until_done", "task": "t", "done_criteria": "完成",
+    }, FuncProvider(fn))
+
+    assert payload["status"] == "partial"            # 非法期间一律判未完成
+    assert payload["verdict"]["done"] is False
+    assert payload["verdict_parsed"] is False
+    assert "无效" in payload["note"]
+
+
+def test_loop_done_bool_semantics():
+    """真布尔走原语义：false → 未完成继续迭代；true → 立即完成。"""
+    def fn_false(snap):
+        if snap["tools"] is None:
+            return {"content": '{"done": false, "missing": ["还差"]}'}
+        return {"content": "草稿"}
+
+    payload = _run_workflow({
+        "workflow": "loop_until_done", "task": "t", "done_criteria": "完成",
+    }, FuncProvider(fn_false))
+    assert payload["status"] == "partial"
+    assert payload["verdict"]["done"] is False
+    assert "note" not in payload                     # 合法 verdict 不附注
+
+    def fn_true(snap):
+        if snap["tools"] is None:
+            return {"content": '{"done": true, "missing": []}'}
+        return {"content": "终稿"}
+
+    payload = _run_workflow({
+        "workflow": "loop_until_done", "task": "t", "done_criteria": "完成",
+    }, FuncProvider(fn_true))
+    assert payload["status"] == "ok"
+    assert payload["verdict"] == {"done": True, "missing": []}
+
+
+def test_tournament_winner_null_falls_back_to_first():
+    def fn(snap):
+        assert snap["tools"] is None                 # 只有评委调用
+        return {"content": '{"winner": null, "reason": "无"}'}
+
+    provider = FuncProvider(fn)
+    payload = _run_workflow({
+        "workflow": "tournament", "task": "二选一",
+        "inputs": ["甲方案全文", "乙方案全文"],
+    }, provider)
+
+    assert payload["status"] == "ok"
+    assert payload["content"] == "甲方案全文"        # 绝不静默落到 B
+    assert "无效" in payload["note"]
+    assert len(provider.seen) == 2                   # 一次修复重试
+
+
+def test_tournament_chinese_winner_invalid():
+    def fn(snap):
+        return {"content": '{"winner": "候选A", "reason": "偏好"}'}
+
+    payload = _run_workflow({
+        "workflow": "tournament", "task": "二选一",
+        "inputs": ["甲", "乙"],
+    }, FuncProvider(fn))
+
+    assert payload["content"] == "甲"                # 非法 → 前者胜兜底
+    assert "无效" in payload["note"]
+
+
+def test_tournament_winner_normalized():
+    def fn(snap):
+        return {"content": '{"winner": "b"}'}        # 小写也归一
+
+    payload = _run_workflow({
+        "workflow": "tournament", "task": "二选一",
+        "inputs": ["甲", "乙"],
+    }, FuncProvider(fn))
+
+    assert payload["content"] == "乙"
+    assert "note" not in payload
+
+
+def test_gaf_filter_failure_keeps_superset():
+    def fn(snap):
+        system = _sys(snap)
+        if "累积合并器" in system:
+            return {"content": "超集草案"}
+        if "筛选收敛器" in system:
+            raise RuntimeError("filter boom")        # 筛选阶段 provider 异常
+        return {"content": "候选"}
+
+    provider = FuncProvider(fn)
+    payload = _run_workflow({
+        "workflow": "generate_add_filter", "task": "t",
+        "angles": ["视角一", "视角二"],
+    }, provider)
+
+    # 不是 error+空 content：降级为 partial，超集透传
+    assert payload["status"] == "partial"
+    assert payload["content"] == "超集草案"
+    assert "filter 阶段失败未过滤" in payload["note"]
+    statuses = {s["step"]: s["status"] for s in payload["steps"]}
+    assert statuses["gen#1"] == "ok"
+    assert statuses["add"] == "ok"
+    assert statuses["filter"] == "failed"
+
+
+def test_fanout_synthesize_failure_concatenates():
+    def fn(snap):
+        if snap["tools"] is None:
+            raise RuntimeError("synth boom")         # 汇总阶段 provider 异常
+        user = _user(snap)
+        if user == "子任务一":
+            return {"content": "结果一"}
+        return {"content": "结果二"}
+
+    provider = FuncProvider(fn)
+    payload = _run_workflow({
+        "workflow": "fanout_and_synthesize", "task": "t",
+        "subtasks": ["子任务一", "子任务二"],
+    }, provider)
+
+    assert payload["status"] == "partial"
+    assert "结果一" in payload["content"] and "结果二" in payload["content"]
+    assert "synthesize 阶段失败" in payload["note"]
+    statuses = {s["step"]: s["status"] for s in payload["steps"]}
+    assert statuses["synthesize"] == "failed"
+
+
+def test_gaf_add_failure_concatenates_then_filters():
+    def fn(snap):
+        system = _sys(snap)
+        if "累积合并器" in system:
+            raise RuntimeError("add boom")           # 累积阶段 provider 异常
+        if "筛选收敛器" in system:
+            return {"content": "筛选后"}
+        return {"content": "候选"}
+
+    payload = _run_workflow({
+        "workflow": "generate_add_filter", "task": "t",
+        "angles": ["视角一", "视角二"],
+    }, FuncProvider(fn))
+
+    # 累积降级为拼接草案后，筛选阶段照常收敛
+    assert payload["status"] == "partial"
+    assert payload["content"] == "筛选后"
+    assert "add 阶段失败" in payload["note"]
+    statuses = {s["step"]: s["status"] for s in payload["steps"]}
+    assert statuses["add"] == "failed"
+    assert statuses["filter"] == "ok"
