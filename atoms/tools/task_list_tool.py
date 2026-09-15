@@ -41,9 +41,12 @@ logger = logging.getLogger(__name__)
 
 # 会话隔离的任务清单仓：session_id -> {"next_id", "tasks": [...]}。
 # 同步 handler 跑在 to_thread、fire 场景在事件循环线程，用 threading.Lock。
+# 作用域数 LRU 封顶：长跑主机每个会话/cron 作业累积一条，冷作用域
+#（dict 首端）在超限时先被清（清单是会话内工作状态，本就允许消失）
 _GLOBAL_SCOPE = "_global"
 _STORE: Dict[str, Dict[str, Any]] = {}
 _STORE_LOCK = threading.Lock()
+_STORE_CAP = 256
 
 _VALID_STATUS = ("pending", "in_progress", "completed")
 _VALID_PRIORITY = ("high", "medium", "low")
@@ -119,7 +122,9 @@ READ_TASKS_SCHEMA = {
 def _handle_read_tasks(args: Dict[str, Any]) -> str:
     scope = _current_scope()
     with _STORE_LOCK:
-        board = _STORE.get(scope)
+        board = _STORE.pop(scope, None)     # LRU 触碰：读也计活跃
+        if board is not None:
+            _STORE[scope] = board
         tasks = list(board["tasks"]) if board else []
     return tool_result({
         "session": scope,
@@ -181,7 +186,7 @@ def _handle_write_tasks(args: Dict[str, Any]) -> str:
 
     scope = _current_scope()
     with _STORE_LOCK:
-        board = _STORE.setdefault(scope, {"next_id": 1, "tasks": []})
+        board = _STORE.get(scope) or {"next_id": 1, "tasks": []}
         # 稳定 id：按写入顺序 1 起分配，前缀相同的旧条目保持原 id
         # （write 是全量替换，"保持"指本次数组前部与上次一致的条目）
         old_ids = {t["content"]: t["id"] for t in board["tasks"]}
@@ -192,6 +197,10 @@ def _handle_write_tasks(args: Dict[str, Any]) -> str:
                 board["next_id"] = task_id + 1
             tasks.append({"id": task_id, **item})
         board["tasks"] = tasks
+        _STORE.pop(scope, None)             # LRU 触碰：移到最近使用端
+        _STORE[scope] = board
+        while len(_STORE) > _STORE_CAP:     # 超限从最旧作用域清起
+            del _STORE[next(iter(_STORE))]
 
     logger.info("[write_tasks] session=%s: %d 条（in_progress=%d）", scope,
                 len(tasks),

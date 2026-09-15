@@ -151,3 +151,26 @@ def test_subagent_inherits_session_scope():
         r = json.loads(arun(tool_registry.dispatch("read_tasks", {})))
     assert r["session"] == "sess-S"
     assert "主会话任务" in r["tasks"][0]["content"]
+
+
+def test_store_scopes_lru_capped(monkeypatch):
+    """作用域仓 LRU 封顶：超过 _STORE_CAP 的最旧作用域先被清，活跃
+    作用域不受影响（长跑主机不再只增不减）。"""
+    import atoms.tools.task_list_tool as tlt
+
+    monkeypatch.setattr(tlt, "_STORE_CAP", 2)
+    tlt._STORE.clear()
+
+    from nexus.engine.tool_context import tool_call_context
+    for sid in ("s1", "s2"):
+        with tool_call_context({"code": "x"}, set(), session_id=sid):
+            _dispatch("write_tasks", {"tasks": [
+                {"content": f"t-{sid}", "status": "pending"}]})
+    with tool_call_context({"code": "x"}, set(), session_id="s3"):
+        _dispatch("write_tasks", {"tasks": [
+            {"content": "t-s3", "status": "pending"}]})
+
+    assert set(tlt._STORE) == {"s2", "s3"}   # s1 最旧被淘汰
+    with tool_call_context({"code": "x"}, set(), session_id="s2"):
+        r = _dispatch("read_tasks", {})
+    assert r["count"] == 1                   # 活跃作用域完好
