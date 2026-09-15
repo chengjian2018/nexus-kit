@@ -258,3 +258,15 @@ def test_system_reload_replays_console_after_code_modules(client, stub,
     cm = body["data"]["report"]["code_modules"]
     assert cm["console_replayed"] == 0
     assert "console_replay_failed" not in cm
+
+
+def test_discover_tracks_atoms_hooks_modules():
+    # atoms.hooks.* 与 atoms.executors.* 同为模块级注册的插件——发现域必须
+    # 覆盖，否则 studio 系统插件页勾选 tool_guard 重载会静默落进 unknown
+    import atoms.hooks.tool_guard  # noqa: F401 -- 触发导入进 sys.modules
+    from host.reload import _discover_module_names
+
+    names = _discover_module_names()
+    assert "atoms.hooks.tool_guard" in names
+    assert "atoms.executors.loop_executor" in names
+    assert not any(n.startswith("nexus.") for n in names)

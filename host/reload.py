@@ -74,7 +74,8 @@ not business code. Restart the process when needed.
 
 Host mount points: the ``POST /api/v1/reload`` endpoint in
 ``host/main.py`` (baseline established at startup via
-:func:`init_baseline`); the CLI's ``/reload`` slash command; the
+:func:`init_baseline`); the studio 系统插件页's selective replay
+(``POST /api/v1/system/reload``); the
 :class:`ReloadWatcher` background poller when ``NEXUS_RELOAD_WATCH=1``.
 """
 
@@ -95,7 +96,11 @@ def _discover_module_names() -> List[str]:
 
     Scan domain = module name prefixes: ``apps.<pkg>.<mod>`` (deeper
     nesting counts too — prompts and other non-registering support modules
-    are tracked alongside) and ``atoms.executors.<mod>``. nexus/ is not
+    are tracked alongside), ``atoms.executors.<mod>`` and
+    ``atoms.hooks.<mod>`` (agent_hooks plugins register from module level
+    like executors; the studio 系统插件 page classifies them as
+    hot-reloadable code, so discovery must track them or their reload
+    silently lands in "unknown"). nexus/ is not
     scanned (the kernel does not reload) nor is atoms/stages (stage
     instances are referenced by pattern.stages declarations; reloading
     them needs cascading pattern rebuilds — restart the process when
@@ -108,7 +113,8 @@ def _discover_module_names() -> List[str]:
         parts = name.split(".")
         if len(parts) >= 3 and parts[0] == "apps":
             names.append(name)
-        elif len(parts) >= 3 and parts[0] == "atoms" and parts[1] == "executors":
+        elif (len(parts) >= 3 and parts[0] == "atoms"
+              and parts[1] in ("executors", "hooks")):
             names.append(name)
     return names
 
