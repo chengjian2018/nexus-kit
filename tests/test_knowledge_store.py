@@ -81,6 +81,7 @@ def test_list_scopes_aggregates_both_tables(store):
     assert set(by_scope) == {"xianyu:a1", "xianyu:a2"}
     assert by_scope["xianyu:a1"]["product_count"] == 1
     assert by_scope["xianyu:a1"]["cs_count"] == 1
+    assert by_scope["xianyu:a1"]["collection_count"] == 0
     assert by_scope["xianyu:a2"]["cs_count"] == 0
     assert by_scope["xianyu:a1"]["updated_at"] > 0
 
@@ -149,9 +150,13 @@ def test_clear_scope(store):
     store.upsert_product("s", 1, "商品")
     store.upsert_product("s", 2, "商品")
     store.add_cs("s", "政策", "内容")
+    cid = store.create_collection("s", "案例库", None,
+                                  [{"name": "a", "type": "text"}])
+    store.add_record(cid, {"a": "记录"})
     store.upsert_product("other", 1, "别动我")
     counts = store.clear_scope("s")
-    assert counts == {"products_deleted": 2, "cs_deleted": 1}
+    assert counts == {"products_deleted": 2, "cs_deleted": 1,
+                      "collections_deleted": 1, "records_deleted": 1}
     scopes = store.list_scopes()
     assert [s["scope"] for s in scopes] == ["other"]
     assert scopes[0]["product_count"] == 1
@@ -200,10 +205,111 @@ def test_seed_idempotent(store):
     n1 = len(store.search_products("xianyu:demo", limit=50))
     ncs1 = len(store.search_cs("xianyu:demo", limit=50))
     assert n1 > 0 and ncs1 > 0
+    # demo custom collection seeded alongside (with records)
+    colls = store.list_collections("xianyu:demo")
+    assert len(colls) == 1 and colls[0]["record_count"] > 0
 
     store.seed("xianyu:demo")  # idempotent: counts do not double
     assert len(store.search_products("xianyu:demo", limit=50)) == n1
     assert len(store.search_cs("xianyu:demo", limit=50)) == ncs1
+    assert len(store.list_collections("xianyu:demo")) == 1
+    assert store.list_collections("xianyu:demo")[0]["record_count"] == colls[0]["record_count"]
+
+
+def test_seed_marker_prevents_resurrect_after_clear(store):
+    """清空空间后（模拟重启再 seed）不得复活——kb_meta 标记守卫而非行数守卫。"""
+    store.seed("xianyu:demo")
+    store.clear_scope("xianyu:demo")
+    store.seed("xianyu:demo")
+    assert store.search_products("xianyu:demo", limit=50) == []
+    assert store.search_cs("xianyu:demo", limit=50) == []
+    assert store.list_collections("xianyu:demo") == []
+
+
+# ---------------------------------------------------------------------------
+# Custom knowledge collections (ops-console user-defined tables)
+# ---------------------------------------------------------------------------
+
+def test_collection_crud_and_duplicate_name(store):
+    cid = store.create_collection("s", "案例库", "说明", [
+        {"name": "a", "label": "字段A", "type": "text", "required": True},
+        {"name": "n", "type": "number"},
+    ])
+    coll = store.get_collection(cid)
+    assert coll["name"] == "案例库" and coll["record_count"] == 0
+    assert coll["fields"][0] == {"name": "a", "label": "字段A",
+                                 "type": "text", "required": True}
+
+    with pytest.raises(ValueError):  # 同 scope 重名
+        store.create_collection("s", "案例库", None, [{"name": "a"}])
+    store.create_collection("t", "案例库", None, [{"name": "a"}])  # 跨 scope 同名 OK
+
+    assert store.update_collection(cid, {"description": "新说明"}) is True
+    assert store.get_collection(cid)["description"] == "新说明"
+    with pytest.raises(ValueError):
+        store.update_collection(cid, {"no_such_key": 1})
+
+    assert store.delete_collection(cid) is True
+    assert store.get_collection(cid) is None
+    assert store.delete_collection(cid) is False
+
+
+def test_collection_field_validation(store):
+    with pytest.raises(ValueError):
+        store.create_collection("s", "空字段", None, [])
+    with pytest.raises(ValueError):
+        store.create_collection("s", "空名", None, [{"name": "", "type": "text"}])
+    with pytest.raises(ValueError):
+        store.create_collection("s", "非法名", None, [{"name": "1bad", "type": "text"}])
+    with pytest.raises(ValueError):
+        store.create_collection("s", "重复名", None, [{"name": "a"}, {"name": "a"}])
+    with pytest.raises(ValueError):
+        store.create_collection("s", "坏类型", None, [{"name": "a", "type": "json"}])
+
+
+def test_record_validation_search_and_replace(store):
+    cid = store.create_collection("s", "案例库", None, [
+        {"name": "title", "type": "text", "required": True},
+        {"name": "detail", "type": "textarea"},
+        {"name": "amount", "type": "number"},
+    ])
+    rid = store.add_record(cid, {"title": "屏幕亮线", "detail": "寄回换屏",
+                                 "amount": "12.5"})  # 数字字符串被 coercion
+    assert store.list_records(cid)[0]["data"] == {
+        "title": "屏幕亮线", "detail": "寄回换屏", "amount": 12.5}
+
+    with pytest.raises(ValueError):
+        store.add_record(cid, {"title": "x", "bogus": 1})      # 未知字段
+    with pytest.raises(ValueError):
+        store.add_record(cid, {"detail": "缺必填"})              # required
+    with pytest.raises(ValueError):
+        store.add_record(cid, {"title": "x", "amount": "abc"})  # number
+    with pytest.raises(ValueError):
+        store.add_record(999, {"title": "x"})                    # 库不存在
+
+    # 全字段值检索（分词 AND）+ 无命中
+    assert [r["id"] for r in store.list_records(cid, query="亮线 换屏")] == [rid]
+    assert store.list_records(cid, query="不存在的词xyz") == []
+
+    # 全量替换：可选字段显式清空（None）
+    assert store.update_record(cid, rid, {"title": "改"}) is True
+    assert store.list_records(cid)[0]["data"] == {
+        "title": "改", "detail": None, "amount": None}
+    assert store.update_record(cid, 999, {"title": "x"}) is False
+
+    assert store.delete_record(cid, rid) is True
+    assert store.delete_record(cid, rid) is False
+
+
+def test_update_collection_fields_reindexes_records(store):
+    cid = store.create_collection("s", "库", None, [
+        {"name": "a", "type": "text"}, {"name": "b", "type": "text"}])
+    rid = store.add_record(cid, {"a": "苹果", "b": "香蕉"})
+    # 删掉字段 b：记录值被清理，且不再命中其旧值
+    assert store.update_collection(cid, {"fields": [{"name": "a", "type": "text"}]}) is True
+    assert store.list_records(cid)[0]["data"] == {"a": "苹果"}
+    assert store.list_records(cid, query="香蕉") == []
+    assert [r["id"] for r in store.list_records(cid, query="苹果")] == [rid]
 
 
 # ---------------------------------------------------------------------------
