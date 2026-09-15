@@ -1,0 +1,48 @@
+pattern: archify            # 必填，绑定 pattern code
+
+llm:                        # pattern 级默认，全体节点继承
+  temperature: 0.2          # 词表：code/model/temperature/max_tokens/
+  max_tokens: 16000         #   enable_thinking/timeout/max_retries
+  enable_thinking: true
+
+nodes:                      # node 级细化：只开放 llm 与 loop.max_tool_rounds
+  af_route:
+    llm: {temperature: 0.0, max_tokens: 2000}
+  af_author:
+    llm: {max_tokens: 100000, timeout: 180, max_retries: 3}
+    loop: {max_tool_rounds: 20}
+  af_repair:
+    llm: {max_tokens: 100000, timeout: 180, max_retries: 3}
+    loop: {max_tool_rounds: 20}
+  af_percept:               # 感知评审：glm-5.3-flash 是视觉模型（读截图判定）
+    llm: {code: zai, model: glm-5.3-flash, temperature: 0.0, max_tokens: 40000, enable_thinking: false}
+  af_report:                # 换 provider：code 与 model 必须一起写
+    llm: {temperature: 0.4}
+  # 未列出的节点整体继承 pattern 级
+
+loop:                       # pattern 级循环预算
+  max_tool_rounds: 12       # 全局默认 10
+  max_steps: 20             # 诚实退出全程 16 步(6 validate + 6 repair),
+                            # 20 留余量;与 stale-5 止损独立兜底
+  max_fanout: 8
+
+compression:
+  threshold: 6000           # 0 = 该应用关闭压缩
+  retain_count: 12
+
+guardrails:                 # 键名与全局段同名（subagent_tool/workflow_tool/
+  shell_tool:               #   shell_tool/file_tool/tasks_tool/cron_tool）
+    timeout_seconds: 120    # 字段级合并覆盖全局，可放宽也可收紧
+
+skills:
+  dir: skills
+
+config:                     # 自由 bag：app 自定义参数收口
+  workspace_root: data/archify
+  repo_root: .              # 仓库证据核验根（--repo-root，architecture 声明
+                            # sources 时生效；缺省=服务启动目录，即本仓库根）
+  author_rounds: 10
+  repair_rounds: 3
+  route_retries: 1
+  stale_limit: 3
+  percept_retries: 1        # 感知评审判定 JSON 自纠重试

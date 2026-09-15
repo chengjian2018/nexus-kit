@@ -1,0 +1,61 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "archify pattern · 图表工程工作流",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "diagrams/archify-pattern.html"
+  },
+  "lanes": [
+    { "id": "main", "label": "主干 · 每条消息从入口跑全图" },
+    { "id": "side", "label": "回路与侧枝 · 收敛护栏", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "ph_author", "label": "语义创作", "fromCol": 0, "toCol": 1 },
+    { "id": "ph_gate", "label": "验证与修复回路", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "ph_deliver", "label": "交付与汇报", "fromCol": 4, "toCol": 5 }
+  ],
+  "mainPath": ["af_route", "af_author", "af_validate", "af_deliver", "af_visual_check", "af_report"],
+  "semanticChecks": {
+    "allowedRoots": ["af_route"],
+    "allowedTerminals": ["af_report"],
+    "requiredEdges": [
+      { "from": "af_repair", "to": "af_validate" },
+      { "from": "af_repair", "to": "af_report" },
+      { "from": "af_update_probe", "to": "af_validate" },
+      { "from": "af_deliver", "to": "af_report" }
+    ],
+    "requiredPaths": [
+      { "from": "af_route", "to": "af_report" }
+    ]
+  },
+  "nodes": [
+    { "id": "af_route", "lane": "main", "col": 0, "type": "backend", "label": "类型路由", "sublabel": "五类选型 · Mermaid 取义" },
+    { "id": "af_author", "lane": "main", "col": 1, "type": "backend", "label": "产物优先创作", "sublabel": "候选 JSON · 节点 ≤12", "tag": "showcase" },
+    { "id": "af_validate", "lane": "main", "col": 2, "type": "security", "label": "验证闸门", "sublabel": "9 检全过 · 0 错 0 警", "tag": "通过即冻结" },
+    { "id": "af_deliver", "lane": "main", "col": 3, "type": "backend", "label": "最终交付", "sublabel": "快照 + SHA-256 回执", "tag": "一次性" },
+    { "id": "af_visual_check", "lane": "main", "col": 4, "type": "backend", "label": "浏览器证据", "sublabel": "不改已交付 HTML", "tag": "有界" },
+    { "id": "af_report", "lane": "main", "col": 5, "type": "external", "label": "三级分离汇报", "sublabel": "deliver / 浏览器 / 感知", "tag": "is_end" },
+    { "id": "af_update_probe", "lane": "side", "col": 2, "type": "cloud", "label": "更新探针", "sublabel": "仅一次 · 信息非许可" },
+    { "id": "af_repair", "lane": "side", "col": 3, "type": "backend", "label": "聚焦修复回路", "sublabel": "subject → fixes", "tag": "两轮止损" }
+  ],
+  "edges": [
+    { "from": "af_route", "to": "af_author" },
+    { "from": "af_author", "to": "af_validate", "label": "候选落地", "variant": "emphasis" },
+    { "from": "af_author", "to": "af_update_probe", "label": "首个候选后 · 仅一次", "role": "branch" },
+    { "from": "af_update_probe", "to": "af_validate", "label": "ack 后回主线", "role": "return", "variant": "dashed" },
+    { "from": "af_validate", "to": "af_deliver", "label": "通过 · 冻结", "variant": "emphasis" },
+    { "from": "af_validate", "to": "af_repair", "label": "未过 · 携诊断", "role": "branch" },
+    { "from": "af_repair", "to": "af_validate", "label": "错误数刷新下限", "role": "return", "variant": "dashed" },
+    { "from": "af_repair", "to": "af_report", "label": "两轮无改进 · 如实上报", "role": "error", "variant": "security" },
+    { "from": "af_deliver", "to": "af_visual_check" },
+    { "from": "af_deliver", "to": "af_report", "label": "非零退出 · 逃生边", "role": "error", "variant": "security", "route": "bottom-channel" },
+    { "from": "af_visual_check", "to": "af_report", "label": "证据独立入报" }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "主干一次成型", "items": ["产物优先:下一个动作就是写出候选 JSON", "未经诊断不添加任何几何控制", "验证通过即冻结候选,此后绝不修改"] },
+    { "dot": "amber", "title": "收敛护栏", "items": ["修复只改被诊断的 subject,核实 evidence", "每轮至多应用一个几何控制", "连续两轮不刷新错误数下限即停止打磨"] },
+    { "dot": "cyan", "title": "三级证明分离", "items": ["deliver 证明确定性产物检查", "交付非零退出走逃生边直达汇报,绝不对失败交付跑浏览器检查", "感知审查需真人或图像能力,非零退出绝不称成功"] }
+  ]
+}

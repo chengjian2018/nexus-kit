@@ -1,0 +1,590 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "nexus-kit 运行时架构",
+    "locale": "zh-CN",
+    "output": "runtime-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/chengjian2018/nexus-kit",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "4a87e46dfd0cb46ae6ad21731928c13a34599661"
+    },
+    "views": [
+      {
+        "id": "main-path",
+        "label": "主路径 · 一轮对话",
+        "focus": [
+          "client",
+          "studio",
+          "fastapi_host",
+          "governor",
+          "chat_engine",
+          "graph_runtime",
+          "executors",
+          "llm_service"
+        ],
+        "note": "浏览器 → 宿主 → 会话治理 → 引擎 → 图运行时 → 执行器 → LLM 云服务"
+      },
+      {
+        "id": "ingress",
+        "label": "入口与渠道",
+        "focus": [
+          "client",
+          "channel_peer",
+          "studio",
+          "console",
+          "fastapi_host"
+        ],
+        "note": "三类入站：Studio SSE、Console REST、渠道 webhook"
+      },
+      {
+        "id": "tools",
+        "label": "工具与外部服务",
+        "focus": [
+          "executors",
+          "tool_box",
+          "mcp_gateway",
+          "mcp_servers",
+          "knowledge_db",
+          "llm_service"
+        ],
+        "note": "执行器经三层收口调用工具；MCP 网关出网连接外部工具服务"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "浏览器 / API 调用方",
+      "sublabel": "Studio · Console",
+      "pos": [
+        0,
+        90
+      ],
+      "size": [
+        120,
+        64
+      ]
+    },
+    {
+      "id": "studio",
+      "type": "frontend",
+      "label": "Studio 工作台",
+      "sublabel": "模版测试 · 自动编排",
+      "tag": "claude CLI",
+      "pos": [
+        180,
+        90
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ui/studio/api.py",
+          "line": 306,
+          "label": "自动编排入口"
+        }
+      ]
+    },
+    {
+      "id": "fastapi_host",
+      "type": "backend",
+      "label": "FastAPI 宿主",
+      "sublabel": "组装根 · 热重载",
+      "tag": "/api/v1/chat(/stream)",
+      "pos": [
+        370,
+        90
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "host/main.py",
+          "line": 485,
+          "label": "POST /api/v1/chat"
+        }
+      ]
+    },
+    {
+      "id": "governor",
+      "type": "backend",
+      "label": "会话治理 Governor",
+      "sublabel": "内存会话 LRU / TTL",
+      "pos": [
+        560,
+        90
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "host/governor.py",
+          "line": 26
+        }
+      ]
+    },
+    {
+      "id": "chat_engine",
+      "type": "backend",
+      "label": "chat_turn 引擎",
+      "sublabel": "R1 配置 · 压缩 · 分流",
+      "pos": [
+        750,
+        90
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "nexus/engine/chat.py",
+          "line": 810,
+          "label": "chat_turn"
+        }
+      ]
+    },
+    {
+      "id": "graph_runtime",
+      "type": "backend",
+      "label": "图运行时",
+      "sublabel": "AGENT 图 · FSM",
+      "tag": "挂起 / 扇出",
+      "pos": [
+        940,
+        90
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "nexus/engine/chat.py",
+          "line": 503,
+          "label": "_run_agent_graph"
+        }
+      ]
+    },
+    {
+      "id": "console",
+      "type": "frontend",
+      "label": "Console 运营台",
+      "sublabel": "浏览器 /console",
+      "tag": "应用 · 知识库",
+      "pos": [
+        180,
+        216
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ui/api.py",
+          "line": 45
+        }
+      ]
+    },
+    {
+      "id": "session_db",
+      "type": "database",
+      "label": "SQLite 会话库",
+      "sublabel": "sessions · messages",
+      "tag": "graph_state 游标",
+      "pos": [
+        560,
+        216
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "nexus/engine/store.py",
+          "line": 32
+        }
+      ]
+    },
+    {
+      "id": "patterns",
+      "type": "backend",
+      "label": "业务 Pattern",
+      "sublabel": "apps ×6 声明式配方",
+      "pos": [
+        750,
+        216
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "apps/deep_research_agent/route_multi.py",
+          "label": "图化配方"
+        },
+        {
+          "path": "apps/xianyu_agent/route.py",
+          "label": "渠道配方"
+        }
+      ]
+    },
+    {
+      "id": "executors",
+      "type": "backend",
+      "label": "节点执行器",
+      "sublabel": "ReAct 循环 / FSM",
+      "pos": [
+        940,
+        216
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "atoms/executors/loop_executor.py"
+        },
+        {
+          "path": "atoms/executors/fsm_executor.py"
+        }
+      ]
+    },
+    {
+      "id": "llm_service",
+      "type": "cloud",
+      "label": "LLM 云服务",
+      "sublabel": "百炼 dashscope · z.ai GLM",
+      "tag": "API Key",
+      "pos": [
+        1120,
+        216
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "atoms/providers/dashscope_provider.py"
+        },
+        {
+          "path": "atoms/providers/zai_provider.py"
+        }
+      ]
+    },
+    {
+      "id": "plugin_registry",
+      "type": "backend",
+      "label": "插件中心 · 注册表",
+      "sublabel": "executor / stage / hooks",
+      "pos": [
+        750,
+        342
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "nexus/registry/plugins.py",
+          "line": 58
+        }
+      ]
+    },
+    {
+      "id": "tool_box",
+      "type": "security",
+      "label": "工具箱",
+      "sublabel": "六件套 + tool_guard",
+      "tag": "deny-by-default",
+      "pos": [
+        940,
+        342
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "atoms/tools/__init__.py"
+        },
+        {
+          "path": "atoms/hooks/tool_guard.py"
+        }
+      ]
+    },
+    {
+      "id": "knowledge_db",
+      "type": "database",
+      "label": "SQLite 知识库",
+      "sublabel": "检索配置热生效",
+      "pos": [
+        750,
+        468
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "atoms/knowledge/store.py"
+        }
+      ]
+    },
+    {
+      "id": "mcp_gateway",
+      "type": "backend",
+      "label": "MCP 网关",
+      "sublabel": "工具动态注册 mcp-*",
+      "pos": [
+        920,
+        468
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "atoms/mcp/manager.py"
+        }
+      ]
+    },
+    {
+      "id": "mcp_servers",
+      "type": "external",
+      "label": "MCP 工具服务",
+      "sublabel": "外部进程 / 远端",
+      "pos": [
+        1120,
+        468
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "channel_peer",
+      "type": "external",
+      "label": "渠道对端",
+      "sublabel": "闲鱼等平台回调",
+      "tag": "webhook",
+      "pos": [
+        0,
+        468
+      ],
+      "size": [
+        120,
+        64
+      ],
+      "sources": [
+        {
+          "path": "nexus/channels/webhooks.py",
+          "line": 42
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "nexus-kit 单进程 · uvicorn host.main:app",
+      "wraps": [
+        "studio",
+        "fastapi_host",
+        "governor",
+        "chat_engine",
+        "graph_runtime",
+        "console",
+        "session_db",
+        "patterns",
+        "executors",
+        "plugin_registry",
+        "tool_box",
+        "knowledge_db",
+        "mcp_gateway"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "入口校验 · NEXUS_API_KEY",
+      "wraps": [
+        "fastapi_host"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "c-client-studio",
+      "from": "client",
+      "to": "studio",
+      "variant": "emphasis",
+      "width": 1.6
+    },
+    {
+      "id": "c-studio-api",
+      "from": "studio",
+      "to": "fastapi_host",
+      "label": "SSE 对话",
+      "variant": "emphasis",
+      "width": 1.6
+    },
+    {
+      "id": "c-api-gov",
+      "from": "fastapi_host",
+      "to": "governor",
+      "label": "定位会话",
+      "variant": "emphasis",
+      "width": 1.6
+    },
+    {
+      "id": "c-gov-engine",
+      "from": "governor",
+      "to": "chat_engine",
+      "label": "chat_turn",
+      "variant": "emphasis",
+      "width": 1.6
+    },
+    {
+      "id": "c-engine-graph",
+      "from": "chat_engine",
+      "to": "graph_runtime",
+      "label": "图/FSM 分流",
+      "variant": "emphasis",
+      "width": 1.6,
+      "labelDy": 56
+    },
+    {
+      "id": "c-graph-exec",
+      "from": "graph_runtime",
+      "to": "executors",
+      "label": "节点执行",
+      "variant": "emphasis",
+      "width": 1.6,
+      "labelDy": 24
+    },
+    {
+      "id": "c-exec-llm",
+      "from": "executors",
+      "to": "llm_service",
+      "label": "HTTPS · API Key",
+      "variant": "emphasis",
+      "width": 1.6,
+      "labelDy": 56
+    },
+    {
+      "id": "c-console-api",
+      "from": "console",
+      "to": "fastapi_host",
+      "label": "REST 管理",
+      "labelAt": [
+        250,
+        186
+      ]
+    },
+    {
+      "id": "c-channel-api",
+      "from": "channel_peer",
+      "to": "fastapi_host",
+      "label": "webhook 回调"
+    },
+    {
+      "id": "c-engine-patterns",
+      "from": "chat_engine",
+      "to": "patterns",
+      "label": "取配方路由",
+      "labelDy": 24
+    },
+    {
+      "id": "c-engine-session",
+      "from": "chat_engine",
+      "to": "session_db",
+      "label": "轮次状态落盘"
+    },
+    {
+      "id": "c-exec-registry",
+      "from": "executors",
+      "to": "plugin_registry",
+      "label": "注册/解析扩展点"
+    },
+    {
+      "id": "c-exec-tools",
+      "from": "executors",
+      "to": "tool_box",
+      "label": "工具调用",
+      "labelDy": 24
+    },
+    {
+      "id": "c-tools-knowledge",
+      "from": "tool_box",
+      "to": "knowledge_db",
+      "label": "知识检索"
+    },
+    {
+      "id": "c-tools-mcp",
+      "from": "tool_box",
+      "to": "mcp_gateway",
+      "label": "MCP 工具代理",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "c-mcp-servers",
+      "from": "mcp_gateway",
+      "to": "mcp_servers",
+      "label": "stdio/sse/http",
+      "labelAt": [
+        1090,
+        546
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主路径 · 一轮对话",
+      "items": [
+        "POST /api/v1/chat → chat_turn：R1 配置 → 压缩 → pattern_type 分流",
+        "图运行时：条件边 / 挂起恢复 / sends 扇出；回复底层全流式 SSE"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "四层分层 · host → apps → atoms → nexus",
+      "items": [
+        "apps ×6：闲鱼客服 / 店铺客服 / 深度研究 / 主题研究 / 安装·维修预约",
+        "atoms：执行器 / 工具六件套 / hooks / Provider / 知识库 / MCP 网关",
+        "nexus 零业务依赖：默认实现由 atoms import 时反向注册进插件中心"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "信任边界 · 外部依赖 · 热重载",
+      "items": [
+        "NEXUS_API_KEY 全 API；工具 deny-by-default 三层收口；tool_guard 先播报",
+        "外部：百炼 / z.ai LLM（HTTPS + 密钥）、MCP 工具服务、claude CLI、SQLite",
+        "热重载：yaml 下一轮生效；/reload 重放重绑；graph_state 挂起续跑"
+      ]
+    }
+  ]
+}
