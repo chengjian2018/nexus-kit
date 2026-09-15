@@ -1,7 +1,7 @@
 """
 Dialogue system base types — PipelineStage, SessionMessage, DialogueContext
 
-All stages and modules depend on these standard types to keep session storage
+All stages and executors depend on these standard types to keep session storage
 and context passing consistent.
 """
 
@@ -125,7 +125,7 @@ class DialogueContext:
     Every PipelineStage receives and returns this object; all intermediate results are stored here.
 
     # metadata key conventions (self-managed by stages / the chat layer):
-    #   served_by_projection : Dict{module, source}  a projection-borrowed answering turn: borrower module and source domain
+    #   llm_override         : Dict                  per-turn explicit LLM pick — overrides the whole config chain (set by callers/tests)
     #   clarify              : Dict                  set and cleared each turn by ClarifyStage
     """
 
@@ -303,7 +303,7 @@ class DialogueContext:
         return ""
 
     # ------------------------------------------------------------------
-    # Current node / module accessors
+    # Current node accessors
     # ------------------------------------------------------------------
 
     def get_next_node(self):
@@ -321,8 +321,8 @@ class DialogueContext:
         return self.node_map.get(self.current_node_code)
 
     # ------------------------------------------------------------------
-    # Node / module slot formatting — delegation to the data layer
-    # (node.py / module.py own the formatting; ctx only resolves "which node/module")
+    # Node slot formatting — delegation to the data layer
+    # (node.py owns the formatting; ctx only resolves "which node")
     # ------------------------------------------------------------------
 
     def format_nlg_next_node(self, stage: str = "nlg") -> str:
@@ -409,9 +409,8 @@ class DialogueContext:
 # Fixed slot vocabulary: every stage's prompt template shares the same set of
 # {__key__} placeholders. Concatenation logic lives in the layer that owns the
 # data:
-#   - node layer  : cur_node (stage-specific facet) / next_node / answer_pattern  (node.py)
-#   - module layer: task_info                              (module.py)
-#   - ctx layer   : query / query_rewrite / recall_info / history / filled_slots
+#   - node layer: cur_node (stage-specific facet) / next_node / answer_pattern  (node.py)
+#   - ctx layer  : query / query_rewrite / recall_info / history / filled_slots / task_info
 # Stages (nlu / nlg / query / recaller) only map "slot name -> data-layer
 # formatting method"; they no longer implement concatenation themselves.
 #
@@ -438,7 +437,7 @@ def resolve_prompt_template(
     """Resolve a stage's prompt template by priority.
 
     Priority: node.config[prompt_attr] > *default_template* (the pre-merge
-    node/module attribute layers collapsed into the node's config bag).
+    node attribute layers collapsed into the node's config bag).
 
     Args:
         ctx: current dialogue context.
