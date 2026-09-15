@@ -29,7 +29,7 @@ from atoms.tools._cron_core import (
     reset_scheduler,
     snapshot_tool_pool,
 )
-from nexus.engine.tool_context import tool_call_context
+from nexus.engine.tool_context import current_tool_context, tool_call_context
 from nexus.registry.tools import registry as tool_registry
 from async_utils import arun
 
@@ -376,3 +376,78 @@ def test_disabled_env_keeps_scheduler_inert(monkeypatch, tmp_path):
                             "input": "t"})))
         assert "NEXUS_CRON_DISABLED" in r["note"]
         assert not (tmp_path / "j.json").exists()
+
+
+# =========================================================================
+# 锁纪律 / 死日期 / fire 作用域 / stop 回收
+# =========================================================================
+
+def test_create_rejects_dead_date_schedule():
+    r = _dispatch("create_cron", {"name": "死日期", "schedule": "0 0 30 2 *",
+                                  "input": "task"})
+    assert "永不命中" in r["error"]
+
+
+def test_update_dead_date_keeps_original_schedule():
+    r = _dispatch("create_cron", {"name": "好作业", "interval_minutes": 60,
+                                  "input": "task"})
+    jid = r["job_id"]
+    r2 = _dispatch("update_cron", {"job_id": jid, "schedule": "0 0 29 2 *"})
+    assert "永不命中" in r2["error"]
+    # mutate 抛错时作业保持原状（写穿前拒绝）
+    assert get_scheduler().get_job(jid)["schedule"] == {
+        "interval_minutes": 60}
+
+
+def test_add_enforces_max_jobs_under_lock():
+    from unittest.mock import patch as _patch
+    with _patch("atoms.tools._cron_core.get_cron_tool_config",
+                return_value={**_GUARD, "max_jobs": 2}):
+        sched = CronScheduler()
+        sched.add({"id": "a"})
+        sched.add({"id": "b"})
+        with pytest.raises(ValueError):
+            sched.add({"id": "c"})       # 锁内检查：并发 create 不再双双通过
+        sched.add({"id": "b"})           # 覆盖已有（update 复用）不受限
+
+
+def test_scheduler_update_missing_job_returns_none():
+    sched = CronScheduler()
+    assert sched.update("nope", lambda j: None) is None
+
+
+def test_fire_scopes_tool_context_per_job():
+    seen = {}
+
+    async def spy(job):
+        ctx = current_tool_context()
+        seen[job["id"]] = ctx.session_id if ctx is not None else None
+        return {"status": "ok"}
+
+    sched = CronScheduler(execute_job=spy)
+    j1, j2 = _make_job(), _make_job()
+    sched.jobs[j1["id"]] = j1
+    sched.jobs[j2["id"]] = j2
+    arun(sched._fire(j1["id"]))
+    arun(sched._fire(j2["id"]))
+    # 每作业独立会话作用域——不再全体共享 _global 任务清单桶
+    assert seen == {j1["id"]: f"cron:{j1['id']}",
+                    j2["id"]: f"cron:{j2['id']}"}
+
+
+def test_stop_cancels_inflight_fire_tasks():
+    async def scenario():
+        async def sleepy(job):
+            await asyncio.sleep(30)
+            return {"status": "ok"}
+
+        sched = CronScheduler(execute_job=sleepy)
+        job = _make_job()
+        sched.jobs[job["id"]] = job
+        sched._tick_once()               # 到点 → fire 任务被追踪
+        await asyncio.sleep(0.05)
+        assert sched._fire_tasks
+        await sched.stop()               # 停机取消在途 fire 并等收尾
+        assert not sched._fire_tasks
+
+    arun(scenario())

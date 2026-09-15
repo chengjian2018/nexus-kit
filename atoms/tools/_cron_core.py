@@ -246,6 +246,7 @@ class CronScheduler:
         self._execute_job = execute_job
         self._tick_task: Optional[asyncio.Task] = None
         self._firing: Set[str] = set()
+        self._fire_tasks: Set[asyncio.Task] = set()
         self._lock = threading.Lock()
 
     # -- 生命周期 --------------------------------------------------------
@@ -269,9 +270,20 @@ class CronScheduler:
             self._tick_loop(), name="nexus-cron-tick")
 
     async def stop(self) -> None:
-        if self._tick_task is not None:
-            self._tick_task.cancel()
-            self._tick_task = None
+        """停机回收：等 tick 退出，并取消在途 fire（LLM 调用）——
+        fire 任务被追踪，不再在宿主拆除时无人认领地继续跑。"""
+        tick, self._tick_task = self._tick_task, None
+        if tick is not None:
+            tick.cancel()
+            try:
+                await tick
+            except (asyncio.CancelledError, Exception):
+                pass
+        pending = list(self._fire_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _tick_loop(self) -> None:
         while True:
@@ -297,8 +309,10 @@ class CronScheduler:
             for jid in due:
                 self._firing.add(jid)
         for jid in due:
-            asyncio.get_running_loop().create_task(
+            task = asyncio.get_running_loop().create_task(
                 self._fire(jid), name=f"nexus-cron-fire-{jid}")
+            self._fire_tasks.add(task)
+            task.add_done_callback(self._fire_tasks.discard)
 
     # -- fire -------------------------------------------------------------
 
@@ -322,8 +336,17 @@ class CronScheduler:
             timed_out = False
             error: Optional[str] = None
             try:
-                payload = await asyncio.wait_for(
-                    self._execute_job(job), timeout=timeout)
+                # 挂起会话作用域：fire 的子代理工具调用（如 task_list）
+                # 以 cron:<job_id> 隔离——否则全部无上下文调用共享 _global
+                # 桶，并发 fire 的 write_tasks 全量替换会互踩（llm/授权
+                # 字段留空：fire 子代理池按冻结快照名字直发，不读这两项；
+                # 同步 with 即可——contextvar 在同一 Task 内跨 await 生效）
+                from nexus.engine.tool_context import tool_call_context
+                with tool_call_context(
+                        llm_config={}, allow_toolsets=set(),
+                        session_id=f"cron:{job_id}"):
+                    payload = await asyncio.wait_for(
+                        self._execute_job(job), timeout=timeout)
             except asyncio.TimeoutError:
                 timed_out = True
                 payload, error = None, f"触发超时（{timeout:.0f}s）被终止"
@@ -373,9 +396,45 @@ class CronScheduler:
         CronStore(guard["jobs_path"]).save(self.jobs)
 
     def add(self, job: Dict[str, Any]) -> None:
+        """新增/覆盖一个作业（update_cron 复用覆盖语义）。
+
+        max_jobs 上限在锁内检查：锁外的先查后加在并发 create 下会双双
+        通过、超限写入。新增（id 不存在）超限时抛 ValueError。"""
         with self._lock:
+            guard = get_cron_tool_config()
+            if (job["id"] not in self.jobs
+                    and len(self.jobs) >= int(guard["max_jobs"])):
+                raise ValueError(
+                    f"作业数已达上限 {guard['max_jobs']}，"
+                    f"请先用 delete_cron 清理不再需要的作业")
             self.jobs[job["id"]] = job
+            self._persist_locked(guard)
+
+    def update(self, job_id: str,
+               mutate: Callable[[Dict[str, Any]], None]
+               ) -> Optional[Dict[str, Any]]:
+        """锁内「读取-变更-持久化」：活字典不再在锁外被直改——半更新
+        状态若被并发的 _fire 持久化，会把过期的 next_fire_at 固化到盘上
+        （重启后 load 只在 nxt < now 时重算，作业会沉睡到旧的未来时刻）。
+        mutate 抛 ValueError 视为校验失败，作业保持原状。"""
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return None
+            mutate(job)
             self._persist_locked(get_cron_tool_config())
+            return job
+
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        """锁内快照（history 单独拷贝）：CRUD 与 tick/fire 并发变更时，
+        调用方在锁外排序/渲染不再迭代活容器。"""
+        with self._lock:
+            snapshot = []
+            for job in self.jobs.values():
+                view = dict(job)
+                view["history"] = list(job.get("history") or [])
+                snapshot.append(view)
+            return snapshot
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:

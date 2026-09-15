@@ -185,10 +185,13 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
         return tool_error(err)
 
     sched = get_scheduler()
-    if len(sched.jobs) >= int(guard["max_jobs"]):
+    next_fire_at = compute_next_fire({"schedule": schedule})
+    if next_fire_at is None:
+        # 死日期（如 2 月 30 日）：静默接受 = 永不触发的哑作业，且每次
+        # 排程都要白扫一整年（52 万分钟步）——创建即拒绝
         return tool_error(
-            f"作业数已达上限 {guard['max_jobs']}，请先用 delete_cron 清理"
-            "不再需要的作业")
+            "调度表达式永不命中（如 2 月 30 日 / 非闰年 2 月 29 日），"
+            "请修正 schedule")
 
     job = {
         "id": new_job_id(),
@@ -203,11 +206,15 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
         "created_at": datetime.datetime.now().isoformat(
             timespec="seconds"),
         "runs": 0,
-        "next_fire_at": compute_next_fire({"schedule": schedule}),
+        "next_fire_at": next_fire_at,
         "last_run": None,
         "history": [],
     }
-    sched.add(job)
+    try:
+        # max_jobs 在 add() 锁内检查（锁外先查后加在并发 create 下会超限）
+        sched.add(job)
+    except ValueError as e:
+        return tool_error(str(e))
     logger.info("[create_cron] %s (%s): tools=%d, %s", job["id"], name,
                 len(tools), sched_desc)
     return tool_result({
@@ -247,8 +254,9 @@ def _job_public(job: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_list_crons(args: Dict[str, Any]) -> str:
     sched = get_scheduler()
+    # 锁内快照后锁外排序渲染——不迭代活容器（add/remove/_fire 并发变更）
     jobs = [_job_public(job)
-            for job in sorted(sched.jobs.values(),
+            for job in sorted(sched.list_jobs(),
                               key=lambda j: j.get("created_at", ""))]
     return tool_result({"jobs": jobs, "count": len(jobs)})
 
@@ -285,7 +293,10 @@ UPDATE_CRON_SCHEMA = {
 
 def _handle_update_cron(args: Dict[str, Any]) -> str:
     sched = get_scheduler()
-    job = sched.get_job(str(args.get("job_id") or ""))
+    job_id = str(args.get("job_id") or "")
+    # 校验阶段基于 get_job 快照读取（_pool 等只读字段）；变更阶段整体
+    # 收进 scheduler.update 的锁内 mutate——活字典不再锁外直改
+    job = sched.get_job(job_id)
     if job is None:
         return tool_error("job_id 不存在，请用 list_crons 查询有效作业")
 
@@ -335,17 +346,32 @@ def _handle_update_cron(args: Dict[str, Any]) -> str:
         return tool_error("没有任何要更新的字段（name/enabled/schedule/"
                           "input/system_prompt/tools/timeout_seconds）")
 
-    job.update(updates)
-    if reschedule or updates.get("enabled") is True:
-        job["next_fire_at"] = compute_next_fire(job)
-    elif updates.get("enabled") is False:
-        job["next_fire_at"] = None   # 暂停：不排下次；恢复时重排
-    # 持久化经 scheduler 的 add 路径复用（job dict 已就地更新）
-    sched.add(job)
-    logger.info("[update_cron] %s: 更新字段 %s", job["id"], sorted(updates))
-    return tool_result({"job_id": job["id"], "updated": sorted(updates),
-                        "enabled": job.get("enabled", True),
-                        "next_fire_at": job.get("next_fire_at")})
+    def _mutate(live: Dict[str, Any]) -> None:
+        if reschedule or updates.get("enabled") is True:
+            # 先在「合并视图」上排程、写穿前拒绝死日期——mutate 抛错时
+            # 作业保持原状（scheduler.update 的契约）
+            nxt = compute_next_fire({**live, **updates})
+            if nxt is None and reschedule:
+                raise ValueError(
+                    "调度表达式永不命中（如 2 月 30 日 / 非闰年 2 月 29 日），"
+                    "请修正 schedule")
+            live.update(updates)
+            live["next_fire_at"] = nxt
+        else:
+            live.update(updates)
+            if updates.get("enabled") is False:
+                live["next_fire_at"] = None   # 暂停：不排下次；恢复时重排
+
+    try:
+        updated = sched.update(job_id, _mutate)
+    except ValueError as e:
+        return tool_error(str(e))
+    if updated is None:
+        return tool_error("job_id 不存在，请用 list_crons 查询有效作业")
+    logger.info("[update_cron] %s: 更新字段 %s", job_id, sorted(updates))
+    return tool_result({"job_id": job_id, "updated": sorted(updates),
+                        "enabled": updated.get("enabled", True),
+                        "next_fire_at": updated.get("next_fire_at")})
 
 
 # ---------------------------------------------------------------------------
