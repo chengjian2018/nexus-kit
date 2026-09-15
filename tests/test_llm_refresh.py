@@ -85,7 +85,7 @@ def test_r3_refresh_after_node_resolution():
 
 def test_r4_graph_runtime_refreshes_per_node_step():
     """R4: the AGENT graph runtime refreshes the LLM config at EVERY node
-    step (a node-level plugins['llm'] would take effect mid-run)."""
+    step (a node-level app overlay takes effect mid-run)."""
 
     class _RouteExecutor(NodeExecutor):
         async def execute(self, ec: ExecutionContext) -> TurnResult:

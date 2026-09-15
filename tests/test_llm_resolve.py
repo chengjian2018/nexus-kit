@@ -125,5 +125,7 @@ def test_call_llm_with_none_config_loads_real_yaml(monkeypatch):
     from async_utils import arun
     arun(FSMNLG()._call_llm("ping", None))
 
-    assert built.get("code") == "dashscope"  # the code from local_config.yaml
+    from nexus.settings import load_config
+    expected_code = load_config()["llm_default"]["code"]
+    assert built.get("code") == expected_code  # the code from local_config.yaml
     assert built.get("api_base")  # yaml's api_base flows into build_provider with the config

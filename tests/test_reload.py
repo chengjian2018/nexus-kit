@@ -75,10 +75,10 @@ def test_config_deep_copy_no_cache_pollution(tmp_path):
     path = _write(tmp_path, _LLM_MIN)
     cfg = load_config(path)
     cfg["llm_default"]["model"] = "hacked"
-    cfg["pattern_llm"]["injected"] = True
+    cfg["llm_providers"]["injected"] = True
     again = load_config(path)
     assert again["llm_default"]["model"] == "qwen3.8-max"
-    assert "injected" not in again["pattern_llm"]
+    assert "injected" not in again["llm_providers"]
 
 
 def test_reload_config_programmatic_entry(tmp_path):
@@ -102,9 +102,9 @@ def test_reload_config_programmatic_entry(tmp_path):
 
 
 def test_get_llm_config_uses_cache(tmp_path):
-    """The three-level orchestration entry get_llm_config also benefits from the cache (hot path of every R1 round)."""
-    path = _write(tmp_path, _LLM_MIN + "\npattern_llm:\n  p1:\n    model: pm\n")
-    assert get_llm_config("p1", config_path=path)["model"] == "pm"
+    """The orchestration entry get_llm_config also benefits from the cache (hot path of every R1 round)."""
+    path = _write(tmp_path, _LLM_MIN)
+    assert get_llm_config("p1", config_path=path)["model"] == "qwen3.8-max"
     with patch("nexus.settings._parse_config_file",
                wraps=settings._parse_config_file) as spy:
         get_llm_config("p1", config_path=path)

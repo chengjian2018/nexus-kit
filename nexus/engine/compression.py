@@ -205,12 +205,17 @@ async def maybe_compress(session: "Session", store: "SessionStore") -> None:
 
     store None / threshold 0 / too few messages → skip silently; failures are only logged —
     compression is an optimization and must never block the dialogue.
+
+    The threshold / retain-count resolve per pattern: the session's
+    pattern_code keys the app ``compression`` overlay over the global
+    session_compress_* keys (getattr-tolerant for duck-typed test shims).
     """
     if store is None:
         return
+    pattern_code = str(getattr(session, "pattern_code", "") or "")
     try:
         from nexus.settings import get_session_compress_config
-        threshold, retain_count = get_session_compress_config()
+        threshold, retain_count = get_session_compress_config(pattern_code)
     except Exception:
         logger.exception("读取压缩配置失败，跳过压缩")
         return

@@ -3,7 +3,7 @@
 import pytest
 
 from nexus.settings import DEFAULT_SESSION_DB_PATH, get_session_db_path
-from nexus.settings import get_llm_config, load_config
+from nexus.settings import get_llm_config, get_mcp_servers, load_config
 
 _LLM_MIN = """\
 llm:
@@ -30,7 +30,9 @@ def test_session_db_path_override(tmp_path):
 
 
 # ============================================================================
-# Pattern-level LLM config, new structure (spec 2026-09-02): llm_providers / llm_default / pattern_llm
+# New structure: llm_providers / llm_default (spec 2026-09-02; the
+# pattern_llm section was replaced by per-app apps/*/config.yaml overlays —
+# see tests/test_app_config.py; a leftover pattern_llm key is simply ignored)
 # ============================================================================
 
 _NEW_STRUCT = """\
@@ -42,11 +44,6 @@ llm_default:
   code: openai
   model: qwen3.8-max
   temperature: 0.7
-pattern_llm:
-  xianyu_agent:
-    model: qwen-flash
-    nodes:
-      xy_route_root: {code: deepseek, model: deepseek-chat}
 """
 
 _LEGACY = """\
@@ -69,7 +66,7 @@ def test_new_structure_parsed(tmp_path):
     cfg = load_config(_write(tmp_path, _NEW_STRUCT))
     assert cfg["llm_default"]["code"] == "openai"
     assert cfg["llm_providers"]["openai"]["api_key_env"] == "DASHSCOPE_API_KEY"
-    assert cfg["pattern_llm"]["xianyu_agent"]["nodes"]["xy_route_root"]["code"] == "deepseek"
+    assert "pattern_llm" not in cfg  # died with the app-config redesign
     assert "llm" not in cfg
 
 
@@ -83,7 +80,6 @@ def test_legacy_llm_converted(tmp_path):
         }
     }
     assert cfg["llm_default"] == {"code": "openai", "model": "qwen3.8-max", "temperature": 0.7}
-    assert cfg.get("pattern_llm") == {}
 
 
 def test_legacy_and_new_coexist_rejected(tmp_path):
@@ -101,88 +97,10 @@ def test_no_llm_section_at_all_rejected(tmp_path):
         load_config(_write(tmp_path, "session_db_path: /tmp/x.db\n"))
 
 
-def test_unknown_orchestration_field_warns(tmp_path, caplog):
-    text = _NEW_STRUCT.replace(
-        "xianyu_agent:\n    model: qwen-flash",
-        "xianyu_agent:\n    model: qwen-flash\n    bogus_field: 1",
-    )
-    with caplog.at_level("WARNING"):
-        cfg = load_config(_write(tmp_path, text))
-    assert cfg["pattern_llm"]["xianyu_agent"].get("bogus_field") is None
-    assert any("bogus_field" in r.message for r in caplog.records)
-
-
-def test_nested_nodes_rejected_with_warning(tmp_path, caplog):
-    text = _NEW_STRUCT.replace(
-        "xy_route_root: {code: deepseek, model: deepseek-chat}",
-        "xy_route_root:\n        nodes: {inner: {model: m}}",
-    )
-    with caplog.at_level("WARNING"):
-        cfg = load_config(_write(tmp_path, text))
-    assert cfg["pattern_llm"]["xianyu_agent"]["nodes"]["xy_route_root"] == {}
-    assert any("嵌套" in r.message for r in caplog.records)
-
-
 # ============================================================================
-# get_llm_config three-tier merge (spec 2026-09-02 §3.2/§3.3)
+# get_llm_config entry: no-args global + override path (the layered
+# llm_default ⊕ app ⊕ node priority chain lives in tests/test_app_config.py)
 # ============================================================================
-
-def test_layered_merge_priority(tmp_path):
-    """node > pattern > global，逐层浅合并（模块子层已随模块层删除）。"""
-    path = _write(tmp_path, _NEW_STRUCT + """\
-  xianyu_agent2:
-    model: qwen3.8-max
-    temperature: 0.2
-    nodes:
-      n1: {code: deepseek, model: deepseek-chat}
-""")
-    cfg = get_llm_config(pattern_code="xianyu_agent2",
-                         node_code="n1", config_path=path)
-    # n1 switches code -> connection layer switches to the deepseek section (empty if that section is absent); temperature inherited from the pattern layer
-    assert cfg["code"] == "deepseek"
-    assert cfg["model"] == "deepseek-chat"
-    assert cfg["temperature"] == 0.2
-    assert cfg.get("api_base", "") == ""
-
-
-def test_cross_provider_connection_switch(tmp_path):
-    """When a node switches code, connection fields come from the new code's provider section, with no cross-wiring."""
-    text = """\
-llm_providers:
-  openai:
-    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env: DASHSCOPE_API_KEY
-  deepseek:
-    api_base: https://api.deepseek.com/v1
-    api_key_env: DEEPSEEK_API_KEY
-llm_default:
-  code: openai
-  model: qwen3.8-max
-pattern_llm:
-  p:
-    nodes:
-      n: {code: deepseek, model: deepseek-chat}
-"""
-    cfg = get_llm_config(pattern_code="p", node_code="n",
-                         config_path=_write(tmp_path, text))
-    assert cfg["api_base"] == "https://api.deepseek.com/v1"
-    assert cfg["api_key_env"] == "DEEPSEEK_API_KEY"
-
-
-def test_unknown_codes_fallback_to_shallow_layer(tmp_path, caplog):
-    cfg = get_llm_config(pattern_code="no_such_pattern", config_path=_write(tmp_path, _NEW_STRUCT))
-    assert cfg["model"] == "qwen3.8-max"
-    cfg2 = get_llm_config(pattern_code="xianyu_agent", node_code="no_such_node",
-                          config_path=_write(tmp_path, _NEW_STRUCT))
-    assert cfg2["model"] == "qwen-flash"
-    # An unconfigured pattern is the normal case, so it drops to debug; a node miss still warns
-    with caplog.at_level("DEBUG"):
-        get_llm_config(pattern_code="no_such_pattern", config_path=_write(tmp_path, _NEW_STRUCT))
-    assert any("no_such_pattern" in r.message for r in caplog.records)
-    with caplog.at_level("WARNING"):
-        get_llm_config(pattern_code="xianyu_agent", node_code="no_such_node",
-                       config_path=_write(tmp_path, _NEW_STRUCT))
-    assert any("no_such_node" in r.message for r in caplog.records)
 
 
 def test_no_args_returns_global(tmp_path):
@@ -200,43 +118,10 @@ def test_override_skips_layers(tmp_path):
 
 
 # ============================================================================
-# main startup cross-check (spec 2026-09-02 §5): unknown codes only warn, never block
+# main startup cross-check: the pattern_llm-era checks died with the
+# app-config redesign — the app-config cross-check lives in
+# tests/test_app_config.py (host.main._cross_check_app_configs)
 # ============================================================================
-
-def test_cross_check_warns_unknown_codes(tmp_path, caplog):
-    """Unknown pattern/module/node codes in pattern_llm only warn, never raise."""
-    import host.main as main
-    text = _NEW_STRUCT + """\
-  no_such_pattern:
-    model: m
-"""
-    # For an unregistered pattern the modules/nodes branch is unreachable (continue), so the
-    # unknown module/node branches are verified separately under a registered pattern
-    text = text.replace("xy_route_root: {code: deepseek, model: deepseek-chat}",
-                        "no_such_node: {code: deepseek, model: deepseek-chat}")
-    with caplog.at_level("WARNING"):
-        main._cross_check_pattern_llm(config_path=_write(tmp_path, text))
-    msgs = " ".join(r.message for r in caplog.records)
-    assert "no_such_pattern" in msgs
-    assert "no_such_node" in msgs
-
-
-def test_cross_check_skips_on_load_failure(tmp_path, caplog):
-    """On load_config failure only an exception is logged; nothing raises."""
-    import host.main as main
-    with caplog.at_level("WARNING"):
-        main._cross_check_pattern_llm(config_path="/no/such/file.yaml")
-    assert not any("未注册" in r.message for r in caplog.records)
-
-
-def test_cross_check_registered_codes_no_warning(tmp_path, caplog):
-    """Registered pattern/module/node codes produce no warning."""
-    import host.main as main
-    pattern = main.pattern_registry.list_codes()
-    assert pattern  # discover already ran at import main
-    with caplog.at_level("WARNING"):
-        main._cross_check_pattern_llm(config_path=_write(tmp_path, _NEW_STRUCT))
-    assert not any("未注册" in r.message for r in caplog.records)
 
 
 def test_override_survives_missing_yaml(tmp_path, caplog):
@@ -278,3 +163,49 @@ def test_override_with_code_but_no_model_falls_back(tmp_path):
     cfg = get_llm_config(override=ov, config_path=_write(tmp_path, _NEW_STRUCT))
     assert cfg["code"] == "openai"
     assert cfg["model"] == "qwen3.8-max"
+
+
+# ============================================================================
+# mcp_servers: $VAR / ${VAR} env expansion (secrets via process environment)
+# ============================================================================
+
+_MCP_YAML = """\
+mcp_servers:
+  zai:
+    transport: stdio
+    command: npx
+    args: ["-y", "@z_ai/mcp-server"]
+    env:
+      Z_AI_API_KEY: ${MCP_TEST_KEY}
+  websearch:
+    transport: streamable_http
+    url: "https://api.z.ai/api/mcp/web_search_prime/mcp"
+    headers:
+      Authorization: "Bearer $MCP_TEST_KEY"
+"""
+
+
+def test_mcp_env_expansion(tmp_path, monkeypatch):
+    """$VAR / ${VAR} in env / headers (and other string values) expand from the process environment."""
+    monkeypatch.setenv("MCP_TEST_KEY", "sk-test-123")
+    servers = get_mcp_servers(_write_config(tmp_path, _MCP_YAML))
+    assert servers["zai"]["env"]["Z_AI_API_KEY"] == "sk-test-123"
+    assert servers["websearch"]["headers"]["Authorization"] == "Bearer sk-test-123"
+
+
+def test_mcp_env_expansion_unset_keeps_raw(tmp_path, monkeypatch, caplog):
+    """An unset variable keeps its raw reference with a warning — load_config must stay env-independent."""
+    monkeypatch.delenv("MCP_TEST_KEY", raising=False)
+    with caplog.at_level("WARNING"):
+        servers = get_mcp_servers(_write_config(tmp_path, _MCP_YAML))
+    assert servers["zai"]["env"]["Z_AI_API_KEY"] == "${MCP_TEST_KEY}"
+    assert servers["websearch"]["headers"]["Authorization"] == "Bearer $MCP_TEST_KEY"
+    msgs = " ".join(r.message for r in caplog.records)
+    assert "$MCP_TEST_KEY" in msgs
+
+
+def test_mcp_env_expansion_no_dollar_untouched(tmp_path):
+    """Literal values (no $ reference) pass through verbatim — zero behavior change."""
+    servers = get_mcp_servers(_write_config(tmp_path, _MCP_YAML.replace(
+        "${MCP_TEST_KEY}", "sk-literal").replace("$MCP_TEST_KEY", "sk-literal")))
+    assert servers["zai"]["env"]["Z_AI_API_KEY"] == "sk-literal"

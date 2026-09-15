@@ -3,7 +3,8 @@ the shared slot table).
 
 - normalize_plugins: unknown slot / illegal value fail fast; values are
   str/None only (the callable transition window is closed)
-- slot table: loop / fsm / messages_builder / agent_hooks / llm
+- slot table: loop / fsm / messages_builder / agent_hooks (the "llm" slot
+  died with the app-config redesign — LLM selection lives in settings)
 - Pattern sugar: the agent_hooks param folds into the plugins dict (dict
   value wins); node plugins carry the same normalization
 - label helper: executor family slots report executor_<family>
@@ -22,18 +23,18 @@ from nexus.model.plugins_field import (
 
 def test_slot_table():
     assert set(PLUGIN_KINDS) == {
-        "loop", "fsm", "messages_builder", "agent_hooks", "llm"}
+        "loop", "fsm", "messages_builder", "agent_hooks"}
     assert PLUGIN_KINDS["loop"] == "executor"
     assert PLUGIN_KINDS["fsm"] == "executor"
     assert PLUGIN_KINDS["messages_builder"] == "messages_builder"
     assert PLUGIN_KINDS["agent_hooks"] == "agent_hooks"
-    assert PLUGIN_KINDS["llm"] == ""  # settings-resolved, no registry kind
 
 
 def test_normalize_plugins_accepts_str_and_none():
     merged = normalize_plugins(
-        {"loop": "default_loop", "fsm": None, "llm": "openai"})
-    assert merged == {"loop": "default_loop", "fsm": None, "llm": "openai"}
+        {"loop": "default_loop", "fsm": None, "agent_hooks": "pkg_a"})
+    assert merged == {"loop": "default_loop", "fsm": None,
+                      "agent_hooks": "pkg_a"}
 
 
 def test_unknown_slot_raises():
@@ -74,10 +75,16 @@ def test_node_plugins_normalized():
     with pytest.raises(ValueError, match="槽位名非法"):
         BaseNode(code="x", plugins={"bad_slot": "y"})
     with pytest.raises(ValueError, match="str/None"):
-        BaseNode(code="x", plugins={"llm": {"model": "m"}})
+        BaseNode(code="x", plugins={"loop": {"model": "m"}})
+
+
+def test_llm_slot_died_with_app_config():
+    """The plugins["llm"] declaration was replaced by the app-config
+    overlay: the slot is no longer in the vocabulary (fail fast)."""
+    with pytest.raises(ValueError, match="槽位名非法"):
+        normalize_plugins({"llm": "openai"})
 
 
 def test_slot_label():
     assert plugins_slot_label("loop") == "executor_loop"
     assert plugins_slot_label("fsm") == "executor_fsm"
-    assert plugins_slot_label("llm") == "llm"

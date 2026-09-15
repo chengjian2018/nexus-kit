@@ -16,9 +16,7 @@ loop               executor            AGENT 节点执行器（ReAct 工具循�
                                         自定义 / 规则 executor）
 fsm                executor            FSM 执行器（pattern_type="fsm"）
 messages_builder   messages_builder    AGENT 消息构建器
-agent_hooks        agent_hooks         agent 循环 hooks 包
-llm                llm_providers code  LLM provider code（settings 解析，
-                                        声明式只存 code，不内联密钥）
+agent_hooks        agent_hooks          agent 循环 hooks 包
 =================  ===================  =================================
 
 Resolution chains (node over pattern, the two-layer successor of the old
@@ -29,21 +27,20 @@ module > pattern):
 - executor（FSM pattern）: ``pattern.plugins["fsm"]`` > default_fsm
 - messages_builder / agent_hooks: ``node.plugins[key]`` >
   ``pattern.plugins[key]`` > kernel default / empty passthrough
-- llm: ``node.plugins["llm"]`` > ``pattern.plugins["llm"]`` > settings 的
-  pattern_llm 分层解析（见 nexus.settings.get_llm_config）
+
+LLM selection is NOT a plugins slot: it lives in settings
+（llm_default ⊕ app config ⊕ metadata override，见 nexus.settings.
+get_llm_config——per-app config 接管了旧的 plugins["llm"] 声明位）。
 """
 
 from typing import Any, Dict, Optional
 
 # slot name → plugin-registry kind (a new extension point is one line here).
-# "llm" has no registry kind — its value is an llm_providers code resolved
-# by nexus.settings at refresh time (R1/R3/R4), not a plugin instance.
 PLUGIN_KINDS: Dict[str, str] = {
     "loop": "executor",
     "fsm": "executor",
     "messages_builder": "messages_builder",
     "agent_hooks": "agent_hooks",
-    "llm": "",  # settings-resolved (llm_providers code)
 }
 
 # executor-family slots (mirror the pattern_type dispatch: loop drives AGENT

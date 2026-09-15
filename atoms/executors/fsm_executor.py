@@ -103,8 +103,7 @@ def _emit_node_jump(stream_emitter, before: str, after: str) -> None:
 def _refresh_llm_config_by_node(ec):
     """R3 refresh via a session-like shim (the kernel helper reads
     session.pattern / session.pattern_code / session.cxt; ec carries the
-    same data — pattern included, for the node/pattern plugins["llm"]
-    resolution)."""
+    same data — pattern_code included, for the app layered lookup)."""
     from nexus.engine.chat import _refresh_llm_config
 
     class _Shim:
