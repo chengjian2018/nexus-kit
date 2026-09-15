@@ -1,17 +1,19 @@
 """Serialization regression for concurrent turns on the same session (audit
 M-4).
 
-Production code relies on ``async with session.turn_lock`` inside
-``_run_chat_turn_core`` to keep concurrent turns on the same session from
-interleaving begin_turn resets and history appends (buyer retry / channel
-replay scenarios); the only related test previously just asserted
-``isinstance(turn_lock, asyncio.Lock)``. This is behavior-level verification:
+The per-session turn_lock now lives INSIDE the engine's turn task
+(docs/design/session-persistence.md §5 — it must span the settled callback
+and survive SSE detach), so the host layer no longer holds it around
+``chat``. This is behavior-level verification of the same invariant:
 
 - Two concurrent turns on the same session: history holds two complete
   (user, assistant) pairs, never interleaved (adjacent user rows = the
   direct symptom of failed serialization)
 - Across sessions: a slow turn does not block other sessions (the lock is
   per-session)
+
+The stub chat mirrors the real engine's contract: it acquires the session
+lock for the whole turn, exactly as chat_turn_stream's turn task does.
 """
 
 import asyncio
@@ -51,11 +53,14 @@ def _install_chat(monkeypatch, *sessions: Session):
 
 def _make_stub_chat():
     async def stub_chat(query, session_id, all_sessions, store=None, **kw):
-        cxt = all_sessions[session_id].cxt
-        await cxt.add_message("user", query, stage="chat")
-        await asyncio.sleep(0.2)  # slow LLM: leaves ample window for concurrent interleaving
-        await cxt.add_message("assistant", f"reply::{query}", stage="chat")
-        return f"reply::{query}"
+        # 锁在引擎 turn task 内持有（session-persistence §5）——stub 镜像该契约
+        session = all_sessions[session_id]
+        async with session.turn_lock:
+            cxt = session.cxt
+            await cxt.add_message("user", query, stage="chat")
+            await asyncio.sleep(0.2)  # slow LLM: leaves ample window for concurrent interleaving
+            await cxt.add_message("assistant", f"reply::{query}", stage="chat")
+            return f"reply::{query}"
 
     return stub_chat
 

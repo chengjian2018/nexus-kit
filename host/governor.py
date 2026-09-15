@@ -10,7 +10,7 @@ not affect the running dialogue.
 import logging
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 
 from nexus.engine.session import Session
 
@@ -24,10 +24,19 @@ MAX_SESSIONS = 10_000
 
 
 class SessionGovernor:
-    """In-memory session table with sliding-TTL renewal and over-limit LRU eviction."""
+    """In-memory session table with sliding-TTL renewal and over-limit LRU eviction.
+
+    ``protected`` (optional) returns the set of session ids that must never be
+    evicted/purged — the host injects the turn registry's running ids so a
+    session with an in-flight (possibly detached/backgrounded) turn stays in
+    memory until the turn settles; evicting it mid-turn would let the next
+    request recreate the Session object with a fresh turn_lock and truly run
+    two turns of one session concurrently.
+    """
 
     def __init__(self, ttl_seconds: float = SESSION_TTL_SECONDS,
-                 max_sessions: int = MAX_SESSIONS):
+                 max_sessions: int = MAX_SESSIONS,
+                 protected: Optional[Callable[[], Set[str]]] = None):
         self.ttl_seconds = ttl_seconds
         self.max_sessions = max_sessions
         self.sessions: Dict[str, Session] = {}
@@ -37,6 +46,17 @@ class SessionGovernor:
         # Serializes concurrent access to sessions / last_active (launch
         # registration, chat lookup, TTL and over-limit eviction)
         self.lock = threading.Lock()
+        self._protected = protected
+
+    def _protected_ids(self) -> Set[str]:
+        """Current protected-ids snapshot (lock helper; empty when unset)."""
+        if self._protected is None:
+            return set()
+        try:
+            return self._protected() or set()
+        except Exception:
+            logger.exception("protected 会话集合查询失败（按空集处理）")
+            return set()
 
     # ------------------------------------------------------------------
     # Lock-held primitives
@@ -47,11 +67,13 @@ class SessionGovernor:
         self.last_active[session_id] = time.monotonic()
 
     def _purge_expired(self) -> int:
-        """Purge sessions idle beyond ttl_seconds (lock held)."""
+        """Purge sessions idle beyond ttl_seconds (lock held); sessions with
+        an in-flight turn are shielded (mid-turn eviction breaks the turn)."""
         now = time.monotonic()
+        protected = self._protected_ids()
         expired = [
             sid for sid, ts in self.last_active.items()
-            if now - ts > self.ttl_seconds
+            if now - ts > self.ttl_seconds and sid not in protected
         ]
         for sid in expired:
             self.sessions.pop(sid, None)
@@ -63,10 +85,19 @@ class SessionGovernor:
     def _evict_oldest_if_over_limit(self) -> int:
         """Evict the least-recently-active sessions once the count reaches
         max_sessions (lock held), so the total stays within the cap after
-        insertion."""
+        insertion; sessions with an in-flight turn are shielded."""
+        protected = self._protected_ids()
         evicted = []
-        while len(self.sessions) >= self.max_sessions and self.last_active:
-            oldest_sid = min(self.last_active, key=self.last_active.get)
+        while len(self.sessions) >= self.max_sessions:
+            candidates = [sid for sid in self.last_active
+                          if sid not in protected]
+            if not candidates:
+                logger.warning(
+                    "会话数达到上限 %d 且全部有进行中对话轮，放弃逐出",
+                    self.max_sessions,
+                )
+                break
+            oldest_sid = min(candidates, key=self.last_active.get)
             self.sessions.pop(oldest_sid, None)
             self.last_active.pop(oldest_sid, None)
             evicted.append(oldest_sid)

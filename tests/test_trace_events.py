@@ -5,11 +5,15 @@ TraceEvent) at every state transition a streaming consumer wants to see live:
 
 - FSM    : node_jump (only when the node moved) + conversation_end + the
            reply as a single delta (stages are one-shot, no token stream)
-- AGENT  : node_start / node_end per graph step (with node_code + step),
+- AGENT  : node_start / node_end per graph step (with node_code + step;
+           node_end additionally carries the result brief — content / next
+           / wait_human / sends, keys present only when set),
            graph_wait / graph_resume around a wait_human suspension,
            graph_done on termination (terminal / is_end / max_steps /
            undeclared_edge), plus tool_call / tool_result per dispatch
            (synthetic flag marks the intercepted-backfill rows)
+- thinking models: reasoning deltas stream as kind="thinking" events on
+  both the agent loop and the stage reply tap (aggregation ignores them)
 
 The module-jump family (module_jump / route_hit / route_root / defer_switch
 / module_start) is gone with the module layer. FSM stay-in-place turns emit
@@ -225,6 +229,62 @@ def test_agent_tool_round_traces():
     assert events[-1].result.text == "答案是42"
 
 
+def test_node_end_trace_carries_result_brief():
+    """node_end 携带执行结果摘要（content/next），实时消费者能看到节点
+    产出了什么而不只是「完成了」；缺席键不进 data（wire 紧凑）。"""
+
+    class _RouterExecutor(NodeExecutor):
+        async def execute(self, ec: ExecutionContext) -> TurnResult:
+            if ec.node.code == "n1":
+                return TurnResult(content="第一步产物", next="n2")
+            return TurnResult(content="最终产物")
+
+    plugin_registry.register("executor", "te_router", _RouterExecutor)
+    p = Pattern(code="rp", name="t", description="t",
+                nodes=[BaseNode(code="n1", name="一", sub_nodes=["n2"],
+                                plugins={"loop": "te_router"}),
+                       BaseNode(code="n2", name="二",
+                                plugins={"loop": "te_router"})])
+    s = _bind(Session(session_id="rp", pattern_code="rp"), p)
+    with patch("nexus.engine.chat.get_llm_config",
+               return_value={"code": "x", "model": "m"}):
+        events = _collect(chat_turn_stream("跑", "rp", {"rp": s}))
+
+    ends = [e.trace for e in events
+            if getattr(e.trace, "event", "") == "node_end"]
+    assert len(ends) == 2
+    assert ends[0].data["content"] == "第一步产物"
+    assert ends[0].data["next"] == "n2"
+    assert ends[1].data["content"] == "最终产物"
+    assert "next" not in ends[1].data
+    assert events[-1].result.text == "最终产物"
+
+
+def test_thinking_chunks_stream_as_thinking_events():
+    """thinking 模型的 reasoning 增量以 kind="thinking" 实时透出，不混入
+    回复 delta；聚合结果（done.result）不受影响。"""
+    from nexus.llm.types import LLMChunk
+
+    class _ThinkingProvider:
+        async def achat_completion_stream(self, messages, model,
+                                          temperature=0.7, max_tokens=2048,
+                                          **kwargs):
+            yield LLMChunk(text="", reasoning="先想一想")
+            yield LLMChunk(text="答", reasoning="再想想")
+            yield LLMChunk(text="案", finish_reason="stop")
+
+    s = _agent_session()
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=_ThinkingProvider()):
+        events = _collect(chat_turn_stream("q", "as", {"as": s}))
+
+    thinks = [e.text for e in events if e.kind == "thinking"]
+    assert thinks == ["先想一想", "再想想"]
+    deltas = [e.text for e in events if e.kind == "delta"]
+    assert deltas == ["答", "案"]
+    assert events[-1].result.text == "答案"
+
+
 # ============================================================================
 # AGENT graph: graph_wait / graph_resume around a wait_human suspension
 # ============================================================================
@@ -423,6 +483,33 @@ def test_unified_stage_streams_reply_incrementally():
     assert _kinds(events) == [("delta", None)] * len(deltas) + [
         ("trace", "node_jump"), ("trace", "conversation_end"),
         ("done", None)]
+
+
+def test_unified_stage_streams_thinking_events():
+    """stage 回复流（stream_llm_reply）同样转发 reasoning 增量为 thinking
+    事件；reply 字段的增量仍走 delta，两者互不污染。"""
+
+    class _ThinkingChunkProvider:
+        async def achat_completion_stream(self, messages, model,
+                                          temperature=0.7, max_tokens=2048,
+                                          **kwargs):
+            from nexus.llm.types import LLMChunk
+            yield LLMChunk(text="", reasoning="用户想登记")
+            yield LLMChunk(text='{"reply": "已记录", ',
+                           finish_reason="")
+            yield LLMChunk(text='"next_node": "n2", "slots": {}}',
+                           finish_reason="stop")
+
+    s = _bind(Session(session_id="us2", pattern_code="fp"), _fsm_pattern())
+    with patch("nexus.llm.resolve.build_provider",
+               return_value=_ThinkingChunkProvider()):
+        events = _collect(chat_turn_stream("q", "us2", {"us2": s}))
+
+    thinks = [e.text for e in events if e.kind == "thinking"]
+    assert thinks == ["用户想登记"]
+    assert "".join(e.text for e in events if e.kind == "delta") == "已记录"
+    assert events[-1].result.text == "已记录"
+    assert s.cxt.current_node_code == "n2"
 
 
 def test_two_stage_nlg_streams_reply():

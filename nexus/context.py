@@ -145,6 +145,12 @@ class DialogueContext:
     # side — they must never block the dialogue.
     message_sink: Optional[Any] = None
 
+    # Per-trace-event write-through hook (same shape and failure contract as
+    # message_sink; injected by SessionStore.attach). The engine's turn task
+    # fans kind="trace" events here (append-only trail — facts, written as
+    # they happen) while the SSE queue remains the real-time channel.
+    trace_sink: Optional[Any] = None
+
     # Cumulative count of message_sink write failures (per process lifetime).
     # A missed row makes DB < memory permanently (no backfill path exists);
     # compression checks this counter when it abandons on DB/memory mismatch,

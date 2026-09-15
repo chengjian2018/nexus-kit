@@ -9,6 +9,9 @@ equivalence is what the tests pin).
 Event kinds:
 - "delta": a text increment of the in-flight module's reply (optimistic
   forwarding — see the caveat below)
+- "thinking": a thinking-model reasoning increment (LLMChunk.reasoning —
+  the model's intermediate thought, never part of the reply); real-time
+  consumers render it separately, aggregation ignores it
 - "round": an agent-loop round boundary with its outcome
   ({"outcome": "tool"|"final"|"transfer"|"max_rounds", "round_idx": n})
 - "trace": a state-transition observability event (jump routing / node
@@ -63,8 +66,8 @@ def reset_streamed_reply() -> None:
 class ChatStreamEvent:
     """One streamed event of a dialogue turn."""
 
-    kind: str  # "delta" | "round" | "trace" | "done"
-    text: str = ""                                  # delta: text increment
+    kind: str  # "delta" | "thinking" | "round" | "trace" | "done"
+    text: str = ""                                  # delta/thinking: text increment
     round_info: Optional[Dict[str, Any]] = None     # round: outcome info
     trace: Optional["TraceEvent"] = None            # trace: transition event
     result: Optional[ChatResult] = None             # done: terminal ChatResult
@@ -80,7 +83,9 @@ class ChatStreamEvent:
 # (worker instances of a runtime sends dispatch) + graph_compile.
 TRACE_EVENT_NAMES = (
     "node_start",        # an AGENT graph node's execution begins
-    "node_end",          # an AGENT graph node's execution finished
+    "node_end",          # an AGENT graph node's execution finished (data
+                         # carries the result brief: content / next /
+                         # wait_human / sends, keys present only when set)
     "node_jump",         # FSM end-of-turn node transition
     "graph_compile",     # a fresh graph run started (compiled shape summary)
     "graph_wait",        # AGENT graph suspended (wait_human)
@@ -89,7 +94,7 @@ TRACE_EVENT_NAMES = (
                          # is_end / max_steps / undeclared_edge)
     "fanout_start",      # a node dispatched N worker instances
     "branch_start",      # one worker instance began (branch_id)
-    "branch_end",        # one worker instance settled (ok/error)
+    "branch_end",        # one worker instance settled (ok/error + content brief)
     "fanout_join",       # all instances settled, join node fires
     "tool_call",         # agent loop: one tool invocation issued
     "tool_result",       # agent loop: one tool invocation returned
@@ -98,6 +103,9 @@ TRACE_EVENT_NAMES = (
                          # the generic-text done; lets real-time consumers
                          # flag the failure instead of string-matching the
                          # done text — aggregation ignores it, per protocol)
+    "app_trace",         # app-level final-state trace picked up at turn end
+                         # (e.g. archify's metadata[_TRACE_KEY] — one event
+                         # per app key, data carries the app's own dict)
 )
 
 
@@ -161,6 +169,12 @@ class StreamEmitter:
             self._append(ChatStreamEvent(kind="delta", text=text,
                                          branch_id=branch_id))
 
+    def emit_thinking(self, text: str, branch_id: str = "") -> None:
+        """Forward a thinking-model reasoning increment (kind="thinking")."""
+        if text:
+            self._append(ChatStreamEvent(kind="thinking", text=text,
+                                         branch_id=branch_id))
+
     def emit_round(self, outcome: str, round_idx: int,
                    branch_id: str = "") -> None:
         self._append(ChatStreamEvent(
@@ -201,6 +215,9 @@ class BranchStreamEmitter:
 
     def emit_delta(self, text: str) -> None:
         self._inner.emit_delta(text, branch_id=self._branch_id)
+
+    def emit_thinking(self, text: str) -> None:
+        self._inner.emit_thinking(text, branch_id=self._branch_id)
 
     def emit_round(self, outcome: str, round_idx: int) -> None:
         self._inner.emit_round(outcome, round_idx, branch_id=self._branch_id)
@@ -424,6 +441,9 @@ async def stream_llm_reply(chunks: AsyncGenerator[Any, None],
                 if delta:
                     forwarded.append(delta)
                     emitter.emit_delta(delta)
+            reasoning = getattr(chunk, "reasoning", "") or ""
+            if reasoning and emitter is not None:
+                emitter.emit_thinking(reasoning)
             yield chunk
 
     result = await acollect_stream(_tap())

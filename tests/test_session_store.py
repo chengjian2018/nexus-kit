@@ -542,3 +542,136 @@ def test_replace_history_midway_failure_rolls_back_delete(tmp_path, monkeypatch)
     assert [m.content for m in history] == [
         "旧问题", "旧回答", "新问题", "新回答", "又一条"]
     arun(store.close())
+
+
+# ============================================================================
+# trace_events（append-only 过程轨迹，docs/design/session-persistence.md §4）
+# ============================================================================
+
+def _trace_row(session_id="s1", kind="node_start", turn_id="req-turn-9",
+               payload=None):
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "kind": kind,
+        "payload": payload or {"node_code": "af_route", "data": {"step": 1}},
+    }
+
+
+def test_append_trace_roundtrip_and_pagination(tmp_path):
+    """trace rows land with epoch lookup + id ordering; turn filter and the
+    id cursor paginate; a missing session returns None (mirrors get_messages)."""
+    db = str(tmp_path / "t.db")
+    store = arun(SessionStore.create(db))
+    session = make_session()
+    arun(store.create_session(session))
+
+    for i in range(3):
+        arun(store.append_trace(session, _trace_row(
+            kind=f"ev{i}", turn_id="req-turn-9" if i < 2 else "req-turn-10",
+            payload={"n": i})))
+
+    rows = arun(store.get_trace_events("s1"))
+    assert [r["kind"] for r in rows] == ["ev0", "ev1", "ev2"]
+    assert rows[0]["turn_id"] == "req-turn-9"
+    assert rows[0]["launch_epoch"] == 0
+    assert rows[0]["payload"] == {"n": 0}
+    assert rows[0]["truncated"] is False
+
+    # turn 过滤
+    rows_t9 = arun(store.get_trace_events("s1", turn_id="req-turn-9"))
+    assert [r["kind"] for r in rows_t9] == ["ev0", "ev1"]
+    # id 游标翻页（after_id 独占）
+    rows_page2 = arun(store.get_trace_events("s1", after_id=rows[0]["id"],
+                                             limit=1))
+    assert [r["kind"] for r in rows_page2] == ["ev1"]
+    # 未知会话
+    assert arun(store.get_trace_events("no-such")) is None
+    arun(store.close())
+
+
+def test_append_trace_truncates_oversize_payload(tmp_path):
+    """超限 payload 截断为 preview + truncated 标记；base64 data-URI 同样拦截
+    （二进制不进 trace 行）。"""
+    db = str(tmp_path / "t.db")
+    store = arun(SessionStore.create(db))
+    session = make_session()
+    arun(store.create_session(session))
+
+    big = "x" * (8 * 1024 + 100)
+    arun(store.append_trace(session, _trace_row(
+        kind="tool_result", payload={"result": big})))
+    arun(store.append_trace(session, _trace_row(
+        kind="tool_result", payload={"img": "data:image/png;base64,AAAA"})))
+    arun(store.append_trace(session, _trace_row(
+        kind="node_start", payload={"ok": True})))
+
+    rows = arun(store.get_trace_events("s1"))
+    assert rows[0]["truncated"] is True
+    assert rows[0]["payload"]["_truncated"] is True
+    assert len(rows[0]["payload"]["_preview"]) <= 8 * 1024
+    assert rows[1]["truncated"] is True          # data-URI 被拦截
+    assert rows[2]["truncated"] is False
+    arun(store.close())
+
+
+def test_attach_wires_trace_sink(tmp_path):
+    """attach 同时挂 message_sink 与 trace_sink（trace_sink 指向 append_trace）。"""
+    db = str(tmp_path / "t.db")
+    store = arun(SessionStore.create(db))
+    session = make_session()
+    arun(store.create_session(session))
+    store.attach(session)
+    assert session.cxt.message_sink is not None
+    assert session.cxt.trace_sink is not None
+    # 经 trace_sink 写一条（引擎 choke point 的调用形态）
+    arun(session.cxt.trace_sink(_trace_row(turn_id="req-s1")))
+    rows = arun(store.get_trace_events("s1"))
+    assert len(rows) == 1 and rows[0]["kind"] == "node_start"
+    arun(store.close())
+
+
+def test_list_sessions_session_id_contains(tmp_path):
+    """session_id_contains LIKE narrowing: user % / _ stay literal (escaped)."""
+    db = str(tmp_path / "t.db")
+    store = arun(SessionStore.create(db))
+    for sid in ("abc_def_1", "abcxdefy1", "other"):
+        arun(store.create_session(make_session(sid)))
+
+    hits = arun(store.list_sessions(session_id_contains="c_def"))
+    assert [r["session_id"] for r in hits] == ["abc_def_1"]
+
+    # % 不得作为通配符生效
+    hits = arun(store.list_sessions(session_id_contains="c%def"))
+    assert hits == []
+    # _ 不得匹配任意字符：'abc_def_1' 若未转义会同时命中 'abcxdefy1'
+    hits = arun(store.list_sessions(session_id_contains="abc_def_1"))
+    assert [r["session_id"] for r in hits] == ["abc_def_1"]
+    hits = arun(store.list_sessions(session_id_contains="bc_d"))
+    assert [r["session_id"] for r in hits] == ["abc_def_1"]
+
+    # 与 pattern_code 组合
+    arun(store.create_session(make_session("abc_def_x", pattern_code="other")))
+    hits = arun(store.list_sessions(pattern_code="other",
+                                    session_id_contains="abc_def"))
+    assert [r["session_id"] for r in hits] == ["abc_def_x"]
+    arun(store.close())
+
+
+def test_get_session_summary_row(tmp_path):
+    """Single summary row (list-row shape + request_id/task_info/filled_slots); None when missing."""
+    db = str(tmp_path / "t.db")
+    store = arun(SessionStore.create(db))
+    _seed_two_sessions(store)
+
+    row = arun(store.get_session("sa"))
+    assert row is not None
+    assert row["session_id"] == "sa"
+    assert row["pattern_code"] == "xianyu_agent"
+    assert row["request_id"] == "req-sa"
+    assert json.loads(row["task_info"]) == {"caller": "pytest"}
+    assert row["message_count"] == 2
+    assert row["created_at"] > 0 and row["last_active_at"] > 0
+
+    assert arun(store.get_session("missing")) is None
+    arun(store.close())

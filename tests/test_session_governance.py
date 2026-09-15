@@ -182,3 +182,77 @@ def test_concurrent_duplicate_launch(registry_guard):
     assert results.count("409") == 7
     assert list(main.governor.sessions) == ["gov-race"]
     assert list(main.governor.last_active) == ["gov-race"]
+
+
+# ============================================================================
+# Turn registry + eviction shield（docs/design/session-persistence.md §5）
+# ============================================================================
+
+def test_governor_shields_sessions_with_running_turn(client, registry_guard,
+                                                     monkeypatch):
+    """有进行中对话轮的 session 不被 TTL 清理/LRU 逐出（中途逐出会配上
+    新建的 Session/新锁，同 session 两轮真并发）。"""
+    import asyncio
+    import contextlib
+
+    import host.main as main
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    async def _scenario():
+        task = asyncio.create_task(_never())
+        main.turn_registry.register("gov-shield", task)
+        try:
+            # 1) TTL 清理跳过
+            monkeypatch.setattr(main.governor, "ttl_seconds", 60)
+            with main.governor.lock:
+                main.governor.last_active["gov-shield"] = (
+                    time.monotonic() - 61)
+            assert main.governor.get("gov-shield") is not None
+            assert "gov-shield" in main.governor.sessions
+
+            # 2) LRU 逐出跳过（cap 压到 1，唯一候选受保护 → 放弃逐出）
+            monkeypatch.setattr(main.governor, "max_sessions", 1)
+            assert launch(client, "gov-other")["status"] is True
+            assert "gov-shield" in main.governor.sessions
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert launch(client, "gov-shield")["status"] is True
+    arun_run(_scenario())
+
+
+def test_turn_registry_lifecycle():
+    """registry：注册即 has_running；done 回调自动注销；cancel_all 等待落定。"""
+    import asyncio
+
+    from host.turns import TurnRegistry
+
+    async def _sleepy():
+        await asyncio.sleep(60)
+
+    async def _scenario():
+        reg = TurnRegistry()
+        t = asyncio.create_task(_sleepy())
+        reg.register("s1", t)
+        t.add_done_callback(lambda x: reg.unregister("s1", x))
+        assert reg.has_running("s1") is True
+        assert reg.running_session_ids() == {"s1"}
+
+        await reg.cancel_all()
+        assert t.cancelled()
+        await asyncio.sleep(0)                 # done 回调执行
+        assert reg.has_running("s1") is False
+        assert reg.running_session_ids() == set()
+        # 注销幂等
+        reg.unregister("s1", t)
+
+    arun_run(_scenario())
+
+
+def arun_run(coro):
+    from async_utils import arun
+    arun(coro)

@@ -279,7 +279,8 @@ def fake_chat(monkeypatch):
 
     calls = []
 
-    async def _chat(query, session_id, all_sessions, store=None):
+    # on_settled/turn_task_out：宿主层轮次托管的新契约参数（stub 不消费）
+    async def _chat(query, session_id, all_sessions, store=None, **kwargs):
         calls.append((session_id, query))
         session = all_sessions[session_id]
         await session.cxt.add_message("user", query, stage="chat")

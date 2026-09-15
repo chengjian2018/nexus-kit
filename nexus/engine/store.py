@@ -17,6 +17,7 @@ path)`` (open + WAL + schema); there is no sync constructor.
 import contextlib
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,11 @@ from nexus.engine.session import Session
 from nexus.context import SessionMessage
 
 logger = logging.getLogger(__name__)
+
+# 单事件 payload 上限（序列化后字符数；超出截断存 preview + truncated 标记），
+# 并拒绝 base64 data-URI（二进制不进 trace 行——审计trail保持轻量文本形态）
+_TRACE_PAYLOAD_LIMIT = 8 * 1024
+_DATA_URI_RE = re.compile(r"data:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+;base64,")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -55,6 +61,23 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+
+-- Append-only trace trail (docs/design/session-persistence.md §4): kind="trace"
+-- events are *facts already happened* — persisted as they fire (mid-turn
+-- included, unlike the end-of-turn sessions snapshot). The autoincrement id
+-- IS the global ordering; turn_id carries the initiating request_id.
+CREATE TABLE IF NOT EXISTS trace_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL REFERENCES sessions(session_id),
+    turn_id      TEXT NOT NULL DEFAULT '',
+    launch_epoch INTEGER NOT NULL DEFAULT 0,
+    kind         TEXT NOT NULL,
+    payload      TEXT NOT NULL DEFAULT '{}',
+    truncated    INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trace_session ON trace_events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_trace_turn    ON trace_events(session_id, turn_id, id);
 """
 
 
@@ -177,9 +200,15 @@ class SessionStore:
 
         The sink is a coroutine function (``add_message`` awaits it since the
         asyncio rewrite); the lambda returns the coroutine un-run.
+
+        trace_sink gets the same wiring for the append-only trace trail: the
+        engine's turn task fans each kind="trace" event to it (fire-and-forget
+        on the engine side, serialized per turn by a single writer).
         """
         session.cxt.message_sink = (
             lambda msg: self.append_message(session, msg))
+        session.cxt.trace_sink = (
+            lambda ev: self.append_trace(session, ev))
 
     async def save_snapshot(self, session: Session) -> None:
         """Write back the end-of-turn sessions state snapshot
@@ -241,6 +270,42 @@ class SessionStore:
                 msg.content,
                 msg.stage,
                 json.dumps(msg.metadata or {}, ensure_ascii=False),
+                time.time(),
+            ),
+        )
+        await self._conn.commit()
+
+    async def append_trace(self, session: Session, ev: Dict[str, Any]) -> None:
+        """Persist one trace event immediately (write side of trace_sink).
+
+        Shape of ``ev`` (built by the engine's per-turn choke point):
+        ``{session_id, turn_id, kind, payload}`` where payload is a
+        JSON-ready dict of the TraceEvent's remaining fields. The epoch is
+        looked up at write time (same idiom as append_message) and the
+        payload is capped: over-limit or base64-carrying payloads are stored
+        as a ``{"_truncated": true, "_preview": ...}`` placeholder — audit
+        rows stay lightweight text, the flag keeps the cut visible.
+        """
+        epoch = await self._current_epoch(session.session_id)
+        raw = json.dumps(ev.get("payload") or {}, ensure_ascii=False,
+                         default=str)
+        truncated = 0
+        if len(raw) > _TRACE_PAYLOAD_LIMIT or _DATA_URI_RE.search(raw):
+            raw = json.dumps(
+                {"_truncated": True, "_preview": raw[:_TRACE_PAYLOAD_LIMIT]},
+                ensure_ascii=False)
+            truncated = 1
+        await self._conn.execute(
+            """INSERT INTO trace_events
+               (session_id, turn_id, launch_epoch, kind, payload, truncated, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session.session_id,
+                ev.get("turn_id") or "",
+                epoch,
+                ev.get("kind") or "",
+                raw,
+                truncated,
                 time.time(),
             ),
         )
@@ -390,8 +455,13 @@ class SessionStore:
         pattern_code: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        session_id_contains: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Session list (descending by last_active_at), with message counts."""
+        """Session list (descending by last_active_at), with message counts.
+
+        ``session_id_contains`` narrows by a substring of session_id
+        (LIKE with ``%``/``_`` escaped — user input stays literal).
+        """
         sql = """
             SELECT s.session_id, s.pattern_code, s.launch_epoch,
                    s.current_node_code, s.graph_state,
@@ -401,13 +471,40 @@ class SessionStore:
             FROM sessions s
         """
         params: List[Any] = []
+        wheres: List[str] = []
         if pattern_code:
-            sql += " WHERE s.pattern_code = ?"
+            wheres.append("s.pattern_code = ?")
             params.append(pattern_code)
+        if session_id_contains:
+            escaped = (session_id_contains
+                       .replace("\\", "\\\\")
+                       .replace("%", "\\%")
+                       .replace("_", "\\_"))
+            wheres.append("s.session_id LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        if wheres:
+            sql += " WHERE " + " AND ".join(wheres)
         sql += " ORDER BY s.last_active_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = await self._conn.execute_fetchall(sql, params)
         return [dict(r) for r in rows]
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Single session summary row (same shape as ``list_sessions`` rows,
+        plus request_id/task_info/filled_slots); None if it does not exist."""
+        rows = await self._conn.execute_fetchall(
+            """SELECT s.session_id, s.pattern_code, s.launch_epoch,
+                      s.request_id, s.task_info, s.current_node_code,
+                      s.graph_state, s.filled_slots,
+                      s.created_at, s.last_active_at,
+                      (SELECT COUNT(*) FROM messages m
+                       WHERE m.session_id = s.session_id) AS message_count
+               FROM sessions s WHERE s.session_id = ?""",
+            (session_id,),
+        )
+        if not rows:
+            return None
+        return dict(rows[0])
 
     async def get_messages(self, session_id: str) -> Optional[List[Dict[str, Any]]]:
         """All messages of a session across every generation (with launch_epoch;
@@ -429,3 +526,43 @@ class SessionStore:
             d["metadata"] = json.loads(d["metadata"] or "{}")
             messages.append(d)
         return messages
+
+    async def get_trace_events(
+        self,
+        session_id: str,
+        turn_id: Optional[str] = None,
+        limit: int = 200,
+        after_id: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Trace trail of a session, ascending by id (the id IS the global
+        ordering); optional turn filter + id-cursor pagination (``after_id``
+        exclusive). Payload round-trips as a parsed dict. None if the
+        session does not exist (mirrors ``get_messages``).
+        """
+        exists_rows = await self._conn.execute_fetchall(
+            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        if not exists_rows:
+            return None
+        sql = """SELECT id, turn_id, launch_epoch, kind, payload, truncated, created_at
+                 FROM trace_events WHERE session_id = ?"""
+        params: List[Any] = [session_id]
+        if turn_id:
+            sql += " AND turn_id = ?"
+            params.append(turn_id)
+        if after_id > 0:
+            sql += " AND id > ?"
+            params.append(after_id)
+        sql += " ORDER BY id LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        rows = await self._conn.execute_fetchall(sql, params)
+        events = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["payload"] = json.loads(d["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d["payload"] = {"_unparsable": str(d["payload"])[:512]}
+            d["truncated"] = bool(d["truncated"])
+            events.append(d)
+        return events

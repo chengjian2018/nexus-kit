@@ -27,8 +27,9 @@ from nexus.registry.channels import discover_builtin_channels
 from nexus.registry.patterns import discover_builtin_patterns, registry as pattern_registry
 from nexus.registry.plugins import discover_builtin_plugins
 from nexus.registry.tools import discover_builtin_tools
-from nexus.settings import get_session_db_path, load_config
+from nexus.settings import get_session_db_path
 from host.governor import SessionGovernor
+from host.turns import TurnRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,16 @@ async def _api_key_guard(request, call_next):
                 )
     return await call_next(request)
 
+# In-flight turn registry (docs/design/session-persistence.md §5): holds the
+# strong reference to detached turn tasks, shields them from governor
+# eviction, guards re-launch and drives graceful-shutdown cancellation.
+turn_registry = TurnRegistry()
+
 # Session governance (TTL expiry + LRU cap); tunable via governor.ttl_seconds
-# / governor.max_sessions, replaceable wholesale in tests.
-governor = SessionGovernor()
+# / governor.max_sessions, replaceable wholesale in tests. Sessions with an
+# in-flight turn are eviction-shielded (mid-turn eviction would pair the
+# running turn with a recreated Session / fresh lock).
+governor = SessionGovernor(protected=turn_registry.running_session_ids)
 
 # Session persistence store (SQLite audit + restart restore); initialized at
 # startup, replaceable in tests.
@@ -167,22 +175,28 @@ async def _restore_sessions() -> int:
     return restored
 
 
-def _cross_check_pattern_llm(config_path: str = "") -> None:
-    """Cross-check that pattern_llm codes exist: unknown ones only warn, never block."""
+def _cross_check_app_configs() -> None:
+    """Cross-check the loaded app configs (apps/*/config.yaml, design
+    2026-09-15): the pattern binding is registered, node keys exist in that
+    pattern's node set. Unknown ones only warn, never block — an app config
+    for a not-yet-registered pattern is a normal transient (studio reload
+    ordering), the runtime falls back to the global config."""
+    from nexus.settings import _load_app_configs
+
     try:
-        pattern_llm = load_config(config_path).get("pattern_llm", {})
+        app_configs = _load_app_configs()
     except Exception:
-        logger.exception("加载配置失败，跳过 pattern_llm 交叉校验")
+        logger.exception("加载 app 配置失败，跳过 app 配置交叉校验")
         return
-    for pcode, pcfg in pattern_llm.items():
+    for pcode, app_cfg in app_configs.items():
         pattern = pattern_registry.get(pcode)
         if pattern is None:
-            logger.warning("pattern_llm 配置了未注册的 pattern '%s'", pcode)
+            logger.warning("app 配置绑定了未注册的 pattern '%s'", pcode)
             continue
-        for ncode in (pcfg.get("nodes") or {}):
+        for ncode in (app_cfg.get("nodes") or {}):
             if ncode not in pattern.node_map:
                 logger.warning(
-                    "pattern '%s' 的 pattern_llm.nodes 配置了未注册 node '%s'",
+                    "pattern '%s' 的 app 配置 nodes 配置了未注册 node '%s'",
                     pcode, ncode)
 
 
@@ -226,7 +240,7 @@ def _validate_registered_patterns() -> None:
 @app.on_event("startup")
 async def _startup_persistence() -> None:
     """Service startup: initialize the session store + restore non-expired
-    sessions + cross-check pattern_llm + start MCP connections."""
+    sessions + cross-check app configs + start MCP connections."""
     # heavy/blocking warm-ups go through to_thread so the startup loop stays responsive
     await _init_store()
     try:
@@ -234,19 +248,22 @@ async def _startup_persistence() -> None:
     except Exception:
         logger.exception("重启恢复失败，跳过恢复")
     # Warm up the knowledge-base connection (moves the tools' lazy-init
-    # fallback to startup); jieba first-load (~1s) off the loop.
+    # fallback to startup); jieba first-load (~1s) off the loop. Also seeds
+    # the console's default demo scope (idempotent, marker-guarded in
+    # kb_meta — an explicitly cleared scope stays empty across restarts).
     # Failure does not block the service.
     try:
-        from atoms.knowledge.store import get_knowledge_store
+        from atoms.knowledge.store import DEFAULT_DEMO_SCOPE, get_knowledge_store
 
         def _warm_kb():
             kb = get_knowledge_store()
+            kb.seed(DEFAULT_DEMO_SCOPE)
             return kb._conn and "ok"
         logger.info("知识库已启用: %s",
                     await asyncio.to_thread(_warm_kb))
     except Exception:
         logger.exception("初始化知识库失败，知识工具将在首次调用时重试")
-    await asyncio.to_thread(_cross_check_pattern_llm)
+    await asyncio.to_thread(_cross_check_app_configs)
     await asyncio.to_thread(_validate_registered_patterns)
     # MCP: spawn server connections on the main loop (registered lazily by
     # ensure_mcp_ready too — this just front-loads the startup race)
@@ -266,8 +283,17 @@ async def _startup_persistence() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown_stores() -> None:
-    """Service shutdown: release the knowledge-base / session-store / MCP connections."""
+    """Service shutdown: cancel in-flight turns, then release the
+    knowledge-base / session-store / MCP connections."""
     global store
+    # Cancel tracked turn tasks FIRST (before the store closes underneath
+    # them): cancellation keeps already-written messages/trace rows; the
+    # turn itself is discarded and re-run from scratch after a restart
+    # (existing semantics, no new resume behavior).
+    try:
+        await turn_registry.cancel_all()
+    except Exception:
+        logger.exception("取消进行中对话轮失败")
     try:
         from atoms.knowledge.store import close_knowledge_store
         await asyncio.to_thread(close_knowledge_store)
@@ -332,6 +358,7 @@ class SessionSummary(BaseModel):
     message_count: int
     created_at: float
     last_active_at: float
+    turn_running: bool = False
 
 
 class SessionListResponse(BaseModel):
@@ -356,6 +383,23 @@ class SessionMessagesResponse(BaseModel):
     message: str
     status: bool
     data: Dict[str, List[MessageItem]] = {}
+
+
+class TraceEventItem(BaseModel):
+    id: int
+    turn_id: str = ""
+    launch_epoch: int = 0
+    kind: str
+    payload: Dict[str, Any] = {}
+    truncated: bool = False
+    created_at: float
+
+
+class SessionTraceResponse(BaseModel):
+    code: str
+    message: str
+    status: bool
+    data: Dict[str, List[TraceEventItem]] = {}
 
 
 # ----Engine-op core (shared by endpoints and channels; main injects these functions into channels)----
@@ -384,6 +428,13 @@ async def _launch_session_core(
     if pattern is None:
         return None, "404", (
             f"pattern_code '{pattern_code}' 未注册，已注册: {pattern_registry.list_codes()}"
+        )
+
+    # Re-launch while a turn is in flight (possibly detached/backgrounded):
+    # rejected — the epoch bump would orphan the running turn's writes.
+    if turn_registry.has_running(session_id):
+        return None, "409", (
+            f"session_id '{session_id}' 有进行中的对话轮，请等待其结束后再重新发起"
         )
 
     session = Session(session_id=session_id, pattern_code=pattern_code)
@@ -422,56 +473,76 @@ def _get_session(session_id: str) -> Optional[Session]:
     return governor.get(session_id)
 
 
-async def _run_chat_turn_core(
-    session: Session, query: str
-) -> Tuple[Optional[str], Optional[Exception]]:
-    """Single chat-turn core: run chat + end-of-turn audit persistence.
-
-    Runs outside the lock (LLM calls are slow and must not block other
-    requests); chat re-fetches the session by session_id internally, and the
-    local session reference here exists only for persisting the snapshot —
-    even a concurrent eviction mid-turn does not affect this dialogue. The
-    exception path persists too (same as the success path). Messages were
-    already persisted per-message by the sink; end of turn only writes back
-    the state snapshot.
-
-    Returns:
-        (reply, error): error is None on success; reply is None only on the
-        exception path.
-    """
-    error: Optional[Exception] = None
-    try:
-        # Per-session serialization: concurrent turns on the same session_id
-        # (buyer retries / channel replays) would otherwise interleave
-        # begin_turn resets and history appends. Cross-session parallelism is
-        # unaffected — each session holds only its own lock (asyncio.Lock:
-        # waiters queue as tasks, the loop keeps serving other sessions).
-        async with session.turn_lock:
-            response_text = await chat(
-                query=query,
-                session_id=session.session_id,
-                all_sessions=governor.sessions,
-                store=store,
-            )
-    except Exception as e:
-        logger.exception("对话处理异常")
-        error = e
-
-    if store is not None:
-        try:
-            await store.save_snapshot(session)
-        except Exception:
-            logger.exception("会话轮末快照失败: session=%s", session.session_id)
-        # Audit finding M-1: sink failures never block the dialogue, but the
-        # silent degradation must stay visible — sessions with known missing
-        # rows get one warning per turn (compression also abandons them on
-        # the count mismatch)
+def _turn_settled_callback(session: Session):
+    """End-of-turn audit callback handed to the engine (invoked once per
+    settled turn, inside the turn task under the session lock — also for
+    turns detached from a disconnected SSE consumer). Audit parity with the
+    pre-detach host-side logic: state snapshot + sink-failure visibility."""
+    async def _settled() -> None:
+        if store is not None:
+            try:
+                await store.save_snapshot(session)
+            except Exception:
+                logger.exception("会话轮末快照失败: session=%s",
+                                 session.session_id)
         if session.cxt.sink_failure_count > 0:
             logger.warning(
                 "session=%s 存在未落库消息（本进程内 sink 失败 %d 次，"
                 "重启后该段对话将丢失）",
                 session.session_id, session.cxt.sink_failure_count,
             )
+    return _settled
+
+
+def _register_turn_task(session_id: str, task: Optional[Any]) -> None:
+    """Put an engine turn task under the registry (strong ref + eviction
+    shield + shutdown cancel); the done callback removes it on completion
+    however the turn ends — a detached turn outlives its response."""
+    if task is None:
+        return
+    turn_registry.register(session_id, task)
+    task.add_done_callback(
+        lambda t, sid=session_id: turn_registry.unregister(sid, t))
+
+
+async def _run_chat_turn_core(
+    session: Session, query: str
+) -> Tuple[Optional[str], Optional[Exception]]:
+    """Single chat-turn core: run chat + end-of-turn audit persistence.
+
+    The turn runs as a registry-tracked wrapper task (transport-agnostic —
+    POST / channels / SSE all own their turns through the same table); the
+    per-session serialization now lives INSIDE the engine's turn task (the
+    lock spans body + settled callback), so a queued same-session request
+    simply waits for its own engine task. The settled callback (snapshot +
+    sink-failure warning) runs inside the turn task while the lock is held.
+
+    Returns:
+        (reply, error): error is None on success; reply is None only on the
+        exception path.
+    """
+    holder: Dict[str, Any] = {}
+
+    async def _run() -> str:
+        return await chat(
+            query=query,
+            session_id=session.session_id,
+            all_sessions=governor.sessions,
+            store=store,
+            on_settled=_turn_settled_callback(session),
+            turn_task_out=holder,
+        )
+
+    task = asyncio.create_task(_run())
+    _register_turn_task(session.session_id, task)
+
+    error: Optional[Exception] = None
+    response_text: Optional[str] = None
+    try:
+        response_text = await task
+    except Exception as e:
+        logger.exception("对话处理异常")
+        error = e
 
     if error is not None:
         return None, error
@@ -500,6 +571,10 @@ async def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
             status=False,
             message=f"session_id '{chat_request.session_id}' 不存在或已过期，请先发起对话任务",
         )
+
+    # The initiating request's id marks this turn (trace rows' turn_id —
+    # per-turn trail identity, not the launch-time id).
+    session.cxt.metadata["request_id"] = chat_request.request_id
 
     response_text, error = await _run_chat_turn_core(session, chat_request.query)
 
@@ -531,22 +606,23 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
 
     Always mounted (the same NEXUS_API_KEY middleware covers it as any
     /api/v1/* endpoint; ops-console-prd §6.8 anticipated this promotion).
-    An async generator driving the async engine core; the per-session
-    turn_lock is held across yields by design: same-session requests queue
-    as tasks while the loop keeps serving other sessions.
 
     Event stream (text/event-stream, one JSON payload per line):
         data: {"kind": "delta", "text": "..."}
+        data: {"kind": "thinking", "text": "..."}
         data: {"kind": "round", "round_info": {"outcome": "tool|final|...", "round_idx": n}}
         data: {"kind": "trace", "trace": {"event": "node_start", "node_code": ...}}
         data: {"kind": "done", "result": {"text": "...", "actions": [...]}}
 
-    End-of-turn audit parity with /api/v1/chat (_run_chat_turn_core): the
-    state snapshot persists once the turn has SETTLED (done / error events
-    actually emitted). A client disconnect mid-stream cancels the engine
-    turn instead — the cxt then holds mid-walk markers (__step__ /
-    __paused_node__ / partial fanout) with no assistant reply; persisting
-    that snapshot would restore a half-executed walk after a restart.
+    TURN OWNERSHIP (docs/design/session-persistence.md §5): the turn task is
+    created by the engine, tracked in ``turn_registry``, and NOT cancelled by
+    a client disconnect — the generator closing early only detaches
+    consumption; the turn keeps running in the background, message/trace
+    sinks keep writing, and the end-of-turn snapshot fires through the
+    engine's ``on_settled`` callback when the turn actually settles. Same-
+    session requests still serialize (the engine's turn task holds the
+    per-session lock; waiters queue as tasks while the loop serves other
+    sessions).
     """
     import json as _json
 
@@ -560,66 +636,68 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
                      "message": f"session_id '{chat_request.session_id}' 不存在或已过期"},
         )
 
+    # The initiating request's id marks this turn (trace rows' turn_id).
+    session.cxt.metadata["request_id"] = chat_request.request_id
+
     async def _gen():
-        turn_settled = False
+        holder: Dict[str, Any] = {}
+        agen = chat_turn_stream(
+            query=chat_request.query,
+            session_id=chat_request.session_id,
+            all_sessions=governor.sessions,
+            store=store,
+            detach_on_close=True,
+            on_settled=_turn_settled_callback(session),
+            turn_task_out=holder,
+        )
         try:
-            async with session.turn_lock:
-                agen = chat_turn_stream(
-                    query=chat_request.query,
-                    session_id=chat_request.session_id,
-                    all_sessions=governor.sessions,
-                    store=store,
-                )
-                result = None
-                async for event in agen:
-                    if event.kind == "done":
-                        result = event.result
-                        turn_settled = True
-                        yield "data: " + _json.dumps({
-                            "kind": "done",
-                            "result": {"text": result.text,
-                                       "actions": result.actions},
-                        }, ensure_ascii=False) + "\n\n"
-                    elif event.kind == "round":
-                        yield "data: " + _json.dumps({
-                            "kind": "round",
-                            "round_info": event.round_info,
-                        }, ensure_ascii=False) + "\n\n"
-                    elif event.kind == "trace":
-                        yield "data: " + _json.dumps({
-                            "kind": "trace",
-                            "trace": (event.trace.to_dict()
-                                      if event.trace is not None else {}),
-                        }, ensure_ascii=False) + "\n\n"
-                    else:
-                        yield "data: " + _json.dumps({
-                            "kind": "delta", "text": event.text,
-                        }, ensure_ascii=False) + "\n\n"
-                del result
+            iterator = agen.__aiter__()
+            event = await iterator.__anext__()   # starts the engine turn task
+            # Track the turn from its first event on: strong ref + eviction
+            # shield + shutdown cancel. Unregistration happens via the task's
+            # done callback, so a detached (still-running) turn stays
+            # shielded until it settles.
+            _register_turn_task(chat_request.session_id, holder.get("task"))
+            while True:
+                if event.kind == "done":
+                    result = event.result
+                    yield "data: " + _json.dumps({
+                        "kind": "done",
+                        "result": {"text": result.text,
+                                   "actions": result.actions},
+                    }, ensure_ascii=False) + "\n\n"
+                    break
+                elif event.kind == "round":
+                    yield "data: " + _json.dumps({
+                        "kind": "round",
+                        "round_info": event.round_info,
+                    }, ensure_ascii=False) + "\n\n"
+                elif event.kind == "thinking":
+                    yield "data: " + _json.dumps({
+                        "kind": "thinking", "text": event.text,
+                    }, ensure_ascii=False) + "\n\n"
+                elif event.kind == "trace":
+                    yield "data: " + _json.dumps({
+                        "kind": "trace",
+                        "trace": (event.trace.to_dict()
+                                  if event.trace is not None else {}),
+                    }, ensure_ascii=False) + "\n\n"
+                else:
+                    yield "data: " + _json.dumps({
+                        "kind": "delta", "text": event.text,
+                    }, ensure_ascii=False) + "\n\n"
+                event = await iterator.__anext__()
+        except StopAsyncIteration:
+            pass
+        except asyncio.CancelledError:
+            raise   # client disconnect — the engine's detach path takes over
         except Exception:
             logger.exception("流式对话异常")
-            turn_settled = True
             yield "data: " + _json.dumps({
                 "kind": "error", "message": "对话处理异常，请稍后重试",
             }, ensure_ascii=False) + "\n\n"
         finally:
-            # Audit parity with _run_chat_turn_core — but ONLY when the turn
-            # actually settled (done / error reached the wire). A disconnect
-            # cancels the engine turn mid-walk; snapshotting then would
-            # persist half-executed graph state (skipped/duplicated node
-            # replies after a restart-restore).
-            if turn_settled and store is not None:
-                try:
-                    await store.save_snapshot(session)
-                except Exception:
-                    logger.exception(
-                        "会话轮末快照失败: session=%s", session.session_id)
-                if session.cxt.sink_failure_count > 0:
-                    logger.warning(
-                        "session=%s 存在未落库消息（本进程内 sink 失败 %d 次，"
-                        "重启后该段对话将丢失）",
-                        session.session_id, session.cxt.sink_failure_count,
-                    )
+            await agen.aclose()   # detach path: stops consumption, never the turn
 
     return fastapi.responses.StreamingResponse(
         _gen(), media_type="text/event-stream")
@@ -941,6 +1019,7 @@ async def list_sessions(
                 row["graph_state"] = _json.loads(raw_state or "{}")
             except ValueError:
                 row["graph_state"] = {}
+        row["turn_running"] = turn_registry.has_running(row["session_id"])
 
     return SessionListResponse(
         code="0", status=True, message="success", data={"sessions": sessions}
@@ -966,4 +1045,34 @@ async def get_session_messages(session_id: str) -> SessionMessagesResponse:
 
     return SessionMessagesResponse(
         code="0", status=True, message="success", data={"messages": messages}
+    )
+
+
+# func5 (read-only audit; docs/design/session-persistence.md §4.3)
+@app.get("/api/v1/sessions/{session_id}/trace")
+async def get_session_trace(
+    session_id: str, turn_id: str = "", after_id: int = 0, limit: int = 200
+) -> SessionTraceResponse:
+    """Append-only trace trail of a session (ascending id = global order;
+    optional turn filter + id-cursor pagination). Feeds the after-the-fact
+    replay view: node/tool events survive consumer disconnects and process
+    lifetimes (archify app traces included)."""
+    if store is None:
+        return SessionTraceResponse(code="500", status=False, message="会话存储未启用")
+
+    try:
+        events = await store.get_trace_events(
+            session_id, turn_id=turn_id or None,
+            limit=limit, after_id=max(0, after_id))
+    except Exception:
+        logger.exception("查询会话 trace 失败")
+        return SessionTraceResponse(code="500", status=False, message="查询会话 trace 失败，请稍后重试")
+
+    if events is None:
+        return SessionTraceResponse(
+            code="404", status=False, message=f"session_id '{session_id}' 不存在"
+        )
+
+    return SessionTraceResponse(
+        code="0", status=True, message="success", data={"events": events}
     )

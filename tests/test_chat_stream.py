@@ -42,10 +42,10 @@ class _StreamProvider:
             yield chunk
 
 
-def _stream_session():
+def _stream_session(session_id="ss"):
     p = Pattern(code="sp", name="t", description="t",
                 nodes=[BaseNode(code="n1", name="主节点")])
-    s = Session(session_id="ss", pattern_code="sp")
+    s = Session(session_id=session_id, pattern_code="sp")
     s.pattern = p
     s.cxt.node_map = p.node_map
     s.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
@@ -270,15 +270,52 @@ def test_sse_endpoint_streams_events(_host_main, monkeypatch):
     assert payloads[-1]["result"]["text"] == "流式回复"
 
 
+def test_sse_endpoint_forwards_thinking_events(_host_main):
+    """thinking 增量经 /chat/stream 以 {"kind": "thinking"} 原样转发
+    （studio 模版测试页据此渲染思考块）。"""
+    from fastapi.testclient import TestClient
+    from nexus.llm.types import LLMChunk
+
+    host_main = _host_main
+    client = TestClient(host_main.app)
+
+    class _ThinkingProvider:
+        async def achat_completion_stream(self, messages, model,
+                                          temperature=0.7, max_tokens=2048,
+                                          **kwargs):
+            yield LLMChunk(text="", reasoning="想一想")
+            yield LLMChunk(text="答复", finish_reason="stop")
+
+    s = _stream_session()
+    host_main.governor.register_new(s)
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=_ThinkingProvider()):
+        resp = client.post("/api/v1/chat/stream",
+                           json={"request_id": "r2", "session_id": "ss",
+                                 "query": "你好"})
+    assert resp.status_code == 200
+    payloads = [json.loads(line[6:]) for line in resp.text.splitlines()
+                if line.startswith("data: ")]
+    thinks = [p for p in payloads if p["kind"] == "thinking"]
+    assert thinks == [{"kind": "thinking", "text": "想一想"}]
+    assert payloads[-1]["kind"] == "done"
+    assert payloads[-1]["result"]["text"] == "答复"
+
+
 @pytest.fixture()
 def _host_main():
     import host.main as host_main
     return host_main
 
 
-def test_sse_disconnect_midstream_skips_snapshot(_host_main, monkeypatch):
-    """断连会取消引擎轮次：半执行状态（__step__/半程消息）不得落盘——
-    否则重启恢复后会跳节点/重复回复；正常 done 仍照常快照。"""
+def test_sse_disconnect_detaches_turn_snapshot_on_settle(_host_main, monkeypatch):
+    """断连只解除消费，不取消轮次（docs/design/session-persistence.md §5）：
+    turn 转后台继续跑（gate 尚未放行时快照不落 → 证明轮次没被取消），真正
+    落定后 on_settled 快照照常写、完整回复进 history；正常消费到底一样快照。"""
+    import asyncio
+
+    from nexus.llm.types import LLMChunk
+
     host_main = _host_main
     saved = []
 
@@ -288,11 +325,24 @@ def test_sse_disconnect_midstream_skips_snapshot(_host_main, monkeypatch):
 
     monkeypatch.setattr(host_main, "store", _Store())
 
-    async def _run_stream(close_early):
-        provider = _StreamProvider([[("流式", [], ""), ("回复", [], "stop")]])
-        s = _stream_session()
+    class _GatedProvider:
+        def __init__(self, gate):
+            self.gate = gate
+
+        async def achat_completion_stream(self, messages, model,
+                                          temperature=0.7, max_tokens=2048,
+                                          **kwargs):
+            yield LLMChunk(text="第一段", tool_calls=[], finish_reason="")
+            await self.gate.wait()               # turn CANNOT finish yet
+            yield LLMChunk(text="第二段", tool_calls=[], finish_reason="stop")
+
+    async def _run_stream(close_early, gate=None, session_id="ss"):
+        provider = (_GatedProvider(gate) if gate is not None
+                    else _StreamProvider([[("流式", [], ""), ("回复", [], "stop")]]))
+        s = _stream_session(session_id)
         host_main.governor.register_new(s)
-        req = type("R", (), {"session_id": "ss", "query": "你好"})()
+        req = type("R", (), {"session_id": session_id, "query": "你好",
+                             "request_id": "req-detach"})()
         with patch("atoms.executors.loop_executor.build_provider",
                    return_value=provider):
             resp = await host_main._chat_dialogue_stream(req)
@@ -301,15 +351,157 @@ def test_sse_disconnect_midstream_skips_snapshot(_host_main, monkeypatch):
                 first = await body.__anext__()    # 收到首个事件后断连
                 assert first.startswith("data: ")
                 await body.aclose()
-                return []
-            return [c async for c in body]
+                return s
+            chunks = [c async for c in body]
+            assert any('"kind": "done"' in c for c in chunks)
+            return s
 
-    arun(_run_stream(close_early=True))
-    assert saved == []                            # 半执行快照不落盘
+    # 1) 断连：轮次转后台，gate 放行前不落定、不快照
+    async def _detach_scenario():
+        gate = asyncio.Event()
+        s = await _run_stream(close_early=True, gate=gate, session_id="ss-detach")
+        await asyncio.sleep(0.05)
+        assert saved == []                    # 轮次未落定（被 gate 挡住）→ 未快照
+        gate.set()                            # 放行 → 后台轮次跑完
+        for _ in range(200):
+            if saved:
+                break
+            await asyncio.sleep(0.02)
+        assert saved == ["ss-detach"]         # 落定后快照照常写
+        assert (s.cxt.history[-1].role == "assistant"
+                and s.cxt.history[-1].content == "第一段第二段")  # 完整回复已落 history
 
-    chunks = arun(_run_stream(close_early=False))
-    assert any('"kind": "done"' in c for c in chunks)
-    assert saved == ["ss"]                        # 正常完成照常快照
+    arun(_detach_scenario())
+    saved.clear()
+
+    # 2) 正常消费到底：照常快照
+    arun(_run_stream(close_early=False, session_id="ss-full"))
+    assert saved == ["ss-full"]
+
+
+# ============================================================================
+# Trace persistence plumbing + turn ownership (docs/design/session-persistence.md)
+# ============================================================================
+
+def _wired_stream_session(session_id="ss-trace"):
+    """A stream session whose trace_sink records rows (store attached shape)."""
+    s = _stream_session(session_id)
+    s.cxt.metadata["request_id"] = "req-xyz"
+    rows = []
+    recorded = {"rows": rows}
+
+    async def _sink(ev):
+        rows.append(ev)
+
+    s.cxt.trace_sink = _sink
+    return s, recorded
+
+
+def test_trace_events_fan_out_to_sink_with_turn_id():
+    """kind="trace" events reach cxt.trace_sink as flattened rows carrying the
+    initiating request_id as turn_id — the append-only trail (§4)."""
+    provider = _StreamProvider([[("完成", [], "stop")]])
+    s, recorded = _wired_stream_session()
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=provider):
+        events = arun(_collect_events(
+            chat_turn_stream("q", "ss-trace", {"ss-trace": s})))
+    # live stream still sees the same trace events
+    stream_traces = [e.trace.event for e in events if e.kind == "trace"]
+    assert "graph_compile" in stream_traces and "node_start" in stream_traces
+    # and every one of them lands in the sink, FIFO, with turn_id
+    rows = recorded["rows"]
+    assert [r["kind"] for r in rows] == stream_traces
+    assert all(r["turn_id"] == "req-xyz" for r in rows)
+    assert all(r["session_id"] == "ss-trace" for r in rows)
+    compile_row = next(r for r in rows if r["kind"] == "graph_compile")
+    assert compile_row["payload"]["data"]["entry"] == "n1"
+
+
+def test_app_trace_picked_up_and_popped():
+    """metadata 里的 app 终态 trace（_APP_TRACE_KEYS）在 turn 落定点捡成一条
+    app_trace 事件后从 metadata 摘除——后续轮次不得重复捡旧值（§6）。"""
+    s, recorded = _wired_stream_session()
+    s.cxt.metadata["archify"] = {"diagram_type": "architecture",
+                                 "repair_rounds": 6}
+    provider = _StreamProvider([[("图表好了", [], "stop")]])
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=provider):
+        arun(_collect_events(
+            chat_turn_stream("q", "ss-trace", {"ss-trace": s})))
+    app_rows = [r for r in recorded["rows"] if r["kind"] == "app_trace"]
+    assert len(app_rows) == 1
+    assert app_rows[0]["payload"]["data"]["app"] == "archify"
+    assert app_rows[0]["payload"]["data"]["trace"] == {
+        "diagram_type": "architecture", "repair_rounds": 6}
+    assert "archify" not in s.cxt.metadata          # 捡回后摘除
+
+    # 下一轮不再重复捡
+    provider2 = _StreamProvider([[("再来一轮", [], "stop")]])
+    recorded["rows"].clear()
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=provider2):
+        arun(_collect_events(
+            chat_turn_stream("q2", "ss-trace", {"ss-trace": s})))
+    assert not [r for r in recorded["rows"] if r["kind"] == "app_trace"]
+
+
+def test_on_settled_fires_once_after_done():
+    """on_settled 在 done 之后于 turn 任务内触发一次；turn 异常路径同样触发
+    （error done 也是落定）。"""
+    provider = _StreamProvider([[("好", [], "stop")]])
+    s = _stream_session("ss-settle")
+    settled = []
+
+    async def _mark():
+        settled.append(1)
+
+    with patch("atoms.executors.loop_executor.build_provider",
+               return_value=provider):
+        arun(chat_turn("q", "ss-settle", {"ss-settle": s},
+                       on_settled=_mark))
+    assert settled == [1]
+
+
+def test_same_session_turns_serialize():
+    """同 session 的第二个 turn 在引擎侧排队（turn task 持锁），第一个 turn
+    落定前第二个不得开始执行。"""
+    import asyncio
+
+    s = _stream_session("ss-lock")
+    calls = []
+    gate = asyncio.Event()
+
+    class _Gated:
+        def __init__(self, tag):
+            self.tag = tag
+
+        async def achat_completion_stream(self, messages, model,
+                                          temperature=0.7, max_tokens=2048,
+                                          **kwargs):
+            calls.append(f"start-{self.tag}")
+            if self.tag == "first":
+                await gate.wait()
+            calls.append(f"end-{self.tag}")
+            from nexus.llm.types import LLMChunk
+            yield LLMChunk(text=self.tag, tool_calls=[], finish_reason="stop")
+
+    async def _scenario():
+        t1 = asyncio.create_task(chat_turn("q1", "ss-lock", {"ss-lock": s}))
+        # 等 t1 真正拿到锁并开始
+        while "start-first" not in calls:
+            await asyncio.sleep(0.01)
+        t2 = asyncio.create_task(chat_turn("q2", "ss-lock", {"ss-lock": s}))
+        await asyncio.sleep(0.05)
+        assert "start-second" not in calls      # 第二轮仍在排队
+        gate.set()
+        await asyncio.gather(t1, t2)
+
+    with patch("atoms.executors.loop_executor.build_provider",
+               side_effect=[_Gated("first"), _Gated("second")]):
+        arun(_scenario())
+    assert calls[0] == "start-first"
+    assert calls.index("end-first") < calls.index("start-second")
 
 
 def test_sse_endpoint_mounted_without_env(monkeypatch):

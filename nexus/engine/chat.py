@@ -68,7 +68,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from nexus.settings import get_llm_config
+from nexus.settings import get_llm_config, resolve_max_fanout, resolve_max_steps
 from nexus.engine.compression import maybe_compress
 from nexus.engine.context_lifecycle import TurnLifecycle
 from nexus.engine.execution import ExecutionContext
@@ -94,6 +94,21 @@ STEP_KEY = "__step__"
 # fanout_start; join/later nodes read it until the graph terminates
 FANOUT_RESULTS_KEY = "__fanout_results__"
 
+# node_end / branch_end trace 里执行结果摘要的截断长度（过程展示不搬全量；
+# 消费端想看全文走 done.result / 会话审计）
+_RESULT_TRACE_MAX = 400
+
+# App 级终态 trace 的 metadata 键（docs/design/session-persistence.md §6）：
+# app 在 executor 收尾写 cxt.metadata[key]（如 archify 的完整过程 trace），
+# turn 落定点由引擎统一捡回一条 app_trace 事件进 trace_events 后摘除该键
+# （防止后续轮次重复捡旧值）——app 侧零改动。
+_APP_TRACE_KEYS = ("archify",)
+
+
+def _result_brief(text: str) -> str:
+    """节点/分支执行结果的单行摘要（换行拍平 + 截断）。"""
+    return " ".join((text or "").split())[:_RESULT_TRACE_MAX]
+
 
 # ============================================================================
 # LLM config refresh (R1 turn-level / R3 FSM-node-level / R4 AGENT-node-level)
@@ -103,29 +118,17 @@ def _refresh_llm_config(session: Session, node_code: str = "") -> None:
     """Resolve the LLM config for the current position and write it to
     cxt.llm_config (R1-R4 shared).
 
-    Resolution: the explicit plugins["llm"] declaration (node layer over
-    pattern layer — the value is an llm_providers code, resolved as an
-    override) > the settings layered lookup (llm_default ⊕ pattern_llm ⊕
-    pattern_llm.nodes[node_code]) > the session's llm_override metadata
-    (CLI-side explicit pick, highest).
+    Resolution: the session's llm_override metadata (CLI-side explicit pick,
+    highest, an integral override that skips the layered lookup) > the
+    settings layered lookup (llm_default ⊕ app llm ⊕ app nodes[node_code].llm,
+    resolved inside get_llm_config by pattern_code / node_code).
 
     This function must stay in the chat module: R1-R4 resolve
     get_llm_config through this namespace (tests anchor on
     patch("nexus.engine.chat.get_llm_config")).
     """
     cxt = session.cxt
-    pattern = session.pattern
     override = cxt.metadata.get("llm_override")
-
-    llm_code = None
-    if pattern is not None:
-        node = pattern.node_map.get(node_code) if node_code else None
-        if node is not None:
-            llm_code = (node.plugins or {}).get("llm")
-        if not llm_code:
-            llm_code = (pattern.plugins or {}).get("llm")
-    if llm_code and override is None:
-        override = {"code": llm_code}
 
     cxt.llm_config = get_llm_config(
         pattern_code=session.pattern_code or cxt.metadata.get("pattern_code", ""),
@@ -337,7 +340,8 @@ async def _run_fanout(session: Session, node, result: TurnResult,
     graph_state = cxt.graph_state
     sends = list(result.sends or [])
     _emit = getattr(stream, "emit_trace", None)
-    max_fanout = pattern.max_fanout
+    # 扇出宽度守卫上界：app loop.max_fanout 赢，缺省回退 pattern.max_fanout
+    max_fanout = resolve_max_fanout(pattern)
 
     if result.next is not None:
         raise ValueError(
@@ -480,7 +484,9 @@ async def _run_fanout(session: Session, node, result: TurnResult,
         board.append(entry)  # completion order (single event loop)
         if _emit is not None:
             _emit("branch_end", node_code=worker_code, branch_id=branch_id,
-                  ok=entry["ok"], error=entry.get("error", ""))
+                  ok=entry["ok"], error=entry.get("error", ""),
+                  **({"content": _result_brief(entry["content"])}
+                     if entry.get("content") else {}))
 
     await asyncio.gather(*[
         _run_branch(bid, s) for bid, s in zip(branch_ids, sends)])
@@ -514,7 +520,8 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
     """
     cxt = session.cxt
     graph_state = cxt.graph_state
-    max_steps = pattern.max_steps
+    # 图级步数预算：app loop.max_steps 赢，缺省回退 pattern.max_steps
+    max_steps = resolve_max_steps(pattern)
     _emit = getattr(stream, "emit_trace", None)
 
     paused = graph_state.get(PAUSED_NODE_KEY)
@@ -560,7 +567,7 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
         # (store snapshot / trace consumers read it)
         cxt.current_node_code = node.code
 
-        # R4: node-level LLM config (plugins["llm"] node layer over pattern)
+        # R4: node-level LLM config (app nodes[node].llm over app llm)
         _refresh_llm_config(session, node_code=node.code)
 
         if _emit is not None:
@@ -572,7 +579,20 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
         resume_input = None  # only the resumed turn's first execution
 
         if _emit is not None:
-            _emit("node_end", node_code=node.code, step=step)
+            # node_end carries a result brief (content / routing verdict) —
+            # real-time consumers show WHAT the node produced, not just that
+            # it finished
+            end_data: Dict[str, Any] = {}
+            if result.content:
+                end_data["content"] = _result_brief(result.content)
+            if result.wait_human:
+                end_data["wait_human"] = True
+            if result.sends:
+                end_data["sends"] = len(result.sends)
+            if result.next:
+                nxt = result.next
+                end_data["next"] = nxt if isinstance(nxt, str) else str(list(nxt)[:1])
+            _emit("node_end", node_code=node.code, step=step, **end_data)
 
         if result.content:
             content = result.content
@@ -681,6 +701,10 @@ async def chat_turn_stream(
         session_id: str,
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
+        *,
+        detach_on_close: bool = False,
+        on_settled: Optional[Any] = None,
+        turn_task_out: Optional[Dict[str, Any]] = None,
 ):
     """Async generator form of chat_turn: yields ChatStreamEvent objects
     (delta / round / trace / done), the final done event carrying the
@@ -692,10 +716,36 @@ async def chat_turn_stream(
     the done event; if the task dies early the bridge pushes an error done
     so the consumer never hangs.
 
+    PERSISTENCE plumbing (docs/design/session-persistence.md): kind="trace"
+    events additionally fan out to the session's trace_sink (append-only
+    trail, written as they happen via a per-turn serialized writer — FIFO by
+    construction); app-level final-state traces (``_APP_TRACE_KEYS``) are
+    picked up at turn end and removed from metadata.
+
+    TURN OWNERSHIP: the per-session turn_lock is held by the turn task
+    itself (not the consumer), so:
+
+    - ``detach_on_close=True`` — a consumer that closes the generator early
+      (SSE client disconnect) only detaches consumption: the turn keeps
+      running in the background, trace/message sinks keep writing, and
+      ``on_settled`` still fires at the real end of the turn;
+    - ``detach_on_close=False`` (default, tests / aggregation) — closing the
+      generator early cancels the turn task, exactly the pre-detach
+      semantics.
+
+    ``on_settled``: async callback invoked (once, inside the turn task,
+    under the lock) after the turn settles with a done — success or handled
+    failure — but NOT on cancellation; the host uses it for the end-of-turn
+    snapshot. ``turn_task_out``: dict that receives ``{"task": ...}`` right
+    after the turn task is created (the host registers it in the turn
+    registry; it owns the strong reference, eviction shield and shutdown
+    cancel list).
+
     The turn steps:
     1. locate session → begin_turn; 2. R1 refresh → compression → record
     user; 3. dispatch by pattern_type (FSM pipeline / AGENT graph runtime,
-    resuming a suspended graph when present); 4. end_turn → done.
+    resuming a suspended graph when present); 4. app trace pickup →
+    end_turn → done.
     """
     import asyncio
 
@@ -706,37 +756,70 @@ async def chat_turn_stream(
     )
 
     queue: "asyncio.Queue[ChatStreamEvent]" = asyncio.Queue()
-    emitter = StreamEmitter(sink=queue.put_nowait)
+    live = [True]            # consumer attached → queue accepts events
+    trace_q: "asyncio.Queue" = asyncio.Queue()   # serialized trace writes
+    trace_writer: Optional[Any] = None
+    # set once the session is located: the per-turn trace enqueue closure
+    state: Dict[str, Any] = {"enqueue": None}
 
-    async def _run_turn() -> None:
-        token = current_emitter.set(emitter)
-        try:
-            await _run_turn_body()
-        except Exception:
-            # safety net: the consumer loop terminates on done only — an
-            # escaped exception must still produce one (details already
-            # logged by the body's own handling; this is a last resort)
-            logger.exception("流式轮次异常: session=%s", session_id)
-            queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
-                text="对话处理异常，请稍后重试")))
-        finally:
-            current_emitter.reset(token)
+    def _sink(ev: ChatStreamEvent) -> None:
+        # Trace fan-out is independent of the live queue: persistence keeps
+        # flowing after a consumer detaches (facts, not stream).
+        enqueue = state["enqueue"]
+        if enqueue is not None and ev.kind == "trace" and ev.trace is not None:
+            try:
+                enqueue(ev.trace)
+            except Exception:
+                logger.exception("trace 入队失败（不影响对话）: session=%s",
+                                 session_id)
+        if live[0]:
+            queue.put_nowait(ev)
 
-    async def _run_turn_body() -> None:
+    emitter = StreamEmitter(sink=_sink)
+
+    def _trace_row(session: Session, t: Any) -> Dict[str, Any]:
+        """Flatten a TraceEvent into the store's trace_sink row shape."""
+        payload: Dict[str, Any] = {"module_code": t.module_code}
+        if t.node_code:
+            payload["node_code"] = t.node_code
+        if t.branch_id:
+            payload["branch_id"] = t.branch_id
+        if t.data:
+            payload["data"] = t.data
+        return {
+            "session_id": session.session_id,
+            "turn_id": str((session.cxt.metadata or {}).get("request_id")
+                           or ""),
+            "kind": t.event,
+            "payload": payload,
+        }
+
+    async def _trace_writer_loop(session: Session) -> None:
+        """Single per-turn writer: sinks stay serialized (FIFO rows), write
+        failures never block the dialogue (same contract as message_sink)."""
+        failures = 0
+        while True:
+            item = await trace_q.get()
+            if item is None:
+                return
+            try:
+                await item
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failures += 1
+                logger.exception(
+                    "trace_sink 写入失败（不影响对话）: session=%s 累计=%d",
+                    session_id, failures)
+
+    async def _run_turn_body(session: Session) -> None:
         async def _finish(text: str) -> ChatResult:
             await _lifecycle.end_turn(session.cxt, text)
             return build_chat_result(text, session.cxt)
 
         # ----------------------------------------------------------------
-        # 1. Locate the session; start-of-turn reset
+        # 1. Start-of-turn reset
         # ----------------------------------------------------------------
-        session = all_sessions.get(session_id)
-        if session is None:
-            logger.warning("会话不存在: %s", session_id)
-            queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
-                text="会话不存在，请先发起对话任务")))
-            return
-
         _lifecycle.begin_turn(session.cxt, query)
 
         pattern = session.pattern
@@ -748,8 +831,8 @@ async def chat_turn_stream(
 
         session.cxt.metadata["pattern_code"] = session.pattern_code
 
-        # R1: resolve the LLM config for the turn (plugins["llm"] /
-        # settings layered lookup; override takes precedence)
+        # R1: resolve the LLM config for the turn (settings layered lookup;
+        # the session's llm_override metadata takes precedence)
         try:
             _refresh_llm_config(session)
         except Exception as e:
@@ -787,24 +870,116 @@ async def chat_turn_stream(
             # path/config information — return a uniform message only
             response = "对话处理异常，请稍后重试"
 
+        # App-level final-state traces (e.g. archify): pick up at turn end,
+        # persist as one app_trace event per key, then pop (a stale value
+        # must not leak into later turns' trails).
+        for key in _APP_TRACE_KEYS:
+            app_trace = session.cxt.metadata.get(key)
+            if app_trace:
+                emitter.emit_trace("app_trace", node_code=session.cxt.current_node_code or "",
+                                   app=key, trace=app_trace)
+                session.cxt.metadata.pop(key, None)
+
         queue.put_nowait(ChatStreamEvent(kind="done",
                                          result=await _finish(response)))
 
+    async def _run_turn() -> None:
+        nonlocal trace_writer
+        token = current_emitter.set(emitter)
+        session = all_sessions.get(session_id)
+        settled = False
+        try:
+            if session is None:
+                logger.warning("会话不存在: %s", session_id)
+                queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
+                    text="会话不存在，请先发起对话任务")))
+                return
+
+            # Per-turn trace writer: started only when a trace_sink is wired
+            # (store attached); a single task keeps the trail's FIFO order.
+            if session.cxt.trace_sink is not None:
+                state["enqueue"] = lambda t: trace_q.put_nowait(
+                    session.cxt.trace_sink(_trace_row(session, t)))
+                trace_writer = asyncio.create_task(
+                    _trace_writer_loop(session))
+
+            # The lock spans the whole turn INCLUDING the settled callback:
+            # a queued same-session turn must never interleave with the
+            # end-of-turn snapshot.
+            async with session.turn_lock:
+                await _run_turn_body(session)
+                settled = True
+        except Exception:
+            # safety net: the consumer loop terminates on done only — an
+            # escaped exception must still produce one (details already
+            # logged by the body's own handling; this is a last resort)
+            logger.exception("流式轮次异常: session=%s", session_id)
+            emitter.emit_trace("turn_error")
+            queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
+                text="对话处理异常，请稍后重试")))
+            settled = True
+        finally:
+            current_emitter.reset(token)
+            # Drain the trail writer first so the settled snapshot never
+            # races pending trace rows; on cancellation this still flushes
+            # what already happened (facts survive, state does not).
+            if trace_writer is not None and not trace_writer.done():
+                trace_q.put_nowait(None)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(trace_writer), 10)
+                except asyncio.TimeoutError:
+                    trace_writer.cancel()
+                except asyncio.CancelledError:
+                    trace_writer.cancel()
+                    raise
+                except Exception:
+                    logger.exception("trace writer 收尾失败: session=%s",
+                                     session_id)
+            if settled and on_settled is not None:
+                try:
+                    await on_settled()
+                except Exception:
+                    logger.exception("轮末回调失败: session=%s", session_id)
+
     task = asyncio.create_task(_run_turn())
+    if turn_task_out is not None:
+        turn_task_out["task"] = task
+    saw_done = False
     try:
         while True:
             ev = await queue.get()
             yield ev
             if ev.kind == "done":
+                saw_done = True
                 break
     finally:
-        if not task.done():
+        if detach_on_close:
+            if not task.done():
+                # consumer went away (SSE disconnect): detach, don't cancel.
+                # Events stop being queued (the queue would otherwise grow
+                # for the rest of a possibly minutes-long turn); sinks and
+                # the settled callback keep the trail + snapshot complete.
+                live[0] = False
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+        elif not saw_done and not task.done():
             # consumer closed the generator early — don't leak the turn task
             task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            # ran to done: stay for the tail (trace-writer flush + settled
+            # callback) — cancelling here would cut the end-of-turn audit
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 async def chat_turn(
@@ -812,14 +987,19 @@ async def chat_turn(
         session_id: str,
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
+        *,
+        on_settled: Optional[Any] = None,
+        turn_task_out: Optional[Dict[str, Any]] = None,
 ) -> ChatResult:
     """Process one user dialogue turn, returning the full output (text +
     reserved actions). Aggregates chat_turn_stream — behavior identical to
     the pre-streaming implementation; see that generator's docstring for
-    the turn steps."""
+    the turn steps. ``on_settled`` / ``turn_task_out`` pass through to the
+    stream entry (host-side snapshot callback / turn registry capture)."""
     from nexus.engine.streaming import aggregate_turn
-    return await aggregate_turn(chat_turn_stream(query, session_id, all_sessions,
-                                                 store=store))
+    return await aggregate_turn(chat_turn_stream(
+        query, session_id, all_sessions, store=store,
+        on_settled=on_settled, turn_task_out=turn_task_out))
 
 
 async def chat(
@@ -827,7 +1007,11 @@ async def chat(
         session_id: str,
         all_sessions: Dict[str, Session],
         store: Optional["SessionStore"] = None,
+        *,
+        on_settled: Optional[Any] = None,
+        turn_task_out: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compat entry: process one dialogue turn, returning the reply text (equivalent to chat_turn(...).text)."""
-    return (await chat_turn(query, session_id, all_sessions,
-                            store=store)).text
+    return (await chat_turn(query, session_id, all_sessions, store=store,
+                            on_settled=on_settled,
+                            turn_task_out=turn_task_out)).text
