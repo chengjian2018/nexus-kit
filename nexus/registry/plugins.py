@@ -35,6 +35,7 @@ modules more than once).
 
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -67,11 +68,41 @@ class PluginRegistry:
         # atoms.executors.* → 代码模块（可选择性热重载）；nexus.* → 内核。
         self._owners: Dict[tuple, str] = {}
         self._lock = threading.RLock()
-        # Hot-reload window switch (held by host.reload._ReplaceMode): when
-        # True, registering a same-name/different-factory plugin becomes
-        # "replace + drop instance cache" instead of rejection. Default
-        # False — strict mode intercepts genuine same-name conflicts.
-        self.replace_on_conflict = False
+        # Hot-reload window switch: when open, registering a
+        # same-name/different-factory plugin becomes "replace + drop
+        # instance cache" instead of rejection. Reentrant DEPTH counter
+        # guarded by the registry lock — concurrent openers (studio apply
+        # in the threadpool vs generate on the event loop) can no longer
+        # restore each other's save/restore of a plain bool and leave the
+        # process-wide switch stuck open. Default closed — strict mode
+        # intercepts genuine same-name conflicts.
+        self._replace_depth = 0
+
+    @property
+    def replace_on_conflict(self) -> bool:
+        """True while at least one replace window is open."""
+        return self._replace_depth > 0
+
+    @replace_on_conflict.setter
+    def replace_on_conflict(self, value: bool) -> None:
+        """Legacy direct assignment: maps to depth 1/0 (non-reentrant —
+        fine for sequential tests/callers; nested or concurrent use must
+        go through :meth:`replace_window`)."""
+        with self._lock:
+            self._replace_depth = 1 if value else 0
+
+    @contextmanager
+    def replace_window(self):
+        """Reentrant, interleave-safe replace window (see the counter note
+        in ``__init__``); held by host.reload._ReplaceMode and the studio
+        store's plugin re-exec path."""
+        with self._lock:
+            self._replace_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._replace_depth -= 1
 
     # ------------------------------------------------------------------
     # Registration

@@ -14,6 +14,7 @@ import logging
 import re
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -100,12 +101,32 @@ class ChannelRegistry:
     def __init__(self):
         self._channels: dict = {}
         self._lock = threading.RLock()
-        # Hot-reload window switch (held by host.reload._ReplaceMode): when
-        # True, a same-name registration becomes a replace instead of a
-        # rejection (a re-imported spec class is necessarily a new object).
-        # The router handler fetches the spec live from the registry per
+        # Hot-reload window switch: when open, a same-name registration
+        # becomes a replace instead of a rejection (a re-imported spec class
+        # is necessarily a new object). Reentrant DEPTH counter guarded by
+        # the registry lock (interleave-safe — see PluginRegistry). The
+        # router handler fetches the spec live from the registry per
         # request, so a replacement takes effect on the next request.
-        self.replace_on_conflict = False
+        self._replace_depth = 0
+
+    @property
+    def replace_on_conflict(self) -> bool:
+        return self._replace_depth > 0
+
+    @replace_on_conflict.setter
+    def replace_on_conflict(self, value: bool) -> None:
+        with self._lock:
+            self._replace_depth = 1 if value else 0
+
+    @contextmanager
+    def replace_window(self):
+        with self._lock:
+            self._replace_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._replace_depth -= 1
 
     def register(self, spec: Any) -> Any:
         """Register a channel spec; raises ValueError on an invalid/duplicate name or non-callable hooks."""

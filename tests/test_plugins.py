@@ -158,3 +158,32 @@ def test_default_executor_code_rejects_module_era_type():
     """Module-era types (route) have no default executor any more."""
     with pytest.raises(ValueError):
         registry.default_executor_code("route")
+
+
+def test_replace_window_reentrant_and_interleave_safe():
+    """替换窗口是锁保护的可重入计数：嵌套关内层不关外层；并发交错
+    开关（apply 线程池 vs generate 事件循环）不会把进程级开关卡在开。"""
+    from nexus.registry.plugins import PluginRegistry
+
+    reg = PluginRegistry()
+    assert reg.replace_on_conflict is False
+    with reg.replace_window():
+        assert reg.replace_on_conflict is True
+        with reg.replace_window():
+            assert reg.replace_on_conflict is True
+        assert reg.replace_on_conflict is True    # 内层关掉，外层仍开
+    assert reg.replace_on_conflict is False
+    # 旧直接赋值语义兼容（顺序单线程场景）
+    reg.replace_on_conflict = True
+    assert reg.replace_on_conflict is True
+    reg.replace_on_conflict = False
+    assert reg.replace_on_conflict is False
+
+
+def test_channel_replace_window_reentrant():
+    from nexus.registry.channels import ChannelRegistry
+
+    reg = ChannelRegistry()
+    with reg.replace_window():
+        assert reg.replace_on_conflict is True
+    assert reg.replace_on_conflict is False

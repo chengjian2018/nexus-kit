@@ -160,13 +160,13 @@ def delete_plugin_file(stem: str,
 @contextlib.contextmanager
 def _plugin_replace_window():
     """临时打开插件注册表的同名替换窗口（重新 exec 必然产生新类对象，
-    严格模式会拒绝同名重注册；语义与 host.reload._ReplaceMode 一致）。"""
-    old = plugin_registry.replace_on_conflict
-    plugin_registry.replace_on_conflict = True
-    try:
+    严格模式会拒绝同名重注册；语义与 host.reload._ReplaceMode 一致）。
+
+    注册表侧是锁保护的可重入计数窗口：apply（线程池）与 generate
+    （事件循环）并发开窗时不会互相覆写对方的恢复值，把进程级开关
+    永久卡在开。"""
+    with plugin_registry.replace_window():
         yield
-    finally:
-        plugin_registry.replace_on_conflict = old
 
 
 def plugin_module_name(stem: str) -> str:

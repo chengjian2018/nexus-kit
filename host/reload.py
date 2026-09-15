@@ -247,23 +247,24 @@ class _ReplaceMode:
     Reloaded classes/objects are not identical to the old ones (re-import
     produces new classes), while the plugin / channel registries default
     to "same name, different thing → reject". Replace mode is switched on
-    inside the replay window and restored to strict default when it ends.
+    inside the replay window and restored to strict default when it ends
+    (reentrant counter windows — see the registries' replace_window).
     """
 
     def __init__(self):
         from nexus.registry.channels import registry as channel_registry
         from nexus.registry.plugins import registry as plugin_registry
-        self._plugin_reg = plugin_registry
-        self._channel_reg = channel_registry
+        self._windows = [plugin_registry.replace_window(),
+                         channel_registry.replace_window()]
 
     def __enter__(self):
-        self._plugin_reg.replace_on_conflict = True
-        self._channel_reg.replace_on_conflict = True
+        for window in self._windows:
+            window.__enter__()
         return self
 
     def __exit__(self, *exc):
-        self._plugin_reg.replace_on_conflict = False
-        self._channel_reg.replace_on_conflict = False
+        for window in reversed(self._windows):
+            window.__exit__(*exc)
         return False
 
 
