@@ -4,15 +4,14 @@ Architecture after the asyncio rewrite (the old "dedicated background
 thread + dedicated event loop" is gone):
 
 - Connections live directly on the **caller's event loop** (uvicorn's main
-  loop / the CLI's single asyncio.run loop). ``ClientSession`` is bound to
-  the loop that created it anyway — the framework is async-only now, no
-  cross-thread bridge needed.
+  loop). ``ClientSession`` is bound to the loop that created it anyway —
+  the framework is async-only now, no cross-thread bridge needed.
 - ``bootstrap`` only records state (cannot await at import time): parse
   config + build ``_ServerConn``; the actual connecting is spawned by
   ``ensure_started()`` (asyncio task, no waiting — preserving the
   "startup never blocks" semantics).
-- Three mount points: ① FastAPI startup; ② the start of the CLI repl;
-  ③ ``ensure_mcp_ready``'s self-healing fallback (even if the host forgets
+- Two mount points: ① the host HTTP service's FastAPI startup;
+  ② ``ensure_mcp_ready``'s self-healing fallback (even if the host forgets
   to mount, the first dialogue turn lazily starts the connections).
 - ``wait_ready`` uses each conn's ``asyncio.Event`` (set on final state),
   no busy polling.
@@ -85,7 +84,9 @@ class _ServerConn:
     this server's tool names registered into ToolRegistry (the teardown
     list for nuke-and-repave refreshes). ``done_event`` is set when the
     connection reaches a final state (success or failure) — the wait
-    anchor for ``wait_ready``.
+    anchor for ``wait_ready``. ``http_client`` (streamable_http only) is
+    the caller-owned httpx client: the sdk never closes a client it did
+    not create, so ``_teardown`` owns closing it.
     """
 
     def __init__(self, name: str, cfg: Dict[str, Any]):
@@ -96,6 +97,9 @@ class _ServerConn:
         self.registered_tools: List[str] = []
         self.ready = False
         self.error: Optional[str] = None
+        # Caller-owned httpx AsyncClient built by _build_transport for
+        # streamable_http (None for stdio/sse) — closed in _teardown
+        self.http_client: Any = None
         # Reconnect dedup flag: a caller-side-failure-triggered background
         # reconnect is in flight (prevents reconnect storms)
         self.reconnecting = False
@@ -140,7 +144,7 @@ class McpManager:
         (including with a different config — to change config use
         arefresh / restart the process). No connecting happens here
         (cannot await at import time); the actual spawn is in
-        ``ensure_started`` (startup / CLI / ensure_mcp_ready, the three
+        ``ensure_started`` (host startup / ensure_mcp_ready, the two
         mount points).
         """
         with self._lock:
@@ -154,9 +158,9 @@ class McpManager:
         try:
             import mcp  # noqa: F401 -- lazy probe: readable error when the sdk is absent
         except ImportError as e:
-            # A loud startup-time notice (not just logger.error — in CLI
-            # scenarios logs are often swallowed and the user would only see
-            # "MCP not registered" without knowing why)
+            # A loud startup-time notice (not just logger.error — in host
+            # service scenarios logs are often swallowed and the user would
+            # only see "MCP not registered" without knowing why)
             print(f"[mcp] ⚠️ 已配置 {len(servers_cfg)} 个 MCP server,但当前解释器"
                   f"未安装 mcp sdk(pip install mcp),MCP 工具未启用: {e}",
                   file=sys.stderr)
@@ -176,10 +180,10 @@ class McpManager:
         """Idempotent start: spawn connection tasks for configured,
         not-yet-connected conns (without waiting for completion).
 
-        Must be called inside an event loop. Mount points: FastAPI
-        startup / the start of the CLI repl / ``ensure_mcp_ready``'s
-        fallback — even if the host forgets to mount, the first dialogue
-        turn starts them lazily.
+        Must be called inside an event loop. Mount points: the host HTTP
+        service's FastAPI startup / ``ensure_mcp_ready``'s fallback — even
+        if the host forgets to mount, the first dialogue turn starts them
+        lazily.
         """
         with self._lock:
             if self._started:
@@ -241,8 +245,8 @@ class McpManager:
         idempotent).
 
         Stops no loop — the loop belongs to the caller (uvicorn's main
-        loop / the CLI's asyncio.run); this only tears down connections +
-        resets state, allowing a restart within the same process.
+        loop); this only tears down connections + resets state, allowing a
+        restart within the same process.
         """
         with self._lock:
             conns = list(self._servers.values())
@@ -377,7 +381,11 @@ class McpManager:
         hang when the connection is already dead (empirically: while
         grabbing a snapshot, an SSE server's exit hung until process
         timeout) — hanging is worse than erroring: the reconnect task
-        would be stuck in teardown forever."""
+        would be stuck in teardown forever.
+
+        The conn's http_client (streamable_http) is closed AFTER the stack:
+        the transport's exit path may still be using it, and the sdk never
+        closes a caller-provided client (leak fix)."""
         stack, conn.stack = conn.stack, None
         conn.session, conn.ready = None, False
         if stack is not None:
@@ -385,6 +393,13 @@ class McpManager:
                 await asyncio.wait_for(stack.aclose(), timeout=10.0)
             except Exception as e:  # noqa: BLE001 -- teardown best-effort (timeout included)
                 logger.debug("[mcp] server '%s' 连接关闭异常/超时(忽略): %s",
+                             conn.name, e)
+        client, conn.http_client = conn.http_client, None
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.aclose(), timeout=10.0)
+            except Exception as e:  # noqa: BLE001 -- teardown best-effort (timeout included)
+                logger.debug("[mcp] server '%s' http client 关闭异常/超时(忽略): %s",
                              conn.name, e)
         for name in conn.registered_tools:
             _tool_registry().deregister(name)
@@ -426,8 +441,20 @@ class McpManager:
             except ImportError:  # pragma: no cover -- older sdk without the fork
                 import httpx as _httpx
             from mcp.client.streamable_http import streamable_http_client
+            # read=300 mirrors the sdk's own SSE read budget (mcp/shared/
+            # _httpx_utils: 30s general / 300s read): the GET event-stream
+            # is a long-lived read and server keepalive below 300s is legal
+            # — a flat 120s read timeout would kill healthy streams and
+            # churn reconnects. Per-call deadline is enforced separately by
+            # asyncio.wait_for in call_tool.
             client = _httpx.AsyncClient(
-                headers=cfg.get("headers") or None, timeout=_DEFAULT_CALL_TIMEOUT)
+                headers=cfg.get("headers") or None,
+                timeout=_httpx.Timeout(30.0, read=300.0))
+            # The sdk only closes clients it created itself (client_
+            # provided check in streamable_http) — keep the reference on
+            # the conn so _teardown closes it (else every reconnect leaks
+            # the client + its connection pool).
+            conn.http_client = client
             return streamable_http_client(url=str(cfg["url"]), http_client=client)
         raise ValueError(f"mcp server '{conn.name}' transport 非法: {transport!r}")
 

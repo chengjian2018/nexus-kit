@@ -211,3 +211,91 @@ def test_reconnect_dedup_prevents_storm():
     conn.reconnecting = True
     mgr._schedule_reconnect(conn)
     assert conn.reconnecting is True  # not overwritten (dedup took effect)
+
+
+# ============================================================================
+# 4. streamable_http httpx client lifecycle (leak regression: the sdk never
+#    closes a caller-provided client — _teardown owns it; zero network)
+# ============================================================================
+
+def test_build_transport_owns_client_with_sse_read_timeout(monkeypatch):
+    """_build_transport (streamable_http): the httpx client is kept on the
+    conn (http_client attr) and its timeout mirrors the sdk's SSE read
+    budget — read=300, general 30 (a flat 120s read killed healthy
+    keepalive streams and churned reconnects)."""
+    import mcp.client.streamable_http as sh
+    from atoms.mcp.manager import McpManager, _ServerConn
+    from async_utils import arun
+
+    captured = {}
+
+    def _fake_factory(url, http_client=None, **kwargs):
+        captured["url"] = url
+        captured["http_client"] = http_client
+        return object()  # context manager never entered — zero network
+
+    monkeypatch.setattr(sh, "streamable_http_client", _fake_factory)
+
+    mgr = McpManager()
+    conn = _ServerConn("fake", {"transport": "streamable_http",
+                                "url": "http://127.0.0.1:1/mcp",
+                                "headers": {"x-test": "1"}})
+    mgr._build_transport(conn)
+
+    assert captured["url"] == "http://127.0.0.1:1/mcp"
+    # ownership: the same client handed to the sdk is kept on the conn
+    assert conn.http_client is captured["http_client"]
+    assert conn.http_client.headers["x-test"] == "1"
+    timeout = conn.http_client.timeout
+    assert timeout.read == 300.0  # SSE stream budget (sdk default: 30/300)
+    assert timeout.connect == 30.0 and timeout.write == 30.0
+    # hygiene: close the real client built in this test (no request was made)
+    arun(conn.http_client.aclose())
+
+
+def test_teardown_closes_http_client_after_stack():
+    """_teardown is the single teardown funnel: stack closes FIRST, then the
+    conn-owned http client (the transport's exit may still use it), and both
+    references are cleared."""
+    from atoms.mcp.manager import McpManager, _ServerConn
+    from async_utils import arun
+
+    order = []
+
+    class _FakeClosable:
+        def __init__(self, tag):
+            self._tag = tag
+
+        async def aclose(self):
+            order.append(self._tag)
+
+    mgr = McpManager()
+    conn = _ServerConn("fake", {"transport": "streamable_http"})
+    conn.stack = _FakeClosable("stack")
+    conn.http_client = _FakeClosable("client")
+    arun(mgr._teardown(conn))
+
+    assert order == ["stack", "client"]
+    assert conn.stack is None and conn.http_client is None
+
+    # stdio/sse conns (no stack, no client) tear down cleanly too
+    bare = _ServerConn("bare", {"transport": "stdio"})
+    arun(mgr._teardown(bare))
+
+
+def test_teardown_tolerates_http_client_close_failure():
+    """A hanging/dead client aclose must not break the teardown funnel (the
+    reconnect path depends on teardown completing); the reference is cleared
+    regardless."""
+    from atoms.mcp.manager import McpManager, _ServerConn
+    from async_utils import arun
+
+    class _DeadClient:
+        async def aclose(self):
+            raise RuntimeError("connection already closed")
+
+    mgr = McpManager()
+    conn = _ServerConn("fake", {"transport": "streamable_http"})
+    conn.http_client = _DeadClient()
+    arun(mgr._teardown(conn))  # must not raise
+    assert conn.http_client is None
