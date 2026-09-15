@@ -276,6 +276,42 @@ def _host_main():
     return host_main
 
 
+def test_sse_disconnect_midstream_skips_snapshot(_host_main, monkeypatch):
+    """断连会取消引擎轮次：半执行状态（__step__/半程消息）不得落盘——
+    否则重启恢复后会跳节点/重复回复；正常 done 仍照常快照。"""
+    host_main = _host_main
+    saved = []
+
+    class _Store:
+        async def save_snapshot(self, session):
+            saved.append(session.session_id)
+
+    monkeypatch.setattr(host_main, "store", _Store())
+
+    async def _run_stream(close_early):
+        provider = _StreamProvider([[("流式", [], ""), ("回复", [], "stop")]])
+        s = _stream_session()
+        host_main.governor.register_new(s)
+        req = type("R", (), {"session_id": "ss", "query": "你好"})()
+        with patch("atoms.executors.loop_executor.build_provider",
+                   return_value=provider):
+            resp = await host_main._chat_dialogue_stream(req)
+            body = resp.body_iterator
+            if close_early:
+                first = await body.__anext__()    # 收到首个事件后断连
+                assert first.startswith("data: ")
+                await body.aclose()
+                return []
+            return [c async for c in body]
+
+    arun(_run_stream(close_early=True))
+    assert saved == []                            # 半执行快照不落盘
+
+    chunks = arun(_run_stream(close_early=False))
+    assert any('"kind": "done"' in c for c in chunks)
+    assert saved == ["ss"]                        # 正常完成照常快照
+
+
 def test_sse_endpoint_mounted_without_env(monkeypatch):
     """The endpoint is first-class now (studio 模版测试 consumes it): mounted
     with no NEXUS_STREAM_DEBUG set at all (unknown session → JSON 404, which

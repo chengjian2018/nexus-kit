@@ -542,9 +542,11 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
         data: {"kind": "done", "result": {"text": "...", "actions": [...]}}
 
     End-of-turn audit parity with /api/v1/chat (_run_chat_turn_core): the
-    state snapshot persists after the stream ends (success, error, or client
-    disconnect alike) — without it streaming turns would lose restart-restore
-    state while /api/v1/chat keeps it.
+    state snapshot persists once the turn has SETTLED (done / error events
+    actually emitted). A client disconnect mid-stream cancels the engine
+    turn instead — the cxt then holds mid-walk markers (__step__ /
+    __paused_node__ / partial fanout) with no assistant reply; persisting
+    that snapshot would restore a half-executed walk after a restart.
     """
     import json as _json
 
@@ -559,6 +561,7 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
         )
 
     async def _gen():
+        turn_settled = False
         try:
             async with session.turn_lock:
                 agen = chat_turn_stream(
@@ -571,6 +574,7 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
                 async for event in agen:
                     if event.kind == "done":
                         result = event.result
+                        turn_settled = True
                         yield "data: " + _json.dumps({
                             "kind": "done",
                             "result": {"text": result.text,
@@ -594,14 +598,17 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
                 del result
         except Exception:
             logger.exception("流式对话异常")
+            turn_settled = True
             yield "data: " + _json.dumps({
                 "kind": "error", "message": "对话处理异常，请稍后重试",
             }, ensure_ascii=False) + "\n\n"
         finally:
-            # Audit parity with _run_chat_turn_core: persist the end-of-turn
-            # snapshot whatever way the stream ended (done / error / client
-            # disconnect). The lock is already released here.
-            if store is not None:
+            # Audit parity with _run_chat_turn_core — but ONLY when the turn
+            # actually settled (done / error reached the wire). A disconnect
+            # cancels the engine turn mid-walk; snapshotting then would
+            # persist half-executed graph state (skipped/duplicated node
+            # replies after a restart-restore).
+            if turn_settled and store is not None:
                 try:
                     await store.save_snapshot(session)
                 except Exception:
@@ -829,9 +836,22 @@ async def system_reload(body: SystemReloadIn) -> Dict[str, Any]:
                                         "failed": failed_stems}
         if code_modules:
             result = reload_modules(sorted(code_modules))
+            # Replay the studio hosted dirs BEFORE rebinding: reload_modules
+            # re-imports code modules and re-registers the CODE versions of
+            # any console-forked patterns, which would silently overwrite the
+            # console edits (ops-console-prd risk R-2 mitigation — /api/v1/
+            # reload runs the same replay after reload_all).
+            studio_report = studio_store.load_console_artifacts()
             report["code_modules"] = dict(
                 result, sessions_rebound=rebind_sessions(
                     governor.sessions, pattern_registry))
+            report["code_modules"]["console_replayed"] = (
+                len(studio_report["plugins"]["loaded"])
+                + len(studio_report["patterns"]["loaded"]))
+            replay_failed = (len(studio_report["plugins"]["failed"])
+                             + len(studio_report["patterns"]["failed"]))
+            if replay_failed:
+                report["code_modules"]["console_replay_failed"] = replay_failed
         if skipped:
             report["skipped"] = skipped
 
