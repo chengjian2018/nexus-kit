@@ -22,6 +22,13 @@ node.use_tools）::
 调小），并跳过隐藏目录 / .git / __pycache__ / node_modules 与超过
 1MB 的单文件。
 
+不可取消线程的收口（to_thread 工作线程无法中途取消，必须在护栏内
+自行收手）：read_text 先 stat 再读——非普通文件（设备/FIFO）拒读，
+超过按字符上限折算的字节预算（max_read_chars * 4 + 1024）拒绝整读；
+search_files / find_files 的目录 walk 与逐行匹配受单调时钟预算
+（20s）约束，超时提前停止并标记 stopped_early。truncated 只在确实
+放弃了后续命中时为 true——恰好等于上限且遍历自然耗尽不算截断。
+
 路径语义：相对路径相对服务启动目录解析；~ 展开；write_text 自动创建
 父目录。无路径沙箱（本地个人 kit 定位，能力边界收在 pattern 授权层，
 同 shell_tool 的取舍说明）。
@@ -37,6 +44,7 @@ import fnmatch
 import logging
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -56,6 +64,12 @@ _MAX_MATCH_LINE_CHARS = 200
 # read_text 默认/最大行数（行数之外再有 max_read_chars 兜底）
 _DEFAULT_READ_LINES = 2000
 _MAX_READ_LINES = 5000
+# search_files / find_files 单次调用的时间预算：to_thread 线程不可取消，
+# 巨树 walk 或慢正则必须在预算内自行收手，否则占死共享线程池
+_WALK_TIME_BUDGET_SECONDS = 20.0
+# regex 模式跳过的行长上限：灾难回溯的最坏耗时随输入规模增长，
+# 残余的单行风险由此行长上限兜底
+_MAX_REGEX_LINE_CHARS = 64 * 1024
 
 
 def _resolve_path(raw: Any) -> Path:
@@ -72,8 +86,9 @@ READ_TEXT_SCHEMA = {
     "description": (
         "读取文本文件内容。返回从 offset 行开始的至多 limit 行"
         "（1 行 = 1 个换行分段；offset 从 0 记）。文件不存在/是目录/"
-        "疑似二进制时报错。超长内容会被截断——需要后面的部分时带上"
-        "更大的 offset 续读。"
+        "疑似二进制时报错；设备/FIFO 等非普通文件与超过字节预算的"
+        "大文件直接拒绝（请改用 bash 的 sed/awk）。超长内容会被截断"
+        "——需要后面的部分时带上更大的 offset 续读。"
     ),
     "parameters": {
         "type": "object",
@@ -110,14 +125,31 @@ def _handle_read_text(args: Dict[str, Any]) -> str:
         return tool_error("limit 必须 ≥ 1")
     limit = min(limit, _MAX_READ_LINES)
 
+    # stat 不触发 open（FIFO/设备不阻塞），必须先验类型与体量再读：
+    # read_bytes 对 /dev/zero、FIFO 会永久挂死，而 to_thread 线程不可取消
+    try:
+        st = path.stat()
+    except OSError as e:
+        return tool_error(f"无法读取文件状态: {e}")
+    if not stat.S_ISREG(st.st_mode):
+        return tool_error("不是普通文件（设备/FIFO 等），拒绝读取")
+    guard = get_file_tool_config()
+    cap = int(guard["max_read_chars"])
+    # 字节预算按字符上限折算（UTF-8 单字符至多 4 字节）：超预算的文件
+    # 整读后必然截断，白读不如直接拒绝
+    byte_budget = cap * 4 + 1024
+    if st.st_size > byte_budget:
+        return tool_error(
+            f"文件 {st.st_size} 字节超过读取上限 {byte_budget} 字节"
+            f"（由 max_read_chars={cap} 折算）。请用 offset/limit 分页读取"
+            "较小范围，或改用 bash 的 sed/awk 切片")
+
     data = path.read_bytes()
     if b"\x00" in data[:4096]:
         return tool_error(f"疑似二进制文件，无法按文本读取: {path}")
     lines = data.decode("utf-8", errors="replace").splitlines()
 
     sliced = lines[offset:offset + limit]
-    guard = get_file_tool_config()
-    cap = int(guard["max_read_chars"])
     content = "\n".join(sliced)
     truncated = len(content) > cap
     if truncated:
@@ -260,7 +292,8 @@ SEARCH_FILES_SCHEMA = {
         "在目录下递归搜索文件内容：逐行匹配（子串或正则，可选忽略"
         "大小写），文件名需先命中 glob 模式（默认 *）。返回命中文件、"
         "行号与该行文本。自动跳过 .git / __pycache__ / node_modules 等"
-        "目录、隐藏目录与超过 1MB 的文件。"
+        "目录、隐藏目录与超过 1MB 的文件；搜索超过时间预算会提前停止"
+        "并标记 stopped_early（可缩小 path/glob 后重试）。"
     ),
     "parameters": {
         "type": "object",
@@ -277,9 +310,15 @@ SEARCH_FILES_SCHEMA = {
 }
 
 
-def _iter_candidate_files(root: Path, pattern: str):
-    """walk 根目录产出文件名命中 glob 的候选文件（跳过生成物目录）。"""
+def _iter_candidate_files(root: Path, pattern: str, deadline: float):
+    """walk 根目录产出文件名命中 glob 的候选文件（跳过生成物目录）。
+
+    超过 deadline 即停止产出（巨树兜底）；调用方负责感知超时并标记
+    stopped_early。
+    """
     for dirpath, dirnames, filenames in os.walk(root):
+        if time.monotonic() > deadline:
+            return
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in _SKIP_DIRS and not d.startswith("."))
@@ -325,10 +364,12 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
     matches: List[Dict[str, Any]] = []
     files_searched = 0
     truncated = False
+    stopped_early = False
     started = time.monotonic()
-    for file_path in _iter_candidate_files(root, pattern):
-        if len(matches) >= cap:
-            truncated = True
+    deadline = started + _WALK_TIME_BUDGET_SECONDS
+    for file_path in _iter_candidate_files(root, pattern, deadline):
+        if time.monotonic() > deadline:
+            stopped_early = True
             break
         try:
             if file_path.stat().st_size > _MAX_SEARCH_FILE_BYTES:
@@ -341,20 +382,32 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
         files_searched += 1
         text = data.decode("utf-8", errors="replace")
         for line_no, line in enumerate(text.splitlines(), start=1):
+            if time.monotonic() > deadline:
+                stopped_early = True
+                break
+            if matcher is not None and len(line) > _MAX_REGEX_LINE_CHARS:
+                continue  # 超长行不进正则：限制回溯输入规模（见常量注释）
             if matcher is not None:
                 hit = matcher.search(line) is not None
             else:
                 hay = line.lower() if ignore_case else line
                 hit = needle in hay
             if hit:
+                if len(matches) >= cap:
+                    # 满额后又见命中才标记截断——恰好 cap 条且 walk 自然
+                    # 耗尽时 truncated 保持 false，避免误导后续补搜
+                    truncated = True
+                    break
                 matches.append({
                     "path": str(file_path),
                     "line": line_no,
                     "text": line.strip()[:_MAX_MATCH_LINE_CHARS],
                 })
-                if len(matches) >= cap:
-                    truncated = True
-                    break
+        if truncated or stopped_early:
+            break
+    # walk 可能已在生成器内因超时先行停止（不再产出），此处兜底感知
+    if not stopped_early and time.monotonic() > deadline:
+        stopped_early = True
 
     return tool_result({
         "query": query,
@@ -362,7 +415,8 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
         "glob": pattern,
         "regex": use_regex,
         "matches": matches,
-        "truncated": truncated,
+        "truncated": truncated or stopped_early,
+        "stopped_early": stopped_early,
         "files_searched": files_searched,
         "elapsed_seconds": round(time.monotonic() - started, 1),
     })
@@ -458,7 +512,8 @@ FIND_FILES_SCHEMA = {
         "按文件名 glob 模式递归查找文件（只找名字不搜内容；搜内容用 "
         "search_files）。pattern 按相对路径匹配：*.py 匹配任意深度的 "
         "Python 文件，docs/* 匹配 docs 下一层，data/** 匹配 data 下全部。"
-        "自动跳过 .git / __pycache__ / node_modules 等目录与隐藏目录。"
+        "自动跳过 .git / __pycache__ / node_modules 等目录与隐藏目录；"
+        "遍历超过时间预算会提前停止并标记 stopped_early。"
     ),
     "parameters": {
         "type": "object",
@@ -497,19 +552,29 @@ def _handle_find_files(args: Dict[str, Any]) -> str:
     # 所以 *.py 即任意深度）；walk 侧已保证跳过生成物目录
     results: List[str] = []
     truncated = False
+    stopped_early = False
     started = time.monotonic()
+    deadline = started + _WALK_TIME_BUDGET_SECONDS
     for dirpath, dirnames, filenames in os.walk(root):
+        if time.monotonic() > deadline:
+            stopped_early = True
+            break
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in _SKIP_DIRS and not d.startswith("."))
         for name in sorted(filenames):
+            if time.monotonic() > deadline:
+                stopped_early = True
+                break
             rel = (Path(dirpath) / name).relative_to(root).as_posix()
             if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
-                results.append(str(Path(dirpath) / name))
                 if len(results) >= cap:
+                    # 满额后又见候选才标记截断——恰好 cap 条且 walk 自然
+                    # 耗尽时 truncated 保持 false，避免误导后续补找
                     truncated = True
                     break
-        if truncated:
+                results.append(str(Path(dirpath) / name))
+        if truncated or stopped_early:
             break
 
     return tool_result({
@@ -517,7 +582,8 @@ def _handle_find_files(args: Dict[str, Any]) -> str:
         "root": str(root.resolve()),
         "files": results,
         "total": len(results),
-        "truncated": truncated,
+        "truncated": truncated or stopped_early,
+        "stopped_early": stopped_early,
         "elapsed_seconds": round(time.monotonic() - started, 1),
     })
 

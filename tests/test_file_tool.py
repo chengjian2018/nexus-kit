@@ -2,11 +2,13 @@
 find_files（filesystem tool）单测：读写往返、父目录自动创建、覆盖语义、
 分页与截断护栏、超限拒绝、精确替换编辑（唯一匹配/未找到/多处/全替换）、
 目录列举排序与截断、内容检索（glob/大小写/正则/跳过目录/命中截断、
-max_matches 只能调小）、按名查找，以及 registry 层面的注册归属
-（toolset: filesystem）。
+max_matches 只能调小）、按名查找、稳健性护栏（FIFO/设备拒读、读取
+字节预算、walk 时间预算 stopped_early、恰好满额不算截断），以及
+registry 层面的注册归属（toolset: filesystem）。
 """
 
 import json
+import os
 from unittest.mock import patch
 
 from atoms.tools import file_tool  # noqa: F401 -- module import 即注册
@@ -344,3 +346,71 @@ def test_find_files_guards(tmp_path):
     r = _run("find_files", {"pattern": "*.py",
                             "path": str(tmp_path / "nope")})
     assert "根目录" in r["error"]
+
+
+# ---------------------------------------------------------------------------
+# 稳健性护栏：非普通文件拒读 / 读取字节预算 / walk 时间预算 / 恰好满额
+# ---------------------------------------------------------------------------
+
+def test_read_rejects_fifo_and_device(tmp_path):
+    # FIFO 能骗过 exists/is_dir 校验、只有 open 才会永久阻塞——stat 先行
+    # 拒读；本测试能跑完本身即证明没有挂死（to_thread 线程不可取消）
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    r = _run("read_text", {"path": str(fifo)})
+    assert "普通文件" in r["error"]
+    if os.path.exists("/dev/zero"):     # darwin / linux 均有
+        r = _run("read_text", {"path": "/dev/zero"})
+        assert "普通文件" in r["error"]
+
+
+def test_read_byte_budget_rejects_oversized(tmp_path):
+    # 字节预算 = max_read_chars * 4 + 1024（UTF-8 单字符至多 4 字节）
+    big = tmp_path / "big.txt"
+    big.write_text("中" * 400, encoding="utf-8")    # 1200 字节 > 10*4+1024
+    r = _run("read_text", {"path": str(big)},
+             guard={**_GUARD, "max_read_chars": 10})
+    assert "上限" in r["error"]
+    # 预算内的多字节内容照常读取
+    ok = tmp_path / "ok.txt"
+    ok.write_text("中文ok", encoding="utf-8")       # 8 字节
+    r = _run("read_text", {"path": str(ok)},
+             guard={**_GUARD, "max_read_chars": 10})
+    assert r["content"] == "中文ok" and r["truncated"] is False
+
+
+def test_search_and_find_deadline_marks_stopped_early(tmp_path):
+    # 负预算 → deadline 已过，首个检查点立即收手
+    (tmp_path / "a.py").write_text("needle\n", encoding="utf-8")
+    with patch.object(file_tool, "_WALK_TIME_BUDGET_SECONDS", -1.0):
+        r = _run("search_files", {"query": "needle", "path": str(tmp_path)})
+    assert r["stopped_early"] is True and r["truncated"] is True
+    assert r["matches"] == []
+    with patch.object(file_tool, "_WALK_TIME_BUDGET_SECONDS", -1.0):
+        r = _run("find_files", {"pattern": "*.py", "path": str(tmp_path)})
+    assert r["stopped_early"] is True and r["truncated"] is True
+    assert r["files"] == []
+
+
+def test_search_exact_cap_not_truncated(tmp_path):
+    # 恰好 1 条命中 + max_matches=1：没有更多 → 不算截断
+    (tmp_path / "one.py").write_text("hit\nplain\n", encoding="utf-8")
+    r = _run("search_files", {"query": "hit", "path": str(tmp_path),
+                              "max_matches": 1})
+    assert len(r["matches"]) == 1 and r["truncated"] is False
+    # 出现第 2 条命中才构成"还有更多"的证据
+    (tmp_path / "two.py").write_text("hit again\n", encoding="utf-8")
+    r = _run("search_files", {"query": "hit", "path": str(tmp_path),
+                              "max_matches": 1})
+    assert len(r["matches"]) == 1 and r["truncated"] is True
+
+
+def test_find_files_exact_cap_not_truncated(tmp_path):
+    (tmp_path / "only.py").write_text("x", encoding="utf-8")
+    r = _run("find_files", {"pattern": "*.py", "path": str(tmp_path),
+                            "max_results": 1})
+    assert len(r["files"]) == 1 and r["truncated"] is False
+    (tmp_path / "second.py").write_text("x", encoding="utf-8")
+    r = _run("find_files", {"pattern": "*.py", "path": str(tmp_path),
+                            "max_results": 1})
+    assert len(r["files"]) == 1 and r["truncated"] is True
