@@ -533,14 +533,22 @@ class DeepResearchExecutor(NodeExecutor):
 
         # Per tc: validate → execute / feed back error → P5 → append the tool row
         new_findings: List[Dict[str, Any]] = []
+        first_query_in_round = True
         for idx, tc in enumerate(tool_calls):
             name = tc.get("function", {}).get("name", "")
             call_id = tc.get("id", "")
             parsed_args = _parse_args(tc)
 
             if _emit is not None:
-                _emit("tool_call", node_code=node_code, call_id=call_id,
-                      tool_name=name, args=parsed_args, round_idx=round_idx)
+                call_kwargs: Dict[str, Any] = dict(
+                    node_code=node_code, call_id=call_id, tool_name=name,
+                    args=parsed_args, round_idx=round_idx)
+                # P4 改写审计键与内核路径对齐（loop.py 的 rewritten /
+                # original_call）——消费方审计分支的工具改写不再缺数据
+                if idx in rewrite_audits:
+                    call_kwargs["rewritten"] = True
+                    call_kwargs["original_call"] = rewrite_audits[idx]
+                _emit("tool_call", **call_kwargs)
 
             synthetic = False
             if name not in allowed_names:
@@ -552,6 +560,15 @@ class DeepResearchExecutor(NodeExecutor):
                               f"可用工具:{sorted(allowed_names)}。")
                 }, ensure_ascii=False)
             else:
+                # Query rate limit: pause BEFORE every query that follows an
+                # earlier one in this round (synthetic error feedback is not
+                # a query; branches pace independently) — sleeping AFTER the
+                # final query only added a dead 5s tail before the wrap-up
+                # round, and cross-round gaps are already spaced by the
+                # intervening LLM latency
+                if not first_query_in_round:
+                    await asyncio.sleep(_QUERY_INTERVAL_SECONDS)
+                first_query_in_round = False
                 tool_result = await _execute_tool(name, parsed_args)
                 if hooks:
                     event = ToolResultEvent(
@@ -583,13 +600,6 @@ class DeepResearchExecutor(NodeExecutor):
 
             messages.append({"role": "tool", "tool_call_id": call_id,
                              "content": result_content})
-
-            # Query rate limit: pause after every actually-executed research
-            # query (synthetic error feedback is not a query; concurrent
-            # branches each pause their own queries, so the wall-clock gap
-            # per branch stays _QUERY_INTERVAL_SECONDS)
-            if not synthetic:
-                await asyncio.sleep(_QUERY_INTERVAL_SECONDS)
 
         return new_findings
 

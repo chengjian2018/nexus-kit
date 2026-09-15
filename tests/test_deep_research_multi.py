@@ -82,8 +82,9 @@ def fake_mcp_tools():
 
 
 def test_query_budget_and_rate_limit(monkeypatch):
-    """查询预算与限速契约：SEARCH 轮次封顶 5；每次真实执行的查询后
-    sleep _QUERY_INTERVAL_SECONDS（synthetic 错误回填不算查询，不睡）。"""
+    """查询预算与限速契约：SEARCH 轮次封顶 5；同一轮内第 2 个及之后的
+    真实查询执行前 sleep _QUERY_INTERVAL_SECONDS（synthetic 错误回填不
+    算查询不睡；单查询后不睡——消除收尾轮前的死 5s 尾延迟）。"""
     import asyncio as _asyncio
 
     import apps.deep_research_agent.executor_multi as em
@@ -113,17 +114,27 @@ def test_query_budget_and_rate_limit(monkeypatch):
     messages = []
     tool_calls = [
         {"id": "c1", "function": {"name": "web_search_prime",
-                                  "arguments": '{"query": "真实查询"}'}},
+                                  "arguments": '{"query": "第一条"}'}},
         {"id": "c2", "function": {"name": "ghost_tool",
                                   "arguments": "{}"}},  # 拦截回填，不睡
+        {"id": "c3", "function": {"name": "web_search_prime",
+                                  "arguments": '{"query": "第二条"}'}},
     ]
     findings = arun(em.DeepResearchExecutor()._dispatch_research_round(
         messages, tool_calls, hooks=None,
         allowed_names={"web_search_prime"}, round_idx=0,
         cxt=_Cxt(), node=_Node(), findings=[], tool_stats={}, stream=None))
 
-    assert len(findings) == 1            # 只有真实查询进 findings
-    assert sleeps == [5.0]               # 一次真实查询 → 一次限速暂停
+    assert len(findings) == 2            # 两条真实查询进 findings
+    assert sleeps == [5.0]               # 仅第二条查询前一次限速暂停
+
+    # 单查询收尾：无尾延迟睡眠
+    sleeps.clear()
+    arun(em.DeepResearchExecutor()._dispatch_research_round(
+        [], [tool_calls[0]], hooks=None,
+        allowed_names={"web_search_prime"}, round_idx=0,
+        cxt=_Cxt(), node=_Node(), findings=[], tool_stats={}, stream=None))
+    assert sleeps == []
 
 
 class DeepResearchScriptedProvider:
@@ -675,3 +686,45 @@ def test_orphan_paused_plan_bails_to_synthesize(pattern, fake_mcp_tools):
     # 图终止后状态板清空（挂起游标不复存在）
     assert session.cxt.graph_state == {}
     assert session.cxt.current_node_code == "dr_synthesize"
+
+
+def test_tool_call_trace_carries_rewrite_audit_keys():
+    """分支 trace 与内核路径契约对齐：P4 改写过的调用，tool_call 事件
+    携带 rewritten=True 与 original_call（原先 rewrite_audits 收集后被
+    丢弃，分支侧改写审计无数据）。"""
+    import apps.deep_research_agent.executor_multi as em
+
+    emitted = []
+
+    class _Stream:
+        def emit_trace(self, event, **data):
+            emitted.append((event, data))
+
+    def _rewrite(event):                       # P4 改写：名字 + 参数
+        return {"name": "web_search_prime", "args": {"query": "改写后"}}
+
+    class _Cxt:
+        session_id = "s-audit"
+
+    class _Node:
+        code = "dr_search"
+
+    async def _fake_execute_tool(name, args):
+        return json.dumps({"results": []}, ensure_ascii=False)
+
+    with patch.object(em, "_execute_tool", _fake_execute_tool):
+        arun(em.DeepResearchExecutor()._dispatch_research_round(
+            [], [{"id": "c1", "function": {
+                "name": "web_search", "arguments": '{"query": "原始"}'}}],
+            hooks={"on_tool_call": [_rewrite]},
+            allowed_names={"web_search_prime"}, round_idx=0,
+            cxt=_Cxt(), node=_Node(), findings=[], tool_stats={},
+            stream=_Stream()))
+
+    calls = [d for ev, d in emitted if ev == "tool_call"]
+    assert len(calls) == 1
+    assert calls[0]["rewritten"] is True
+    # original_call = hook 改写前的调用（别名归一化已先于此发生）
+    assert calls[0]["original_call"]["name"] == "web_search_prime"
+    assert calls[0]["original_call"]["args"] == {"query": "原始"}
+    assert calls[0]["args"] == {"query": "改写后"}
