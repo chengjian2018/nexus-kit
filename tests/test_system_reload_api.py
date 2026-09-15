@@ -228,3 +228,33 @@ def test_startup_validation_lenient_for_console_patterns(tmp_path, monkeypatch):
         {"pub": _pattern_with_unregistered_tool("pub")})
     monkeypatch.setattr(main, "pattern_registry", only_console)
     main._validate_registered_patterns()       # console 版宽松 → 放行不抛
+
+
+def test_system_reload_replays_console_after_code_modules(client, stub,
+                                                           monkeypatch):
+    # reload_modules 重放代码模块会重注册代码版 pattern，静默覆盖 console
+    # 修改——重放 console 托管目录必须发生在代码模块重载之后、会话重绑之前
+    import host.reload as reload_module
+    import ui.studio.store as studio_store
+
+    seq = []
+
+    def _fake_reload(mods):
+        seq.append("reload")
+        return {"changed": mods, "reloaded": mods, "failed": []}
+
+    def _fake_replay(*args, **kwargs):
+        seq.append("replay")
+        return {"plugins": {"loaded": [], "failed": {}},
+                "patterns": {"loaded": [], "failed": {}}}
+
+    monkeypatch.setattr(reload_module, "reload_modules", _fake_reload)
+    monkeypatch.setattr(studio_store, "load_console_artifacts", _fake_replay)
+
+    body = client.post("/api/v1/system/reload",
+                       json={"plugin_codes": ["executor:default_loop"]}).json()
+    assert body["code"] == "0" and body["status"] is True
+    assert seq == ["reload", "replay"]
+    cm = body["data"]["report"]["code_modules"]
+    assert cm["console_replayed"] == 0
+    assert "console_replay_failed" not in cm
