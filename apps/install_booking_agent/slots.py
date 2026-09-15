@@ -61,6 +61,13 @@ def parse_available_slots(task_info: dict) -> List[Slot]:
                 raw_slots = []
         else:
             raw_slots = [s.strip() for s in re.split(r"[;；，,、\n]+", text) if s.strip()]
+    if not isinstance(raw_slots, (list, tuple)):
+        # 标量（int/bool）等任意 JSON 形态：or [] 不收编 truthy 标量，
+        # dict 迭代出的 key 也不是档期——一律按坏档期降级为空表
+        logger.warning(
+            "[install_booking] available_slots 形态非法（按空档期处理）: %r",
+            raw_slots)
+        raw_slots = []
     slots: List[Slot] = []
     for raw in raw_slots:
         try:

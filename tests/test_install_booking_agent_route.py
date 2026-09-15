@@ -878,3 +878,15 @@ def test_available_slots_string_shapes_normalized():
     assert parse_available_slots(
         {"available_slots": ["not a slot", "2026-09-10 09:00-12:00"]}) == [
         canonical[0]]
+
+
+def test_parse_available_slots_scalar_shapes_never_raise():
+    """任意 JSON 标量形态（int/bool/dict）按坏档期降级为空表——
+    TypeError 会穿透 _apply_booking_guard 炸掉整轮对话。"""
+    from apps.install_booking_agent.slots import parse_available_slots
+
+    assert parse_available_slots({"available_slots": 5}) == []
+    assert parse_available_slots({"available_slots": True}) == []
+    # dict 迭代出的是 key 而非档期，同样降级
+    assert parse_available_slots(
+        {"available_slots": {"2026-09-10 09:00-12:00": 1}}) == []
