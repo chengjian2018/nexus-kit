@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from nexus.engine.tool_context import ambient_pattern_code
 from nexus.registry.tools import registry, tool_error, tool_result
 from nexus.settings import get_shell_tool_config
 
@@ -213,7 +214,7 @@ async def _handle_bash(args: Dict[str, Any]) -> str:
     if not command:
         return tool_error("command 必填：要执行的 shell 命令")
 
-    guard = get_shell_tool_config()
+    guard = get_shell_tool_config(ambient_pattern_code())
     err, workdir = _resolve_workdir(args)
     if err:
         return tool_error(err)
@@ -274,7 +275,7 @@ async def _handle_run_python(args: Dict[str, Any]) -> str:
     if not code.strip():
         return tool_error("code 必填：要执行的 Python 源码")
 
-    guard = get_shell_tool_config()
+    guard = get_shell_tool_config(ambient_pattern_code())
     err, workdir = _resolve_workdir(args)
     if err:
         return tool_error(err)

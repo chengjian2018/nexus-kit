@@ -112,7 +112,8 @@ async def _handle_delegate_task(args: Dict[str, Any]) -> str:
 
     llm_config = (ambient.llm_config if ambient is not None else None) \
         or get_llm_config()
-    guard = get_subagent_tool_config()
+    guard = get_subagent_tool_config(
+        ambient.pattern_code if ambient is not None else "")
 
     system_prompt = str(args.get("system_prompt") or "").strip() \
         or _DEFAULT_SYSTEM_PROMPT

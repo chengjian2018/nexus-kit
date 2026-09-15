@@ -780,7 +780,8 @@ async def _handle_run_workflow(args: Dict[str, Any]) -> str:
             "run_workflow 不允许嵌套调用（v1 深度=1）："
             "子代理/workflow 内无法再发起 workflow")
 
-    guard = get_workflow_tool_config()
+    guard = get_workflow_tool_config(
+        ambient.pattern_code if ambient is not None else "")
     err, parsed = _validate_args(args, guard)
     if err:
         return tool_error(err)

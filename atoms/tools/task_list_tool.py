@@ -33,7 +33,7 @@ import logging
 import threading
 from typing import Any, Dict, List
 
-from nexus.engine.tool_context import current_tool_context
+from nexus.engine.tool_context import ambient_pattern_code, current_tool_context
 from nexus.registry.tools import registry, tool_error, tool_result
 from nexus.settings import get_tasks_tool_config
 
@@ -178,7 +178,7 @@ WRITE_TASKS_SCHEMA = {
 
 
 def _handle_write_tasks(args: Dict[str, Any]) -> str:
-    guard = get_tasks_tool_config()
+    guard = get_tasks_tool_config(ambient_pattern_code())
     try:
         cleaned = _validate_tasks(args.get("tasks"), guard)
     except ValueError as e:

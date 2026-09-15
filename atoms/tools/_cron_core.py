@@ -20,8 +20,10 @@ AST 发现不 import 本模块；由 atoms/tools/cron_tool.py 引入）。
 
 授权模型：job 创建时刻把当时 pattern 的 ``allow_toolset`` 解析成具体
 工具名冻结进 job（剔除 subagent/workflow/cron 三个编排工具集，结构性
-防"编排套编排/自复制"）；fire 时按快照池执行，权限永不越出创建者的
-授权边界。llm_config 在 fire 时刻现解析（配置热更新生效）。
+防"编排套编排/自复制"），并一并冻结创建 pattern 的 ``pattern_code``
+（fire 期护栏与 LLM 配置的 app 覆盖定位键；旧作业文件缺字段回退 ""=
+全局）；fire 时按快照池执行，权限永不越出创建者的授权边界。
+llm_config 在 fire 时刻现解析（配置热更新生效）。
 
 测试隔离：环境变量 ``NEXUS_CRON_DISABLED=1``（tests/conftest.py 与
 NEXUS_MCP_DISABLED 同款模式）让 ensure_scheduler 直接 no-op、仓不读
@@ -40,6 +42,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from nexus.engine.tool_context import ambient_pattern_code
 from nexus.registry.tools import registry as tool_registry
 from nexus.settings import get_cron_tool_config
 
@@ -208,8 +211,9 @@ class CronStore:
 async def default_execute_job(job: Dict[str, Any]) -> Dict[str, Any]:
     """fire 默认执行器：授权快照池上的 delegate 式子代理循环。
 
-    llm_config 在 fire 时刻解析（热更新生效）；工具池是 job.tools 冻结
-    快照（创建时已剔除编排工具集）。
+    llm_config 与护栏在 fire 时刻按作业冻结的 ``pattern_code`` 解析
+    （app 覆盖热更新生效，定位键是创建时刻冻结值）；工具池是 job.tools
+    冻结快照（创建时已剔除编排工具集）。
     """
     from atoms.tools._subagent_core import (  # 延迟导入防环
         _DEFAULT_SYSTEM_PROMPT,
@@ -218,8 +222,9 @@ async def default_execute_job(job: Dict[str, Any]) -> Dict[str, Any]:
     from nexus.llm.resolve import build_provider
     from nexus.settings import get_llm_config
 
-    llm_config = get_llm_config()
-    guard = get_cron_tool_config()
+    pattern_code = str(job.get("pattern_code") or "")
+    llm_config = get_llm_config(pattern_code=pattern_code)
+    guard = get_cron_tool_config(pattern_code)
     state: Dict[str, Any] = {}
     payload = await _run_sub_agent(
         provider=build_provider(llm_config),
@@ -322,7 +327,10 @@ class CronScheduler:
                 job = self.jobs.get(job_id)
                 if job is None or not job.get("enabled", True):
                     return
-                guard = get_cron_tool_config()
+                # fire 期护栏按作业冻结的 pattern_code 解析（无冻结值 =
+                # 旧作业文件，回退全局段）；调度器循环本体（tick/load）在
+                # 会话外运行，保持全局解析是正确行为
+                guard = get_cron_tool_config(str(job.get("pattern_code") or ""))
                 # 触发即排下一次（先排后跑：跑挂了也不丢后续调度）
                 job["next_fire_at"] = compute_next_fire(job)
                 job["runs"] = int(job.get("runs", 0)) + 1
@@ -399,9 +407,10 @@ class CronScheduler:
         """新增/覆盖一个作业（update_cron 复用覆盖语义）。
 
         max_jobs 上限在锁内检查：锁外的先查后加在并发 create 下会双双
-        通过、超限写入。新增（id 不存在）超限时抛 ValueError。"""
+        通过、超限写入。新增（id 不存在）超限时抛 ValueError。护栏按
+        调用方（create handler）所在 pattern 的 app 覆盖解析。"""
         with self._lock:
-            guard = get_cron_tool_config()
+            guard = get_cron_tool_config(ambient_pattern_code())
             if (job["id"] not in self.jobs
                     and len(self.jobs) >= int(guard["max_jobs"])):
                 raise ValueError(

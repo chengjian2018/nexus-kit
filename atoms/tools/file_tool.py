@@ -49,6 +49,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+from nexus.engine.tool_context import ambient_pattern_code
 from nexus.registry.tools import registry, tool_error, tool_result
 from nexus.settings import get_file_tool_config
 
@@ -133,7 +134,7 @@ def _handle_read_text(args: Dict[str, Any]) -> str:
         return tool_error(f"无法读取文件状态: {e}")
     if not stat.S_ISREG(st.st_mode):
         return tool_error("不是普通文件（设备/FIFO 等），拒绝读取")
-    guard = get_file_tool_config()
+    guard = get_file_tool_config(ambient_pattern_code())
     cap = int(guard["max_read_chars"])
     # 字节预算按字符上限折算（UTF-8 单字符至多 4 字节）：超预算的文件
     # 整读后必然截断，白读不如直接拒绝
@@ -196,7 +197,7 @@ def _handle_write_text(args: Dict[str, Any]) -> str:
         return tool_error("content 必填：要写入的完整文本（空内容请显式传空串）")
     content = str(args["content"])
 
-    guard = get_file_tool_config()
+    guard = get_file_tool_config(ambient_pattern_code())
     cap = int(guard["max_write_chars"])
     if len(content) > cap:
         return tool_error(
@@ -269,7 +270,7 @@ def _handle_list_dir(args: Dict[str, Any]) -> str:
     except OSError as e:
         return tool_error(f"无法读取目录: {e}")
 
-    guard = get_file_tool_config()
+    guard = get_file_tool_config(ambient_pattern_code())
     cap = int(guard["max_list_entries"])
     total = len(entries)
     truncated = total > cap
@@ -350,7 +351,7 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
     else:
         needle = query.lower() if ignore_case else query
 
-    guard = get_file_tool_config()
+    guard = get_file_tool_config(ambient_pattern_code())
     cap = int(guard["max_matches"])
     if args.get("max_matches") is not None:
         try:
@@ -466,7 +467,7 @@ def _handle_edit_file(args: Dict[str, Any]) -> str:
     if path.is_dir():
         return tool_error(f"路径是目录不是文件: {path}")
 
-    guard = get_file_tool_config()
+    guard = get_file_tool_config(ambient_pattern_code())
     size_cap = int(guard["max_edit_chars"])
     data = path.read_bytes()
     if b"\x00" in data[:4096]:
@@ -537,7 +538,7 @@ def _handle_find_files(args: Dict[str, Any]) -> str:
     if not root.is_dir():
         return tool_error(f"查找根目录不存在或不是目录: {root}")
 
-    guard = get_file_tool_config()
+    guard = get_file_tool_config(ambient_pattern_code())
     cap = int(guard["max_find_results"])
     if args.get("max_results") is not None:
         try:

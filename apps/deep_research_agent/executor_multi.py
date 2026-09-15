@@ -64,6 +64,7 @@ import asyncio
 import json
 import logging
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -93,6 +94,7 @@ from nexus.engine.loop import (
     warn_prompt_length,
 )
 from nexus.engine.messages import build_agent_messages
+from nexus.engine.tool_context import tool_call_context
 from nexus.engine.turn_result import Send
 from nexus.llm.resolve import build_provider
 from apps.deep_research_agent.prompts import (
@@ -172,6 +174,26 @@ def _normalize_tool_name(name: str, allowed_names: set) -> Tuple[str, bool]:
     if mapped and mapped in allowed_names:
         return mapped, True
     return name, False
+
+
+@contextmanager
+def _dispatch_context(ec):
+    """Publish the branch's position around raw ``_execute_tool`` dispatches.
+
+    These custom stations bypass the default loop executor, which normally
+    publishes this context — without it their tool calls run detached and
+    the guardrail handlers can only fall back to the global sections.
+    ``pattern_code`` is the load-bearing field: it keys the app guardrails
+    overlay (deep_research / topic_research each bind their own
+    apps/<name>/config.yaml; the inherited _search_branch carries whichever
+    pattern's ec it is executing under)."""
+    with tool_call_context(
+        (getattr(ec.cxt, "llm_config", None) or {}),
+        getattr(ec.pattern, "allow_toolset", None) or [],
+        session_id=getattr(ec.cxt, "session_id", "") or "",
+        pattern_code=getattr(ec.pattern, "code", "") or "",
+    ):
+        yield
 
 
 def _load_state(cxt) -> Optional[Dict[str, Any]]:
@@ -268,9 +290,10 @@ class DeepResearchExecutor(NodeExecutor):
         if tool_calls:
             # round_idx=-1 → findings record round=0 (pre-retrieval marker,
             # distinguishing it from SEARCH rounds)
-            findings = await self._dispatch_research_round(
-                messages, tool_calls, hooks, allowed_names, -1,
-                cxt, node, findings, tool_stats, stream=ec.stream)
+            with _dispatch_context(ec):
+                findings = await self._dispatch_research_round(
+                    messages, tool_calls, hooks, allowed_names, -1,
+                    cxt, node, findings, tool_stats, stream=ec.stream)
             _truncate_workspace(messages)
             trace["phases"].append("preplan_search")
             _emit_round(ec.stream, "preplan", 0)
@@ -451,9 +474,10 @@ class DeepResearchExecutor(NodeExecutor):
                 reflection_note = content
                 break
 
-            new_findings = await self._dispatch_research_round(
-                workspace, tool_calls, hooks, allowed_names, round_idx,
-                cxt, node, findings, tool_stats, stream=ec.stream)
+            with _dispatch_context(ec):
+                new_findings = await self._dispatch_research_round(
+                    workspace, tool_calls, hooks, allowed_names, round_idx,
+                    cxt, node, findings, tool_stats, stream=ec.stream)
             findings.extend(new_findings)
             if len(findings) > _MAX_FINDINGS:
                 findings = findings[len(findings) - _MAX_FINDINGS:]

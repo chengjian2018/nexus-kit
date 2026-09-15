@@ -15,9 +15,10 @@ node.use_tools）::
       use_tools: [create_cron, list_crons, update_cron, delete_cron]
 
 作业权限 = 创建时刻 pattern 授权的冻结快照（剔除 subagent/workflow/
-cron 编排工具集，结构性防递归与自复制），args.tools 只能收窄。fire
-在 host 进程内由 tick 循环驱动（默认 20s 一拍），同 job 不重入；停机
-期间错过的触发不补跑（重启后从下一个匹配点继续）。
+cron 编排工具集，结构性防递归与自复制，args.tools 只能收窄；创建
+pattern 的 code 一并冻结——fire 期护栏与 LLM 配置按它解析 app 覆盖）。
+fire 在 host 进程内由 tick 循环驱动（默认 20s 一拍），同 job 不重入；
+停机期间错过的触发不补跑（重启后从下一个匹配点继续）。
 
 调度表达：``schedule`` 传标准 5 字段 cron（分 时 日 月 周，宿主本地
 时间，支持 ``*``/``*/n``/``a``/``a-b``/``a-b/n`` 及逗号），或
@@ -156,7 +157,10 @@ CREATE_CRON_SCHEMA = {
 
 
 def _handle_create_cron(args: Dict[str, Any]) -> str:
-    guard = get_cron_tool_config()
+    # 创建侧护栏按执行 pattern 的 app 覆盖解析（ambient；脱离调用 = 全局）
+    ambient = current_tool_context()
+    pattern_code = ambient.pattern_code if ambient is not None else ""
+    guard = get_cron_tool_config(pattern_code)
     name = str(args.get("name") or "").strip()
     if not name:
         return tool_error("name 必填：作业名（list/update/delete 用它定位）")
@@ -176,8 +180,9 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
     if err:
         return tool_error(err)
 
-    # 授权快照：创建时刻 pattern 授权 − 编排工具集；args.tools 只能收窄
-    ambient = current_tool_context()
+    # 授权快照：创建时刻 pattern 授权 − 编排工具集；args.tools 只能收窄。
+    # pattern_code 一并冻结（对齐"作业权限=创建时刻冻结快照"原则）——
+    # 触发期 fire 用它解析护栏与 LLM 配置的 app 覆盖
     pool = snapshot_tool_pool(
         ambient.allow_toolsets if ambient is not None else [])
     err, tools = _resolve_tools(args, pool)
@@ -202,6 +207,7 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
         "system_prompt": str(args.get("system_prompt") or "").strip(),
         "tools": tools,
         "_pool": pool,          # 授权快照池（内部字段，update 校验用）
+        "pattern_code": pattern_code,   # 创建时刻冻结（fire 期护栏/LLM 定位键）
         "timeout_seconds": timeout,
         "created_at": datetime.datetime.now().isoformat(
             timespec="seconds"),
@@ -300,7 +306,9 @@ def _handle_update_cron(args: Dict[str, Any]) -> str:
     if job is None:
         return tool_error("job_id 不存在，请用 list_crons 查询有效作业")
 
-    guard = get_cron_tool_config()
+    ambient = current_tool_context()
+    guard = get_cron_tool_config(
+        ambient.pattern_code if ambient is not None else "")
     updates: Dict[str, Any] = {}
 
     if args.get("name") is not None:
