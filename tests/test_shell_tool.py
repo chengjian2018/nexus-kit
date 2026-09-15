@@ -142,3 +142,16 @@ def test_run_python_no_stdin_hang():
     r = _py({"code": "input()"})
     assert r["exit_code"] != 0
     assert r["timed_out"] is False
+
+
+def test_bash_timeout_returns_despite_detached_grandchild(monkeypatch):
+    """setsid 逃逸的孙进程握住管道写端：超时击杀后的收尸宽限兜底，
+    调用必须返回（exit_code/输出可缺），而不是在"超时之后"永久挂死
+    一个不可取消的 to_thread 线程。"""
+    import atoms.tools.shell_tool as st
+
+    monkeypatch.setattr(st, "_POST_KILL_GRACE_SECONDS", 0.5)
+    cmd = ('python3 -c "import os,time; os.setsid(); time.sleep(60)" & '
+           'exec sleep 60')
+    r = _bash({"command": cmd}, guard={**_GUARD, "timeout_seconds": 1})
+    assert r["timed_out"] is True

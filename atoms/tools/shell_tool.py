@@ -43,6 +43,10 @@ from nexus.settings import get_shell_tool_config
 
 logger = logging.getLogger(__name__)
 
+# 超时击杀后的收尸宽限（秒）：足够读回管道里的残余输出，又不会让
+# "已超时"的工具调用再挂住一个不可取消的 to_thread 线程
+_POST_KILL_GRACE_SECONDS = 5.0
+
 
 # ---------------------------------------------------------------------------
 # 子进程执行核心（bash 与 run_python 共用）
@@ -91,7 +95,23 @@ async def _run_subprocess(argv: Tuple[str, ...], *, shell: bool = False,
     except asyncio.TimeoutError:
         timed_out = True
         _kill_process_group(proc)
-        stdout_b, stderr_b = await proc.communicate()
+        # 收尸也带宽限：killpg 够不到 setsid 逃逸的孙进程（nohup/双 fork
+        # 守护），它们握着管道写端让 communicate 等不到 EOF——宽限过后
+        # 强制关闭 stdio transport 放弃残余输出，绝不在"超时之后"再挂死
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=_POST_KILL_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "子进程超时击杀后 %.1fs 仍未收尸（孙进程握管道），放弃残余输出",
+                _POST_KILL_GRACE_SECONDS)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:  # noqa: BLE001 -- 尽力而为的收尾
+                        pass
+            stdout_b, stderr_b = b"", b""
 
     return {
         "exit_code": proc.returncode,
