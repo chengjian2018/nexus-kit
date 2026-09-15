@@ -36,7 +36,7 @@ PATTERN_TYPES = ("fsm", "agent")
 DEFAULT_PATTERN_TYPE = "agent"
 
 # AGENT graph step budget default (config.max_steps; one node execution per
-# step — aligns with the loop executor's _MAX_TOOL_ROUNDS guard scale)
+# step — aligns with the global loop.max_tool_rounds guard scale)
 DEFAULT_MAX_STEPS = 10
 
 # Runtime fan-out width default (config.max_fanout — the per-dimension
@@ -56,6 +56,7 @@ class Pattern:
                  plugins: Optional[Dict[str, str]] = None,
                  agent_hooks: Optional[str] = None,
                  allow_toolset: Optional[List[str]] = None,
+                 allow_skills: Optional[List[str]] = None,
                  config: Optional[Dict[str, Any]] = None,
                  **kwargs):
         self.code = code
@@ -148,8 +149,8 @@ class Pattern:
         cfg["stages"] = self.stages
 
         # ------------------------------------------------------------------
-        # plugins（新槽位表 loop/fsm/messages_builder/agent_hooks/llm，
-        # 值收窄为 str/None；agent_hooks 顶级参数是语法糖）
+        # plugins（槽位表 loop/fsm/messages_builder/agent_hooks，值收窄为
+        # str/None；agent_hooks 顶级参数是语法糖）
         # ------------------------------------------------------------------
         declared_plugins = plugins if plugins is not None else cfg.get("plugins")
         self.plugins = normalize_plugins(
@@ -165,6 +166,15 @@ class Pattern:
                              else cfg.get("allow_toolset"))
         self.allow_toolset = list(declared_toolsets or [])
         cfg["allow_toolset"] = self.allow_toolset
+
+        # ------------------------------------------------------------------
+        # allow_skills（技能资产级授权：空 = 无任何技能，node.use_skills
+        # 在其上收口；扫描与解析见 nexus/skills.py——数据资产，无注册表）
+        # ------------------------------------------------------------------
+        declared_skills = (allow_skills if allow_skills is not None
+                           else cfg.get("allow_skills"))
+        self.allow_skills = list(declared_skills or [])
+        cfg["allow_skills"] = self.allow_skills
 
         # ------------------------------------------------------------------
         # entry_node_code：空 = nodes[0].code

@@ -49,9 +49,12 @@ class BaseNode:
         slots: business-slot definitions ``{slot_name: 描述}`` (FSM only).
         use_tools: tool names this node may call — **empty = no tools**
             (deny-by-default; intersected with pattern.allow_toolset).
+        use_skills: skill names this node may load — **empty = no skills**
+            (deny-by-default; intersected with pattern.allow_skills;
+            scanned by nexus/skills.py — a data asset, no registry).
         is_end: terminal marker (FSM end node / AGENT graph terminal).
         plugins: unified plugin declarations (loop / messages_builder /
-            agent_hooks / llm — see nexus/model/plugins_field.py); the node
+            agent_hooks — see nexus/model/plugins_field.py); the node
             layer over the pattern layer.
         config: free-form declaration bag (prompt assets etc.) — the single
             home of ``**kwargs`` extras.
@@ -68,6 +71,7 @@ class BaseNode:
         stages: Optional[Dict[str, str]] = None,
         slots: Optional[Dict[str, str]] = None,
         use_tools: Optional[List[str]] = None,
+        use_skills: Optional[List[str]] = None,
         is_end: Optional[bool] = False,
         plugins: Optional[Dict[str, str]] = None,
         config: Optional[Dict[str, Any]] = None,
@@ -91,6 +95,10 @@ class BaseNode:
 
         # Tool allowlist: empty = NO tools (deny-by-default)
         self.use_tools = list(use_tools or [])
+
+        # Skill allowlist: empty = NO skills (deny-by-default; intersected
+        # with pattern.allow_skills — resolution lives in nexus/skills.py)
+        self.use_skills = list(use_skills or [])
 
         self.is_end = bool(is_end)
 

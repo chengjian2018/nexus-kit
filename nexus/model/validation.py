@@ -11,10 +11,12 @@ Entry points:
   (constructor raised on pattern-level stages; node-level stages are an
   AGENT declaration error caught here).
 - validate_plugin_declarations(pattern): executor / stages / skeleton /
-    messages_builder / agent_hooks codes resolve in the plugin registry
-    (``llm`` resolves via settings at refresh time — not checked here).
+    messages_builder / agent_hooks codes resolve in the plugin registry.
 - validate_tools(pattern): every node.use_tools name is registered AND its
   toolset ∈ pattern.allow_toolset (deny-by-default 三层收口).
+- validate_skills(pattern): skill declarations resolve against the
+  nexus/skills.py scan (missing names / 越权 use_skills / requires_toolsets
+  not granted by allow_toolset).
 
 Callers: host/main startup validates every registered pattern; yml loading
 validates after construction. The structural graph checks (dangling
@@ -106,7 +108,7 @@ def validate_plugin_declarations(pattern: Pattern) -> List[str]:
     pcode = getattr(pattern, "code", "?")
 
     # Pattern-level plugins dict (executor family slots report with their
-    # executor_<family> label; "llm" resolves via settings — skipped here)
+    # executor_<family> label)
     for slot, declared in (getattr(pattern, "plugins", None) or {}).items():
         if not (isinstance(declared, str) and declared):
             continue
@@ -270,18 +272,87 @@ def validate_tools(pattern: Pattern, strict: bool = True) -> List[str]:
     return []
 
 
+def validate_skills(pattern: Pattern, strict: bool = True) -> List[str]:
+    """Validate skill declarations against the scanned skill assets
+    (nexus/skills.py — data assets, no registry).
+
+    Findings:
+    - a declared name (pattern.allow_skills / node.use_skills) missing from
+      the scan root;
+    - a node use_skills name outside pattern.allow_skills (越权声明);
+    - an enabled skill whose ``requires_toolsets`` is not a subset of
+      ``pattern.allow_toolset`` (the skill needs tool surfaces the pattern
+      never granted — it would load but not function).
+
+    Timing exception (mirror of the MCP one): when the scan root itself
+    does not exist, everything defers to runtime resolution with a warning
+    — skill roots are deployment-local (e.g. ~/.claude/skills) and must
+    not block a portable boot.
+
+    ``strict=False``（宽松模式，生成工作台装载路径）: findings downgrade to
+    warnings and pass — same rationale as validate_tools (newly generated
+    patterns may reference resources dropped in later).
+    """
+    from nexus.skills import resolve_skills_dir, scan_skills
+
+    findings: List[str] = []
+    pcode = getattr(pattern, "code", "?")
+    root = resolve_skills_dir(pattern)
+    if not root.is_dir():
+        logger.warning(
+            "[validation] pattern %r 的技能扫描根不存在（%s）——技能声明"
+            "留待运行期解析，不作为错误", pcode, root)
+        return []
+    entries = scan_skills(root)
+
+    allowed = set(getattr(pattern, "allow_skills", None) or [])
+    for name in sorted(allowed):
+        if name not in entries:
+            findings.append(
+                f"pattern {pcode!r} 的 allow_skills 声明了扫描根中不存在的"
+                f"技能 {name!r}（root={root}）")
+
+    granted = set(getattr(pattern, "allow_toolset", None) or [])
+    for node in pattern.nodes:
+        use = set(getattr(node, "use_skills", None) or [])
+        if not use:
+            continue
+        for name in sorted(use - allowed):
+            findings.append(
+                f"pattern {pcode!r} 节点 {node.code!r} 的 use_skills 越权: "
+                f"{name!r}（不在 allow_skills={sorted(allowed) or '空'} 内）")
+        for name in sorted(use & allowed):
+            entry = entries.get(name)
+            if entry is None:
+                continue  # allow_skills 缺失已在上面报过
+            missing = set(entry.requires_toolsets) - granted
+            if missing:
+                findings.append(
+                    f"pattern {pcode!r} 节点 {node.code!r} 启用的技能 "
+                    f"{name!r} 需要 toolset {sorted(missing)}，"
+                    f"但 allow_toolset={sorted(granted) or '空'} 未授权")
+
+    if strict:
+        return findings
+    for msg in findings:
+        logger.warning("[validation]（宽松模式放行）%s", msg)
+    return []
+
+
 def validate_pattern(pattern: Pattern, strict_tools: bool = True) -> None:
     """Full validation: base info + plugin declarations + toolset
-    authorization; collects ALL errors then raises one numbered ValueError
-    (empty list = valid, silent return).
+    authorization + skill declarations; collects ALL errors then raises one
+    numbered ValueError (empty list = valid, silent return).
 
-    ``strict_tools=False``：工具面走宽松校验（见 validate_tools）——
-    生成工作台（studio 生成/发布/应用/托管目录重放）允许引用后补注册
-    的新工具；内置 pattern 装配与 CLI pattern-load 保持严格默认。
+    ``strict_tools=False``：工具面与技能面走宽松校验（见 validate_tools /
+    validate_skills）——生成工作台（studio 生成/发布/应用/托管目录重放）
+    允许引用后补注册的新工具与新投放的技能；内置 pattern 装配与 CLI
+    pattern-load 保持严格默认。
     """
     errors = (validate_base_info(pattern)
               + validate_plugin_declarations(pattern)
-              + validate_tools(pattern, strict=strict_tools))
+              + validate_tools(pattern, strict=strict_tools)
+              + validate_skills(pattern, strict=strict_tools))
     if errors:
         numbered = "\n".join(f"  [{i + 1}] {e}" for i, e in enumerate(errors))
         raise ValueError(

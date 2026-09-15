@@ -23,21 +23,21 @@ from nexus.model.pattern import DEFAULT_MAX_STEPS, Pattern
 _NODE_FIELDS = [
     "code", "name", "description", "task_description",
     "sub_nodes", "answer_examples", "stages", "slots",
-    "use_tools", "is_end", "plugins",
+    "use_tools", "use_skills", "is_end", "plugins",
 ]
 
 # Pattern scalar fields serialized (nodes/stages/plugins handled
 # structurally; everything else lives inside config)
 _PATTERN_FIELDS = [
     "code", "name", "description", "pattern_type",
-    "entry_node_code", "allow_toolset",
+    "entry_node_code", "allow_toolset", "allow_skills",
 ]
 
 # config keys already emitted as top-level structural fields — excluded from
 # the config snapshot to avoid double emission
 _CFG_DEDUP_KEYS = {
     "pattern_type", "entry_node_code", "stages", "plugins",
-    "allow_toolset", "max_steps",
+    "allow_toolset", "allow_skills", "max_steps",
 }
 
 

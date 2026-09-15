@@ -33,17 +33,27 @@ from nexus.engine.loop import (
 from nexus.engine.messages import build_agent_messages
 from nexus.engine.tool_context import tool_call_context
 from nexus.llm.resolve import build_provider
+from nexus.settings import get_loop_limits
+from nexus.skills import resolve_enabled_skills, resolve_skills_dir, skill_prompt_block
+
+from atoms.tools.skill_tool import SKILL_TOOL_SCHEMAS
 
 logger = logging.getLogger(__name__)
-
-# Max tool calling rounds to prevent infinite loops
-_MAX_TOOL_ROUNDS = 10
 
 
 class DefaultLoopExecutor(NodeExecutor):
     """AGENT node executor: ReAct tool loop, replies directly. Tool
     availability = node.use_tools ∩ pattern.allow_toolset 工具集（both
-    deny-by-default，见 nexus/engine/loop.py::_resolve_tools）。"""
+    deny-by-default，见 nexus/engine/loop.py::_resolve_tools）。
+
+    Skills: when the node's resolved skill set (use_skills ∩ allow_skills,
+    nexus/skills.py) is non-empty, the read-only knowledge tools
+    (load_skill / read_skill_file) are appended to the round's tool list
+    automatically — the skill declaration IS the grant; the execution-surface
+    tools still go through the three-layer tool authorization. The L0
+    metadata block (one line per skill) rides extra_blocks into the system
+    prompt, so custom builders honoring the MessagesBuilder contract carry
+    skills without knowing about them."""
 
     async def execute(self, ec: "ExecutionContext") -> TurnResult:
         cxt = ec.cxt
@@ -58,6 +68,11 @@ class DefaultLoopExecutor(NodeExecutor):
         # pass-through)
         hooks = resolve_agent_hooks(node, pattern)
 
+        # Skills: resolve once per execution (fingerprint-cached scan);
+        # the L0 block joins the P1 hook fragments in extra_blocks
+        enabled_skills = resolve_enabled_skills(node, pattern)
+        skills_dir = resolve_skills_dir(pattern)
+
         # P1 on_agent_start: fetched and injected before the loop and messages
         # assembly. Fragments reach the builder via extra_blocks (the contract
         # requires including them); hooks do not write to cxt
@@ -66,6 +81,9 @@ class DefaultLoopExecutor(NodeExecutor):
             AgentStartEvent(session_id=cxt.session_id,
                             node_code=node.code, cxt=cxt),
         ) if hooks else []
+        skill_block = skill_prompt_block(node, pattern)
+        if skill_block:
+            fragments = [*fragments, skill_block]
 
         # MCP servers register asynchronously in the background at startup:
         # if the first turn races ahead of connection completion, the set
@@ -76,6 +94,8 @@ class DefaultLoopExecutor(NodeExecutor):
         await ensure_mcp_ready()
 
         tools = _resolve_tools(node, pattern)
+        if enabled_skills:
+            tools = [*tools, *SKILL_TOOL_SCHEMAS]
         allowed_names = {t.get("function", {}).get("name", "") for t in tools}
 
         # Integrated messages build (system content and list assembly share one
@@ -100,11 +120,21 @@ class DefaultLoopExecutor(NodeExecutor):
         # Context-bound tools (delegate_task / read_tasks) inherit this
         # loop's llm_config, the pattern's toolset grant, and the session id
         # (task-list scoping) via the ambient contextvar; custom loops that
-        # skip this leave those tools on their fallback path
+        # skip this leave those tools on their fallback path. The skill
+        # fields scope the load_skill/read_skill_file handlers (root +
+        # the enabled-set boundary); pattern_code keys the tool-guardrail
+        # app overlay (empty = detached call, global guardrails).
+        max_tool_rounds = get_loop_limits(
+            getattr(pattern, "code", "") or "",
+            getattr(node, "code", "") or "",
+        )["max_tool_rounds"]
         with tool_call_context(
                 llm_config, getattr(pattern, "allow_toolset", None) or [],
-                session_id=cxt.session_id):
-            for round_idx in range(_MAX_TOOL_ROUNDS):
+                session_id=cxt.session_id,
+                skills_dir=str(skills_dir),
+                enabled_skills=frozenset(enabled_skills),
+                pattern_code=getattr(pattern, "code", "") or ""):
+            for round_idx in range(max_tool_rounds):
                 logger.info(
                     "Agent loop 第 %d 轮: session=%s, node=%s, tools=%d",
                     round_idx + 1, cxt.session_id, node.code, len(tools),
@@ -154,15 +184,15 @@ class DefaultLoopExecutor(NodeExecutor):
 
         logger.warning(
             "Agent loop 达到最大轮次 %d，强制终止: session=%s",
-            _MAX_TOOL_ROUNDS, cxt.session_id,
+            max_tool_rounds, cxt.session_id,
         )
         # P7 on_agent_end: max-rounds-exceeded exit
         if hooks:
             fire(hooks, "on_agent_end", AgentEndEvent(
                 session_id=cxt.session_id, node_code=node.code,
-                rounds=_MAX_TOOL_ROUNDS, outcome="max_rounds",
+                rounds=max_tool_rounds, outcome="max_rounds",
                 reply="抱歉，处理超时，请稍后重试。"))
-        _emit_round(ec.stream, "max_rounds", _MAX_TOOL_ROUNDS - 1)
+        _emit_round(ec.stream, "max_rounds", max_tool_rounds - 1)
         return TurnResult(content="抱歉，处理超时，请稍后重试。")
 
 
@@ -171,10 +201,17 @@ class DefaultLoopExecutor(NodeExecutor):
 # ---------------------------------------------------------------------------
 
 async def _stream_round(provider, messages, model, temperature, max_tokens,
-                        stream_emitter, tools=None):
+                        stream_emitter, tools=None, forward_text=True):
     """One agent-loop LLM round, streamed: consume LLMChunks, forward text
-    deltas optimistically (when an emitter is attached), and aggregate the
-    round into the legacy dict (tool dispatch needs merged tool_calls).
+    deltas optimistically and thinking-model reasoning as thinking events
+    (when an emitter is attached), and aggregate the round into the legacy
+    dict (tool dispatch needs merged tool_calls).
+
+    ``forward_text=False`` forwards ONLY thinking events: intermediate work
+    rounds whose text is protocol JSON or between-tool chatter, not a
+    user-visible reply (the multi-station app convention — deep_research /
+    archify pass the emitter for the thinking stream but keep interim text
+    out of the reply area).
 
     Duck-typed providers without ``achat_completion_stream`` (test stubs /
     legacy custom providers) fall back to ``achat_completion`` — no deltas
@@ -198,8 +235,10 @@ async def _stream_round(provider, messages, model, temperature, max_tokens,
 
     async def _tap():
         async for chunk in chunks:
-            if chunk.text:
+            if forward_text and chunk.text:
                 stream_emitter.emit_delta(chunk.text)
+            if getattr(chunk, "reasoning", ""):
+                stream_emitter.emit_thinking(chunk.reasoning)
             yield chunk
 
     return await acollect_stream(_tap())

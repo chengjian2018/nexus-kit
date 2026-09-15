@@ -34,6 +34,23 @@ class ToolCallContext:
                     call (direct dispatch outside an agent loop); sub-agents
                     and workflow leaves inherit the parent session's id via
                     replace(), so they share one task list per session.
+    skills_dir:     the executing pattern's effective skill scan root
+                    (nexus/skills.py resolution) — how the load_skill /
+                    read_skill_file handlers find the skill directory.
+                    Empty string = detached call, falls back to the
+                    configured global root.
+    pattern_code:   the executing pattern's code — the locating key for the
+                    app-overlaid tool guardrails (settings merges the app
+                    guardrails section over the global one by this code).
+                    Empty string = detached call, falls back to the global
+                    guardrails; sub-agents and workflow leaves inherit the
+                    parent's code via replace().
+    enabled_skills: the executing node's resolved skill set (use_skills ∩
+                    allow_skills) — the load-side authorization boundary:
+                    a skill name outside it is rejected with an error
+                    backfill. None (never set) = detached call, any scanned
+                    skill may be loaded (read-only knowledge; the执行面
+                    authorization still lives in the tool 三层收口).
     """
 
     llm_config: Dict[str, Any]
@@ -41,6 +58,9 @@ class ToolCallContext:
     in_subagent: bool = False
     in_workflow: bool = False
     session_id: str = ""
+    skills_dir: str = ""
+    pattern_code: str = ""
+    enabled_skills: Optional[FrozenSet[str]] = None
 
 
 _CURRENT: ContextVar[Optional[ToolCallContext]] = ContextVar(
@@ -52,18 +72,36 @@ def current_tool_context() -> Optional[ToolCallContext]:
     return _CURRENT.get()
 
 
+def ambient_pattern_code() -> str:
+    """The ambient context's pattern_code, or "" outside an agent loop —
+    the locating key guardrail handlers pass to the settings accessors
+    (empty code = no app overlay, the global section applies)."""
+    ctx = _CURRENT.get()
+    return ctx.pattern_code if ctx is not None else ""
+
+
 @contextmanager
-def tool_call_context(llm_config, allow_toolsets, session_id: str = ""
+def tool_call_context(llm_config, allow_toolsets, session_id: str = "",
+                      skills_dir: str = "",
+                      pattern_code: str = "",
+                      enabled_skills: Optional[FrozenSet[str]] = None
                       ) -> Iterator[ToolCallContext]:
     """Publish the caller's position for the duration of the block.
 
     Values are copied into a fresh frozen snapshot, so later mutation of the
     caller's llm_config dict cannot leak into handlers mid-block.
+    ``pattern_code`` keys the app guardrails overlay; callers that don't
+    carry one (custom executors predating the field) default to "" — the
+    global guardrails, never an error.
     """
     ctx = ToolCallContext(
         llm_config=dict(llm_config or {}),
         allow_toolsets=frozenset(allow_toolsets or []),
         session_id=str(session_id or ""),
+        skills_dir=str(skills_dir or ""),
+        pattern_code=str(pattern_code or ""),
+        enabled_skills=frozenset(enabled_skills or ())
+        if enabled_skills is not None else None,
     )
     token = _CURRENT.set(ctx)
     try:
