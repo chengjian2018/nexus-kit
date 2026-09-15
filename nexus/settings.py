@@ -220,7 +220,10 @@ DEFAULT_CRON_TICK_SECONDS = 20
 # seconds 单次判读超时；llm 为叠加在 ambient 连接之上的 judge 模型
 # 覆盖（code/model/max_tokens/...，推荐指向便宜小模型）。
 DEFAULT_TOOL_GUARD_ENABLED = True
-DEFAULT_TOOL_GUARD_LLM_FALLBACK = True
+# LLM 判读默认关（显式 opt-in）：配置缺失 tool_guard 节时静默走环境
+# provider 会把工具参数送出进程，与配置读失败回退的"规则开、LLM 关"
+# 保守姿态对齐；需要判读的部署显式写 llm_fallback: true
+DEFAULT_TOOL_GUARD_LLM_FALLBACK = False
 DEFAULT_TOOL_GUARD_LLM_MAX_INPUT_CHARS = 2000
 DEFAULT_TOOL_GUARD_LLM_MAX_QUEUE = 64
 DEFAULT_TOOL_GUARD_LLM_TIMEOUT_SECONDS = 15.0
@@ -526,6 +529,16 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
     tool_guard_llm = tool_guard.get("llm") or {}
     if not isinstance(tool_guard_llm, dict):
         raise ValueError("tool_guard.llm 应为字典")
+    # judge 覆盖的未知字段只告警并剔除——打错的键（如 modle）若静默流进
+    # build_provider，失败会被判读层 DEBUG 吞掉，judge 永远不跑且无人知晓
+    _tg_llm_unknown = set(tool_guard_llm.keys()) - _LLM_ALL_FIELDS
+    if _tg_llm_unknown:
+        import logging
+        logging.getLogger(__name__).warning(
+            "tool_guard.llm 包含未知字段将被忽略: %s", sorted(_tg_llm_unknown)
+        )
+        tool_guard_llm = {k: v for k, v in tool_guard_llm.items()
+                          if k in _LLM_ALL_FIELDS}
 
     return {
         "llm_providers": llm_providers,
@@ -626,12 +639,16 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
             "tick_seconds": int(cron_tool.get(
                 "tick_seconds", DEFAULT_CRON_TICK_SECONDS)),
         },
-        # tool guard（可选；defaults see DEFAULT_TOOL_GUARD_* constants）
+        # tool guard（可选；defaults see DEFAULT_TOOL_GUARD_* constants）。
+        # 布尔字段经 _strict_bool 收口——YAML 手写的 "false" 字符串按
+        # bool(...) 是 truthy，会把想关掉的守卫/判读悄悄打开
         "tool_guard": {
-            "enabled": bool(tool_guard.get(
-                "enabled", DEFAULT_TOOL_GUARD_ENABLED)),
-            "llm_fallback": bool(tool_guard.get(
-                "llm_fallback", DEFAULT_TOOL_GUARD_LLM_FALLBACK)),
+            "enabled": _strict_bool(tool_guard.get("enabled"),
+                                    DEFAULT_TOOL_GUARD_ENABLED,
+                                    "tool_guard.enabled"),
+            "llm_fallback": _strict_bool(tool_guard.get("llm_fallback"),
+                                         DEFAULT_TOOL_GUARD_LLM_FALLBACK,
+                                         "tool_guard.llm_fallback"),
             "llm_max_input_chars": int(tool_guard.get(
                 "llm_max_input_chars", DEFAULT_TOOL_GUARD_LLM_MAX_INPUT_CHARS)),
             "llm_max_queue": int(tool_guard.get(
@@ -642,6 +659,27 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
         },
         # More top-level nodes may be added later, e.g. "dialogue", "logging", "storage"
     }
+
+
+def _strict_bool(value: Any, default: bool, field: str) -> bool:
+    """布尔配置收口：真布尔直通；常见的 "true"/"false"/"yes"/"no"/"on"/
+    "off"/1/0 字符串与整数按语义转换；其余形态告警并回落默认值——
+    bool("false") 是 truthy，裸强转会把想关的开关悄悄打开。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "yes", "on", "1"):
+            return True
+        if lowered in ("false", "no", "off", "0"):
+            return False
+    if value is not None:
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s 应为布尔，收到 %r，按默认 %r 处理", field, value, default)
+    return default
 
 
 def _merge_connection(orch: Dict[str, Any], providers: Dict[str, Any]) -> Dict[str, Any]:

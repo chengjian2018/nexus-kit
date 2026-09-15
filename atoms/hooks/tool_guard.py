@@ -114,7 +114,7 @@ _SHELL_RULES: List[tuple] = [
     (_RM_RF_RULE_ID, SEV_HIGH, _RM_RF_RE, _RM_RF_SUMMARY),
     ("shell.pipe-to-shell", SEV_HIGH,
      re.compile(r"\b(?:curl|wget|base64|openssl|echo|printf)\b[^|;&\n]*\|"
-                r"\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b"),
+                r"\s*(?:sudo\s+)?(?:ba|z|fi|da)?sh\b"),
      "下载/解码内容直接管道进 shell 执行"),
     ("shell.reverse-shell", SEV_HIGH,
      re.compile(r"/dev/tcp/|\bbash\s+-i\s+>&|\bnc(?:at)?\b[^|;&\n]*\s-e\b"),
@@ -127,7 +127,7 @@ _SHELL_RULES: List[tuple] = [
      re.compile(r":\s*\(\)\s*\{"),
      "fork 炸弹函数定义特征"),
     ("shell.sudo", SEV_HIGH,
-     re.compile(r"\bsudo\b|\bsu\s+-\b"),
+     re.compile(r"^(?:sudo\b|su\s+-)"),
      "提权执行（sudo / su -）"),
     ("shell.shutdown", SEV_HIGH,
      re.compile(r"\b(?:shutdown|reboot|halt|poweroff)\b"),
@@ -136,8 +136,11 @@ _SHELL_RULES: List[tuple] = [
      re.compile(r"\bgit\s+push\b[^|;&\n]*\s(?:--force(?!-with-lease)|-f\b)"),
      "强推远端（覆盖他人提交历史）"),
     ("shell.write-etc", SEV_HIGH,
-     re.compile(r">{1,2}\s*/etc/|\btee\b[^|;&\n]*\s/etc/"),
-     "重定向写入 /etc（系统配置改写）"),
+     re.compile(r">{1,2}\s*/{1,2}etc/"
+                r"|\btee\b[^|;&\n]*\s/{1,2}etc/"
+                r"|\b(?:cp|mv|install|rsync)\b[^|;&\n]*\s/{1,2}etc/"
+                r"|\bsed\b[^|;&\n]*\s-[a-zA-Z]*i\b[^|;&\n]*\s/{1,2}etc/"),
+     "写入 /etc（系统配置改写：重定向/tee/cp/mv/install/rsync/sed -i）"),
     ("shell.write-shell-rc", SEV_HIGH,
      re.compile(r"(?:>{1,2}|tee\s+(?:-a\s+)?)[^|;&\n]*"
                 r"\.(?:bashrc|zshrc|bash_profile|zprofile|zlogin)\b"),
@@ -331,14 +334,35 @@ def _scan_rm_dangerous(command: str) -> Optional[tuple]:
 
 
 def _scan_write_path(raw_path: str) -> List[tuple]:
-    """路径规则：原串与 expanduser 归一串各试一次（~/x 与 /Users/u/x 等价）。"""
-    texts = [raw_path]
+    """路径规则：与被守工具的解析形态对齐后多候选各试一次。
+
+    file_tool._resolve_path 做 strip().expanduser()；内核开档把 //etc
+    当 /etc；macOS 上 /etc → /private/etc 是 symlink，read_text 回显的
+    resolve() 路径会以 /private 拼法喂给模型——三个拼法都要能命中。
+    大小写不敏感文件系统上的 /ETC/.SSH 变体用小写化候选覆盖（observe-
+    only 通道，多报不错过可接受）。symlink 解析需要 IO，违背本层
+    「无 IO」契约，是已知残留。"""
+    stripped = str(raw_path).strip()
+    texts: List[str] = []
+    seen = set()
+
+    def _add(candidate: str) -> None:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            texts.append(candidate)
+
+    _add(stripped)
     try:
-        expanded = str(Path(raw_path).expanduser())
-        if expanded != raw_path:
-            texts.append(expanded)
+        _add(str(Path(stripped).expanduser()))
     except Exception:
         pass
+    for base in list(texts):
+        # 多斜杠归一（normpath 特意保留前导 //，不适用）
+        _add(re.sub(r"/{2,}", "/", base))
+        # macOS /private 前缀剥离（/etc、/tmp 等的真实落点）
+        if base.startswith("/private/"):
+            _add(base[len("/private"):])
+        _add(base.lower())
     return _match_rules(_WRITE_PATH_RULES, texts)
 
 
@@ -558,7 +582,19 @@ class _LLMAnalyzer:
                 break
 
 
-_ANALYZER = _LLMAnalyzer()
+# 惰性构造：队列容量在首次使用时按配置定型（queue.Queue 的 maxsize
+# 构造即定，运行期换队列会漏掉阻塞在旧队列 get 上的 worker）——测试
+# 经 monkeypatch 替换 _ANALYZER 注入自己的实例
+_ANALYZER: Optional[_LLMAnalyzer] = None
+_ANALYZER_LOCK = threading.Lock()
+
+
+def _get_analyzer(max_queue: int) -> _LLMAnalyzer:
+    global _ANALYZER
+    with _ANALYZER_LOCK:
+        if _ANALYZER is None:
+            _ANALYZER = _LLMAnalyzer(max_queue=max(1, int(max_queue)))
+        return _ANALYZER
 
 
 # ============================================================================
@@ -610,7 +646,8 @@ def reset_guard_state() -> None:
         _LEDGER.clear()
         _STATS.update(findings=0, llm_asked=0,
                       llm_verdicts={"high": 0, "medium": 0, "low": 0})
-    _ANALYZER.reset()
+    if _ANALYZER is not None:
+        _ANALYZER.reset()
 
 
 # ============================================================================
@@ -668,7 +705,7 @@ def _guard_on_tool_call(event) -> None:
         if tc is not None and tc.llm_config:
             overrides.update(tc.llm_config)
         overrides.update(cfg.get("llm") or {})
-        _ANALYZER.submit(
+        _get_analyzer(int(cfg.get("llm_max_queue") or 64)).submit(
             event.tool_name, args, llm_overrides=overrides,
             max_input_chars=int(cfg.get("llm_max_input_chars") or 2000),
             timeout_seconds=float(cfg.get("llm_timeout_seconds") or 15.0),

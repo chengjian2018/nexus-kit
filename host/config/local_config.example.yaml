@@ -206,7 +206,8 @@ mcp_servers: {}
 
 # tool_guard:
 #   enabled: true               # 总开关（false = hook 直接返回）
-#   llm_fallback: true          # 可疑但规则未定的调用是否送小模型判读
+#   llm_fallback: false         # 可疑但规则未定的调用是否送小模型判读
+#                               # （默认关=opt-in：判读会把工具参数送外部模型）
 #   llm_max_input_chars: 2000   # 送审参数 JSON 截断长度
 #   llm_max_queue: 64           # 判读队列上限（满则丢弃新条）
 #   llm_timeout_seconds: 15     # 单次判读超时
