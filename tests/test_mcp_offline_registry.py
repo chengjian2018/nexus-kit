@@ -109,8 +109,9 @@ def test_snapshot_shape_and_openai_schema_convertible():
 # ============================================================================
 
 def test_offline_mcp_tools_visible_to_deep_research(offline_register):
-    """toolset 授权：allow_toolset 列出 mcp-<server> + 节点 use_tools
-    列名 → 工具可用（正是「不在本轮可用集合」拦截的反面回归锚点）。"""
+    """Toolset authorization: allow_toolset lists mcp-<server> and the node's use_tools names
+    the tool → it resolves (the regression anchor on the opposite side of the
+    "not in this round's available set" interception)."""
     from nexus.engine.loop import _resolve_tools
     from nexus.model.node import BaseNode
     from nexus.model.pattern import Pattern
@@ -126,8 +127,9 @@ def test_offline_mcp_tools_visible_to_deep_research(offline_register):
 
 
 def test_offline_mcp_tools_hidden_from_other_patterns(offline_register):
-    """未把 mcp-<server> 列入 allow_toolset 的 pattern 一律看不到这些工具
-    （deny-by-default 契约）；节点 use_tools 列了也没用。"""
+    """A pattern that does not list mcp-<server> in allow_toolset never sees these tools
+    (the deny-by-default contract); listing them in node use_tools does
+    nothing."""
     from nexus.engine.loop import _resolve_tools
     from nexus.model.node import BaseNode
     from nexus.model.pattern import Pattern

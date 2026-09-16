@@ -1,17 +1,21 @@
-"""read_text / write_text / edit_file / list_dir / search_files /
-find_files（filesystem tool）单测：读写往返、父目录自动创建、覆盖语义、
-分页与截断护栏、超限拒绝、精确替换编辑（唯一匹配/未找到/多处/全替换）、
-目录列举排序与截断、内容检索（glob/大小写/正则/跳过目录/命中截断、
-max_matches 只能调小）、按名查找、稳健性护栏（FIFO/设备拒读、读取
-字节预算、walk 时间预算 stopped_early、恰好满额不算截断），以及
-registry 层面的注册归属（toolset: filesystem）。
+"""Unit tests for read_text / write_text / edit_file / list_dir /
+search_files / find_files (filesystem tools): read/write round-trip,
+automatic parent-directory creation, overwrite semantics, pagination and
+truncation guards, oversized-content rejection, exact-replacement edits
+(unique match / not found / multiple matches / replace_all), directory
+listing ordering and truncation, content search (glob / case /
+regex / skipped directories / hit truncation, max_matches can only be
+lowered), find-by-name, robustness guards (FIFO/device read refusal,
+read byte budget, walk time budget stopped_early, exact cap not counted
+as truncated), plus registry-level registration ownership
+(toolset: filesystem).
 """
 
 import json
 import os
 from unittest.mock import patch
 
-from atoms.tools import file_tool  # noqa: F401 -- module import 即注册
+from atoms.tools import file_tool  # noqa: F401 -- registers on module import
 from nexus.registry.tools import registry as tool_registry
 
 _GUARD = {"max_read_chars": 50000, "max_write_chars": 200000,
@@ -43,7 +47,7 @@ def test_registered_in_filesystem_toolset():
 # ---------------------------------------------------------------------------
 
 def test_write_then_read_roundtrip(tmp_path):
-    target = tmp_path / "sub" / "note.md"      # 父目录不存在 → 自动创建
+    target = tmp_path / "sub" / "note.md"      # missing parent directory -> created automatically
     r = _run("write_text", {"path": str(target), "content": "hello\nworld"})
     assert r["created"] is True
     assert r["chars_written"] == len("hello\nworld")
@@ -126,7 +130,7 @@ def test_list_dir_ordering_types_and_truncation(tmp_path):
 
     r = _run("list_dir", {"path": str(tmp_path)})
     names = [e["name"] for e in r["entries"]]
-    # 目录排前、各自按名称排序
+    # directories first, each group sorted by name
     assert names == ["a_dir", "z_dir", "a_file.txt", "b_file.txt"]
     kinds = {e["name"]: e["type"] for e in r["entries"]}
     assert kinds["a_dir"] == "dir" and kinds["a_file.txt"] == "file"
@@ -172,7 +176,7 @@ def test_search_substring_and_skip_dirs(tmp_path):
     r = _run("search_files", {"query": "NEEDLE", "path": str(tmp_path)})
     hit_paths = {m["path"] for m in r["matches"]}
     assert str(tmp_path / "src" / "a.py") in hit_paths
-    # .git / __pycache__ 目录被跳过（大小写敏感：markdown 里的 needle 不中）
+    # .git / __pycache__ directories skipped (case-sensitive: the needle in markdown does not match)
     assert all(".git" not in p and "__pycache__" not in p for p in hit_paths)
     assert r["truncated"] is False
     line = next(m for m in r["matches"] if m["path"].endswith("a.py"))
@@ -184,14 +188,14 @@ def test_search_ignore_case_glob_and_max_matches(tmp_path):
     r = _run("search_files",
              {"query": "needle", "path": str(tmp_path), "ignore_case": True})
     hit_paths = {m["path"] for m in r["matches"]}
-    assert str(tmp_path / "src" / "notes.md") in hit_paths  # 大小写不敏感后命中
+    assert str(tmp_path / "src" / "notes.md") in hit_paths  # hits once case-insensitive
 
     r = _run("search_files",
              {"query": "needle", "path": str(tmp_path),
               "ignore_case": True, "glob": "*.py"})
     assert all(m["path"].endswith(".py") for m in r["matches"])
 
-    # args 只能调小：max_matches=1 → 恰一条 + truncated 标记
+    # args can only lower it: max_matches=1 -> exactly one hit + truncated flag
     r = _run("search_files",
              {"query": "needle", "path": str(tmp_path),
               "ignore_case": True, "max_matches": 1})
@@ -208,14 +212,14 @@ def test_search_errors(tmp_path):
 def test_search_regex_mode(tmp_path):
     (tmp_path / "r.py").write_text("x1 = 1\nfoo = 2\nbar42 = 3\n",
                                    encoding="utf-8")
-    # 正则命中：只匹配 foo 行
+    # regex hit: only the foo line matches
     r = _run("search_files", {"query": r"^f\w+ = 2$", "path": str(tmp_path),
                               "regex": True, "glob": "*.py"})
     assert {m["line"] for m in r["matches"]} == {2}
     r = _run("search_files", {"query": r"[unclosed(", "path": str(tmp_path),
                               "regex": True})
     assert "正则" in r["error"]
-    # ignore_case 与 regex 组合
+    # ignore_case combined with regex
     r = _run("search_files", {"query": r"^FOO", "path": str(tmp_path),
                               "regex": True, "ignore_case": True})
     assert any(m["line"] == 2 for m in r["matches"])
@@ -255,7 +259,7 @@ def test_edit_file_replace_all_and_delete(tmp_path):
                            "new_str": "x", "replace_all": True})
     assert r["replacements"] == 2
     assert target.read_text(encoding="utf-8") == "x\nbbb\nx\n"
-    # new_str 空串 = 删除（留下空行是精确替换的自然结果）
+    # empty new_str = deletion (the leftover empty line is a natural result of exact replacement)
     r = _run("edit_file", {"path": str(target), "old_str": "bbb",
                            "new_str": ""})
     assert target.read_text(encoding="utf-8") == "x\n\nx\n"
@@ -273,12 +277,12 @@ def test_edit_file_guards(tmp_path):
     r = _run("edit_file", {"path": str(tmp_path / "nope"), "old_str": "a",
                            "new_str": "b"})
     assert "不存在" in r["error"]
-    # 超大文件拒绝
+    # oversized file rejected
     r = _run("edit_file", {"path": str(target), "old_str": "h",
                            "new_str": "H"},
              guard={**_GUARD, "max_edit_chars": 3})
     assert "编辑上限" in r["error"]
-    # 二进制拒绝
+    # binary rejected
     blob = tmp_path / "blob.bin"
     blob.write_bytes(b"a\x00b")
     r = _run("edit_file", {"path": str(blob), "old_str": "a", "new_str": "b"})
@@ -286,22 +290,23 @@ def test_edit_file_guards(tmp_path):
 
 
 def test_edit_file_rejects_non_utf8_without_corrupting(tmp_path):
-    # 非 UTF-8（GBK 等）严格解码拒绝，且文件字节原样保留——errors=replace
-    # 回写会把整个文件固化成 U+FFFD 乱码，不可逆
+    # non-UTF-8 (GBK etc.) rejected via strict decoding, file bytes kept
+    # intact — an errors=replace rewrite would bake the whole file into
+    # irreversible U+FFFD mojibake
     target = tmp_path / "gbk.txt"
     raw = "姓名:张三\nkeep me here\n".encode("gbk")
     target.write_bytes(raw)
     r = _run("edit_file", {"path": str(target), "old_str": "keep me",
                            "new_str": "keep us"})
     assert "UTF-8" in r["error"]
-    assert target.read_bytes() == raw       # 未被写坏
+    assert target.read_bytes() == raw       # not corrupted
 
 
 def test_edit_file_cap_counts_chars_not_bytes(tmp_path):
-    # 上限按解码后的字符数计：8 个字符的 CJK 文件占 12+ 字节，字节口径
-    # 会在约 1/3 阈值处误拒
+    # the cap counts decoded characters: an 8-char CJK file takes 12+ bytes,
+    # a byte-based measure would falsely reject at about 1/3 of the threshold
     target = tmp_path / "cjk.txt"
-    target.write_text("中文内容abcd", encoding="utf-8")   # 8 字符 / 12 字节
+    target.write_text("中文内容abcd", encoding="utf-8")   # 8 chars / 12 bytes
     r = _run("edit_file", {"path": str(target), "old_str": "abcd",
                            "new_str": "ABC"},
              guard={**_GUARD, "max_edit_chars": 10})
@@ -322,15 +327,15 @@ def test_find_files_glob_and_skips(tmp_path):
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "hidden.py").write_text("x", encoding="utf-8")
 
-    # *.py 按相对路径匹配 = 任意深度
+    # *.py matches relative paths = any depth
     r = _run("find_files", {"pattern": "*.py", "path": str(tmp_path)})
     found = {p.replace(str(tmp_path) + "/", "") for p in r["files"]}
     assert found == {"src/a.py", "src/deep/b.py", "top.py"}
     assert r["truncated"] is False
-    # 顶层限定
+    # top-level restriction
     r = _run("find_files", {"pattern": "*.md", "path": str(tmp_path)})
     assert r["files"] == [str(tmp_path / "src" / "c.md")]
-    # docs/** 形式的目录内全部
+    # "docs/**"-style: everything inside the directory
     r = _run("find_files", {"pattern": "src/deep/*", "path": str(tmp_path)})
     assert r["files"] == [str(tmp_path / "src" / "deep" / "b.py")]
 
@@ -349,38 +354,39 @@ def test_find_files_guards(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 稳健性护栏：非普通文件拒读 / 读取字节预算 / walk 时间预算 / 恰好满额
+# Robustness guards: non-regular-file read refusal / read byte budget / walk time budget / exact cap
 # ---------------------------------------------------------------------------
 
 def test_read_rejects_fifo_and_device(tmp_path):
-    # FIFO 能骗过 exists/is_dir 校验、只有 open 才会永久阻塞——stat 先行
-    # 拒读；本测试能跑完本身即证明没有挂死（to_thread 线程不可取消）
+    # a FIFO can fool the exists/is_dir checks; only open blocks forever —
+    # stat runs first and refuses; this test finishing at all proves there
+    # was no hang (to_thread threads cannot be cancelled)
     fifo = tmp_path / "pipe"
     os.mkfifo(fifo)
     r = _run("read_text", {"path": str(fifo)})
     assert "普通文件" in r["error"]
-    if os.path.exists("/dev/zero"):     # darwin / linux 均有
+    if os.path.exists("/dev/zero"):     # present on both darwin and linux
         r = _run("read_text", {"path": "/dev/zero"})
         assert "普通文件" in r["error"]
 
 
 def test_read_byte_budget_rejects_oversized(tmp_path):
-    # 字节预算 = max_read_chars * 4 + 1024（UTF-8 单字符至多 4 字节）
+    # byte budget = max_read_chars * 4 + 1024 (a UTF-8 char takes at most 4 bytes)
     big = tmp_path / "big.txt"
-    big.write_text("中" * 400, encoding="utf-8")    # 1200 字节 > 10*4+1024
+    big.write_text("中" * 400, encoding="utf-8")    # 1200 bytes > 10*4+1024
     r = _run("read_text", {"path": str(big)},
              guard={**_GUARD, "max_read_chars": 10})
     assert "上限" in r["error"]
-    # 预算内的多字节内容照常读取
+    # multi-byte content within budget reads normally
     ok = tmp_path / "ok.txt"
-    ok.write_text("中文ok", encoding="utf-8")       # 8 字节
+    ok.write_text("中文ok", encoding="utf-8")       # 8 bytes
     r = _run("read_text", {"path": str(ok)},
              guard={**_GUARD, "max_read_chars": 10})
     assert r["content"] == "中文ok" and r["truncated"] is False
 
 
 def test_search_and_find_deadline_marks_stopped_early(tmp_path):
-    # 负预算 → deadline 已过，首个检查点立即收手
+    # negative budget -> deadline already passed, stops at the first checkpoint
     (tmp_path / "a.py").write_text("needle\n", encoding="utf-8")
     with patch.object(file_tool, "_WALK_TIME_BUDGET_SECONDS", -1.0):
         r = _run("search_files", {"query": "needle", "path": str(tmp_path)})
@@ -393,12 +399,12 @@ def test_search_and_find_deadline_marks_stopped_early(tmp_path):
 
 
 def test_search_exact_cap_not_truncated(tmp_path):
-    # 恰好 1 条命中 + max_matches=1：没有更多 → 不算截断
+    # exactly 1 hit + max_matches=1: nothing more -> not truncated
     (tmp_path / "one.py").write_text("hit\nplain\n", encoding="utf-8")
     r = _run("search_files", {"query": "hit", "path": str(tmp_path),
                               "max_matches": 1})
     assert len(r["matches"]) == 1 and r["truncated"] is False
-    # 出现第 2 条命中才构成"还有更多"的证据
+    # a second hit is the evidence of "there is more"
     (tmp_path / "two.py").write_text("hit again\n", encoding="utf-8")
     r = _run("search_files", {"query": "hit", "path": str(tmp_path),
                               "max_matches": 1})

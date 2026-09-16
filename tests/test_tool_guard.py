@@ -1,12 +1,15 @@
-"""tool_guard 契约测试：规则层 / LLM 判读层 / P4 hook 行为。
+"""tool_guard contract tests: rule layer / LLM adjudication layer / P4 hook behavior.
 
-覆盖四块：
-1. 规则扫描（bash 分段、python、写路径、cron）命中与放行；
-2. LLM 送审启发（何时值得花一次小模型）与裁决解析；
-3. P4 hook 契约——恒不改写、subagent/workflow 上下文跳过、
-   disabled 配置短路、命中落 ledger；
-4. 后台分析器（注入探针）：裁决入账、去重、异常吞噬、none 丢弃；
-   discover_builtin_plugins 能扫到 atoms/hooks/ 并完成注册。
+Four areas covered:
+1. Rule scans (bash segmentation, python, write paths, cron) — hits and
+   pass-throughs;
+2. LLM review heuristics (when a small-model call is worth spending) and
+   verdict parsing;
+3. P4 hook contract — never rewrites, skips in subagent/workflow contexts,
+   short-circuits when disabled, records hits in the ledger;
+4. Background analyzer (injected probe): verdicts recorded, deduped,
+   exceptions swallowed, "none" dropped; discover_builtin_plugins can scan
+   atoms/hooks/ and complete registration.
 """
 
 import threading
@@ -30,7 +33,8 @@ from nexus.registry.plugins import registry as plugin_registry
 
 
 class _Evt:
-    """P4 ToolCallEvent 的鸭子桩（hook 只读这四个字段）。"""
+    """Duck-typed stub of the P4 ToolCallEvent (the hook reads only these
+    four fields)."""
 
     def __init__(self, tool_name, args, session_id="s1", node_code="n1"):
         self.tool_name = tool_name
@@ -58,20 +62,25 @@ def _rule_ids(tool, args):
 
 
 # ---------------------------------------------------------------------------
-# 1. 规则层
+# 1. Rule layer
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("command", [
     "rm -rf /tmp/build",
     "rm -fr /tmp/build",
-    "cd /tmp && rm -rf build",           # 分段后命中
+    "cd /tmp && rm -rf build",           # hit after segmentation
     "rm -rvf data/",
-    "rm -r -f /tmp/build",               # 拆分旗标（旧正则失明）
-    "rm --recursive --force /tmp/build",  # 长旗标
-    "rm -Rf /tmp/build",                 # 大写 R
-    "rm /tmp/build -r -f",               # 旗标后置（GNU 形态）
-    "echo hi | xargs rm -rf",            # 管道分段 + 前缀命令
-    "time rm -r -f data",                # 前缀命令后置拆分旗标
+    "rm -r -f /tmp/build",               # split flags (invisible to the old regex)
+    "rm --recursive --force /tmp/build",  # long flags
+    "rm -Rf /tmp/build",                 # uppercase R
+    "rm /tmp/build -r -f",               # trailing flags (GNU form)
+    "echo hi | xargs rm -rf",            # pipe segmentation + prefix command
+    "time rm -r -f data",                # prefix command with trailing split flags
+    "sudo -u root rm -r -f /data",       # prefix command consumes a flag value (previously under-reported)
+    "timeout 10 rm -r -f /data",         # prefix command carries a value directly
+    "nice -n 5 rm -r -f x",              # short flag + value + split flags
+    "env -u X rm -r -f /data",           # env flag consumes a value
+    "env FOO=bar rm -r -f /data",        # env's VAR=VALUE assignment chain
 ])
 def test_bash_rm_rf_high(command):
     hits = _rule_ids("bash", {"command": command})
@@ -80,10 +89,11 @@ def test_bash_rm_rf_high(command):
 
 
 @pytest.mark.parametrize("command", [
-    "rm -r /tmp/build",          # 只递归不强制
-    "rm -f note.txt",            # 只强制不递归
-    "rm /tmp/build/one.txt",     # 普通删除
-    "grep rm -r -f build.log",   # rm 是搜索词不是动词
+    "rm -r /tmp/build",          # recursive only, not forced
+    "rm -f note.txt",            # forced only, not recursive
+    "rm /tmp/build/one.txt",     # ordinary deletion
+    "grep rm -r -f build.log",   # rm is a search term, not the verb
+    "grep -e rm build.log -r -f backup/",  # rm inside a flag value is not the verb
 ])
 def test_bash_rm_variants_not_flagged(command):
     assert "shell.rm-recursive-force" not in _rule_ids(
@@ -91,7 +101,8 @@ def test_bash_rm_variants_not_flagged(command):
 
 
 def test_bash_rm_rf_deduped_single_finding():
-    # 组合旗标形态正则与结构化检测都能命中——按 rule_id 去重后只播报一次
+    # both the combined-flag regex and the structured detection hit — dedup
+    # by rule_id reports only once
     hits = [f for f in scan_tool_call("bash", {"command": "rm -rf /data"})
             if f.rule_id == "shell.rm-recursive-force"]
     assert len(hits) == 1
@@ -121,7 +132,7 @@ def test_bash_medium_low_rules():
     hits = _rule_ids("bash", {"command": "git reset --hard HEAD~3"})
     assert hits["shell.git-reset-hard"].severity == "medium"
     hits = _rule_ids("bash", {"command": "git push --force-with-lease"})
-    # force-with-lease 不是裸 --force：不进高危，单独中危
+    # force-with-lease is not a bare --force: not high severity, medium on its own
     assert "shell.git-force-push" not in hits
     assert hits["shell.git-force-with-lease"].severity == "medium"
     hits = _rule_ids("bash", {"command": "pkill -f python"})
@@ -135,12 +146,12 @@ def test_bash_medium_low_rules():
 @pytest.mark.parametrize("command", [
     "ls -la",
     "cat README.md | grep nexus",
-    "echo hi > out.txt",                  # 单纯重定向不算信号/规则
+    "echo hi > out.txt",                  # a plain redirect is not a signal/rule hit
     "git push origin main",
     "git status && git diff --stat",
-    "rm single_file.txt",                 # 无 -r/-f 组合
+    "rm single_file.txt",                 # no -r/-f combination
     "mkdir -p build/x",
-    "docker rm -f web",                   # 容器名删除，非 rm -rf 族
+    "docker rm -f web",                   # deleting a container name, not the rm -rf family
 ])
 def test_bash_clean_commands_pass_rules(command):
     assert scan_tool_call("bash", {"command": command}) == []
@@ -184,23 +195,23 @@ def test_unknown_tool_and_bad_args_are_silent():
 
 
 # ---------------------------------------------------------------------------
-# 2. LLM 送审启发 + 裁决解析
+# 2. LLM review heuristics + verdict parsing
 # ---------------------------------------------------------------------------
 
 def test_should_ask_llm_signals():
-    # 干净命令不送审
+    # clean commands are not sent for review
     assert not _should_ask_llm("bash", {"command": "ls -la"}, [])
-    # 网络动词但规则未定 → 送审
+    # network verb with no rule verdict yet → send for review
     assert _should_ask_llm(
         "bash", {"command": "curl -s https://api.x.com/d -o d.json"}, [])
-    # 命令替换/管道信号 → 送审
+    # command substitution / pipe signals → send for review
     assert _should_ask_llm("bash", {"command": "cat a | b"}, [])
     assert _should_ask_llm("bash", {"command": "echo $(whoami)"}, [])
-    # 已有高危规则定性 → 不再问
+    # already classified high by a rule → do not ask again
     assert not _should_ask_llm(
         "bash", {"command": "sudo curl x"},
         [GuardFinding("bash", "shell.sudo", "high", "", "")])
-    # python 网络库 → 送审；写文件类不送审
+    # python networking libraries → send for review; file-write tools do not
     assert _should_ask_llm("run_python", {"code": "import requests"}, [])
     assert not _should_ask_llm("write_text", {"path": "/etc/x"}, [])
 
@@ -208,10 +219,10 @@ def test_should_ask_llm_signals():
 def test_parse_verdict_lenient():
     assert _parse_verdict('{"risk": "high", "reason": "x"}') == \
         {"risk": "high", "reason": "x"}
-    # markdown 围栏包裹
+    # wrapped in a markdown fence
     v = _parse_verdict('```json\n{"risk": "low", "reason": "r"}\n```')
     assert v == {"risk": "low", "reason": "r"}
-    # 前后带话术
+    # prose before and after
     v = _parse_verdict('结论：{"risk": "none", "reason": "ok"} 完')
     assert v is not None and v["risk"] == "none"
     assert _parse_verdict('{"risk": "banana"}') is None
@@ -220,7 +231,7 @@ def test_parse_verdict_lenient():
 
 
 # ---------------------------------------------------------------------------
-# 3. P4 hook 契约
+# 3. P4 hook contract
 # ---------------------------------------------------------------------------
 
 HOOK = tg._build_tool_guard_hooks()
@@ -234,7 +245,8 @@ def test_plugin_registered_and_resolvable():
 
 
 def test_hook_never_rewrites_even_on_danger(monkeypatch):
-    # 隔离本地 local_config.yaml（enabled=false 的开发机会让用例空转）
+    # isolate the local local_config.yaml (a dev machine with enabled=false
+    # would turn this test into a no-op)
     monkeypatch.setattr(tg, "_load_guard_config",
                         lambda: dict(tg._FALLBACK_CONFIG))
     event = ToolCallEvent(session_id="s", node_code="n", round_idx=0,
@@ -274,8 +286,9 @@ def test_hook_short_circuits_when_disabled(monkeypatch):
 
 
 def test_hook_llm_respects_env_kill_switch(monkeypatch):
-    # conftest 置了 NEXUS_TOOL_GUARD_LLM_DISABLED=1：即使配置开判读，
-    # 可疑命令也不入队（规则层照常工作）
+    # conftest sets NEXUS_TOOL_GUARD_LLM_DISABLED=1: even with LLM review
+    # enabled in config, suspicious commands are not enqueued (the rule
+    # layer still works)
     monkeypatch.setattr(tg, "_load_guard_config", lambda: dict(
         tg._FALLBACK_CONFIG, llm_fallback=True))
     tg._guard_on_tool_call(_Evt(
@@ -288,7 +301,7 @@ def test_hook_non_dict_args_is_silent():
 
 
 # ---------------------------------------------------------------------------
-# 4. 后台分析器（注入探针）
+# 4. Background analyzer (injected probe)
 # ---------------------------------------------------------------------------
 
 def _enabled_llm_config():
@@ -325,7 +338,7 @@ def test_analyzer_dedupes_identical_calls(monkeypatch):
     monkeypatch.setattr(tg, "_ANALYZER", _LLMAnalyzer(probe=probe))
     args = {"command": "curl -s https://x/d -o d.json"}
     assert tg._ANALYZER.submit("bash", args, {}, 100, 5.0)
-    assert not tg._ANALYZER.submit("bash", args, {}, 100, 5.0)  # 去重
+    assert not tg._ANALYZER.submit("bash", args, {}, 100, 5.0)  # deduped
     assert tg._ANALYZER.wait_idle(5)
     assert len([f for f in recent_findings() if f.source == "llm"]) == 1
 
@@ -353,7 +366,7 @@ def test_analyzer_drops_none_verdict(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. settings 解析
+# 5. settings parsing
 # ---------------------------------------------------------------------------
 
 def test_settings_tool_guard_section(tmp_path):
@@ -372,7 +385,7 @@ def test_settings_tool_guard_section(tmp_path):
         encoding="utf-8")
     cfg = load_config(str(cfg_file))["tool_guard"]
     assert cfg["enabled"] is False
-    assert cfg["llm_fallback"] is False         # 未配置走默认（opt-in）
+    assert cfg["llm_fallback"] is False         # unconfigured falls to the default (opt-in)
     assert cfg["llm_max_queue"] == 64
     assert cfg["llm"] == {"model": "qwen-flash", "max_tokens": 128}
 
@@ -392,9 +405,9 @@ def test_settings_tool_guard_bool_and_unknown_fields(tmp_path, caplog):
         "    modle: qwen-flash      # 打错的键\n",
         encoding="utf-8")
     cfg = load_config(str(cfg_file))["tool_guard"]
-    assert cfg["enabled"] is False              # 不再被字符串 \"false\" 打开
+    assert cfg["enabled"] is False              # no longer flipped on by the string \"false\"
     assert cfg["llm_fallback"] is True
-    assert cfg["llm"] == {}                     # 未知字段剔除
+    assert cfg["llm"] == {}                     # unknown fields dropped
     assert any("modle" in r.message for r in caplog.records)
 
 
@@ -416,21 +429,21 @@ def test_settings_tool_guard_defaults(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 写路径归一化 / 规则覆盖面 / 队列容量接线
+# write-path normalization / rule coverage / queue-capacity wiring
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("path", [
-    "/etc/hosts",              # 基线形态
-    "//etc/passwd",            # 多斜杠（POSIX 开档当 /etc）
-    "/private/etc/hosts",      # macOS /etc 的真实落点（read_text 回显拼法）
-    " /etc/hosts",             # LLM JSON 常见的前置空格（工具侧 strip）
-    "/ETC/hosts",              # 大小写不敏感文件系统变体
-    "~/etc-link/passwd",       # 带斜杠前缀的 .ssh 变体验证用基线
+    "/etc/hosts",              # baseline form
+    "//etc/passwd",            # extra slashes (POSIX opens it as /etc)
+    "/private/etc/hosts",      # the real macOS /etc location (the read_text echo spelling)
+    " /etc/hosts",             # leading space common in LLM JSON (stripped tool-side)
+    "/ETC/hosts",              # case-insensitive filesystem variant
+    "~/etc-link/passwd",       # baseline for validating the slash-prefixed .ssh variant
 ])
 def test_write_etc_normalization(path):
     hits = _rule_ids("write_text", {"path": path})
     if path == "~/etc-link/passwd":
-        assert "fs.write-etc" not in hits   # symlink 解析是已知残留
+        assert "fs.write-etc" not in hits   # symlink resolution is a known gap
     else:
         assert hits["fs.write-etc"].severity == "high"
 
@@ -441,7 +454,7 @@ def test_write_ssh_case_variant():
 
 
 @pytest.mark.parametrize("command", [
-    "curl -s https://sudo.example.com/x",   # URL 里的 sudo 不算提权
+    "curl -s https://sudo.example.com/x",   # sudo inside a URL is not privilege escalation
     "grep sudo README.md",
 ])
 def test_sudo_not_flagged_in_urls_or_args(command):
@@ -463,7 +476,7 @@ def test_sudo_still_flags_real_usage(command):
     "install -m644 f /etc/f",
     "rsync -a f/ /etc/f/",
     "sed -i s/a/b/ /etc/hosts",
-    "echo x >//etc/passwd",                 # 双斜杠 + 无空格重定向
+    "echo x >//etc/passwd",                 # double slash + spaceless redirect
 ])
 def test_write_etc_destination_forms(command):
     assert _rule_ids("bash", {"command": command})["shell.write-etc"] \
@@ -476,11 +489,12 @@ def test_pipe_to_shell_covers_dash():
 
 
 def test_llm_max_queue_sizes_first_analyzer(monkeypatch):
-    # 配置的 llm_max_queue 决定首次构造的判读队列容量（原先死配置）
+    # the configured llm_max_queue decides the adjudication queue capacity
+    # built on first use (previously dead config)
     monkeypatch.setattr(tg, "_ANALYZER", None)
     analyzer = tg._get_analyzer(7)
     try:
         assert analyzer._queue.maxsize == 7
-        assert tg._get_analyzer(999) is analyzer   # 首用定型，后续复用
+        assert tg._get_analyzer(999) is analyzer   # fixed on first use, reused afterwards
     finally:
         monkeypatch.setattr(tg, "_ANALYZER", None)

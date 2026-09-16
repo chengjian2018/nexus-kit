@@ -1,43 +1,52 @@
 """read_text / write_text / edit_file / list_dir / search_files /
-find_files（toolset: filesystem）.
+find_files (toolset: filesystem).
 
-本地文件系统的常用 agent 工具六件套，覆盖"找文件 → 看目录 → 读内容 →
-检索 → 局部修改 → 落盘"的完整回路；与 shell 工具集
-（atoms/tools/shell_tool.py）互补：结构化文件操作走这里（确定性、有
-护栏、无 shell 注入面），任意命令才走 bash。改局部内容优先 edit_file
-（精确替换、不误伤未提及部分），整文件生成/重写才用 write_text。
+The six everyday local-filesystem agent tools, covering the full loop of
+"find file → list directory → read content → search → local edit → write
+back"; complementary to the shell toolset (atoms/tools/shell_tool.py):
+structured file operations go through here (deterministic, guarded, no
+shell-injection surface), arbitrary commands go through bash. Prefer
+edit_file for local changes (exact replacement, never touching unmentioned
+parts); write_text only for whole-file generation/rewrites.
 
-授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
-node.use_tools）::
+Authorization (deny-by-default three-layer gate: registered toolset →
+pattern.allow_toolset → node.use_tools)::
 
     pattern:
       allow_toolset: [filesystem, knowledge]
     node:
-      use_tools: [read_text, list_dir, search_files]   # 按需点名
+      use_tools: [read_text, list_dir, search_files]   # name tools as needed
 
-护栏（config ``file_tool`` 节可调）：read_text 内容截断 max_read_chars
-（默认 50000）；write_text 拒绝超过 max_write_chars（默认 200000）的
-写入（防上下文里的超大内容写盘）；list_dir 条目截断 max_list_entries
-（默认 500）；search_files 命中截断 max_matches（默认 100，args 只能
-调小），并跳过隐藏目录 / .git / __pycache__ / node_modules 与超过
-1MB 的单文件。
+Guardrails (tunable via the config ``file_tool`` section): read_text
+truncates content at max_read_chars (default 50000); write_text rejects
+writes over max_write_chars (default 200000, blocking oversized context
+content from hitting disk); list_dir truncates entries at max_list_entries
+(default 500); search_files truncates hits at max_matches (default 100,
+args may only lower it) and skips hidden dirs / .git / __pycache__ /
+node_modules and files over 1MB.
 
-不可取消线程的收口（to_thread 工作线程无法中途取消，必须在护栏内
-自行收手）：read_text 先 stat 再读——非普通文件（设备/FIFO）拒读，
-超过按字符上限折算的字节预算（max_read_chars * 4 + 1024）拒绝整读；
-search_files / find_files 的目录 walk 与逐行匹配受单调时钟预算
-（20s）约束，超时提前停止并标记 stopped_early。truncated 只在确实
-放弃了后续命中时为 true——恰好等于上限且遍历自然耗尽不算截断。
+Self-termination inside the guardrails (to_thread workers cannot be
+cancelled mid-flight — they must stop on their own within the budget):
+read_text stats before reading — non-regular files (devices/FIFOs) are
+refused, and files over the byte budget (max_read_chars * 4 + 1024) reject
+the whole read; the directory walks and per-line matching of
+search_files / find_files run under a monotonic-clock budget (20s), stopping
+early with stopped_early flagged. truncated is true only when further hits
+were actually given up — landing exactly on the cap with the walk naturally
+exhausted does not count as truncation.
 
-路径语义：相对路径相对服务启动目录解析；~ 展开；write_text 自动创建
-父目录。无路径沙箱（本地个人 kit 定位，能力边界收在 pattern 授权层，
-同 shell_tool 的取舍说明）。
+Path semantics: relative paths resolve against the service startup
+directory; ~ is expanded; write_text auto-creates parent directories. No
+path sandbox (a local personal kit by positioning; the capability boundary
+is the pattern authorization layer — same trade-off note as shell_tool).
 
-命名说明：读写工具叫 read_text / write_text 而非 read_file /
-write_file——registry 对跨工具集同名工具是硬拒绝（防影子），而
-read_file 是 MCP 生态高频工具名（z.ai zread 服务器即带同名工具），
-内置占用通用名会静默顶掉 MCP 版注册；read_text 也更贴行为（只处理
-文本，二进制拒绝）。MCP 侧真实撞名由 server 的 tool_name_prefix 兜底。
+Naming note: the read/write tools are read_text / write_text rather than
+read_file / write_file — the registry hard-rejects same-named tools across
+toolsets (shadowing guard), and read_file is a high-frequency MCP ecosystem
+tool name (the z.ai zread server ships one); a builtin occupying the common
+name would silently displace the MCP registration. read_text also describes
+the behavior better (text only, binary refused). Real MCP-side collisions
+are handled by the server's tool_name_prefix.
 """
 
 import fnmatch
@@ -55,26 +64,28 @@ from nexus.settings import get_file_tool_config
 
 logger = logging.getLogger(__name__)
 
-# search_files 跳过的目录名（隐藏目录 + 常见生成物目录）
+# Directories skipped by search_files (hidden dirs + common build artifacts)
 _SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv",
                         "venv", ".tox", ".mypy_cache", ".pytest_cache"})
-# search_files 单文件大小上限（超大文件多半是数据/二进制，跳过）
+# search_files per-file size cap (oversized files are mostly data/binary — skip)
 _MAX_SEARCH_FILE_BYTES = 1_000_000
-# search_files 单行命中回填的行长上限（防 minified 巨行刷屏）
+# search_files per-hit line-length cap (prevents minified mega-lines flooding)
 _MAX_MATCH_LINE_CHARS = 200
-# read_text 默认/最大行数（行数之外再有 max_read_chars 兜底）
+# read_text default/max lines (max_read_chars is the further backstop beyond lines)
 _DEFAULT_READ_LINES = 2000
 _MAX_READ_LINES = 5000
-# search_files / find_files 单次调用的时间预算：to_thread 线程不可取消，
-# 巨树 walk 或慢正则必须在预算内自行收手，否则占死共享线程池
+# Time budget per search_files / find_files call: a to_thread thread cannot
+# be cancelled, so a giant-tree walk or slow regex must stop within the
+# budget or it occupies the shared thread pool indefinitely
 _WALK_TIME_BUDGET_SECONDS = 20.0
-# regex 模式跳过的行长上限：灾难回溯的最坏耗时随输入规模增长，
-# 残余的单行风险由此行长上限兜底
+# Line-length cap for lines entering the regex path: worst-case catastrophic
+# backtracking time grows with input size; the residual single-line risk is
+# bounded by this length cap
 _MAX_REGEX_LINE_CHARS = 64 * 1024
 
 
 def _resolve_path(raw: Any) -> Path:
-    """参数路径 → 展开的 Path（不强制存在，由各 handler 自行校验）。"""
+    """Argument path → expanded Path (existence not enforced; handlers validate their own)."""
     return Path(str(raw).strip()).expanduser()
 
 
@@ -126,8 +137,9 @@ def _handle_read_text(args: Dict[str, Any]) -> str:
         return tool_error("limit 必须 ≥ 1")
     limit = min(limit, _MAX_READ_LINES)
 
-    # stat 不触发 open（FIFO/设备不阻塞），必须先验类型与体量再读：
-    # read_bytes 对 /dev/zero、FIFO 会永久挂死，而 to_thread 线程不可取消
+    # stat does not open the file (no blocking on FIFO/devices): validate
+    # type and size BEFORE reading — read_bytes hangs forever on /dev/zero
+    # or a FIFO, and to_thread threads cannot be cancelled
     try:
         st = path.stat()
     except OSError as e:
@@ -136,14 +148,16 @@ def _handle_read_text(args: Dict[str, Any]) -> str:
         return tool_error("不是普通文件（设备/FIFO 等），拒绝读取")
     guard = get_file_tool_config(ambient_pattern_code())
     cap = int(guard["max_read_chars"])
-    # 字节预算按字符上限折算（UTF-8 单字符至多 4 字节）：超预算的文件
-    # 整读后必然截断，白读不如直接拒绝
+    # Byte budget derived from the char cap (UTF-8 is at most 4 bytes per
+    # char): a file over budget would truncate anyway after a full read —
+    # rejecting outright beats a wasted read
     byte_budget = cap * 4 + 1024
     if st.st_size > byte_budget:
         return tool_error(
             f"文件 {st.st_size} 字节超过读取上限 {byte_budget} 字节"
-            f"（由 max_read_chars={cap} 折算）。请用 offset/limit 分页读取"
-            "较小范围，或改用 bash 的 sed/awk 切片")
+            f"（由 max_read_chars={cap} 折算）。本工具是整文件读入,"
+            f"offset/limit 无法绕过该预算;请改用 bash 的 sed/awk/head/tail"
+            "做范围切片")
 
     data = path.read_bytes()
     if b"\x00" in data[:4096]:
@@ -311,14 +325,18 @@ SEARCH_FILES_SCHEMA = {
 }
 
 
-def _iter_candidate_files(root: Path, pattern: str, deadline: float):
-    """walk 根目录产出文件名命中 glob 的候选文件（跳过生成物目录）。
+def _iter_candidate_files(root: Path, pattern: str, deadline: float,
+                          timed_out: List[bool]):
+    """Walk the root yielding files whose names hit the glob (artifact dirs skipped).
 
-    超过 deadline 即停止产出（巨树兜底）；调用方负责感知超时并标记
-    stopped_early。
+    Stops producing past the deadline (giant-tree backstop); appending True
+    to *timed_out* marks an abandoned walk — the caller flags stopped_early
+    from this signal instead of re-checking the clock, which cannot tell a
+    genuine stop from a walk that merely finished after the deadline.
     """
     for dirpath, dirnames, filenames in os.walk(root):
         if time.monotonic() > deadline:
+            timed_out.append(True)
             return
         dirnames[:] = sorted(
             d for d in dirnames
@@ -366,9 +384,11 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
     files_searched = 0
     truncated = False
     stopped_early = False
+    walk_timed_out: List[bool] = []   # the generator's genuine stop signal from abandoning the walk
     started = time.monotonic()
     deadline = started + _WALK_TIME_BUDGET_SECONDS
-    for file_path in _iter_candidate_files(root, pattern, deadline):
+    for file_path in _iter_candidate_files(root, pattern, deadline,
+                                           walk_timed_out):
         if time.monotonic() > deadline:
             stopped_early = True
             break
@@ -379,7 +399,7 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
         except OSError:
             continue
         if b"\x00" in data[:4096]:
-            continue  # 疑似二进制
+            continue  # likely binary
         files_searched += 1
         text = data.decode("utf-8", errors="replace")
         for line_no, line in enumerate(text.splitlines(), start=1):
@@ -387,7 +407,7 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
                 stopped_early = True
                 break
             if matcher is not None and len(line) > _MAX_REGEX_LINE_CHARS:
-                continue  # 超长行不进正则：限制回溯输入规模（见常量注释）
+                continue  # mega-lines skip the regex: bound backtracking input (see constant note)
             if matcher is not None:
                 hit = matcher.search(line) is not None
             else:
@@ -395,8 +415,9 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
                 hit = needle in hay
             if hit:
                 if len(matches) >= cap:
-                    # 满额后又见命中才标记截断——恰好 cap 条且 walk 自然
-                    # 耗尽时 truncated 保持 false，避免误导后续补搜
+                    # Flag truncation only when a hit appears after the cap —
+                    # exactly cap hits with a naturally exhausted walk keeps
+                    # truncated false, avoiding misleading later re-searches
                     truncated = True
                     break
                 matches.append({
@@ -406,8 +427,11 @@ def _handle_search_files(args: Dict[str, Any]) -> str:
                 })
         if truncated or stopped_early:
             break
-    # walk 可能已在生成器内因超时先行停止（不再产出），此处兜底感知
-    if not stopped_early and time.monotonic() > deadline:
+    # Trust only the iterator's own abandonment signal: a walk that naturally
+    # finished but whose tail processing crossed the deadline is not a
+    # truncation and must not induce a pointless re-search (re-reading the
+    # clock cannot make that distinction)
+    if walk_timed_out:
         stopped_early = True
 
     return tool_result({
@@ -475,8 +499,9 @@ def _handle_edit_file(args: Dict[str, Any]) -> str:
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
-        # 严格解码拒绝：errors=replace 的替换结果一旦回写，整个文件（而
-        # 非仅编辑区）都会被 U+FFFD 固化——GBK 等编码文件就此不可逆损坏
+        # Strict decode refusal: once a errors=replace result is written
+        # back, the WHOLE file (not just the edited region) gets U+FFFD
+        # baked in — GBK etc. files would be irreversibly corrupted
         return tool_error(
             f"文件不是 UTF-8 文本（可能是 GBK 等其他编码），拒绝编辑以"
             f"避免整文件乱码回写。请先转码（如 iconv -f GBK -t UTF-8）"
@@ -549,8 +574,9 @@ def _handle_find_files(args: Dict[str, Any]) -> str:
             return tool_error("max_results 必须 ≥ 1")
         cap = min(requested, cap)
 
-    # pattern 匹配相对 posix 路径（fnmatch 的 * 天然跨目录分隔符，
-    # 所以 *.py 即任意深度）；walk 侧已保证跳过生成物目录
+    # Match the pattern against the relative posix path (fnmatch's * crosses
+    # directory separators naturally, so *.py means any depth); the walk
+    # side already skips artifact dirs
     results: List[str] = []
     truncated = False
     stopped_early = False
@@ -570,8 +596,10 @@ def _handle_find_files(args: Dict[str, Any]) -> str:
             rel = (Path(dirpath) / name).relative_to(root).as_posix()
             if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
                 if len(results) >= cap:
-                    # 满额后又见候选才标记截断——恰好 cap 条且 walk 自然
-                    # 耗尽时 truncated 保持 false，避免误导后续补找
+                    # Flag truncation only when a candidate appears after the
+                    # cap — exactly cap results with a naturally exhausted
+                    # walk keeps truncated false, avoiding misleading
+                    # later re-searches
                     truncated = True
                     break
                 results.append(str(Path(dirpath) / name))
@@ -591,8 +619,9 @@ def _handle_find_files(args: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------------------
 # Self-registration (registered on module import; AST scan auto-discovery —
-# 注意必须是顶层 registry.register() 调用表达式：扫描器（nexus/registry/
-# discovery.py）只匹配 module body 的 Expr，for 循环体内的调用不可见)
+# note this must be a top-level registry.register() call expression: the
+# scanner (nexus/registry/discovery.py) only matches module-body Exprs;
+# calls inside for loops are invisible)
 # ---------------------------------------------------------------------------
 
 registry.register(

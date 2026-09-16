@@ -363,6 +363,28 @@ class McpManager:
         except Exception as e:  # noqa: BLE001 -- one server's failure must not sink the rest
             conn.ready, conn.error = False, str(e)
             logger.error("[mcp] server '%s' 连接失败: %s", conn.name, e)
+            if conn.stack is None:
+                # Half-initialized teardown: the transport/session may have
+                # entered the local stack but conn never took it over
+                # (conn.stack is still None) — _teardown cannot see it, and
+                # not closing it here means a dangling transport + connection
+                # pool. aclose on an empty stack is a harmless no-op; the
+                # stack's exit path does not close a caller-provided
+                # http_client (pre-attached on conn.http_client), so close
+                # it here as well.
+                try:
+                    await asyncio.wait_for(stack.aclose(), timeout=10.0)
+                except Exception as te:  # noqa: BLE001 -- best-effort
+                    logger.debug("[mcp] server '%s' 半初始化 stack 关闭"
+                                 "异常(忽略): %s", conn.name, te)
+                client, conn.http_client = conn.http_client, None
+                if client is not None:
+                    try:
+                        await asyncio.wait_for(client.aclose(), timeout=10.0)
+                    except Exception as te:  # noqa: BLE001 -- best-effort
+                        logger.debug("[mcp] server '%s' 半初始化 http "
+                                     "client 关闭异常(忽略): %s",
+                                     conn.name, te)
         finally:
             if conn.done_event is not None:
                 conn.done_event.set()

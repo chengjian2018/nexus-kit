@@ -1,37 +1,46 @@
-"""tool_guard —— P4 工具执行前危险操作播报（kind="agent_hooks"）.
+"""tool_guard — P4 pre-execution announce of dangerous tool calls
+(kind="agent_hooks").
 
-借鉴 Claude Code 的 bash 权限分析（命令分段 + 规则命中 + 次级小模型
-判读）与 hermes 的 declarative guardrail 风格，做成 agent_hooks 插件包：
+Borrowing Claude Code's bash permission analysis (command segmentation +
+rule hits + a secondary small-model review) and hermes's declarative
+guardrail style, packaged as an agent_hooks plugin:
 
-- **规则层（同步、微秒级）**：编译好的正则规则表按工具扫描
-  ``bash`` 的 command（先整串、再按 ``; / && / || / | / 换行`` 分段，
-  使管道规则与段子规则都能命中）、``run_python`` 的 code、
-  ``write_text`` / ``edit_file`` 的 path、``create_cron``。
-- **LLM 判读层（异步、旁路）**：规则未命中高危但命令带可疑信号
-  （网络动词 / 管道 / 命令替换 / 隐匿编码）时，把调用提交给后台单线程
-  分析器，用轻量模型输出 ``{"risk": ..., "reason": ...}`` JSON 裁决。
-  分析绝不阻塞主循环：hook 在事件循环线程里只做入队，LLM 调用在
-  worker 线程内 ``asyncio.run`` 独立执行，队列满即丢弃新条。
+- **Rule layer (synchronous, microsecond-scale)**: a compiled regex rule
+  table scans the ``bash`` command per tool (whole string first, then
+  segmented on ``; / && / || / | / newline`` so both pipe rules and segment
+  rules hit), the ``run_python`` code, ``write_text`` / ``edit_file``
+  paths, and ``create_cron``.
+- **LLM review layer (async, bypass)**: when no high-risk rule hit but the
+  command carries suspicious signals (network verbs / pipes / command
+  substitution / stealth encoding), the call is submitted to a background
+  single-thread analyzer that asks a lightweight model for a
+  ``{"risk": ..., "reason": ...}`` JSON verdict. The review never blocks
+  the main loop: the hook only enqueues on the event-loop thread, the LLM
+  call runs independently via ``asyncio.run`` inside the worker thread,
+  and a full queue drops the new entry.
 
-v1 契约（对应"先播报、不卡控"）：
+v1 contract ("announce first, never gate"):
 
-- hook 恒返回 ``None``（P4 语义 = 不改写 name/args）；
-- subagent / workflow 运行期不校验——P4 本就不在 ``_run_sub_agent``
-  的路径上（子循环直连 registry.dispatch），此处再读一次
-  ``current_tool_context()`` 标志位做双保险；
-- hook 异常由 agent_hooks 分发器统一吞掉，本模块内部也各自兜底
-  （配置读不到 → 默认值；LLM 失败 → 静默丢弃），播报通道只有日志
-  与内存 ledger（``recent_findings()``，供 studio/测试取用）。
+- the hook always returns ``None`` (P4 semantics = no name/args rewrite);
+- subagent / workflow runs are not scanned — P4 is structurally not on
+  ``_run_sub_agent``'s path (the sub loop dispatches the registry
+  directly); reading the ``current_tool_context()`` flags here again is a
+  second line of defense;
+- hook exceptions are swallowed by the agent_hooks dispatcher, and this
+  module also backstops internally (unreadable config → defaults; LLM
+  failure → silent drop); the announce channels are only the log and the
+  in-memory ledger (``recent_findings()``, consumed by studio / tests).
 
-启用方式（pattern 级声明，与 allow_toolset 授权哲学一致——谁授了
-shell/filesystem 谁挂 guard）::
+Enablement (pattern-level declaration, aligned with the allow_toolset
+authorization philosophy — whoever grants shell/filesystem hangs the
+guard)::
 
     Pattern(..., plugins={"agent_hooks": "tool_guard"}, ...)
 
-配置节 ``tool_guard``（可选，见 local_config.example.yaml）：
+Config section ``tool_guard`` (optional, see local_config.example.yaml):
 enabled / llm_fallback / llm_max_input_chars / llm_max_queue /
-llm_timeout_seconds / llm（llm 为叠加在 ambient 连接之上的 judge 模型
-覆盖，推荐指向便宜小模型）。
+llm_timeout_seconds / llm (``llm`` is a judge-model override layered on top
+of the ambient connection — point it at a cheap small model).
 """
 
 import asyncio
@@ -54,11 +63,11 @@ from nexus.registry.plugins import registry
 
 logger = logging.getLogger(__name__)
 
-# 测试隔离开关（conftest 置 1）：杀掉 LLM 判读的旁路线程路径
+# Test-isolation switch (conftest sets it to 1): kills the LLM review bypass thread path
 LLM_DISABLED_ENV = "NEXUS_TOOL_GUARD_LLM_DISABLED"
 
 # ============================================================================
-# 裁决与播报的数据形状
+# Data shapes for verdicts and findings
 # ============================================================================
 
 SEV_HIGH = "high"
@@ -79,38 +88,41 @@ _SEV_TAG = {
 
 @dataclass(frozen=True)
 class GuardFinding:
-    """一次命中（规则或 LLM 裁决同形，方便 ledger / UI 统一消费）。"""
+    """One hit (rule or LLM verdict share the shape, so ledger / UI consume them uniformly)."""
 
     tool: str
-    rule_id: str          # 如 "shell.rm-force" / "llm.verdict"
+    rule_id: str          # e.g. "shell.rm-force" / "llm.verdict"
     severity: str         # high | medium | low
-    summary: str          # 一句话危险定性
-    evidence: str         # 命中片段（已截断）
+    summary: str          # one-line danger characterization
+    evidence: str         # the matched fragment (already truncated)
     session_id: str = ""
     node_code: str = ""
     source: str = "rule"  # rule | llm
 
 
 # ============================================================================
-# 规则表（正则均为模块加载期一次性编译）
+# Rule table (all regexes compiled once at module load)
 # ============================================================================
 
-# --- bash：分段符。注意 "curl … | sh" 这类管道规则必须在整串上匹配，
-# --- 而 "rm -rf" 这类段子规则在分段后匹配——两张都跑，按 rule_id 去重。
-# --- rm 的递归+强制另走 _scan_rm_dangerous 结构化检测（正则对拆分旗标/
-# --- 长旗标/大写 -R 全部失明），同样按 rule_id 去重。
+# --- bash: segment delimiters. Note that pipe rules like "curl … | sh" must
+# --- match on the whole string, while segment rules like "rm -rf" match
+# --- after segmentation — both tables run, deduped by rule_id.
+# --- rm's recursive+force combo also goes through the _scan_rm_dangerous
+# --- structured detection (regexes are blind to split flags / long flags /
+# --- uppercase -R), also deduped by rule_id.
 _SHELL_SPLIT_RE = re.compile(r"\n|&&|\|\||;|\|")
 
 _RM_RF_RULE_ID = "shell.rm-recursive-force"
 _RM_RF_SUMMARY = "递归强制删除（rm -rf 族，误伤不可逆）"
-# 同一 token 内挤着 r 和 f 的组合旗标形态（-rf/-fr/-Rf/-rvf…）——结构化
-# 检测的 shlex 失败（引号不平衡）时的兜底层，正常路径先由它快速命中
+# Combined-flag forms squeezing r and f into one token (-rf/-fr/-Rf/-rvf…) —
+# the fallback layer when the structured detection's shlex fails (unbalanced
+# quotes); the normal path hits this first, quickly
 _RM_RF_RE = re.compile(r"\brm\b[^|;&\n]*\s-[a-zA-Z]*r[a-zA-Z]*f\b"
                        r"|\brm\b[^|;&\n]*\s-[a-zA-Z]*f[a-zA-Z]*r\b")
 
-# (rule_id, severity, pattern, summary) —— 先整串后分段各试一次
+# (rule_id, severity, pattern, summary) — whole string first, then segments
 _SHELL_RULES: List[tuple] = [
-    # ---- 高：破坏 / 提权执行面 / 远端历史改写 ----
+    # ---- high: destruction / privilege-escalation surfaces / remote history rewrite ----
     (_RM_RF_RULE_ID, SEV_HIGH, _RM_RF_RE, _RM_RF_SUMMARY),
     ("shell.pipe-to-shell", SEV_HIGH,
      re.compile(r"\b(?:curl|wget|base64|openssl|echo|printf)\b[^|;&\n]*\|"
@@ -148,7 +160,7 @@ _SHELL_RULES: List[tuple] = [
     ("shell.chmod-system", SEV_HIGH,
      re.compile(r"\bchmod\b[^|;&\n]*(?:/etc|/usr|/System|/bin)\b"),
      "对系统目录改权限"),
-    # ---- 中：不可逆 / 持久化 / 越权面 ----
+    # ---- medium: irreversible / persistence / out-of-scope surfaces ----
     ("shell.git-reset-hard", SEV_MEDIUM,
      re.compile(r"\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z]*f)"),
      "本地历史/工作区硬清除（未提交内容丢失）"),
@@ -182,14 +194,14 @@ _SHELL_RULES: List[tuple] = [
     ("shell.nc-listen", SEV_MEDIUM,
      re.compile(r"\bnc(?:at)?\b[^|;&\n]*\s-l\b"),
      "netcat 监听端口"),
-    # ---- 低：供应链 / 副作用提示 ----
+    # ---- low: supply chain / side-effect notices ----
     ("shell.package-install", SEV_LOW,
      re.compile(r"\b(?:pip3?|pipx|npm|yarn|pnpm|brew|apt(?:-get)?|yum|dnf|uv)"
                 r"\b[^|;&\n]*\s(?:install|add|i)\b"),
      "安装外部包（供应链引入面）"),
 ]
 
-# run_python：对整段 code 匹配
+# run_python: matched against the whole code block
 _PYTHON_RULES: List[tuple] = [
     ("python.os-system", SEV_HIGH,
      re.compile(r"\bos\.(?:system|popen)\s*\("),
@@ -213,7 +225,8 @@ _PYTHON_RULES: List[tuple] = [
      "代码触及密钥/凭据类路径"),
 ]
 
-# write_text / edit_file：对 path 参数（原串 + expanduser 归一后各试一次）
+# write_text / edit_file: matched against the path arg (raw string and the
+# expanduser-normalized form each get a try)
 _WRITE_PATH_RULES: List[tuple] = [
     ("fs.write-ssh", SEV_HIGH,
      re.compile(r"(?:^|/)\.ssh/|(?:^|/)authorized_keys"),
@@ -244,8 +257,9 @@ _WRITE_PATH_RULES: List[tuple] = [
      "相对路径含 .. 上跳（可能越出工作区）"),
 ]
 
-# 工具名分组（guard 只认清单内的字段形状；MCP/自定义工具 v1 不扫，
-# 交给 LLM 判读层的可疑信号决定是否送审）
+# Tool-name groups (the guard only knows the field shapes in this list;
+# MCP / custom tools are not scanned in v1 — whether to submit for review
+# is decided by the LLM layer's suspicious signals)
 _BASH_TOOLS = frozenset({"bash"})
 _PY_TOOLS = frozenset({"run_python"})
 _WRITE_TOOLS = frozenset({"write_text", "edit_file"})
@@ -259,13 +273,14 @@ def _clip(text: str, limit: int = _EVIDENCE_CHARS) -> str:
 
 
 def _shell_segments(command: str) -> List[str]:
-    """按 ; / && / || / | / 换行切段。简单 split，不感知引号——引号内的
-    分隔符会造成误报，对"只播报不干预"的 v1 可接受（保守方向）。"""
+    """Split on ; / && / || / | / newline. A plain split, quote-unaware —
+    separators inside quotes cause false positives, acceptable for the
+    announce-only v1 (the conservative direction)."""
     return [seg.strip() for seg in _SHELL_SPLIT_RE.split(command) if seg.strip()]
 
 
 def _match_rules(rules: List[tuple], texts: List[str]) -> List[tuple]:
-    """对 texts（整串 + 各段）逐一试规则，按 rule_id 去重后返回命中。"""
+    """Try each rule against the texts (whole string + segments), deduped by rule_id."""
     hits: "OrderedDict[str, tuple]" = OrderedDict()
     for rule_id, severity, pattern, summary in rules:
         for text in texts:
@@ -276,32 +291,49 @@ def _match_rules(rules: List[tuple], texts: List[str]) -> List[tuple]:
     return list(hits.values())
 
 
-# rm 动词之前允许出现的前缀命令（sudo rm / xargs -0 rm / nohup rm…）
+# Prefix commands allowed before the rm verb (sudo rm / xargs -0 rm / nohup rm…)
 _RM_PREFIX_CMDS = frozenset({
     "sudo", "env", "nohup", "xargs", "command", "nice", "time", "timeout"})
 
 
 def _rm_verb_index(tokens: List[str]) -> Optional[int]:
-    """定位段内 rm 动词位置：sudo/env/xargs 等前缀命令（及其自身旗标）
-    之后才可能是动词；遇到其他非旗标 token 即该段动词不是 rm（避免
-    ``grep rm -r -f log`` 这类把搜索词当动词的误报）。"""
+    """Locate the rm verb inside a segment: it can only appear after prefix
+    commands like sudo/env/xargs — including the prefix's own flags AND the
+    values those flags/prefixes consume (``sudo -u root rm``, ``timeout 10
+    rm``, ``nice -n 5 rm``, ``env FOO=bar rm``). A bare token with no
+    flag/prefix/value-slot immediately before it still ends the scan (avoids
+    false positives like ``grep rm -r -f log`` treating a search term as the
+    verb)."""
+    prev_takes_value = False
     for i, tok in enumerate(tokens):
         name = os.path.basename(tok)
         if name == "rm":
             return i
-        if name not in _RM_PREFIX_CMDS and not (i > 0 and tok.startswith("-")):
-            return None
+        if tok.startswith("-") and len(tok) > 1:
+            prev_takes_value = True     # flag: may consume the immediately following value (-u root / -n 5)
+            continue
+        if name in _RM_PREFIX_CMDS:
+            prev_takes_value = True     # prefix command: may carry a value directly (timeout 10)
+            continue
+        if prev_takes_value:
+            if "=" in tok:
+                continue                # env's VAR=VALUE chain (does not consume the flag slot)
+            prev_takes_value = False    # consumes exactly one value token, only one
+            continue
+        return None
     return None
 
 
 def _scan_rm_dangerous(command: str) -> Optional[tuple]:
-    """结构化检测 rm 的「递归 + 强制」组合（与 _SHELL_RULES 的
-    shell.rm-recursive-force 同 id，调用方按 id 去重）。
+    """Structured detection of rm's "recursive + force" combo (same id as
+    _SHELL_RULES' shell.rm-recursive-force; the caller dedups by id).
 
-    正则只认 r/f 挤在同一个 token 的形态，对 ``rm -r -f`` /
-    ``rm --recursive --force`` / ``rm -Rf`` 全部失明——这里按 shlex 分词
-    读选项集合，贴近 rm 自身的解析语义（含 ``rm dir -r -f`` 旗标后置）。
-    shlex 抛错（引号不平衡）的段退回 _RM_RF_RE 兜底。"""
+    The regex only recognizes forms with r/f squeezed into one token and is
+    blind to ``rm -r -f`` / ``rm --recursive --force`` / ``rm -Rf`` — here
+    the option set is read via shlex tokenization, close to rm's own parse
+    semantics (including trailing flags like ``rm dir -r -f``). Segments
+    where shlex raises (unbalanced quotes) fall back to the _RM_RF_RE
+    bottom line."""
     for seg in _shell_segments(command):
         try:
             tokens = shlex.split(seg)
@@ -334,14 +366,17 @@ def _scan_rm_dangerous(command: str) -> Optional[tuple]:
 
 
 def _scan_write_path(raw_path: str) -> List[tuple]:
-    """路径规则：与被守工具的解析形态对齐后多候选各试一次。
+    """Path rules: aligned with the guarded tools' resolution shapes, each
+    candidate tried once.
 
-    file_tool._resolve_path 做 strip().expanduser()；内核开档把 //etc
-    当 /etc；macOS 上 /etc → /private/etc 是 symlink，read_text 回显的
-    resolve() 路径会以 /private 拼法喂给模型——三个拼法都要能命中。
-    大小写不敏感文件系统上的 /ETC/.SSH 变体用小写化候选覆盖（observe-
-    only 通道，多报不错过可接受）。symlink 解析需要 IO，违背本层
-    「无 IO」契约，是已知残留。"""
+    file_tool._resolve_path does strip().expanduser(); the kernel treats
+    //etc as /etc when opening files; on macOS /etc → /private/etc is a
+    symlink, so the resolve() path read_text echoes back feeds the model
+    the /private spelling — all three spellings must hit. /ETC/.SSH-style
+    variants on case-insensitive filesystems are covered by lowercased
+    candidates (an observe-only channel; over-reporting beats missing).
+    Symlink resolution needs IO, violating this layer's "no IO" contract —
+    a known residual."""
     stripped = str(raw_path).strip()
     texts: List[str] = []
     seen = set()
@@ -357,9 +392,9 @@ def _scan_write_path(raw_path: str) -> List[tuple]:
     except Exception:
         pass
     for base in list(texts):
-        # 多斜杠归一（normpath 特意保留前导 //，不适用）
+        # Multi-slash normalization (normpath deliberately keeps a leading //, so it is not used)
         _add(re.sub(r"/{2,}", "/", base))
-        # macOS /private 前缀剥离（/etc、/tmp 等的真实落点）
+        # macOS /private prefix stripping (the real location of /etc, /tmp, etc.)
         if base.startswith("/private/"):
             _add(base[len("/private"):])
         _add(base.lower())
@@ -367,7 +402,7 @@ def _scan_write_path(raw_path: str) -> List[tuple]:
 
 
 def scan_tool_call(tool_name: str, args: Dict[str, Any]) -> List[GuardFinding]:
-    """纯规则扫描（同步、无 IO、无副作用）——测试与 hook 共用。"""
+    """Pure rule scan (synchronous, no IO, no side effects) — shared by tests and the hook."""
     if not isinstance(args, dict):
         return []
 
@@ -403,11 +438,12 @@ def scan_tool_call(tool_name: str, args: Dict[str, Any]) -> List[GuardFinding]:
 
 
 # ============================================================================
-# LLM 判读层：可疑信号识别 + 后台单线程分析器
+# LLM review layer: suspicious-signal detection + background single-thread analyzer
 # ============================================================================
 
-# 触发判读的信号：网络/执行动词、管道、命令替换、隐匿编码（重定向不在
-# 内——太常见，单独重定向不足以动用一次模型调用）
+# Signals that trigger review: network/execution verbs, pipes, command
+# substitution, stealth encoding (redirects excluded — too common; a lone
+# redirect does not justify a model call)
 _LLM_SIGNAL_SHELL_RE = re.compile(
     r"\b(?:curl|wget|nc|ncat|ssh|scp|rsync|base64|eval|printenv|chmod"
     r"|chown|sudo|crontab|launchctl|osascript|python3?|perl|ruby|node)\b"
@@ -419,9 +455,9 @@ _LLM_SIGNAL_PY_RE = re.compile(
 
 def _should_ask_llm(tool_name: str, args: Dict[str, Any],
                     findings: List[GuardFinding]) -> bool:
-    """只有"规则没打出高危、但信号可疑"的调用才值得花一次小模型。"""
+    """Only "no high-risk rule hit but suspicious signals" calls are worth a small-model call."""
     if any(f.severity == SEV_HIGH for f in findings):
-        return False  # 高危已由规则定性，不需要再问
+        return False  # rules already characterized the high risk; no need to ask again
     if tool_name in _BASH_TOOLS:
         return bool(_LLM_SIGNAL_SHELL_RE.search(str(args.get("command") or "")))
     if tool_name in _PY_TOOLS:
@@ -442,7 +478,7 @@ _VERDICT_RISKS = {SEV_HIGH, SEV_MEDIUM, SEV_LOW, "none"}
 
 
 def _parse_verdict(text: str) -> Optional[Dict[str, str]]:
-    """宽松解析模型输出：截取首尾大括号间的 JSON；risk 非法则丢弃。"""
+    """Lenient parse of the model output: JSON between the first/last braces; an illegal risk is dropped."""
     if not text:
         return None
     start, end = text.find("{"), text.rfind("}")
@@ -463,8 +499,9 @@ def _parse_verdict(text: str) -> Optional[Dict[str, str]]:
 async def _default_probe(tool_name: str, args: Dict[str, Any],
                          llm_overrides: Dict[str, Any],
                          input_cap: int) -> Optional[Dict[str, str]]:
-    """默认判读探针：llm_overrides（tool_guard.llm > ambient 快照）叠加在
-    全局 llm_default 之上构造 provider，做一次小模型补全。"""
+    """Default review probe: llm_overrides (tool_guard.llm > ambient
+    snapshot) layered over the global llm_default builds the provider for
+    one small-model completion."""
     from nexus.settings import get_llm_config
     from nexus.llm.resolve import build_provider
 
@@ -486,11 +523,12 @@ async def _default_probe(tool_name: str, args: Dict[str, Any],
 
 
 class _LLMAnalyzer:
-    """后台单线程分析器：queue 有界、去重有界、逐条 asyncio.run。
+    """Background single-thread analyzer: bounded queue, bounded dedup, one asyncio.run per item.
 
-    线程在首次 submit 时惰性启动（不挂 guard 的进程零成本）；probe 可
-    注入（测试替身）。任何失败——队列满、超时、provider 异常、输出
-    不合法——都只记 debug 日志然后丢条，绝不影响主循环。
+    The thread starts lazily on first submit (zero cost for processes
+    without the guard); the probe is injectable (test double). Any failure —
+    full queue, timeout, provider error, malformed output — only logs at
+    debug and drops the item, never touching the main loop.
     """
 
     def __init__(self, probe: Optional[Callable] = None,
@@ -502,14 +540,15 @@ class _LLMAnalyzer:
         self._thread: Optional[threading.Thread] = None
         self._thread_lock = threading.Lock()
 
-    # -- 提交端（事件循环线程，必须非阻塞） -----------------------------
+    # -- submit side (event-loop thread; must be non-blocking) -----------------------------
 
     def submit(self, tool_name: str, args: Dict[str, Any],
                llm_overrides: Optional[Dict[str, Any]],
                max_input_chars: int, timeout_seconds: float,
                session_id: str = "", node_code: str = "") -> bool:
-        """入队一条待审调用。重复调用（同 tool + 同 args）直接吞掉；
-        队列满丢弃新条并记 debug——观测旁路不值得反压主循环。"""
+        """Enqueue one call for review. Duplicate calls (same tool + same args) are swallowed;
+        a full queue drops the new entry and logs debug — an observability
+        bypass is never worth backpressuring the main loop."""
         raw = json.dumps(args, sort_keys=True, ensure_ascii=False,
                          default=str)
         key = hashlib.sha1(
@@ -537,7 +576,7 @@ class _LLMAnalyzer:
                     target=self._worker, name="tool-guard-llm", daemon=True)
                 self._thread.start()
 
-    # -- 消费端（worker 线程） -----------------------------------------
+    # -- consume side (worker thread) -----------------------------------------
 
     def _worker(self) -> None:
         while True:
@@ -557,13 +596,13 @@ class _LLMAnalyzer:
                                                   default=str)),
                         session_id=session_id, node_code=node_code,
                         source="llm"))
-            except Exception as e:  # 任何判读失败都静默（旁路观测而已）
+            except Exception as e:  # any review failure stays silent (it is just an observability bypass)
                 logger.debug("[tool_guard] LLM 判读失败（丢弃）: %s", e)
             finally:
                 self._queue.task_done()
 
     def wait_idle(self, timeout: float = 5.0) -> bool:
-        """测试辅助：等队列清空（含正在处理的一条）。"""
+        """Test helper: wait for the queue to drain (including an in-flight item)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._queue.empty() and self._queue.unfinished_tasks == 0:
@@ -572,7 +611,7 @@ class _LLMAnalyzer:
         return False
 
     def reset(self) -> None:
-        """清去重表与待处理队列（测试隔离用；不动线程）。"""
+        """Clear the dedup table and pending queue (test isolation; leaves the thread alone)."""
         self._seen.clear()
         while True:
             try:
@@ -582,9 +621,10 @@ class _LLMAnalyzer:
                 break
 
 
-# 惰性构造：队列容量在首次使用时按配置定型（queue.Queue 的 maxsize
-# 构造即定，运行期换队列会漏掉阻塞在旧队列 get 上的 worker）——测试
-# 经 monkeypatch 替换 _ANALYZER 注入自己的实例
+# Lazy construction: the queue capacity is fixed from config at first use
+# (queue.Queue's maxsize is set at construction; swapping the queue at
+# runtime would strand the worker blocked on the old queue's get) — tests
+# replace _ANALYZER via monkeypatch to inject their own instance
 _ANALYZER: Optional[_LLMAnalyzer] = None
 _ANALYZER_LOCK = threading.Lock()
 
@@ -598,7 +638,7 @@ def _get_analyzer(max_queue: int) -> _LLMAnalyzer:
 
 
 # ============================================================================
-# Ledger / 计数（内存态，重启清空；供 recent_findings() 消费）
+# Ledger / counters (in-memory, cleared on restart; consumed by recent_findings())
 # ============================================================================
 
 _LEDGER_CAP = 200
@@ -626,7 +666,7 @@ def _record_finding(finding: GuardFinding) -> None:
 
 
 def recent_findings() -> List[GuardFinding]:
-    """最近命中的快照（观测/测试用；只读副本）。"""
+    """Snapshot of the latest hits (observability/testing; a read-only copy)."""
     with _LEDGER_LOCK:
         return list(_LEDGER)
 
@@ -641,7 +681,7 @@ def guard_stats() -> Dict[str, Any]:
 
 
 def reset_guard_state() -> None:
-    """清空 ledger/计数/去重（测试隔离用）。"""
+    """Clear the ledger / counters / dedup (test isolation)."""
     with _LEDGER_LOCK:
         _LEDGER.clear()
         _STATS.update(findings=0, llm_asked=0,
@@ -651,10 +691,10 @@ def reset_guard_state() -> None:
 
 
 # ============================================================================
-# Hook 本体（P4 on_tool_call）
+# The hook itself (P4 on_tool_call)
 # ============================================================================
 
-# 配置读失败时的回退（保守：规则开、LLM 关——不动网络）
+# Fallback when the config read fails (conservative: rules on, LLM off — no network)
 _FALLBACK_CONFIG = {
     "enabled": True, "llm_fallback": False,
     "llm_max_input_chars": 2000, "llm_max_queue": 64,
@@ -671,7 +711,7 @@ def _load_guard_config() -> Dict[str, Any]:
 
 
 def _guard_on_tool_call(event) -> None:
-    """P4 hook：扫描 → 播报 → 视可疑度旁路送审。恒返回 None（不改写）。"""
+    """P4 hook: scan → announce → submit suspicious calls for review. Always returns None (no rewrite)."""
     args = event.args
     if not isinstance(args, dict):
         return None
@@ -679,8 +719,9 @@ def _guard_on_tool_call(event) -> None:
     if not cfg.get("enabled"):
         return None
 
-    # 需求：subagent / workflow 运行期不校验。P4 结构上不在子循环路径，
-    # 这里读标志位是双保险（防未来有人把 P4 接进别的路径）。
+    # Requirement: subagent / workflow runs are not scanned. P4 is
+    # structurally off the sub-loop path; reading the flags here is a second
+    # line of defense (against someone wiring P4 into another path later).
     tc = current_tool_context()
     if tc is not None and (tc.in_subagent or tc.in_workflow):
         return None
@@ -699,8 +740,9 @@ def _guard_on_tool_call(event) -> None:
             and _should_ask_llm(event.tool_name, args, findings)):
         with _LEDGER_LOCK:
             _STATS["llm_asked"] += 1
-        # ambient llm_config 必须在事件循环线程里捕获（contextvar
-        # 不跨线程）；tool_guard.llm 覆盖优先级更高，叠加其后
+        # ambient llm_config must be captured on the event-loop thread
+        # (the contextvar does not cross threads); the tool_guard.llm
+        # override has the higher priority, layered on top
         overrides: Dict[str, Any] = {}
         if tc is not None and tc.llm_config:
             overrides.update(tc.llm_config)
@@ -714,11 +756,12 @@ def _guard_on_tool_call(event) -> None:
 
 
 # ============================================================================
-# 自注册（AST 扫描要求：模块体顶层的 registry.register(...) 表达式）
+# Self-registration (AST scan requires a top-level module-body
+# registry.register(...) expression)
 # ============================================================================
 
 def _build_tool_guard_hooks() -> Dict[str, List[Callable]]:
-    """零参工厂：plugin_registry.resolve 只调一次并缓存。"""
+    """Zero-arg factory: plugin_registry.resolve calls it once and caches."""
     return {"on_tool_call": [_guard_on_tool_call]}
 
 
