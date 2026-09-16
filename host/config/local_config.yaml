@@ -1,0 +1,82 @@
+# ============================================================================
+# Local configuration — global tier of the two-layer model (app-config spec)
+# ============================================================================
+#
+# llm_providers   Connection layer: declare api_base / api_key_env /
+#                 timeout / max_retries per provider code (no model or
+#                 generation parameters)
+# llm_default     Orchestration layer: default LLM selection (code + model +
+#                 generation params temperature/max_tokens/enable_thinking);
+#                 the fallback tier of the layered merge
+# loop            Global ReAct tool-round budget (per-app config.yaml can
+#                 override at pattern / node level)
+#
+# Per-app overrides live in apps/<name>/config.yaml (explicit `pattern:` key);
+# see docs/design/app-config.md for the vocabulary.
+
+llm_providers:
+  dashscope:
+    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    timeout: 60
+    max_retries: 2
+  zai:
+    # GLM Coding Plan（OpenAI Chat Completion 协议端点；Coding Plan 套餐额度
+    # 只在该端点可用，通用 …/api/paas/v4 走按量付费）
+    api_base: https://open.bigmodel.cn/api/coding/paas/v4
+    # 实际 key 从该环境变量读取（export Z_AI_API_KEY=...）
+    api_key_env: Z_AI_API_KEY
+    timeout: 60
+    max_retries: 2
+
+
+llm_default:
+  code: zai
+  model: glm-5.3-flash
+  temperature: 0.7
+  max_tokens: 10000
+  enable_thinking: true
+
+# ============================================================================
+# MCP servers — 深度研究 / 通用工具网关(atoms/tools/mcp_tool.py 启动时读取)
+# ============================================================================
+# 每个条目:server 名 → toolset 名 mcp-<server 名>
+#   transport          stdio | sse | streamable_http
+#   command/args/env   stdio 传输的子进程命令(stdio 必填 command)
+#   url/headers        sse / streamable_http 传输的端点(必填 url)
+#   tool_name_prefix   可选注册名前缀(防跨 server 撞名),默认保留原名
+#   环境变量引用       command/url/args/env/headers 的字符串值支持 $VAR /
+#                      ${VAR} 从进程环境展开(密钥不落盘;未设置的变量保留
+#                      原样并告警,不阻塞启动)。注意两点:
+#                      ① 展开发生在配置加载时——之后只改进程环境变量、
+#                      不动本文件的话,需走 /api/v1/system/reload 才生效;
+#                      ② 展开后的明文值会出现在 get_mcp_servers() 返回值
+#                      / 连接异常文本里——token 不要内嵌 URL query,优先放
+#                      headers 并尽量用 env 间接引用
+#
+# zai-mcp-server:从 Claude 的 MCP 配置迁移(stdio + @z_ai/mcp-server),
+# 提供视觉分析工具族(analyze_image / analyze_video / extract_text_from_
+# screenshot / ui_diff_check / ui_to_artifact / understand_technical_
+# diagram / analyze_data_visualization / diagnose_error_screenshot)
+
+mcp_servers:
+  zai:
+    transport: stdio
+    command: npx
+    args:
+      - "-y"
+      - "@z_ai/mcp-server"
+    env:
+      # 与 llm_providers.zai 同一把密钥——$VAR 从进程环境展开（未设置保留
+      # 原样并告警，不阻塞启动）
+      Z_AI_API_KEY: ${Z_AI_API_KEY}
+
+  # zai 官方远程 web search。streamable_http(/mcp 端点 + Bearer 头)——
+  # 旧 SSE 传输与 mcp sdk 2.2.0 组合会在几条消息后写阻塞(tools/call 永久
+  # 挂起,无传输层报错),streamable_http 实测稳定
+  websearch:
+    transport: streamable_http
+    url: "https://api.z.ai/api/mcp/web_search_prime/mcp"
+    headers:
+      Authorization: "Bearer ${Z_AI_API_KEY}"
+

@@ -263,9 +263,10 @@ patterns / tools / providers / channels 四个领域注册中心**保持独立**
 | `config` | 自由 bag：执行器自定义参数的家（如 archify 的 author_rounds） |
 
 连接字段（api_base / api_key / api_key_env）在 app 文件出现即 fail-fast
-——app 文件入库，密钥只允许在全局 `llm_providers`。未知键 warn + 忽略；
-无文件 = 全默认（应用零改动照跑）。完整示例：host/config/
-local_config.example.yaml 与 docs/design/app-config.md。
+——app 文件入库，密钥只允许在全局 `llm_providers`（同样经 api_key_env /
+$VAR 环境引用，不入库明文）。未知键 warn + 忽略；无文件 = 全默认（应用
+零改动照跑）。完整示例：host/config/local_config.yaml 与
+docs/design/app-config.md。
 
 ### 优先级链（字段级覆盖，缺项继承浅层）
 

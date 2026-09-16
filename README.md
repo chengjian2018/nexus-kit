@@ -103,15 +103,15 @@ uv sync --extra dev     # 或者 pip install -e ".[dev]"
 ### 3. 配一个模型 Key
 
 ```bash
-# 先复制一份本地配置（这个文件存密钥，已在 .gitignore 里，不会被传上 git）
-cp host/config/local_config.example.yaml host/config/local_config.yaml
+# 本地配置 host/config/local_config.yaml 已入库，密钥不落盘——全部走
+# 环境变量引用（api_key_env / $VAR），配好环境变量即可
 
 # 三选一：
-# ① 用阿里云百炼（默认）
-export DASHSCOPE_API_KEY=sk-...
-
-# ② 用 z.ai（GLM）——还要把 local_config.yaml 里的 llm_default.code 改成 zai
+# ① 用 z.ai（GLM，当前默认 llm_default）
 export Z_AI_API_KEY=...
+
+# ② 用阿里云百炼——把 local_config.yaml 里的 llm_default.code 改成 dashscope
+export DASHSCOPE_API_KEY=sk-...
 
 # ③ 接自己的模型：
 #    兼容 OpenAI 接口的服务 —— 在 llm_providers 里加一节、改个地址就行；
