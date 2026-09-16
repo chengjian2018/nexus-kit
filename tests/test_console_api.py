@@ -65,8 +65,8 @@ def test_catalog_stage_and_executor(client):
     assert "fsm_unified" in stages and "nlg_pass_through" in stages
     executors = _ok_data(client.get("/api/v1/console/catalog/executor"))["codes"]
     assert {"default_loop", "default_fsm"} <= set(executors)
-    assert "default_route" not in executors  # ROUTE executor 已删除
-    assert "xianyu_router" in executors     # app 自有节点执行器可见
+    assert "default_route" not in executors  # the ROUTE executor is deleted
+    assert "xianyu_router" in executors     # app-owned node executors are visible
 
 
 def test_catalog_unknown_kind_404(client):
@@ -171,12 +171,12 @@ def test_custom_collections_and_records_crud(client):
             {"name": "refund", "label": "退款", "type": "number"},
         ]}))["id"]
 
-    # 同 scope 重名 -> 400（store 层校验）
+    # duplicate name in the same scope -> 400 (validated at the store layer)
     resp = client.post(base, json={
         "scope": "xianyu:c1", "name": "售后案例库",
         "fields": [{"name": "a"}]})
     assert resp.status_code == 400
-    # 坏字段名 -> 422（pydantic pattern）
+    # a bad field name -> 422 (pydantic pattern)
     resp = client.post(base, json={
         "scope": "xianyu:c1", "name": "库2", "fields": [{"name": "1bad"}]})
     assert resp.status_code == 422
@@ -185,47 +185,69 @@ def test_custom_collections_and_records_crud(client):
     assert [c["name"] for c in colls] == ["售后案例库"]
     assert colls[0]["fields"][0]["label"] == "案例编号"
 
-    # 记录：新增（数字字符串 coercion）/ 列表 / 检索
-    rid = _ok_data(client.post(f"{base}/{cid}/records",
+    # records: create (numeric-string coercion) / list / search
+    rid = _ok_data(client.post(f"{base}/{cid}/records", params={"scope": "xianyu:c1"},
                                json={"data": {"case_no": "A-1", "refund": "99"}}))["id"]
-    rows = _ok_data(client.get(f"{base}/{cid}/records"))["rows"]
+    rows = _ok_data(client.get(f"{base}/{cid}/records",
+                               params={"scope": "xianyu:c1"}))["rows"]
     assert rows[0]["data"] == {"case_no": "A-1", "refund": 99}
 
-    resp = client.post(f"{base}/{cid}/records",
+    resp = client.post(f"{base}/{cid}/records", params={"scope": "xianyu:c1"},
                        json={"data": {"case_no": "A-2", "bogus": 1}})
-    assert resp.status_code == 400  # 未知字段
-    resp = client.post(f"{base}/{cid}/records", json={"data": {"refund": 1}})
-    assert resp.status_code == 400  # 缺必填
-    resp = client.post(f"{base}/{cid}/records",
+    assert resp.status_code == 400  # unknown field
+    resp = client.post(f"{base}/{cid}/records", params={"scope": "xianyu:c1"},
+                       json={"data": {"refund": 1}})
+    assert resp.status_code == 400  # missing required
+    resp = client.post(f"{base}/{cid}/records", params={"scope": "xianyu:c1"},
                        json={"data": {"case_no": "A-3", "refund": "abc"}})
-    assert resp.status_code == 400  # number 非法
+    assert resp.status_code == 400  # illegal number
 
+    # record search: numeric values tokenize into hits; id-like short words
+    # ("A-1") tokenize to nothing → honestly return an empty set (this used
+    # to silently degrade to "return everything" and pass by luck on a
+    # single-row table)
     hits = _ok_data(client.get(f"{base}/{cid}/records",
-                               params={"query": "A-1"}))["rows"]
+                               params={"query": "99", "scope": "xianyu:c1"}))["rows"]
     assert [r["id"] for r in hits] == [rid]
+    assert client.get(f"{base}/{cid}/records",
+                      params={"query": "A-1", "scope": "xianyu:c1"}).json()[
+        "data"]["rows"] == []
 
-    # 全量替换记录（可选字段显式清空）
-    _ok_data(client.put(f"{base}/{cid}/records/{rid}",
+    # whole-record replace (optional fields explicitly cleared)
+    _ok_data(client.put(f"{base}/{cid}/records/{rid}", params={"scope": "xianyu:c1"},
                         json={"data": {"case_no": "A-1x", "refund": None}}))
-    rows = _ok_data(client.get(f"{base}/{cid}/records"))["rows"]
+    rows = _ok_data(client.get(f"{base}/{cid}/records",
+                               params={"scope": "xianyu:c1"}))["rows"]
     assert rows[0]["data"] == {"case_no": "A-1x", "refund": None}
 
-    # 改字段定义：被删字段的值从记录里清理
-    _ok_data(client.put(f"{base}/{cid}", json={
+    # field-definition change: removed fields' values are pruned from records
+    _ok_data(client.put(f"{base}/{cid}", params={"scope": "xianyu:c1"}, json={
         "fields": [{"name": "case_no", "type": "text", "required": True}]}))
-    rows = _ok_data(client.get(f"{base}/{cid}/records"))["rows"]
+    rows = _ok_data(client.get(f"{base}/{cid}/records",
+                               params={"scope": "xianyu:c1"}))["rows"]
     assert rows[0]["data"] == {"case_no": "A-1x"}
 
-    # 404 路径
-    assert client.get(f"{base}/999").status_code == 404
-    assert client.delete(f"{base}/999").status_code == 404
-    assert client.get(f"{base}/999/records").status_code == 404
-    assert client.delete(f"{base}/{cid}/records/999").status_code == 404
+    # scope-ownership guard: with all params present, cross-scope / bad-scope both map to 404/400
+    assert client.get(f"{base}/{cid}",
+                      params={"scope": "xianyu:other"}).status_code == 404
+    assert client.get(f"{base}/{cid}",
+                      params={"scope": "no-colon"}).status_code == 400
+    assert client.delete(f"{base}/{cid}/records/{rid}",
+                         params={"scope": "xianyu:other"}).status_code == 404
 
-    # 删库（级联删记录）
-    _ok_data(client.delete(f"{base}/{cid}"))
-    assert client.get(f"{base}/{cid}").status_code == 404
-    assert client.get(f"{base}/{cid}/records").status_code == 404
+    # the 404 paths
+    assert client.get(f"{base}/999", params={"scope": "xianyu:c1"}).status_code == 404
+    assert client.delete(f"{base}/999", params={"scope": "xianyu:c1"}).status_code == 404
+    assert client.get(f"{base}/999/records", params={"scope": "xianyu:c1"}).status_code == 404
+    assert client.delete(f"{base}/{cid}/records/999",
+                         params={"scope": "xianyu:c1"}).status_code == 404
+
+    # delete a collection (records cascade)
+    _ok_data(client.delete(f"{base}/{cid}", params={"scope": "xianyu:c1"}))
+    assert client.get(f"{base}/{cid}",
+                      params={"scope": "xianyu:c1"}).status_code == 404
+    assert client.get(f"{base}/{cid}/records",
+                      params={"scope": "xianyu:c1"}).status_code == 404
 
 
 def test_collections_bad_scope_rejected(client):
@@ -244,12 +266,12 @@ def test_search_test_tokens_and_match_explanation(client):
         "scope": "xianyu:t2", "title": "发货时效", "content": "48 小时内发货"})
     data = _ok_data(client.post("/api/v1/console/knowledge/search-test", json={
         "scope": "xianyu:t2", "query": "阅读器 墨水屏"}))
-    # jieba search mode splits sub-words (e.g. 墨水屏 -> 墨水/水屏) — assertions use containment
+    # jieba search mode splits sub-words — assertions use containment
     assert "阅读器" in data["tokens"]
     assert any("墨水" in t for t in data["tokens"])
     assert len(data["products"]) == 1
     assert "阅读器" in data["products"][0]["_match"]["goods_name"]
-    assert data["products"][0]["_match"]["extracted_content"]  # hit via the 墨水* sub-word
+    assert data["products"][0]["_match"]["extracted_content"]  # hit via the ink* sub-word (墨水* = "ink screen")
 
     goods_mode = _ok_data(client.post("/api/v1/console/knowledge/search-test",
                                       json={"scope": "xianyu:t2", "query": "",

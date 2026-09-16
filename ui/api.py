@@ -1,16 +1,23 @@
-"""Ops-console API — /api/v1/console/*（PRD P0 面，见 docs/design/ops-console-prd.md §8）。
+"""Ops-console API — /api/v1/console/* (PRD P0 surface; see
+docs/design/ops-console-prd.md §8).
 
-只读 pattern 视图 + 目录查询 + 知识库管理 CRUD / 试搜台。约定：
+Read-only pattern views + catalog queries + knowledge-base management CRUD /
+search trial console. Conventions:
 
-- 响应沿用 host 的 ``{code, message, status, data}`` 包裹（code "0" 成功）；
-- 路径挂在 /api/v1/ 下，天然被 host.main 的 NEXUS_API_KEY 中间件覆盖
-  （channel 除外的那条规则不影响 console）；
-- 端点同步 def（FastAPI 丢线程池执行）——知识库是 sqlite3 同步连接
-  （自带锁），pattern 序列化也是纯 CPU；例外是会话审查段（§Session
-  review），走 aiosqlite 的 SessionStore，因此为 async def；
-- 事实源口径：pattern 一律来自注册表（当前全部 code-managed，PRD D-1
-  的 fork-to-edit 属 P1）；知识库写操作经 atoms.knowledge.store 的管理
-  CRUD（update 语义 = 出现的键才更新，None 显式清空）。
+- Responses reuse host's ``{code, message, status, data}`` envelope
+  (code "0" means success);
+- Routes are mounted under /api/v1/, so host.main's NEXUS_API_KEY middleware
+  covers them naturally (the channel-exemption rule does not affect the
+  console);
+- Endpoints are sync def (FastAPI dispatches them to the threadpool) — the
+  knowledge base is a synchronous sqlite3 connection (with its own lock) and
+  pattern serialization is pure CPU too; the exception is the session-review
+  section (§Session review), which goes through the aiosqlite-based
+  SessionStore and is therefore async def;
+- Source of truth: patterns always come from the registry (currently all
+  code-managed; PRD D-1's fork-to-edit is P1); knowledge-base writes go
+  through atoms.knowledge.store's management CRUD (update semantics = only
+  the keys that appear are updated; None explicitly clears a field).
 """
 
 from __future__ import annotations
@@ -56,8 +63,10 @@ _SCOPE_RE = re.compile(r"^[^:\s]+:[^:\s]+$")
 
 
 def _ensure_discovery() -> None:
-    """首次请求前暖注册表（真实服务里 host.main import 时已做过；独立
-    挂载/测试场景懒触发）。discover 幂等：同名同 factory 是 no-op。"""
+    """Warm the registries before the first request (host.main's import
+    already did it in the real service; lazily triggered in standalone
+    mounting / tests). Discovery is idempotent: same name + same factory is
+    a no-op."""
     global _discovered
     if _discovered:
         return
@@ -86,10 +95,26 @@ def _bad_scope(scope: str) -> Optional[JSONResponse]:
     return None
 
 
+def _owned_collection(
+    store: Any, collection_id: int, scope: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    """Scope-ownership guard for id-addressed endpoints — the same isolation
+    statement as the list layer: scope is required and format-checked;
+    a mismatching owner is reported as 404 (never leaking other scopes'
+    existence). Returns (collection, None) or (None, error_response)."""
+    bad = _bad_scope(scope or "")
+    if bad is not None:
+        return None, bad
+    coll = store.get_collection(collection_id)
+    if coll is None or coll["scope"] != scope:
+        return None, _fail(404, "404", f"知识库不存在: id={collection_id}")
+    return coll, None
+
+
 def _match_explanation(
     row: Dict[str, Any], tokens: List[str], fields: List[str]
 ) -> Dict[str, List[str]]:
-    """逐字段解释命中：该字段文本包含了哪些分词（试搜台展示用）。"""
+    """Per-field hit explanation: which tokens each field's text contained (for the search-preview display)."""
     explanation: Dict[str, List[str]] = {}
     for field in fields:
         text = str(row.get(field) or "")
@@ -104,7 +129,7 @@ def _match_explanation(
 # ---------------------------------------------------------------------------
 
 def _pattern_meta(pattern: Any) -> Dict[str, Any]:
-    """Pattern 概要（两层模型：pattern_type / nodes / plugins / allow_toolset）。"""
+    """Pattern summary (two-layer model: pattern_type / nodes / plugins / allow_toolset)."""
     skeleton = [slot for entry_dict in (pattern.stages or [])
                 for slot in entry_dict.keys()]
     meta: Dict[str, Any] = {
@@ -185,7 +210,8 @@ class ProductIn(BaseModel):
 
 
 class ProductPatch(BaseModel):
-    """PUT 语义：缺席 = 不修改；显式 null = 清空该字段（store.update_product）。"""
+    """PUT semantics: absent = leave unchanged; explicit null = clear the
+    field (store.update_product)."""
     goods_name: Optional[str] = Field(default=None, max_length=512)
     price: Optional[str] = Field(default=None, max_length=64)
     sold_quantity: Optional[int] = None
@@ -220,7 +246,7 @@ class ClearScopeIn(BaseModel):
 
 
 class FieldDef(BaseModel):
-    """自定义知识库的一个字段定义（name 为记录 JSON 的键）。"""
+    """One field definition of a custom collection (name is the record JSON's key)."""
     name: str = Field(min_length=1, max_length=64,
                       pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     label: Optional[str] = Field(default=None, max_length=64)
@@ -236,8 +262,9 @@ class CollectionIn(BaseModel):
 
 
 class CollectionPatch(BaseModel):
-    """PUT 语义与内置库一致：缺席 = 不修改；fields 变更会重算记录检索文本
-    并清理被删字段的值（store.update_collection）。"""
+    """PUT semantics match the builtin collections: absent = untouched; a
+    fields change recomputes the records' search text and prunes removed
+    fields' values (store.update_collection)."""
     name: Optional[str] = Field(default=None, min_length=1, max_length=64)
     description: Optional[str] = Field(default=None, max_length=512)
     fields: Optional[List[FieldDef]] = None
@@ -367,8 +394,10 @@ def knowledge_cs_delete(entry_id: int):
 
 @router.post("/knowledge/search-test")
 def knowledge_search_test(body: SearchTestIn):
-    """试搜台：跑生产同款检索（search_products / search_cs），并附分词与
-    逐字段命中解释——让运营对「关键词 LIKE 检索」建立真实预期。"""
+    """Search preview: runs the production-identical retrieval
+    (search_products / search_cs) with tokens and per-field hit explanations
+    attached — lets operators build realistic expectations of "keyword LIKE
+    search"."""
     bad = _bad_scope(body.scope)
     if bad is not None:
         return bad
@@ -439,15 +468,19 @@ def knowledge_collection_create(body: CollectionIn):
 
 
 @router.get("/knowledge/collections/{collection_id}")
-def knowledge_collection_get(collection_id: int):
-    coll = get_knowledge_store().get_collection(collection_id)
-    if coll is None:
-        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+def knowledge_collection_get(collection_id: int, scope: str):
+    coll, err = _owned_collection(get_knowledge_store(), collection_id, scope)
+    if err is not None:
+        return err
     return _ok({"collection": coll})
 
 
 @router.put("/knowledge/collections/{collection_id}")
-def knowledge_collection_update(collection_id: int, body: CollectionPatch):
+def knowledge_collection_update(collection_id: int, scope: str,
+                                body: CollectionPatch):
+    coll, err = _owned_collection(get_knowledge_store(), collection_id, scope)
+    if err is not None:
+        return err
     patch = body.model_dump(exclude_unset=True)
     if not patch:
         return _fail(400, "400", "没有可更新的字段")
@@ -461,21 +494,24 @@ def knowledge_collection_update(collection_id: int, body: CollectionPatch):
 
 
 @router.delete("/knowledge/collections/{collection_id}")
-def knowledge_collection_delete(collection_id: int):
-    if not get_knowledge_store().delete_collection(collection_id):
-        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+def knowledge_collection_delete(collection_id: int, scope: str):
+    coll, err = _owned_collection(get_knowledge_store(), collection_id, scope)
+    if err is not None:
+        return err
+    get_knowledge_store().delete_collection(collection_id)
     return _ok({"id": collection_id}, message="已删除（含全部记录）")
 
 
 @router.get("/knowledge/collections/{collection_id}/records")
 def knowledge_collection_records(
-    collection_id: int, query: str = "", limit: int = 100, offset: int = 0,
+    collection_id: int, scope: str, query: str = "", limit: int = 100,
+    offset: int = 0,
 ):
-    """记录列表（响应带 collection 字段定义——前端据此渲染动态列）。"""
+    """Record list (the response carries the collection's field definitions — the frontend renders dynamic columns from them)."""
     store = get_knowledge_store()
-    coll = store.get_collection(collection_id)
-    if coll is None:
-        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    coll, err = _owned_collection(store, collection_id, scope)
+    if err is not None:
+        return err
     limit = max(1, min(limit, 200))
     rows = store.list_records(collection_id, query=query or None,
                               limit=limit, offset=offset)
@@ -483,10 +519,11 @@ def knowledge_collection_records(
 
 
 @router.post("/knowledge/collections/{collection_id}/records")
-def knowledge_record_create(collection_id: int, body: RecordIn):
+def knowledge_record_create(collection_id: int, scope: str, body: RecordIn):
     store = get_knowledge_store()
-    if store.get_collection(collection_id) is None:
-        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    _, err = _owned_collection(store, collection_id, scope)
+    if err is not None:
+        return err
     try:
         rid = store.add_record(collection_id, body.data)
     except ValueError as e:
@@ -495,11 +532,13 @@ def knowledge_record_create(collection_id: int, body: RecordIn):
 
 
 @router.put("/knowledge/collections/{collection_id}/records/{record_id}")
-def knowledge_record_update(collection_id: int, record_id: int, body: RecordIn):
-    """全量替换该记录（表单始终提交所有字段；校验按当前字段定义）。"""
+def knowledge_record_update(collection_id: int, scope: str, record_id: int,
+                            body: RecordIn):
+    """Whole-row replace of the record (the form always submits every field; validation uses the current field definitions)."""
     store = get_knowledge_store()
-    if store.get_collection(collection_id) is None:
-        return _fail(404, "404", f"知识库不存在: id={collection_id}")
+    _, err = _owned_collection(store, collection_id, scope)
+    if err is not None:
+        return err
     try:
         exists = store.update_record(collection_id, record_id, body.data)
     except ValueError as e:
@@ -511,8 +550,12 @@ def knowledge_record_update(collection_id: int, record_id: int, body: RecordIn):
 
 
 @router.delete("/knowledge/collections/{collection_id}/records/{record_id}")
-def knowledge_record_delete(collection_id: int, record_id: int):
-    if not get_knowledge_store().delete_record(collection_id, record_id):
+def knowledge_record_delete(collection_id: int, scope: str, record_id: int):
+    store = get_knowledge_store()
+    _, err = _owned_collection(store, collection_id, scope)
+    if err is not None:
+        return err
+    if not store.delete_record(collection_id, record_id):
         return _fail(404, "404",
                      f"记录不存在: id={record_id}（collection={collection_id}）")
     return _ok({"id": record_id}, message="已删除")
@@ -523,7 +566,8 @@ def knowledge_record_delete(collection_id: int, record_id: int):
 # ---------------------------------------------------------------------------
 
 def _current_rag_config() -> Tuple[Dict[str, Any], str, Optional[str]]:
-    """(当前配置, 来源, 文件错误)。坏文件降级 builtin 并带上错误说明。"""
+    """(current config, source, file error). A broken file degrades to the
+    builtin default together with an error description."""
     try:
         cfg = rag_config.load_rag_config_file()
     except ValueError as e:
@@ -579,7 +623,7 @@ def rag_reset():
 
 @router.post("/rag/test-run")
 def rag_test_run(body: RagTestRunIn):
-    """离线试跑：召回 + 门控零 LLM，确定性呈现配置效果（改参数→看模式变化）。"""
+    """Offline dry run: recall + gating with zero LLM, deterministically showing the config's effect (change a param → see the pattern change)."""
     if body.config is not None:
         try:
             cfg = rag_config.normalize_rag_config(body.config)
@@ -597,26 +641,27 @@ def rag_test_run(body: RagTestRunIn):
 
 
 # ---------------------------------------------------------------------------
-# Session review (read-only audit) — 会话审查：列表 / 详情 / 合并时间线
+# Session review (read-only audit) — list / detail / merged timeline
 #
-# 只读审计面：数据全部来自 SessionStore（sessions / messages / trace_events
-# 三张表），无任何写操作。SessionStore 是 aiosqlite，故本段端点为 async def。
-# 依赖经 _session_deps 惰性取自 host.main（延迟 import 避免环）；
-# 测试 monkeypatch 该函数注入临时 store。
+# A read-only audit surface: all data comes from SessionStore (the sessions /
+# messages / trace_events tables) with no write operations. SessionStore is
+# aiosqlite, so these endpoints are async def. Dependencies are fetched
+# lazily from host.main via _session_deps (a deferred import against a
+# cycle); tests monkeypatch that function to inject a temporary store.
 # ---------------------------------------------------------------------------
 
-_TRACE_LIMIT = 1000  # 单会话 trace 拉取上限（store 侧同值封顶）
+_TRACE_LIMIT = 1000  # per-session trace fetch cap (the store caps at the same value)
 
 
 def _session_deps():
-    """(store, turn_registry) —— host.main 装配后的会话审计读依赖。"""
+    """(store, turn_registry) — session-audit read dependencies after host.main's assembly."""
     import host.main as host_main
     return host_main.store, host_main.turn_registry
 
 
 def _json_field(value: Any, default: Any) -> Any:
-    """JSON TEXT 列解码；坏载荷降级为默认值（口径同 host.main 的
-    /api/v1/sessions：降级永不 500）。"""
+    """JSON TEXT column decode; a bad payload degrades to the default (the same
+    policy as host.main's /api/v1/sessions: degrade, never 500)."""
     if isinstance(value, str):
         try:
             return json.loads(value) if value else default
@@ -678,10 +723,13 @@ async def console_session_detail(session_id: str) -> Dict[str, Any]:
 
 @router.get("/sessions/{session_id}/timeline")
 async def console_session_timeline(session_id: str) -> Dict[str, Any]:
-    """messages + trace_events 合并审计时间线。
+    """Merged audit timeline of messages + trace_events.
 
-    两表自增 id 各自成序、无全局序，合并为近似穿插：created_at（微秒
-    epoch）为主序，同刻消息优先（item_type 字典序）作稳定次序。
+    The two tables' autoincrement ids are each ordered within their own
+    table with no global ordering, so the merge is an approximate
+    interleave: created_at (microsecond epoch) is the primary order, with
+    messages preferred at identical timestamps (item_type lexicographic
+    order) as the stable tie-breaker.
     """
     store, _ = _session_deps()
     if store is None:
@@ -701,7 +749,7 @@ async def console_session_timeline(session_id: str) -> Dict[str, Any]:
         item = dict(m)
         item["item_type"] = "message"
         meta = item.get("metadata") or {}
-        # 审计关注位提前：synthetic=幻觉拦截回填 / rewritten=hook 改写
+        # Audit-relevant flags surfaced first: synthetic = hallucination-intercept backfill / rewritten = hook rewrite
         item["flags"] = {k: meta[k] for k in ("synthetic", "rewritten")
                          if meta.get(k)}
         if item.get("role") == "assistant":
@@ -715,7 +763,7 @@ async def console_session_timeline(session_id: str) -> Dict[str, Any]:
         items.append(item)
     items.sort(key=lambda it: (it.get("created_at") or 0, it["item_type"]))
 
-    turns: List[Dict[str, Any]] = []  # trace 侧按首轮出现序聚合轮次
+    turns: List[Dict[str, Any]] = []  # turns aggregated from the trace side in first-appearance order
     by_turn: Dict[str, Dict[str, Any]] = {}
     for e in trace:
         tid = e.get("turn_id") or ""

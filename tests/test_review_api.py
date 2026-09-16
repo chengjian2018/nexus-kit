@@ -64,7 +64,7 @@ def _ok_data(resp):
 
 
 # ---------------------------------------------------------------------------
-# GET /sessions — 列表
+# GET /sessions — list
 # ---------------------------------------------------------------------------
 
 def test_sessions_list_filters_and_running_flag(review_env):
@@ -87,15 +87,15 @@ def test_sessions_list_filters_and_running_flag(review_env):
     assert by_id["alpha-1"]["turn_running"] is False
     assert by_id["alpha-1"]["message_count"] == 1
 
-    # q 模糊过滤（子串）
+    # q fuzzy filtering (substring)
     data = _ok_data(client.get("/api/v1/console/sessions", params={"q": "alpha"}))
     assert {s["session_id"] for s in data["sessions"]} == {"alpha-1", "alpha-2"}
 
-    # q 中 % / _ 按字面处理（LIKE 通配不生效）
+    # % / _ in q are treated literally (LIKE wildcards disabled)
     data = _ok_data(client.get("/api/v1/console/sessions", params={"q": "alpha%1"}))
     assert data["sessions"] == []
 
-    # pattern_code 过滤 + has_more
+    # pattern_code filtering + has_more
     data = _ok_data(client.get("/api/v1/console/sessions",
                                params={"pattern_code": "other"}))
     assert [s["session_id"] for s in data["sessions"]] == ["alpha-2"]
@@ -117,7 +117,7 @@ def test_sessions_list_store_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# GET /sessions/{id} — 详情
+# GET /sessions/{id} — detail
 # ---------------------------------------------------------------------------
 
 def test_session_detail_decodes_json_columns(review_env):
@@ -158,7 +158,7 @@ def test_session_detail_404(review_env):
 
 
 # ---------------------------------------------------------------------------
-# GET /sessions/{id}/timeline — 合并时间线
+# GET /sessions/{id}/timeline — merged timeline
 # ---------------------------------------------------------------------------
 
 def _seed_tool_turn(store):
@@ -202,16 +202,16 @@ def test_timeline_merges_and_orders(review_env):
     items = data["items"]
     assert sum(1 for i in items if i["item_type"] == "message") == 4
     assert sum(1 for i in items if i["item_type"] == "trace") == 4
-    # created_at 主序（升序）
+    # created_at is the primary order (ascending)
     created = [i["created_at"] for i in items]
     assert created == sorted(created)
 
-    # 工具轮 assistant 消息被解出 text + tool_calls
+    # the tool-round assistant message decodes into text + tool_calls
     tool_round = next(i for i in items if i.get("tool_calls"))
     assert tool_round["content"] == "查库存"
     assert tool_round["tool_calls"][0]["function"]["name"] == "inventory_query"
 
-    # turns 聚合（trace 侧按 turn_id）
+    # turns aggregation (the trace side keys on turn_id)
     assert data["turns"] == [{"turn_id": "req-t1", "count": 4}]
     assert data["trace_truncated"] is False
     assert data["session"]["session_id"] == "s-tl"
