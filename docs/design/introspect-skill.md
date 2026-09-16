@@ -1,6 +1,6 @@
 # 设计方案：nexus-introspect —— 面向 agent 的应用/插件内省 skill
 
-> 状态：设计稿（未实现）｜日期：2026-09-10
+> 状态：**已实现**（`nexus-introspect-skill/introspect.py` + `SKILL.md`，含 §10 模板知识库子命令）｜设计日期：2026-09-10
 > 目标读者：实现者 + 需要在此仓库工作的 coding agent
 
 ## 1. 背景与目标
