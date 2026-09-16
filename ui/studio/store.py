@@ -1,27 +1,41 @@
-"""Studio 托管产物仓库 —— 固定目录 + 装载器（启动/reload 重放）。
+"""Studio hosted-artifact repository — fixed directories + a loader
+(replayed at startup/reload).
 
-两个固定托管目录（对齐 docs/design/ops-console-prd.md §7.1 D-1 的 studio 落点）：
+Two fixed hosted directories (matching studio's placement in
+docs/design/ops-console-prd.md §7.1 D-1):
 
-- ``host/config/plugins/<stem>.py``    自动生成的插件模块。模块级注册习语与
-  apps/*/route.py 相同（``plugin_registry.register("executor", code, Factory)``），
-  首行注释约定 ``# studio-plugin: file=<stem>.py``（agent.py 解析用，装载不依赖）。
-- ``host/config/patterns/<code>.yml``  控制台托管 pattern。同 code 后注册者生效，
-  即 fork-to-edit 语义（console 版覆盖代码版）。
+- ``host/config/plugins/<stem>.py``    auto-generated plugin modules. The
+  module-level registration idiom is the same as apps/*/route.py
+  (``plugin_registry.register("executor", code, Factory)``); the first-line
+  comment convention is ``# studio-plugin: file=<stem>.py`` (parsed by
+  agent.py; the loader does not depend on it).
+- ``host/config/patterns/<code>.yml``  console-hosted patterns. For the same
+  code, the later registration wins — i.e. fork-to-edit semantics (the
+  console version overrides the code version).
 
-装载顺序固定「先插件后 pattern」：pattern 校验要解析插件 code，插件不先注册，
-validate_plugin_declarations 会误报未注册。装载只做两类事：
+Load order is fixed "plugins first, then patterns": pattern validation needs
+to resolve plugin codes, and if plugins are not registered first,
+validate_plugin_declarations would falsely report them as unregistered.
+Loading only does two kinds of things:
 
-1. 插件：以合成模块名（``studio_plugin_<stem>``）importlib 装载——每次都是全新
-   module 对象重新 exec，模块级注册在 exec 中自然发生；重复装载产生的新类对象
-   与旧注册同名不同物，必须开注册表 replace 窗口（对齐 host.reload._ReplaceMode）。
-2. pattern：``pattern_from_yaml → validate_pattern → register`` 三段式（与 CLI
-   ``pattern-load`` 同一条通路）。
+1. Plugins: loaded via importlib under a synthetic module name
+   (``studio_plugin_<stem>``) — a brand-new module object is re-executed
+   every time, and the module-level registration happens naturally during
+   exec; a repeated load produces new class objects that share names with
+   but are distinct from the old registrations, so the registry's replace
+   window must be opened (aligned with host.reload._ReplaceMode).
+2. Patterns: the ``pattern_from_yaml → validate_pattern → register``
+   three-stage pipeline (the same path as the CLI ``pattern-load``).
 
-失败语义：单文件失败只 ERROR 日志 + 收进 report（studio 列表可见），绝不阻断
-服务——坏文件降级跳过，其余照常。安全边界：只装载这两个固定目录下的现存文件。
+Failure semantics: a single-file failure only logs an ERROR and is collected
+into the report (visible in the studio list), never blocking the service —
+broken files are skipped with degradation and everything else proceeds.
+Security boundary: only existing files under these two fixed directories
+are loaded.
 
-测试友好：目录常量是模块级 ``Path``，测试可按需 monkeypatch ``PLUGINS_DIR`` /
-``PATTERNS_DIR``（tests/test_studio_api.py 即如此隔离仓库目录）。
+Test-friendliness: the directory constants are module-level ``Path`` objects,
+so tests can monkeypatch ``PLUGINS_DIR`` / ``PATTERNS_DIR`` as needed
+(tests/test_studio_api.py isolates the repo directories exactly this way).
 """
 
 from __future__ import annotations
@@ -45,11 +59,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGINS_DIR = REPO_ROOT / "host" / "config" / "plugins"
 PATTERNS_DIR = REPO_ROOT / "host" / "config" / "patterns"
 
-# 托管文件名与 pattern code 的合法字符集（小写字母开头，小写字母/数字/下划线）
+# Legal charset for hosted filenames and pattern codes (lowercase letter first, then lowercase letters/digits/underscores)
 _FILENAME_STEM_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
-# 最近一次装载的报告（studio 列表页展示坏文件用；进程内全局，无并发写竞争——
-# 装载只发生在启动 / reload / apply 三个串行入口）
+# The latest load report (the studio list page shows bad files from it; a process-global with no concurrent write races —
+# loading happens only at the three serialized entries: startup / reload / apply)
 _last_report: Dict[str, Any] = {
     "plugins": {"loaded": [], "failed": {}},
     "patterns": {"loaded": [], "failed": {}},
@@ -57,11 +71,11 @@ _last_report: Dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# 目录视图
+# Directory views
 # ---------------------------------------------------------------------------
 
 def plugin_files(plugins_dir: Optional[Path] = None) -> List[Path]:
-    """托管插件文件（排序稳定，跳过 __init__ 等下划线开头文件）。"""
+    """Hosted plugin files (stable order; __init__ and other underscore-prefixed files skipped)."""
     base = Path(plugins_dir) if plugins_dir is not None else PLUGINS_DIR
     if not base.is_dir():
         return []
@@ -73,7 +87,7 @@ def plugin_files(plugins_dir: Optional[Path] = None) -> List[Path]:
 
 
 def pattern_files(patterns_dir: Optional[Path] = None) -> List[Path]:
-    """托管 pattern 文件（.yml/.yaml 均收，排序稳定）。"""
+    """Hosted pattern files (both .yml/.yaml accepted, stable order)."""
     base = Path(patterns_dir) if patterns_dir is not None else PATTERNS_DIR
     if not base.is_dir():
         return []
@@ -81,7 +95,7 @@ def pattern_files(patterns_dir: Optional[Path] = None) -> List[Path]:
 
 
 def console_pattern_codes(patterns_dir: Optional[Path] = None) -> Set[str]:
-    """已落盘的 console pattern codes（source 徽标判定依据）。"""
+    """Persisted console pattern codes (the source-badge decision basis)."""
     return {p.stem for p in pattern_files(patterns_dir)}
 
 
@@ -90,16 +104,16 @@ def last_report() -> Dict[str, Any]:
 
 
 def pattern_load_error(code: str) -> Optional[str]:
-    """某个 console pattern 上次装载的失败原因（None = 无记录/成功）。"""
+    """A console pattern's latest load failure reason (None = no record / success)."""
     return _last_report["patterns"]["failed"].get(code)
 
 
 # ---------------------------------------------------------------------------
-# 写入 / 删除（apply / publish / fork 的落盘面；stem 白名单即安全边界）
+# Write / delete (the persistence face of apply / publish / fork; the stem whitelist IS the security boundary)
 # ---------------------------------------------------------------------------
 
 def check_stem(stem: str) -> str:
-    """校验托管文件名 stem（插件文件与 pattern code 共用一套合法字符集）。"""
+    """Validate a hosted filename stem (plugin files and pattern codes share one legal charset)."""
     if not _FILENAME_STEM_RE.match(stem or ""):
         raise ValueError(
             f"非法文件名/code: {stem!r}（需小写字母开头，仅小写字母/数字/下划线，"
@@ -109,7 +123,7 @@ def check_stem(stem: str) -> str:
 
 def write_plugin_file(stem: str, code_text: str,
                       plugins_dir: Optional[Path] = None) -> Path:
-    """写入（覆盖）一个托管插件模块文件。"""
+    """Write (overwrite) one hosted plugin module file."""
     check_stem(stem)
     base = Path(plugins_dir) if plugins_dir is not None else PLUGINS_DIR
     base.mkdir(parents=True, exist_ok=True)
@@ -120,7 +134,7 @@ def write_plugin_file(stem: str, code_text: str,
 
 def write_pattern_file(code: str, yaml_text: str,
                        patterns_dir: Optional[Path] = None) -> Path:
-    """写入（覆盖）一个托管 pattern YAML 文件。"""
+    """Write (overwrite) one hosted pattern YAML file."""
     check_stem(code)
     base = Path(patterns_dir) if patterns_dir is not None else PATTERNS_DIR
     base.mkdir(parents=True, exist_ok=True)
@@ -131,7 +145,7 @@ def write_pattern_file(code: str, yaml_text: str,
 
 def delete_pattern_file(code: str,
                         patterns_dir: Optional[Path] = None) -> bool:
-    """删除托管 pattern 文件（不存在返回 False；多后缀逐一尝试）。"""
+    """Delete a hosted pattern file (False when absent; each suffix tried in turn)."""
     check_stem(code)
     base = Path(patterns_dir) if patterns_dir is not None else PATTERNS_DIR
     removed = False
@@ -154,17 +168,17 @@ def delete_plugin_file(stem: str,
 
 
 # ---------------------------------------------------------------------------
-# 插件模块装载
+# Plugin module loading
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
 def _plugin_replace_window():
-    """临时打开插件注册表的同名替换窗口（重新 exec 必然产生新类对象，
-    严格模式会拒绝同名重注册；语义与 host.reload._ReplaceMode 一致）。
+    """Temporarily open the plugin registry's same-name replacement window (a re-exec necessarily produces new class objects,
+    which strict mode would reject as same-name re-registrations; the semantics match host.reload._ReplaceMode).
 
-    注册表侧是锁保护的可重入计数窗口：apply（线程池）与 generate
-    （事件循环）并发开窗时不会互相覆写对方的恢复值，把进程级开关
-    永久卡在开。"""
+    The registry side is a lock-protected reentrant counting window: when apply (threadpool) and generate (event
+    loop) open windows concurrently they cannot overwrite each other's restore value and permanently wedge the
+    process-level switch open."""
     with plugin_registry.replace_window():
         yield
 
@@ -174,11 +188,12 @@ def plugin_module_name(stem: str) -> str:
 
 
 def import_plugin_module(path: Path, stem: Optional[str] = None) -> str:
-    """以合成模块名 exec 一个插件模块文件，返回模块名。
+    """Exec a plugin module file under a synthetic module name, returning the module name.
 
-    每次调用都构建全新 module 对象（覆盖 sys.modules 同名项）——重复装载 =
-    重新 exec + 替换窗口内重注册，天然支持 reload 重放与 apply 后刷新。
-    exec 失败时回收 sys.modules 占位并向上抛（调用方决定降级/中止）。
+    Every call builds a fresh module object (overwriting the sys.modules entry of the same name) — repeated loading =
+    re-exec + re-registration inside the replacement window, naturally supporting reload replay and refresh after
+    apply. On an exec failure the sys.modules placeholder is reclaimed and the error propagates (the caller decides
+    to degrade or abort).
     """
     name = plugin_module_name(check_stem(stem if stem is not None else path.stem))
     spec = importlib.util.spec_from_file_location(name, path)
@@ -196,9 +211,9 @@ def import_plugin_module(path: Path, stem: Optional[str] = None) -> str:
 
 
 def load_pattern_text(yaml_text: str):
-    """三段式单文件装载：构造 → 校验 → 注册（与 CLI pattern-load 同款通路，
-    但工具面宽松——托管目录里生成工作台应用的 pattern 可能引用后补注册的
-    新工具，严格校验会让重启重放装载失败）。"""
+    """Three-stage single-file load: construct → validate → register (the same path as the CLI pattern-load,
+    but lenient on the tool surface — a generation-workbench app's pattern in the hosted directory may reference
+    tools registered later; strict validation would make the startup replay load fail)."""
     pattern = pattern_from_yaml(yaml_text)
     validate_pattern(pattern, strict_tools=False)
     pattern_registry.register(pattern)
@@ -206,15 +221,15 @@ def load_pattern_text(yaml_text: str):
 
 
 # ---------------------------------------------------------------------------
-# 全量装载（启动 / reload 重放入口）
+# Full loading (the startup / reload replay entry)
 # ---------------------------------------------------------------------------
 
 def load_console_artifacts(plugins_dir: Optional[Path] = None,
                            patterns_dir: Optional[Path] = None,
                            ) -> Dict[str, Any]:
-    """重放托管目录：先插件后 pattern；返回 report 并记入 _last_report。
+    """Replay the hosted directories: plugins first, then patterns; returns the report and records it in _last_report.
 
-    report 形如::
+    The report looks like::
 
         {"plugins": {"loaded": ["a.py"], "failed": {"b.py": "<error>"}},
          "patterns": {"loaded": ["p1"], "failed": {"p2": "<error>"}}}

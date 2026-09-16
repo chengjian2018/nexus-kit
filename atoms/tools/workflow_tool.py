@@ -1,44 +1,57 @@
-"""run_workflow — 六种拓扑的多子代理 workflow（toolset: workflow）。
+"""run_workflow — multi-sub-agent workflows over six topologies (toolset:
+workflow).
 
-一次 tool call = 一趟由预定义拓扑编排的多子代理 workflow：主 agent 负责
-规划（显式传 subtasks / categories / angles / criteria），本 tool 负责确定
-性执行；每个"叶子"步骤是一次 delegate 式子 ReAct 循环（引擎在
-atoms/tools/_subagent_core.py），"裁判"步骤（分类器/审校者/评委/完成检查/
-汇总）是无工具的单次 LLM 调用（temperature=0.0）。
+One tool call = one multi-sub-agent workflow orchestrated by a predefined
+topology: the main agent plans (passing subtasks / categories / angles /
+criteria explicitly), this tool executes deterministically; each "leaf"
+step is a delegate-style sub ReAct loop (engine in
+atoms/tools/_subagent_core.py) and "judge" steps (classifier / verifier /
+tournament referee / done-checker / synthesizer) are tool-less single LLM
+calls (temperature=0.0).
 
-与现有机制的分工（docstring 边界声明）::
+Division of labor with the existing mechanisms (docstring boundary
+statement)::
 
-    静态已知拓扑   → 图编排（多节点 pattern / TurnResult.sends fanout）
-    运行时才决定   → 本 tool（LLM tool-call 驱动的节点内临时编排）
-    单个子任务     → delegate_task
+    statically known topology  → graph orchestration (multi-node pattern /
+                                 TurnResult.sends fanout)
+    decided only at runtime    → this tool (LLM tool-call driven ad-hoc
+                                 orchestration inside a node)
+    one subtask                → delegate_task
 
-授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
-node.use_tools）::
+Authorization (deny-by-default three-layer gate: registered toolset →
+pattern.allow_toolset → node.use_tools)::
 
     pattern:
-      allow_toolset: [workflow, knowledge]   # 叶子池 = knowledge 工具集
+      allow_toolset: [workflow, knowledge]   # leaf pool = knowledge toolset
     node:
       use_tools: [run_workflow]
 
-叶子可用工具池 = ``pattern.allow_toolset`` 各工具集下的工具，剔除
-``subagent`` 与 ``workflow`` 两个工具集（结构性防递归，深度恒 1）；
-``in_workflow`` 标志位是第二道防线。llm_config 经
-``nexus.engine.tool_context`` 注入（与父节点同模型）；脱离 agent loop
-直接 dispatch 时回退 ``get_llm_config()`` 且叶子无工具。
+The leaf tool pool = the tools under each ``pattern.allow_toolset``
+toolset, minus the ``subagent`` and ``workflow`` toolsets (structural
+anti-recursion, depth always 1); the ``in_workflow`` flag is the second
+line of defense. llm_config is injected via ``nexus.engine.tool_context``
+(same model as the parent node); direct dispatch outside the agent loop
+falls back to ``get_llm_config()`` with tool-less leaves.
 
-裁判容错（Q8a）：verdict JSON 解析失败或布尔/winner 字段类型非法（模型
-给了 ``"pass": "false"`` 字符串等）→ 带错误提示重问 1 次 → 仍失败走保守
-默认并标 ``verdict_parsed: false``。解析失败走原保守默认（adversarial 判
-pass、loop 判未完成、tournament 前者胜）；字段非法走 fail-closed（pass/
-done 一律按 false，tournament 仍前者胜，绝不映射到 B），payload 附
-``note`` 说明。synthesize/add/filter 阶段 LLM 异常就地降级：直接拼接/
-透传超集（status=partial，附 note），已完成步骤不丢弃。
+Judge fault tolerance (Q8a): a verdict JSON parse failure or an illegal
+bool/winner field type (the model passing ``"pass": "false"`` as a string
+etc.) → one repair retry with an error hint → still failing takes the
+conservative default and flags ``verdict_parsed: false``. A parse failure
+takes the original conservative default (adversarial judges pass, loop
+judges not-done, tournament winner A); an illegal field fails closed
+(pass/done always false, tournament still winner A, never mapped to B),
+and the payload carries a ``note``. LLM exceptions in
+synthesize/add/filter stages degrade in place: direct concatenation /
+passthrough superset (status=partial, with a note) — completed steps are
+never dropped.
 
-护栏（config ``workflow_tool`` 节可调）：整体超时默认 300s（args 只能调
-小）、叶子轮次上限 8、并行宽度 ≤8、adversarial/loop 迭代上限 3/5、最终
-结论截断 8000 字符、steps 上限 32 条。并行阶段单叶子失败标记 failed 继续
-兄弟；全灭 → status=error；整体超时 → 已完成步骤照常带出（status=
-timeout）；adversarial/loop 迭代耗尽 → status=partial。
+Guardrails (tunable via the config ``workflow_tool`` section): whole-run
+timeout default 300s (args may only lower it), leaf round cap 8, parallel
+width ≤8, adversarial/loop iteration caps 3/5, final-conclusion truncation
+at 8000 chars, steps cap 32. In parallel stages a single failed leaf is
+marked failed while siblings continue; total wipeout → status=error;
+whole-run timeout → completed steps still come back (status=timeout);
+adversarial/loop iteration exhaustion → status=partial.
 """
 
 import asyncio
@@ -65,13 +78,15 @@ from nexus.settings import get_llm_config, get_workflow_tool_config
 
 logger = logging.getLogger(__name__)
 
-# 叶子池排除两个编排工具集（结构性防递归；in_workflow 标志是第二道防线）
+# The leaf pool excludes both orchestration toolsets (structural
+# anti-recursion; the in_workflow flag is the second line of defense)
 _SELF_TOOLSETS = frozenset({"subagent", "workflow"})
-# 喂给裁判/汇总调用的单份材料截断（防裁判 prompt 爆炸）
+# Per-piece truncation for material fed to judge/synthesis calls (keeps a
+# judge prompt from exploding)
 _PER_SYNTH_CHARS = 3000
 
 # ---------------------------------------------------------------------------
-# 裁判 system prompts
+# Judge system prompts
 # ---------------------------------------------------------------------------
 
 CLASSIFY_SYSTEM_PROMPT = (
@@ -113,7 +128,8 @@ DONE_SYSTEM_PROMPT = (
 )
 
 # ---------------------------------------------------------------------------
-# Schema（workflow 枚举的 description 完整解释六种拓扑的含义与选型）
+# Schema (the workflow enum's description fully explains the six topologies
+# and how to choose)
 # ---------------------------------------------------------------------------
 
 RUN_WORKFLOW_SCHEMA = {
@@ -241,7 +257,7 @@ RUN_WORKFLOW_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
-# 裁判/汇总调用与解析
+# Judge / synthesis calls and parsing
 # ---------------------------------------------------------------------------
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -264,9 +280,10 @@ def _parse_json_object(text: str) -> Optional[dict]:
 
 
 def _strict_bool(value: Any) -> Optional[bool]:
-    """严格布尔化：仅真 bool（及 int 0/1）放行，其余一律 None——模型给的
-    JSON 不能做 truthy 强转（字符串 "false" 为真值，会让 adversarial
-    内容蒙混过关、loop 谎报完成）。"""
+    """Strict boolean coercion: only a real bool (and int 0/1) passes;
+    everything else is None — a model-provided JSON must never be truthy-
+    coerced (the string "false" is truthy, letting adversarial content slip
+    through and loop lie about completion)."""
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and value in (0, 1):
@@ -275,8 +292,9 @@ def _strict_bool(value: Any) -> Optional[bool]:
 
 
 def _norm_winner(value: Any) -> Optional[str]:
-    """winner 归一：仅 "A"/"B" 放行（strip + 忽略大小写），其余（None/
-    "NONE"/"候选A"）一律 None——非法值绝不能映射到 B。"""
+    """Winner normalization: only "A"/"B" pass (strip + case-insensitive);
+    anything else (None / "NONE" / "候选A") is None — an illegal value must
+    never map to B."""
     if not isinstance(value, str):
         return None
     normalized = value.strip().upper()
@@ -328,7 +346,7 @@ async def _judge(rt: Dict[str, Any], system_prompt: str,
         if verdict is not None and field_err is None:
             return verdict, True, usage, ""
         if field_err is not None:
-            note = field_err   # 字段非法（粘性）：最终失败按 fail-closed 语义
+            note = field_err   # illegal field (sticky): final failure takes fail-closed semantics
             repair = (f"上一次输出的 JSON 字段类型无效：{field_err}。"
                       "请重新输出 JSON，对应字段使用要求的类型，"
                       "不要包含任何其他文字。")
@@ -343,21 +361,21 @@ async def _judge(rt: Dict[str, Any], system_prompt: str,
 
 
 def _validate_pass(verdict: dict) -> Optional[str]:
-    """审校 verdict 校验：pass 必须是严格布尔。"""
+    """Verifier verdict validation: pass must be a strict boolean."""
     if _strict_bool(verdict.get("pass")) is None:
         return 'The "pass" field must be a boolean true/false'
     return None
 
 
 def _validate_done(verdict: dict) -> Optional[str]:
-    """完成检查 verdict 校验：done 必须是严格布尔。"""
+    """Done-check verdict validation: done must be a strict boolean."""
     if _strict_bool(verdict.get("done")) is None:
         return 'The "done" field must be a boolean true/false'
     return None
 
 
 def _validate_winner(verdict: dict) -> Optional[str]:
-    """评委 verdict 校验：winner 只认 "A"/"B"。"""
+    """Referee verdict validation: winner accepts only "A"/"B"."""
     if _norm_winner(verdict.get("winner")) is None:
         return 'The "winner" field must be "A" or "B"'
     return None
@@ -365,9 +383,10 @@ def _validate_winner(verdict: dict) -> Optional[str]:
 
 async def _llm_stage(rt: Dict[str, Any], step: str, system_prompt: str,
                      user_prompt: str) -> Tuple[str, bool]:
-    """synthesize/add/filter 阶段调用：异常就地降级（步骤记 failed）而非
-    冒泡到整体 error 路径丢弃已完成工作——由调用方按拓扑拼接/透传并标
-    partial。返回 (文本, 是否成功)。"""
+    """synthesize/add/filter stage call: an exception degrades in place
+    (step recorded failed) instead of bubbling to the whole-run error path
+    and discarding completed work — the topology concatenates/passes
+    through and flags partial. Returns (text, ok)."""
     try:
         content, usage = await _llm_once(rt, system_prompt, user_prompt)
     except Exception as e:
@@ -379,11 +398,11 @@ async def _llm_stage(rt: Dict[str, Any], step: str, system_prompt: str,
 
 
 # ---------------------------------------------------------------------------
-# 步骤记录与叶子/候选辅助
+# Step recording and leaf/candidate helpers
 # ---------------------------------------------------------------------------
 
 class _Steps:
-    """拓扑级步骤记录器（payload 组装时按 trace_cap 截断）。"""
+    """Topology-level step recorder (truncated to trace_cap at payload assembly)."""
 
     def __init__(self):
         self.items: List[Dict[str, Any]] = []
@@ -451,19 +470,19 @@ def _all_failed(items: List[Dict[str, Any]]) -> bool:
 
 
 def _add_note(rt: Dict[str, Any], text: str) -> None:
-    """降级/无效说明（去重），payload 组装时并入 note 字段。"""
+    """Degradation / invalidity notes (deduped), merged into the payload's note field."""
     if text not in rt["notes"]:
         rt["notes"].append(text)
 
 
 def _concat_ok(items: List[Dict[str, Any]]) -> str:
-    """拼接成功候选（synthesize/add 阶段失败时的降级正文）。"""
+    """Concatenate the ok candidates (the degraded body when synthesize/add fails)."""
     return "\n\n".join(it["text"] for it in items
                        if it["ok"] and it["text"].strip())
 
 
 # ---------------------------------------------------------------------------
-# 六种拓扑
+# The six topologies
 # ---------------------------------------------------------------------------
 
 async def _wf_classify_and_act(rt, parsed) -> Dict[str, Any]:
@@ -506,7 +525,8 @@ async def _wf_fanout_and_synthesize(rt, parsed) -> Dict[str, Any]:
         rt, "synthesize", SYNTHESIZE_SYSTEM_PROMPT,
         f"任务：{rt['task']}\n\n各子任务结果：\n{_render_candidates(items)}")
     if not synth_ok:
-        # 降级：汇总调用失败 → 直接拼接子任务结果，不丢弃已完成工作
+        # Degraded: synthesis failed → concatenate subtask results directly,
+        # never dropping completed work
         rt["content"] = _concat_ok(items)
         _add_note(rt, "synthesize 阶段失败，已直接拼接子任务结果")
         return {"status": "partial"}
@@ -537,12 +557,13 @@ async def _wf_adversarial_verification(rt, parsed) -> Dict[str, Any]:
         rt["verdict_parsed"] = parsed_ok
         if not parsed_ok:
             if note:
-                # 字段类型非法：fail-closed（判不过），绝不因 truthy 强转放行
+                # Illegal field type: fail-closed (judged not-pass), never
+                # waved through by truthy coercion
                 rt["verdict"] = {"pass": False}
                 _add_note(rt, f"审校 verdict 无效（{note}），按未通过兜底")
                 issues_text = f"-（verdict 字段无效：{note}）"
                 continue
-            rt["verdict"] = {"pass": True}   # 保守默认：判 pass，避免无意义循环
+            rt["verdict"] = {"pass": True}   # conservative default: pass — avoid a meaningless loop
             return {"status": "ok"}
         rt["verdict"] = verdict
         if _strict_bool(verdict.get("pass")):
@@ -550,7 +571,7 @@ async def _wf_adversarial_verification(rt, parsed) -> Dict[str, Any]:
         issues = verdict.get("issues") or []
         issues_text = ("\n".join(f"- {i}" for i in issues)
                        or "-（审校未列出具体问题）")
-    return {"status": "partial"}   # 轮次耗尽仍未通过
+    return {"status": "partial"}   # rounds exhausted without passing
 
 
 async def _wf_generate_add_filter(rt, parsed) -> Dict[str, Any]:
@@ -562,7 +583,8 @@ async def _wf_generate_add_filter(rt, parsed) -> Dict[str, Any]:
         f"任务：{rt['task']}\n\n各候选：\n{_render_candidates(items)}")
     add_degraded = not add_ok
     if add_degraded:
-        # 降级：累积失败 → 拼接候选充当草案，筛选阶段照常进行
+        # Degraded: accumulation failed → concatenate candidates as the
+        # draft; the filter stage proceeds as usual
         superset = _concat_ok(items)
         _add_note(rt, "add 阶段失败，已直接拼接候选充当草案")
     criteria = parsed.get("criteria", "")
@@ -572,7 +594,7 @@ async def _wf_generate_add_filter(rt, parsed) -> Dict[str, Any]:
         f"任务：{rt['task']}\n\n超集草案：\n"
         f"{_truncate(superset, _PER_SYNTH_CHARS * 2, '草案')}")
     if not filter_ok:
-        # 降级：筛选失败 → 透传超集（未过滤），候选不丢弃
+        # Degraded: filtering failed → pass the superset through (unfiltered), candidates not dropped
         rt["content"] = superset
         _add_note(rt, "filter 阶段失败未过滤")
         return {"status": "partial"}
@@ -600,15 +622,16 @@ async def _wf_tournament(rt, parsed) -> Dict[str, Any]:
                 validate=_validate_winner)
             rt["steps"].add(f"match:r{round_no}#{match_idx}", "ok",
                             rounds=1, usage=usage)
-            winner_is_a = True   # 保守默认：解析失败前者胜
+            winner_is_a = True   # conservative default: a parse failure keeps A
             if parsed_ok and _norm_winner(verdict.get("winner")) == "B":
                 winner_is_a = False
             if not parsed_ok and note:
-                # winner 非法：降级到裁判失败同款兜底（前者胜），绝不映射到 B
+                # Illegal winner: degrade to the same fallback as a judge
+                # failure (A wins), never mapped to B
                 _add_note(rt, f"比赛 verdict 无效（{note}），按前者胜兜底")
             nxt.append(a if winner_is_a else b)
         if len(live) % 2:
-            nxt.append(live[-1])   # 奇数轮空：末位直接晋级
+            nxt.append(live[-1])   # odd count bye: the last entry advances directly
         live = nxt
     rt["content"] = live[0]["text"]
     return {"status": "ok"}
@@ -635,9 +658,9 @@ async def _wf_loop_until_done(rt, parsed) -> Dict[str, Any]:
                         rounds=1, usage=usage)
         rt["verdict_parsed"] = parsed_ok
         if not parsed_ok:
-            rt["verdict"] = {"done": False}   # 保守默认：未完成，继续迭代
+            rt["verdict"] = {"done": False}   # conservative default: not done, keep iterating
             if note:
-                # 类型非法：同样 fail-closed（判未完成），附 note 说明
+                # Illegal type: also fail-closed (judged not-done), with a note
                 _add_note(rt, f"完成 verdict 无效（{note}），按未完成兜底")
                 missing_text = f"-（verdict 字段无效：{note}）"
             continue
@@ -647,7 +670,7 @@ async def _wf_loop_until_done(rt, parsed) -> Dict[str, Any]:
         missing = verdict.get("missing") or []
         missing_text = ("\n".join(f"- {m}" for m in missing)
                         or "-（未列出具体缺口）")
-    return {"status": "partial"}   # 迭代耗尽仍未达标
+    return {"status": "partial"}   # iterations exhausted without meeting the criteria
 
 
 _TOPOLOGIES = {
@@ -661,12 +684,12 @@ _TOPOLOGIES = {
 
 
 # ---------------------------------------------------------------------------
-# 参数校验
+# Argument validation
 # ---------------------------------------------------------------------------
 
 def _opt_count(args: Dict[str, Any], key: str, default: int, cap: int
                ) -> Tuple[Optional[str], Optional[int]]:
-    """选填计数参数：缺省 default，必须 ≥1，args 只能收窄到 cap 内。"""
+    """Optional count arg: default when absent, must be ≥1, args may only narrow within cap."""
     raw = args.get(key)
     if raw is None:
         return None, int(default)
@@ -681,7 +704,7 @@ def _opt_count(args: Dict[str, Any], key: str, default: int, cap: int
 
 def _resolve_angles(args: Dict[str, Any], cap: int, allow_inputs: bool
                     ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """GAF/tournament 候选来源：inputs（仅 tournament）> angles > n 模板视角。"""
+    """GAF/tournament candidate source: inputs (tournament only) > angles > the n-template angles."""
     if allow_inputs and args.get("inputs") is not None:
         inputs = args["inputs"]
         if not isinstance(inputs, list) or not (2 <= len(inputs) <= cap):
@@ -811,7 +834,7 @@ async def _handle_run_workflow(args: Dict[str, Any]) -> str:
             return tool_error("timeout_seconds 必须大于 0")
         timeout = min(requested, timeout)
 
-    # 叶子工具池：pattern 授权工具集 − 编排工具集（结构性防递归）
+    # Leaf tool pool: pattern-granted toolsets − orchestration toolsets (structural anti-recursion)
     pool: Set[str] = set()
     if ambient is not None and ambient.allow_toolsets:
         pool = registry.names_in_toolsets(
@@ -878,7 +901,7 @@ async def _handle_run_workflow(args: Dict[str, Any]) -> str:
     if outcome.get("error"):
         payload["error"] = outcome["error"]
     if rt["notes"]:
-        payload["note"] = "; ".join(rt["notes"])   # 降级/verdict 无效说明
+        payload["note"] = "; ".join(rt["notes"])   # degradation / invalid-verdict notes
     if wf in ("adversarial_verification", "loop_until_done"):
         payload["verdict"] = rt["verdict"]
         payload["verdict_parsed"] = rt["verdict_parsed"]

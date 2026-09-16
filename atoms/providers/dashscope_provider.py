@@ -1,4 +1,4 @@
-"""OpenAI-compatible LLM provider — registered for 阿里云百炼 DashScope.
+"""OpenAI-compatible LLM provider — registered for Alibaba Cloud DashScope.
 
 ``OpenAICompatibleProvider`` itself is generic: any OpenAI-compatible chat
 endpoint works (OpenAI, Azure, local vLLM, etc.); the module-level

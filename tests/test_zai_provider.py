@@ -119,6 +119,20 @@ def test_api_key_resolved_from_env(monkeypatch):
     assert headers["auth"] == "Bearer sk-zai"
 
 
+def test_api_key_legacy_env_fallback(monkeypatch):
+    """The registry default env-name migration (ZAI_API_KEY → Z_AI_API_KEY) keeps the old name as a fallback:
+    existing deployments export the old name, and when local_config does not
+    write api_key_env explicitly the upgrade must not turn into a silent 401."""
+    for var in ("Z_AI_API_KEY", "ZAI_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    p = _provider(api_key="", api_key_env="Z_AI_API_KEY")
+    assert p.resolve_api_key() == ""          # neither name set: honestly return empty
+    monkeypatch.setenv("ZAI_API_KEY", "sk-legacy")
+    assert p.resolve_api_key() == "sk-legacy"  # only the old name: the fallback engages
+    monkeypatch.setenv("Z_AI_API_KEY", "sk-new")
+    assert p.resolve_api_key() == "sk-new"     # the new name wins
+
+
 # ============================================================================
 # Registry metadata — module-level register() wired the entry correctly
 # ============================================================================
@@ -134,13 +148,14 @@ def test_registry_entry():
 
 
 def test_registry_declares_vision_models():
-    """glm-5.3-flash 是视觉模型(注册表声明):supports_vision 三态语义,
-    glm-5.3 不在视觉名单(未声明视觉能力的模型绝不收到图像)。"""
+    """glm-5.3-flash is a vision model (registry-declared): the supports_vision three-state semantics —
+    glm-5.3 is not on the vision list (a model without declared vision
+    capability never receives images)."""
     entry = registry.get("zai")
     assert entry.vision_models == ["glm-5.3-flash"]
     assert entry.supports_vision("glm-5.3-flash") is True
     assert entry.supports_vision("glm-5.3") is False
-    # 未声明 vision_models 的 provider → None(未知,调用方自行尝试)
+    # A provider without declared vision_models → None (unknown; the caller may try on its own)
     from nexus.llm.provider import ProviderEntry
 
     class _P:
@@ -152,8 +167,9 @@ def test_registry_declares_vision_models():
 
 
 def test_payload_carries_multimodal_content_parts_verbatim(monkeypatch):
-    """视觉消息透传:OpenAI 风格 content parts 数组(text + image_url
-    data URL)原样进请求体,thinking 翻译不影响多模态消息。"""
+    """Vision message passthrough: the OpenAI-style content parts array (text + image_url
+    data URL) enters the request body verbatim; the thinking translation
+    never touches multimodal messages."""
     body, url, headers = {}, {}, {}
     _install(monkeypatch, _capture(body, url, headers))
     messages = [{
@@ -164,5 +180,5 @@ def test_payload_carries_multimodal_content_parts_verbatim(monkeypatch):
     }]
     arun(_provider(default_model="glm-5.3-flash").achat_completion(messages))
     assert body["model"] == "glm-5.3-flash"
-    assert body["messages"] == messages          # 字节级透传
-    assert body["thinking"] == {"type": "disabled"}  # 翻译不碰消息
+    assert body["messages"] == messages          # byte-level passthrough
+    assert body["thinking"] == {"type": "disabled"}  # the translation never touches messages

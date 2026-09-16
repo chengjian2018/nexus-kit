@@ -2,7 +2,8 @@
 time annotation after time entities in the original text.
 
 Only times within the coming two weeks are augmented: ones already over stay
-as-is, and so do ones ending beyond two weeks out (e.g. "下下周").
+as-is, and so do ones ending beyond two weeks out
+(e.g. "下下周" ("week after next")).
 
 Examples:
     "I can go next Monday"      -> "I can go next Monday(2026-09-07)"
@@ -131,10 +132,11 @@ _MAX_FUTURE_DAYS = 14  # augment only times ending within 2 weeks from now
 def _in_window(times: List[str], time_base: float) -> bool:
     """A time entity is worth augmenting only when it (partly) lies in the
     future and ends within the 2-week window: past times and far-future ones
-    (e.g. "下下周") stay in the original wording.
+    (e.g. "下下周" ("week after next")) stay in the original wording.
 
     The end (not the start) of the interval is compared: a span starting soon
-    but running past the window ("下周到下个月") is still a distant commitment.
+    but running past the window ("下周到下个月" ("next week to next month"))
+    is still a distant commitment.
     The past bound compares the exact moment; the future bound compares
     calendar dates, so "exactly two weeks out" stays augmentable all day.
     """

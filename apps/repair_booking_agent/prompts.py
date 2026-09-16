@@ -2,13 +2,15 @@
 override.
 
 Same skeleton as the install app's ``INSTALL_UNIFIED_PROMPT`` (outbound
-persona + ### 任务信息 section + special-intent routing), adapted to the
-repair scenario:
+persona + a ### 任务信息 [task info] section + special-intent routing),
+adapted to the repair scenario:
 
-- the goal line: 核对地址 → 约定师傅上门时间 → 采集家具/电器故障信息
+- the goal line: confirm address → book the technician's visit time →
+  collect the furniture/appliance fault info
   (NO arrival check — the customer already owns the item, it is broken);
-- the decline intents drop 商品质量问题/已退货 (a quality complaint IS the
-  repair reason here, not an exit) and add 已自行修好;
+- the decline intents drop the quality-issue / already-returned exits (a
+  quality complaint IS the repair reason here, not an exit) and add
+  "already fixed it myself";
 - a dedicated section for the fault-collection stage: after the visit time
   is confirmed, the assistant asks what is wrong with the item, records the
   fault description, thanks the customer and hangs up.

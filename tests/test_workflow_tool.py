@@ -1,7 +1,9 @@
-"""run_workflow（workflow tool）单测：六种拓扑、裁判容错、护栏（宽度/
-嵌套/超时/settings 封顶）、无 ambient 回退，以及 default_loop 注入契约
-（chat_turn 端到端）。叶子引擎（_subagent_core）的细粒度行为由
-test_delegate_task.py 覆盖，这里只测拓扑编排层。
+"""Unit tests for the run_workflow workflow tool: six topologies, judge
+fault tolerance, guards (width / nesting / timeout / settings caps), the
+no-ambient fallback, and the default_loop injection contract (end-to-end
+via chat_turn). Fine-grained leaf-engine (_subagent_core) behavior is
+covered by test_delegate_task.py; only the topology-orchestration layer
+is tested here.
 """
 
 import asyncio
@@ -10,7 +12,7 @@ import json
 from async_utils import arun
 from unittest.mock import patch
 
-from atoms.tools import subagent_tool, workflow_tool  # import 即注册
+from atoms.tools import subagent_tool, workflow_tool  # importing registers them
 from nexus.engine.chat import chat_turn
 from nexus.engine.session import Session
 from nexus.engine.tool_context import (
@@ -22,11 +24,11 @@ from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from nexus.registry.tools import registry as tool_registry
 
-import atoms.executors  # noqa: F401 -- default_loop 必须已注册
+import atoms.executors  # noqa: F401 -- default_loop must be registered
 
 
 # ---------------------------------------------------------------------------
-# 测试探针工具（toolset: test_wf_pool）
+# Test probe tool (toolset: test_wf_pool)
 # ---------------------------------------------------------------------------
 
 def _wf_probe_handler(args, **kwargs):
@@ -48,7 +50,7 @@ tool_registry.register(
 
 
 # ---------------------------------------------------------------------------
-# 脚本 provider 与运行辅助
+# Scripted provider and run helpers
 # ---------------------------------------------------------------------------
 
 _GUARD = {"timeout_seconds": 300, "max_rounds": 8, "max_width": 8,
@@ -58,10 +60,12 @@ _LLM = {"code": "x", "model": "m", "temperature": 0.7, "max_tokens": 512}
 
 
 class FuncProvider:
-    """fn(snapshot) -> 响应 dict（可含 "hang"）；按调用次序记录快照。
+    """fn(snapshot) -> response dict (may contain "hang"); snapshots are
+    recorded in call order.
 
-    叶子调用（授权池非空时）tools 非 None；裁判/汇总调用 tools 为 None——
-    测试按 system prompt 内容进一步区分裁判类型。
+    Leaf calls (when the allowed pool is non-empty) have tools not None;
+    judge/synthesize calls have tools None — tests further distinguish the
+    judge type by system-prompt content.
     """
 
     def __init__(self, fn):
@@ -107,7 +111,7 @@ class _no_patch:
 def _run_workflow(args, provider, allow=("test_wf_pool",),
                   in_workflow=False, no_ambient=False, llm_fallback=None,
                   guard=None):
-    """经 tool_registry.dispatch 跑 run_workflow（覆盖 is_async 注册路径）。"""
+    """Run run_workflow via tool_registry.dispatch (covers the is_async registration path)."""
     with patch.object(workflow_tool, "build_provider",
                       return_value=provider), \
          patch.object(workflow_tool, "get_workflow_tool_config",
@@ -135,7 +139,7 @@ def _run_workflow(args, provider, allow=("test_wf_pool",),
 
 def test_classify_and_act_routes():
     def fn(snap):
-        if snap["tools"] is None:  # 分类裁判
+        if snap["tools"] is None:  # classify judge
             assert "任务分类器" in _sys(snap)
             return {"content": '{"category": "售后"}'}
         return {"content": "售后处理完成"}
@@ -151,7 +155,7 @@ def test_classify_and_act_routes():
     assert payload["status"] == "ok"
     assert payload["content"] == "售后处理完成"
     assert [s["step"] for s in payload["steps"]] == ["classify", "act:售后"]
-    # 叶子任务带类别指令 + 原始任务
+    # Leaf task carries the category instruction + the original task
     leaf_user = _user(_leaf_calls(provider)[0])
     assert "按售后工单流程处理" in leaf_user
     assert "处理这条客户消息" in leaf_user
@@ -178,7 +182,7 @@ def test_classify_invalid_category_errors():
 
 def test_fanout_parallel_and_synthesize():
     def fn(snap):
-        if snap["tools"] is None:  # 汇总
+        if snap["tools"] is None:  # synthesize
             assert "汇总合成器" in _sys(snap)
             return {"content": "合并结论"}
         user = _user(snap)
@@ -198,10 +202,10 @@ def test_fanout_parallel_and_synthesize():
     assert payload["content"] == "合并结论"
     assert [s["step"] for s in payload["steps"]] == [
         "subtask#1", "subtask#2", "subtask#3", "synthesize"]
-    # 每个叶子的任务就是对应子任务本身（自包含）
+    # Each leaf's task is the subtask itself (self-contained)
     leaf_users = [_user(s) for s in _leaf_calls(provider)]
     assert leaf_users == ["调研 A 的背景", "调研 B 的背景", "调研 C 的背景"]
-    # 汇总拿到全部三份结果
+    # Synthesize receives all three results
     synth_user = _user(_judge_calls(provider)[0])
     for piece in ("结果A", "结果B", "结果C"):
         assert piece in synth_user
@@ -226,7 +230,7 @@ def test_fanout_partial_when_one_leaf_fails():
     assert statuses["subtask#1"] == "ok"
     assert statuses["subtask#2"] == "failed"
     assert statuses["subtask#3"] == "ok"
-    # 汇总材料里带失败标注
+    # Synthesis material carries the failure annotation
     assert "[此候选生成失败]" in _user(_judge_calls(provider)[0])
 
 
@@ -236,7 +240,7 @@ def test_fanout_partial_when_one_leaf_fails():
 
 def test_adversarial_passes_on_second_cycle():
     def fn(snap):
-        if snap["tools"] is None:  # 审校裁判
+        if snap["tools"] is None:  # review judge
             user = _user(snap)
             assert "审校者" in _sys(snap)
             if "草稿V2" in user:
@@ -258,7 +262,7 @@ def test_adversarial_passes_on_second_cycle():
     assert [s["step"] for s in payload["steps"]] == [
         "cycle#1:generate", "cycle#1:verify",
         "cycle#2:generate", "cycle#2:verify"]
-    # 第二轮生成叶子带前稿 + 审校意见
+    # The cycle-2 generation leaf carries the previous draft + review issues
     rewrite_user = _user(_leaf_calls(provider)[1])
     assert "草稿V1" in rewrite_user and "缺数据支撑" in rewrite_user
 
@@ -294,7 +298,7 @@ def test_adversarial_verdict_unparseable_conservative_pass():
     assert payload["status"] == "ok"
     assert payload["verdict"] == {"pass": True}
     assert payload["verdict_parsed"] is False
-    # 一次修复重试：同一轮审校共 2 次调用后走保守默认
+    # One repair retry: after 2 review calls in the same round, take the conservative default
     assert calls["n"] == 2
     assert [s["step"] for s in payload["steps"]] == [
         "cycle#1:generate", "cycle#1:verify"]
@@ -311,7 +315,7 @@ def test_gaf_three_stages():
             return {"content": "超集草案"}
         if "筛选收敛器" in system:
             return {"content": "最终答案"}
-        # 生成叶子
+        # generation leaf
         user = _user(snap)
         if "激进视角" in user:
             return {"content": "激进候选"}
@@ -334,7 +338,7 @@ def test_gaf_three_stages():
     for piece in ("激进候选", "保守候选", "均衡候选"):
         assert piece in add_user
     filter_snap = _judge_calls(provider)[1]
-    assert "成本可控" in _sys(filter_snap)   # 筛选标准进了裁判 prompt
+    assert "成本可控" in _sys(filter_snap)   # filter criteria reached the judge prompt
     assert "超集草案" in _user(filter_snap)
 
 
@@ -354,7 +358,7 @@ def test_gaf_n_fallback_width():
     assert payload["status"] == "ok"
     gen_steps = [s for s in payload["steps"] if s["step"].startswith("gen#")]
     assert len(gen_steps) == 2
-    # 未给 angles → 模板视角
+    # no angles given -> template angles
     assert "第 1 种差异化视角" in _user(_leaf_calls(provider)[0])
 
 
@@ -364,7 +368,7 @@ def test_gaf_n_fallback_width():
 
 def test_tournament_bracket_with_bye():
     def fn(snap):
-        if snap["tools"] is None:  # 评委
+        if snap["tools"] is None:  # judge panel
             user = _user(snap)
             if "方案丙" in user:
                 return {"content": '{"winner": "B", "reason": "丙更优"}'}
@@ -389,7 +393,7 @@ def test_tournament_bracket_with_bye():
 
 def test_tournament_inputs_no_generation():
     def fn(snap):
-        assert snap["tools"] is None  # 只有评委调用，无生成叶子
+        assert snap["tools"] is None  # only judge calls, no generation leaves
         return {"content": '{"winner": "A", "reason": "甲好"}'}
 
     provider = FuncProvider(fn)
@@ -410,7 +414,7 @@ def test_tournament_inputs_no_generation():
 
 def test_loop_done_on_second_iteration():
     def fn(snap):
-        if snap["tools"] is None:  # 完成检查
+        if snap["tools"] is None:  # completion check
             assert "完成检查员" in _sys(snap)
             if "终稿" in _user(snap):
                 return {"content": '{"done": true, "missing": []}'}
@@ -452,7 +456,7 @@ def test_loop_exhausted_partial():
 
 
 # ---------------------------------------------------------------------------
-# 护栏：宽度 / 嵌套 / 超时 / settings 封顶
+# Guards: width / nesting / timeout / settings caps
 # ---------------------------------------------------------------------------
 
 def test_width_and_param_guards():
@@ -487,7 +491,7 @@ def test_nesting_refused():
     assert "嵌套" in payload["error"]
     assert provider.seen == []
 
-    # delegate_task 在 workflow 作用域内同样拒绝
+    # delegate_task is likewise refused inside a workflow scope
     async def _delegate_nested():
         with tool_call_context(_LLM, ("test_wf_pool",)):
             with workflow_scope(current_tool_context()):
@@ -500,7 +504,7 @@ def test_nesting_refused():
 
 def test_timeout_returns_completed_steps():
     def fn(snap):
-        if snap["tools"] is None:  # 汇总阶段挂起
+        if snap["tools"] is None:  # synthesize stage hangs
             return {"hang": True}
         return {"content": "部分结果"}
 
@@ -524,7 +528,7 @@ def test_settings_cap_wins_over_args():
 
     payload = _run_workflow({
         "workflow": "adversarial_verification", "task": "t",
-        "max_cycles": 5,   # args 想跑 5 轮，settings 封顶 1
+        "max_cycles": 5,   # args wants 5 cycles; settings caps at 1
     }, FuncProvider(fn), guard={**_GUARD, "max_cycles": 1})
 
     assert payload["status"] == "partial"
@@ -533,7 +537,7 @@ def test_settings_cap_wins_over_args():
 
 
 # ---------------------------------------------------------------------------
-# 无 ambient contextvar：回退全局 llm 配置、叶子无工具（纯推理）
+# No ambient contextvar: fall back to the global llm config; leaves get no tools (pure reasoning)
 # ---------------------------------------------------------------------------
 
 def test_fallback_without_ambient():
@@ -552,15 +556,15 @@ def test_fallback_without_ambient():
     assert payload["status"] == "ok"
     assert payload["content"] == "A类处理完成"
     assert provider.seen[0]["model"] == "m"
-    assert all(s["tools"] is None for s in provider.seen)  # 无授权边界 → 无工具
+    assert all(s["tools"] is None for s in provider.seen)  # no authorization boundary -> no tools
 
 
 # ---------------------------------------------------------------------------
-# default_loop 注入契约（chat_turn 端到端）
+# default_loop injection contract (end-to-end via chat_turn)
 # ---------------------------------------------------------------------------
 
 class ParentScriptedProvider:
-    """主循环侧脚本 provider（与 test_loop_tool_guards 同款鸭子类型）。"""
+    """Main-loop-side scripted provider (same duck-typing as test_loop_tool_guards)."""
 
     def __init__(self, script):
         self.script = list(script)
@@ -580,8 +584,9 @@ def _tc(cid, name, args_dict):
 
 
 def test_loop_executor_injects_context_e2e():
-    """主 agent 经 default_loop 调 run_workflow：executor 注入的 llm_config
-    与 pattern 授权边界一路传到 workflow 的叶子与裁判。"""
+    """The main agent calls run_workflow via default_loop: the executor's
+    injected llm_config and the pattern authorization boundary flow all the
+    way to the workflow's leaves and judge."""
     node = BaseNode(code="main", name="主节点", use_tools=["run_workflow"])
     p = Pattern(code="pg-wf", name="t", description="t",
                 allow_toolset=["workflow", "test_wf_pool"], nodes=[node])
@@ -624,24 +629,25 @@ def test_loop_executor_injects_context_e2e():
     assert [st["step"] for st in payload["steps"]] == [
         "subtask#1", "subtask#2", "synthesize"]
 
-    # 注入契约：叶子用父节点同款 model，叶子工具池剔除编排工具集
+    # Injection contract: leaves use the parent node's model; the leaf tool pool excludes the orchestration toolset
     leaves = _leaf_calls(wf_provider)
     assert {t["function"]["name"] for t in leaves[0]["tools"]} == {"wf_probe"}
     assert all(leaf["model"] == "m" for leaf in leaves)
     leaf_users = [_user(leaf) for leaf in leaves]
     assert leaf_users == ["子任务甲", "子任务乙"]
-    # 主循环侧：节点只暴露 run_workflow
+    # Main-loop side: the node only exposes run_workflow
     assert {t["function"]["name"]
             for t in parent.seen[0]["tools"]} == {"run_workflow"}
 
 
 # ---------------------------------------------------------------------------
-# 裁判字段严格类型 / winner 校验 / LLM 阶段异常降级
+# Strict judge-field typing / winner validation / LLM-stage exception degradation
 # ---------------------------------------------------------------------------
 
 def test_adversarial_pass_string_fails_closed():
-    """pass 给字符串 "false"（truthy）→ 类型非法 → 修复重试仍非法 →
-    fail-closed 判不过（adversarial 内容被拒），轮次耗尽 partial。"""
+    """pass given as the string "false" (truthy) -> invalid type -> the
+    repair retry is still invalid -> fail-closed rejection (adversarial
+    content rejected); cycles exhausted -> partial."""
     calls = {"n": 0}
 
     def fn(snap):
@@ -654,32 +660,33 @@ def test_adversarial_pass_string_fails_closed():
         "workflow": "adversarial_verification", "task": "t",
     }, FuncProvider(fn))
 
-    assert payload["status"] == "partial"            # 不是 ok：被判不过
+    assert payload["status"] == "partial"            # not ok: judged as failed
     assert payload["verdict"]["pass"] is False       # fail-closed
     assert payload["verdict_parsed"] is False
     assert "无效" in payload["note"]
-    # 每轮审校各带一次类型修复重试（2 次调用），3 轮全部耗尽
+    # each cycle's review carries one type-repair retry (2 calls); all 3 cycles exhausted
     assert calls["n"] == _GUARD["max_cycles"] * 2
 
 
 def test_loop_done_string_invalid_until_valid_bool():
     def fn(snap):
         if snap["tools"] is None:
-            return {"content": '{"done": "true", "missing": []}'}  # 字符串真值
+            return {"content": '{"done": "true", "missing": []}'}  # string truthy value
         return {"content": "草稿"}
 
     payload = _run_workflow({
         "workflow": "loop_until_done", "task": "t", "done_criteria": "完成",
     }, FuncProvider(fn))
 
-    assert payload["status"] == "partial"            # 非法期间一律判未完成
+    assert payload["status"] == "partial"            # while invalid, always judged not done
     assert payload["verdict"]["done"] is False
     assert payload["verdict_parsed"] is False
     assert "无效" in payload["note"]
 
 
 def test_loop_done_bool_semantics():
-    """真布尔走原语义：false → 未完成继续迭代；true → 立即完成。"""
+    """Real booleans keep the original semantics: false -> not done, keep
+    iterating; true -> finish immediately."""
     def fn_false(snap):
         if snap["tools"] is None:
             return {"content": '{"done": false, "missing": ["还差"]}'}
@@ -690,7 +697,7 @@ def test_loop_done_bool_semantics():
     }, FuncProvider(fn_false))
     assert payload["status"] == "partial"
     assert payload["verdict"]["done"] is False
-    assert "note" not in payload                     # 合法 verdict 不附注
+    assert "note" not in payload                     # a valid verdict adds no note
 
     def fn_true(snap):
         if snap["tools"] is None:
@@ -706,7 +713,7 @@ def test_loop_done_bool_semantics():
 
 def test_tournament_winner_null_falls_back_to_first():
     def fn(snap):
-        assert snap["tools"] is None                 # 只有评委调用
+        assert snap["tools"] is None                 # only judge calls
         return {"content": '{"winner": null, "reason": "无"}'}
 
     provider = FuncProvider(fn)
@@ -716,9 +723,9 @@ def test_tournament_winner_null_falls_back_to_first():
     }, provider)
 
     assert payload["status"] == "ok"
-    assert payload["content"] == "甲方案全文"        # 绝不静默落到 B
+    assert payload["content"] == "甲方案全文"        # never silently falls to B
     assert "无效" in payload["note"]
-    assert len(provider.seen) == 2                   # 一次修复重试
+    assert len(provider.seen) == 2                   # one repair retry
 
 
 def test_tournament_chinese_winner_invalid():
@@ -730,13 +737,13 @@ def test_tournament_chinese_winner_invalid():
         "inputs": ["甲", "乙"],
     }, FuncProvider(fn))
 
-    assert payload["content"] == "甲"                # 非法 → 前者胜兜底
+    assert payload["content"] == "甲"                # invalid -> fallback to the former
     assert "无效" in payload["note"]
 
 
 def test_tournament_winner_normalized():
     def fn(snap):
-        return {"content": '{"winner": "b"}'}        # 小写也归一
+        return {"content": '{"winner": "b"}'}        # lowercase is normalized too
 
     payload = _run_workflow({
         "workflow": "tournament", "task": "二选一",
@@ -753,7 +760,7 @@ def test_gaf_filter_failure_keeps_superset():
         if "累积合并器" in system:
             return {"content": "超集草案"}
         if "筛选收敛器" in system:
-            raise RuntimeError("filter boom")        # 筛选阶段 provider 异常
+            raise RuntimeError("filter boom")        # filter-stage provider exception
         return {"content": "候选"}
 
     provider = FuncProvider(fn)
@@ -762,7 +769,7 @@ def test_gaf_filter_failure_keeps_superset():
         "angles": ["视角一", "视角二"],
     }, provider)
 
-    # 不是 error+空 content：降级为 partial，超集透传
+    # not error + empty content: degrade to partial, pass the superset through
     assert payload["status"] == "partial"
     assert payload["content"] == "超集草案"
     assert "filter 阶段失败未过滤" in payload["note"]
@@ -775,7 +782,7 @@ def test_gaf_filter_failure_keeps_superset():
 def test_fanout_synthesize_failure_concatenates():
     def fn(snap):
         if snap["tools"] is None:
-            raise RuntimeError("synth boom")         # 汇总阶段 provider 异常
+            raise RuntimeError("synth boom")         # synthesize-stage provider exception
         user = _user(snap)
         if user == "子任务一":
             return {"content": "结果一"}
@@ -798,7 +805,7 @@ def test_gaf_add_failure_concatenates_then_filters():
     def fn(snap):
         system = _sys(snap)
         if "累积合并器" in system:
-            raise RuntimeError("add boom")           # 累积阶段 provider 异常
+            raise RuntimeError("add boom")           # add-stage provider exception
         if "筛选收敛器" in system:
             return {"content": "筛选后"}
         return {"content": "候选"}
@@ -808,7 +815,7 @@ def test_gaf_add_failure_concatenates_then_filters():
         "angles": ["视角一", "视角二"],
     }, FuncProvider(fn))
 
-    # 累积降级为拼接草案后，筛选阶段照常收敛
+    # after add degrades to a concatenated draft, the filter stage still converges
     assert payload["status"] == "partial"
     assert payload["content"] == "筛选后"
     assert "add 阶段失败" in payload["note"]

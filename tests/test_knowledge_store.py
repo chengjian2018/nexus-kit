@@ -217,7 +217,9 @@ def test_seed_idempotent(store):
 
 
 def test_seed_marker_prevents_resurrect_after_clear(store):
-    """清空空间后（模拟重启再 seed）不得复活——kb_meta 标记守卫而非行数守卫。"""
+    """After clearing a scope (simulating a restart followed by another
+    seed), data must not resurrect — the kb_meta marker guard is used,
+    not a row-count guard."""
     store.seed("xianyu:demo")
     store.clear_scope("xianyu:demo")
     store.seed("xianyu:demo")
@@ -240,9 +242,9 @@ def test_collection_crud_and_duplicate_name(store):
     assert coll["fields"][0] == {"name": "a", "label": "字段A",
                                  "type": "text", "required": True}
 
-    with pytest.raises(ValueError):  # 同 scope 重名
+    with pytest.raises(ValueError):  # duplicate name within the same scope
         store.create_collection("s", "案例库", None, [{"name": "a"}])
-    store.create_collection("t", "案例库", None, [{"name": "a"}])  # 跨 scope 同名 OK
+    store.create_collection("t", "案例库", None, [{"name": "a"}])  # same name across scopes is OK
 
     assert store.update_collection(cid, {"description": "新说明"}) is True
     assert store.get_collection(cid)["description"] == "新说明"
@@ -274,24 +276,24 @@ def test_record_validation_search_and_replace(store):
         {"name": "amount", "type": "number"},
     ])
     rid = store.add_record(cid, {"title": "屏幕亮线", "detail": "寄回换屏",
-                                 "amount": "12.5"})  # 数字字符串被 coercion
+                                 "amount": "12.5"})  # numeric string gets coerced
     assert store.list_records(cid)[0]["data"] == {
         "title": "屏幕亮线", "detail": "寄回换屏", "amount": 12.5}
 
     with pytest.raises(ValueError):
-        store.add_record(cid, {"title": "x", "bogus": 1})      # 未知字段
+        store.add_record(cid, {"title": "x", "bogus": 1})      # unknown field
     with pytest.raises(ValueError):
         store.add_record(cid, {"detail": "缺必填"})              # required
     with pytest.raises(ValueError):
         store.add_record(cid, {"title": "x", "amount": "abc"})  # number
     with pytest.raises(ValueError):
-        store.add_record(999, {"title": "x"})                    # 库不存在
+        store.add_record(999, {"title": "x"})                    # collection does not exist
 
-    # 全字段值检索（分词 AND）+ 无命中
+    # full-field value search (tokenized AND) + no hit
     assert [r["id"] for r in store.list_records(cid, query="亮线 换屏")] == [rid]
     assert store.list_records(cid, query="不存在的词xyz") == []
 
-    # 全量替换：可选字段显式清空（None）
+    # full replace: optional fields explicitly cleared (None)
     assert store.update_record(cid, rid, {"title": "改"}) is True
     assert store.list_records(cid)[0]["data"] == {
         "title": "改", "detail": None, "amount": None}
@@ -305,11 +307,38 @@ def test_update_collection_fields_reindexes_records(store):
     cid = store.create_collection("s", "库", None, [
         {"name": "a", "type": "text"}, {"name": "b", "type": "text"}])
     rid = store.add_record(cid, {"a": "苹果", "b": "香蕉"})
-    # 删掉字段 b：记录值被清理，且不再命中其旧值
+    # dropping field b: record values are cleaned up and no longer match
+    # the old value
     assert store.update_collection(cid, {"fields": [{"name": "a", "type": "text"}]}) is True
     assert store.list_records(cid)[0]["data"] == {"a": "苹果"}
     assert store.list_records(cid, query="香蕉") == []
     assert [r["id"] for r in store.list_records(cid, query="苹果")] == [rid]
+
+
+def test_update_collection_empty_patch_is_existence_check(store):
+    """An empty patch is equivalent to an existence check — previously an
+    empty SET clause produced invalid SQL (OperationalError), which was
+    not caught by the API layer's except ValueError."""
+    cid = store.create_collection("s", "库", None, [{"name": "a", "type": "text"}])
+    assert store.update_collection(cid, {}) is True
+    assert store.update_collection(999, {}) is False
+    # the normalized result is not written back into the caller's dict
+    patch = {"name": "  改名  "}
+    assert store.update_collection(cid, patch) is True
+    assert patch == {"name": "  改名  "}
+    assert store.get_collection(cid)["name"] == "改名"
+
+
+def test_list_records_untokenizable_query_returns_empty(store):
+    """Single-character / punctuation-only queries tokenize to empty ->
+    return an empty set instead of silently degrading to "return
+    everything" (callers with filtering semantics would present the whole
+    table as hits)."""
+    cid = store.create_collection("s", "库", None, [{"name": "t", "type": "text"}])
+    store.add_record(cid, {"t": "苹果香蕉"})
+    assert store.list_records(cid, query="果") == []
+    assert store.list_records(cid, query="！。") == []
+    assert len(store.list_records(cid)) == 1
 
 
 # ---------------------------------------------------------------------------

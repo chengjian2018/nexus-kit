@@ -161,8 +161,9 @@ def test_default_executor_code_rejects_module_era_type():
 
 
 def test_replace_window_reentrant_and_interleave_safe():
-    """替换窗口是锁保护的可重入计数：嵌套关内层不关外层；并发交错
-    开关（apply 线程池 vs generate 事件循环）不会把进程级开关卡在开。"""
+    """The replace window is a lock-protected reentrant count: closing the inner of nested windows never closes the outer;
+    interleaved concurrent open/close (the apply threadpool vs the generate
+    event loop) cannot wedge the process-level switch open."""
     from nexus.registry.plugins import PluginRegistry
 
     reg = PluginRegistry()
@@ -171,9 +172,9 @@ def test_replace_window_reentrant_and_interleave_safe():
         assert reg.replace_on_conflict is True
         with reg.replace_window():
             assert reg.replace_on_conflict is True
-        assert reg.replace_on_conflict is True    # 内层关掉，外层仍开
+        assert reg.replace_on_conflict is True    # the inner closes, the outer stays open
     assert reg.replace_on_conflict is False
-    # 旧直接赋值语义兼容（顺序单线程场景）
+    # Compatible with the old direct-assignment semantics (sequential single-thread scenarios)
     reg.replace_on_conflict = True
     assert reg.replace_on_conflict is True
     reg.replace_on_conflict = False

@@ -49,7 +49,7 @@ Fan-out adaptations over the static-relay form:
   cxt copies whose message_sink is cut); history keeps only the "user
   question → research report" Q/A pair;
 - each tool-carrying node resolves its own tool surface (_resolve_tools:
-  node.use_tools ∩ pattern.allow_toolset 工具集， both deny-by-default);
+  node.use_tools ∩ pattern.allow_toolset, both deny-by-default);
   intermediate phases forward no deltas — the only streaming phase is
   still SYNTHESIZE.
 
@@ -111,15 +111,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Runaway protection budget (hard LLM call ceiling ≈ 1(pre-retrieval) + 1 +
 # 1(self-correct retry) + max_fanout × per-branch SEARCH + 1; the fan-out
-# the pre-fan-out single 12-round loop for N concurrent instances of a
-# tighter per-branch cap — width × depth, each dimension independently
+# replaces the pre-fan-out single 12-round loop with N concurrent instances
+# of a tighter per-branch cap — width × depth, each dimension independently
 # bounded)
 # ---------------------------------------------------------------------------
 
 _MAX_SEARCH_ROUNDS = 5         # per-branch SEARCH round ceiling — the
-                               # research-query budget (深度研究相关应用最多
-                               # 调用 5 轮查询，覆盖 deep_research 与复用
-                               # _search_branch 的 topic_research)
+                               # research-query budget (research-type apps
+                               # call at most 5 query rounds, covering
+                               # deep_research and the topic_research that
+                               # reuses _search_branch)
 _QUERY_INTERVAL_SECONDS = 5.0  # pause after EVERY executed research query
                                # (rate limit; read at call time so tests can
                                # zero it via monkeypatch)
@@ -371,7 +372,7 @@ class DeepResearchExecutor(NodeExecutor):
         return plan
 
     # ------------------------------------------------------------------
-    # SEARCH（fan-out worker：一个实例一个子问题）
+    # SEARCH (fan-out worker: one instance per sub-question)
     # ------------------------------------------------------------------
 
     async def _search_branch(self, provider, theme: str, sub_question: str,
@@ -414,7 +415,7 @@ class DeepResearchExecutor(NodeExecutor):
             return findings, {"tool_stats": tool_stats, "rounds": 0,
                               "reflection_note": ""}
 
-        # Initial workspace shape: system (base + 子任务框定 + 状态板) +
+        # Initial workspace shape: system (base + sub-task framing + state board) +
         # user (the sub-question itself)
         sub_questions = [sub_question]
         covered = _covered_questions(sub_questions, findings)
@@ -567,8 +568,9 @@ class DeepResearchExecutor(NodeExecutor):
                 call_kwargs: Dict[str, Any] = dict(
                     node_code=node_code, call_id=call_id, tool_name=name,
                     args=parsed_args, round_idx=round_idx)
-                # P4 改写审计键与内核路径对齐（loop.py 的 rewritten /
-                # original_call）——消费方审计分支的工具改写不再缺数据
+                # P4 rewrite audit keys aligned with the kernel path (loop.py's
+                # rewritten / original_call) — the consumer-side audit branch no
+                # longer lacks tool-rewrite data
                 if idx in rewrite_audits:
                     call_kwargs["rewritten"] = True
                     call_kwargs["original_call"] = rewrite_audits[idx]

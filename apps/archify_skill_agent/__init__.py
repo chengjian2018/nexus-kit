@@ -1,7 +1,10 @@
-"""archify_skill_agent — archify 技能的「说明书式」单节点运行时。
+"""archify_skill_agent — a "manual-style" single-node runtime for the
+archify skill.
 
-与 apps/archify_agent（九节点 workflow 版，把 SKILL.md 的验收纪律编译成
-图闸门）完全独立：本应用验证的是另一条路线——技能作为数据资产
-（nexus/skills.py 扫描 + allow_skills/use_skills 双层授权）被单个
-default_loop 节点按需装载，全部流程纪律交给 SKILL.md 手册本身。
+Fully independent of apps/archify_agent (the nine-node workflow version
+that compiles SKILL.md's acceptance discipline into graph gates): this app
+validates the other route — the skill as a data asset (nexus/skills.py
+scanning + the allow_skills/use_skills two-layer grant) loaded on demand by
+a single default_loop node, with all process discipline left to the
+SKILL.md manual itself.
 """

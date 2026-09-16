@@ -564,15 +564,20 @@ def test_custom_config_bag(app_env):
 # pattern_llm removal + mcp allowed_patterns dead-key cleanup
 # ============================================================================
 
-def test_leftover_pattern_llm_key_ignored(app_env):
-    """A legacy pattern_llm section in the global yaml no longer parses (nor breaks)."""
+def test_leftover_pattern_llm_key_ignored(app_env, caplog):
+    """A legacy pattern_llm section no longer parses nor breaks, and the
+    silent fall-back to llm_default is loudly reported (a real deployment
+    upgrading with content in there must get a migration signal)."""
     cfg_path = Path(settings._get_config_path())
     cfg_path.write_text(_GLOBAL + "\npattern_llm:\n  some_pattern:\n    model: m\n",
                         encoding="utf-8")
     _bump_mtime(cfg_path)
-    cfg = load_config()
+    with caplog.at_level("WARNING"):
+        cfg = load_config()
     assert "pattern_llm" not in cfg
     assert get_llm_config(pattern_code="some_pattern")["model"] == "glm-5.3-flash"
+    assert any("pattern_llm" in r.message and "废弃" in r.message
+               for r in caplog.records)
 
 
 def test_mcp_allowed_patterns_stripped(app_env):
@@ -756,7 +761,7 @@ _CRON_GUARD = {"max_jobs": 20, "fire_timeout_seconds": 300, "max_rounds": 8,
 
 
 def test_cron_job_freezes_pattern_code(app_env):
-    from atoms.tools import cron_tool  # noqa: F401 -- module import 即注册
+    from atoms.tools import cron_tool  # noqa: F401 -- the module import registers
     from atoms.tools._cron_core import get_scheduler, reset_scheduler
 
     reset_scheduler()
@@ -893,8 +898,8 @@ nodes:
 
 
 # ============================================================================
-# Phase 3/4 收尾:入库的 apps/archify_agent/config.yaml 真文件端到端,
-# skills 链的 app 层覆盖
+# Phase 3/4 wrap-up: end-to-end over the committed real file
+# apps/archify_agent/config.yaml, plus the skill chain's app-level overlay
 # ============================================================================
 
 _REPO_APPS = Path(__file__).resolve().parents[1] / "apps"
@@ -902,10 +907,12 @@ _REPO_APPS = Path(__file__).resolve().parents[1] / "apps"
 
 @pytest.fixture()
 def real_apps(app_env, monkeypatch):
-    """恢复真实仓库锚点:撤销 conftest 的 NEXUS_APPS_DIR 隔离,apps/ 回到
-    repo 根(apps/archify_agent/config.yaml 入库后的真文件)。全局 yaml 仍是
-    app_env 的 tmp 份——"真文件"指 app 侧;连接层不依赖部署机的
-    local_config.yaml。teardown 双向恢复(monkeypatch 逆序 + 双失效)。"""
+    """Restore the real repo anchor: undo conftest's NEXUS_APPS_DIR isolation so
+    apps/ points back at the repo root (the committed real file
+    apps/archify_agent/config.yaml). The global yaml stays app_env's tmp copy
+    — "real file" means the app side; the connection layer never depends on
+    the deployment machine's local_config.yaml. Teardown restores both ways
+    (monkeypatch reversal + double invalidation)."""
     monkeypatch.delenv("NEXUS_APPS_DIR", raising=False)
     invalidate_config_cache()
     yield
@@ -913,26 +920,28 @@ def real_apps(app_env, monkeypatch):
 
 
 def test_real_repo_app_config_end_to_end(real_apps):
-    """仓库里真实的 apps/archify_agent/config.yaml:加载 + 三个 accessor
-    读到覆盖值(设计 §4.1 示例即首个落地,此测试钉住它别漂)。"""
+    """The repo's real apps/archify_agent/config.yaml: load + three accessors
+    reading the overridden values (the design §4.1 example was the first to
+    land; this test pins it against drift)."""
     assert (_REPO_APPS / "archify_agent" / "config.yaml").is_file()
     assert "archify" in _load_app_configs()
 
-    # llm 优先级链(§5.1 走查):① llm_default ⊕ ② app llm ⊕ ③ node llm
-    # (创作/修复节点只覆写采样预算,provider 整体继承 ① 的 zai/glm-5.3-flash)
+    # The llm priority chain (§5.1 walkthrough): (1) llm_default ⊕ (2) app
+    # llm ⊕ (3) node llm (the authoring/repair nodes override only sampling
+    # budgets; the provider inherits (1)'s zai/glm-5.3-flash wholesale)
     cfg = get_llm_config(pattern_code="archify", node_code="af_author")
-    assert cfg["temperature"] == 0.2        # ② pattern 级
-    assert cfg["max_tokens"] == 100000      # ③ node 级赢
+    assert cfg["temperature"] == 0.2        # layer (2), the pattern level
+    assert cfg["max_tokens"] == 100000      # layer (3), the node level wins
     assert cfg["timeout"] == 180 and cfg["max_retries"] == 3
-    assert cfg["code"] == "zai"             # ① 继承(节点未显式换 provider)
+    assert cfg["code"] == "zai"             # layer (1) inherited (the node never switches provider)
     assert cfg["model"] == "glm-5.3-flash"
     assert cfg["api_base"] == "https://zai.example/v1"
-    # af_report 只调温度:其余整体继承
+    # af_report overrides only temperature: everything else inherits wholesale
     report = get_llm_config(pattern_code="archify", node_code="af_report")
     assert report["code"] == "zai"
     assert report["model"] == "glm-5.3-flash"
     assert report["temperature"] == 0.4
-    # af_percept 感知评审:zai 视觉模型 glm-5.3-flash(节点级关闭思考)
+    # af_percept perceptual review: the zai vision model glm-5.3-flash (thinking off at node level)
     percept = get_llm_config(pattern_code="archify", node_code="af_percept")
     assert percept["code"] == "zai"
     assert percept["model"] == "glm-5.3-flash"
@@ -940,31 +949,35 @@ def test_real_repo_app_config_end_to_end(real_apps):
     assert percept["temperature"] == 0.0
     assert percept["max_tokens"] == 40000
 
-    # loop:pattern 级 12 → node 级 af_author 20
+    # loop: pattern-level 12 → node-level af_author 20
     assert get_loop_limits("archify")["max_tool_rounds"] == 12
     assert get_loop_limits("archify", "af_author")["max_tool_rounds"] == 20
 
-    # config bag:archify 迁移后的执行器读取面(executor._runtime_settings)
+    # config bag: the executor's read face after the archify migration
+    # (executor._runtime_settings)
     bag = get_pattern_custom_config("archify")
     assert bag["author_rounds"] == 10
     assert bag["repair_rounds"] == 3
     assert bag["route_retries"] == 1
-    assert bag["stale_limit"] == 3     # 部署收紧(stale-3 诚实退出)
+    assert bag["stale_limit"] == 3     # tightened by deployment (stale-3 honest exit)
     assert bag["percept_retries"] == 1
     assert bag["workspace_root"] == "data/archify"
-    assert bag["repo_root"] == "."     # 仓库证据核验根(执行器钉绝对)
-    # skill_dir 未写入真实 yaml → 执行器按代码默认回落(同为
-    # ~/.claude/skills/archify,见 executor._DEFAULT_SKILL_DIR)
+    assert bag["repo_root"] == "."     # repo-evidence verification root (the executor pins it absolute)
+    # skill_dir is not written into the real yaml → the executor falls back
+    # to the code default (also ~/.claude/skills/archify, see
+    # executor._DEFAULT_SKILL_DIR)
     assert bag.get("skill_dir") is None
 
-    # guardrails:shell 放宽 120s(archify CLI 经 bash 跑 validate/deliver)
+    # guardrails: shell relaxed to 120s (the archify CLI runs validate/deliver via bash)
     assert get_shell_tool_config("archify")["timeout_seconds"] == 120
 
 
 def test_app_skills_dir_beats_pattern_config(app_env, tmp_path):
-    """skills 链(设计 §5.4):app skills.dir 赢过 pattern.config.skills_dir
-    (代码级默认);app 缺席 → 代码默认生效。真 SKILL.md 结构(参考
-    tests/test_skills.py 手法),扫描结果指认实际生效的根。"""
+    """The skills chain (design §5.4): the app skills.dir beats
+    pattern.config.skills_dir (the code-level default); with no app binding →
+    the code default applies. A real SKILL.md structure (the same technique
+    as tests/test_skills.py); the scan result identifies the actually
+    effective root."""
     from nexus.skills import (
         invalidate_skills_cache,
         resolve_skills_dir,
@@ -982,12 +995,12 @@ def test_app_skills_dir_beats_pattern_config(app_env, tmp_path):
     pattern = SimpleNamespace(code="sk_app",
                               config={"skills_dir": str(code_root)})
 
-    # 无 app 绑定:pattern.config.skills_dir(代码级默认)生效
+    # No app binding: pattern.config.skills_dir (the code-level default) applies
     invalidate_skills_cache()
     assert resolve_skills_dir(pattern) == code_root
     assert list(scan_skills(code_root)) == ["probe_skill"]
 
-    # app 绑定后:app skills.dir 赢(同一 pattern 对象,yaml 覆盖代码声明)
+    # With an app binding: the app skills.dir wins (same pattern object; the yaml overrides the code declaration)
     _write_app(app_env, "sk_app_dir",
                f"pattern: sk_app\nskills:\n  dir: {app_root}\n")
     invalidate_skills_cache()

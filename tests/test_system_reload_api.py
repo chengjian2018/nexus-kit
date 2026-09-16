@@ -1,11 +1,13 @@
 """System hot-reload API tests (host/main.py: /api/v1/system/*) — offline.
 
-端点语义：``GET /status`` = 插件（kind/code/来源/归属模块）+ MCP server +
-toolset 概览；``POST /reload`` = 勾选插件按归属分流重载（studio 托管按文件
-重放 / 代码插件走 reload_modules 依赖序重放 + 会话重绑）+ 可选 MCP 工具面
-重建（重读配置 → shutdown → bootstrap → ensure_started → wait_ready）。
-MCP 全程打桩 get_mcp_manager（记录调用序）与 settings.get_mcp_servers，
-零真实连接。
+Endpoint semantics: ``GET /status`` = plugins (kind/code/source/owner
+module) + MCP servers + the toolset overview; ``POST /reload`` = the
+checked plugins reload routed by owner (studio-hosted replayed by file /
+code plugins via reload_modules in dependency order + session rebinding)
+plus an optional MCP tool-surface rebuild (re-read config → shutdown →
+bootstrap → ensure_started → wait_ready). get_mcp_manager (recording call
+order) and settings.get_mcp_servers are stubbed throughout; zero real
+connections.
 """
 
 import pytest
@@ -16,7 +18,7 @@ import host.main as main
 
 
 class _StubManager:
-    """记录调用序的最小 McpManager 桩（bootstrap 同步、其余 async，对齐真身）。"""
+    """A minimal McpManager stub recording call order (sync bootstrap, async elsewhere — matching the real one)."""
 
     def __init__(self):
         self.calls = []
@@ -62,11 +64,11 @@ def mcp_cfg(monkeypatch):
 
 @pytest.fixture()
 def client():
-    # TestClient 不用 with（startup 不触发）：不拉起真实 MCP 连接任务
+    # TestClient without with (startup not triggered): no real MCP connection tasks are started
     return TestClient(main.app)
 
 
-# 自包含的 studio 托管插件（owner = studio_plugin_sys_reload_demo）
+# A self-contained studio-hosted plugin (owner = studio_plugin_sys_reload_demo)
 STUDIO_PLUGIN_PY = """\
 from nexus.engine.execution import ExecutionContext, NodeExecutor
 from nexus.engine.turn_result import TurnResult
@@ -84,7 +86,7 @@ plugin_registry.register("executor", "sys_reload_demo", SysReloadDemo)
 
 @pytest.fixture()
 def hosted_studio_plugin(tmp_path, monkeypatch):
-    """tmp 托管目录 + 一个已装载的 studio 插件（不依赖仓库本机产物）。"""
+    """A tmp hosted directory + one loaded studio plugin (no dependence on repo-local artifacts)."""
     import ui.studio.store as studio_store
 
     plugins_dir = tmp_path / "plugins"
@@ -107,16 +109,16 @@ def test_system_status_lists_plugins_servers_toolsets(client, stub):
     assert data["servers"] == stub.servers
     assert isinstance(data["toolsets"], dict) and data["toolsets"]
     plugins = {(p["kind"], p["code"]): p for p in data["plugins"]}
-    # 代码插件（atoms/executors 默认执行器）归属其模块
+    # Code plugins (the atoms/executors default executor) are owned by their module
     assert plugins[("executor", "default_loop")]["source"] == "code"
     assert plugins[("executor", "default_loop")]["module"] \
         == "atoms.executors.loop_executor"
-    # 内核默认实现标记 kernel、不可热重载
+    # Kernel default implementations are marked kernel and not hot-reloadable
     assert plugins[("messages_builder", "default")]["source"] == "kernel"
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/system/reload：插件
+# POST /api/v1/system/reload: plugins
 # ---------------------------------------------------------------------------
 
 def test_system_reload_studio_plugin_replays_file(client, stub,
@@ -127,7 +129,7 @@ def test_system_reload_studio_plugin_replays_file(client, stub,
     report = body["data"]["report"]
     assert report["studio_plugins"]["reloaded"] == ["sys_reload_demo"]
     assert not report["studio_plugins"]["failed"]
-    # 重放后注册仍在（replace 窗口吸收新类对象）
+    # After replay the registration survives (the replace window absorbs the new class objects)
     from nexus.registry.plugins import registry as plugin_registry
     assert plugin_registry.has("executor", "sys_reload_demo")
 
@@ -160,7 +162,7 @@ def test_system_reload_requires_target(client, stub):
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/system/reload：MCP 工具面
+# POST /api/v1/system/reload: the MCP tool surface
 # ---------------------------------------------------------------------------
 
 def test_system_reload_mcp_rebuilds_with_fresh_config(client, stub, mcp_cfg):
@@ -171,7 +173,7 @@ def test_system_reload_mcp_rebuilds_with_fresh_config(client, stub, mcp_cfg):
     assert "1/1" in body["message"]
     names = [c[0] for c in stub.calls]
     assert names == ["shutdown", "bootstrap", "ensure_started", "wait_ready"]
-    assert stub.calls[1][1] is mcp_cfg["value"]  # bootstrap 收到重读后的新配置
+    assert stub.calls[1][1] is mcp_cfg["value"]  # bootstrap received the re-read fresh config
 
 
 def test_system_reload_bad_mcp_config_keeps_current(client, stub, mcp_cfg):
@@ -179,16 +181,16 @@ def test_system_reload_bad_mcp_config_keeps_current(client, stub, mcp_cfg):
     body = client.post("/api/v1/system/reload", json={"mcp": True}).json()
     assert body["code"] == "400" and body["status"] is False
     assert "配置非法" in body["message"]
-    # 拆连接之前就失败——现有工具面保持不动
+    # Failing before the connections are torn down — the existing tool surface stays untouched
     assert stub.calls == []
 
 
 # ---------------------------------------------------------------------------
-# 启动装配校验 _validate_registered_patterns：console 托管 pattern 宽松工具面
+# Startup assembly validation _validate_registered_patterns: console-hosted patterns' lenient tool surface
 # ---------------------------------------------------------------------------
 
 class _StubPatternRegistry:
-    """最小 pattern registry 桩（list_codes/get 即可，校验函数只读这两者）。"""
+    """A minimal pattern-registry stub (list_codes/get only; the validation functions read exactly those)."""
 
     def __init__(self, patterns):
         self._patterns = patterns
@@ -211,29 +213,33 @@ def _pattern_with_unregistered_tool(code):
 
 
 def test_startup_validation_lenient_for_console_patterns(tmp_path, monkeypatch):
-    # 发布链（store.load_pattern_text）宽松放行未注册工具，启动校验必须
-    # 同宽——否则「发布成功 → 重启 SystemExit 变砖」；代码版 pattern 仍严格
+    # The publish chain (store.load_pattern_text) leniently allows
+    # unregistered tools, so startup validation must be equally lenient —
+    # otherwise "publish OK → restart SystemExit bricks the host"; code
+    # versions of patterns stay strict
     (tmp_path / "pub.yml").write_text("placeholder: 1", encoding="utf-8")
     monkeypatch.setattr("ui.studio.store.PATTERNS_DIR", tmp_path)
 
     both = _StubPatternRegistry({
-        "pub": _pattern_with_unregistered_tool("pub"),          # console 托管
-        "code_pat": _pattern_with_unregistered_tool("code_pat")  # 纯代码版
+        "pub": _pattern_with_unregistered_tool("pub"),          # console-hosted
+        "code_pat": _pattern_with_unregistered_tool("code_pat")  # pure code version
     })
     monkeypatch.setattr(main, "pattern_registry", both)
     with pytest.raises(SystemExit):
-        main._validate_registered_patterns()   # 代码版严格 → 启动终止
+        main._validate_registered_patterns()   # the code version is strict → startup aborts
 
     only_console = _StubPatternRegistry(
         {"pub": _pattern_with_unregistered_tool("pub")})
     monkeypatch.setattr(main, "pattern_registry", only_console)
-    main._validate_registered_patterns()       # console 版宽松 → 放行不抛
+    main._validate_registered_patterns()       # the console version is lenient → passes without raising
 
 
 def test_system_reload_replays_console_after_code_modules(client, stub,
                                                            monkeypatch):
-    # reload_modules 重放代码模块会重注册代码版 pattern，静默覆盖 console
-    # 修改——重放 console 托管目录必须发生在代码模块重载之后、会话重绑之前
+    # reload_modules replaying code modules re-registers the code versions
+    # of patterns, silently overwriting console edits — replaying the console
+    # hosted directories must happen after code-module reloads and before
+    # session rebinding
     import host.reload as reload_module
     import ui.studio.store as studio_store
 
@@ -261,9 +267,11 @@ def test_system_reload_replays_console_after_code_modules(client, stub,
 
 
 def test_discover_tracks_atoms_hooks_modules():
-    # atoms.hooks.* 与 atoms.executors.* 同为模块级注册的插件——发现域必须
-    # 覆盖，否则 studio 系统插件页勾选 tool_guard 重载会静默落进 unknown
-    import atoms.hooks.tool_guard  # noqa: F401 -- 触发导入进 sys.modules
+    # atoms.hooks.* and atoms.executors.* are both module-level registered
+    # plugins — the discovery domain must cover them, otherwise checking
+    # tool_guard on the studio system-plugins page for reload would silently
+    # land in "unknown"
+    import atoms.hooks.tool_guard  # noqa: F401 -- forces the import into sys.modules
     from host.reload import _discover_module_names
 
     names = _discover_module_names()

@@ -1,17 +1,24 @@
-"""xianyu_agent（AGENT 图形态）离线测试——复刻闲鱼自动回复的多轮
-对话管理。
+"""Offline tests for xianyu_agent (AGENT-graph form) — replicating the
+multi-turn dialogue management of Xianyu auto-replies.
 
-LLM 输出由脚本化 FakeProvider 模拟（无真实 API）。图结构：路由根节点
-（xianyu_router 执行器：本地意图规则 + LLM 兜底 + 议价计数）条件边分发到
-四个菜单节点；议价拒绝节点挂规则执行器（answer_examples 直出，零 LLM），
-其余菜单节点挂生成执行器。每条买家消息从入口重跑全图（原"轮末回根"天然
-成立）。覆盖：
-1. 图结构与 AST 自动发现注册（节点邻接、执行器接线、prompt 资产在 config）
-2. 本地意图关键词表（price/tech/default，复刻 detect_intent）
-3. 意图路由：三轮独立检测、命中对应菜单节点
-4. 议价轮次控制：第 max_bargain_rounds 刀起固定拒绝话术 + 零 LLM
-5. 议价参数注入：bargain_count/max_* 经 slots 进 filled_slots 供 NLG
-6. 自定义议价配置：metadata.bargain_settings 覆盖默认
+LLM output is simulated by a scripted FakeProvider (no real API). Graph
+structure: the routing root node (xianyu_router executor: local intent
+rules + LLM fallback + bargain counting) dispatches via conditional edges
+to four menu nodes; the bargain-refusal node carries the rule executor
+(answer_examples direct output, zero LLM), while the other menu nodes carry
+generation executors. Every buyer message re-runs the full graph from the
+entry (the original "return to root at end of turn" holds naturally).
+Coverage:
+1. Graph structure and AST auto-discovery registration (node adjacency,
+   executor wiring, prompt assets in config)
+2. Local intent keyword table (price/tech/default, replicating detect_intent)
+3. Intent routing: independent detection per turn, hitting the matching
+   menu node
+4. Bargain round control: from the max_bargain_rounds-th haggle on, a fixed
+   refusal script + zero LLM
+5. Bargain parameter injection: bargain_count/max_* reach filled_slots via
+   slots for NLG
+6. Custom bargain config: metadata.bargain_settings overrides the default
 """
 
 import logging
@@ -125,7 +132,8 @@ def test_pattern_auto_discovered_and_structure(pattern):
         "xy_route_root", "xy_menu_price", "xy_menu_price_refuse",
         "xy_menu_tech", "xy_menu_default",
     ]
-    # 条件边邻接：根节点路由到四个菜单节点；菜单节点无后继（图自然终止）
+    # conditional-edge adjacency: the root routes to the four menu nodes;
+    # menu nodes have no successors (the graph terminates naturally)
     root = pattern.node_map["xy_route_root"]
     assert set(root.sub_nodes) == {"xy_menu_price", "xy_menu_price_refuse",
                                    "xy_menu_tech", "xy_menu_default"}
@@ -133,25 +141,27 @@ def test_pattern_auto_discovered_and_structure(pattern):
                  "xy_menu_tech", "xy_menu_default"):
         assert pattern.node_map[code].sub_nodes == []
 
-    # 执行器接线：根 = 路由执行器；拒绝节点 = 规则执行器；其余 = 生成执行器
+    # executor wiring: root = router executor; refusal node = rule executor;
+    # the rest = generation executors
     assert root.plugins["loop"] == "xianyu_router"
     assert pattern.node_map["xy_menu_price_refuse"].plugins["loop"] == \
         "xianyu_rule_reply"
     for code in ("xy_menu_price", "xy_menu_tech", "xy_menu_default"):
         assert pattern.node_map[code].plugins["loop"] == "xianyu_reply"
 
-    # 执行器 code 经插件中心可解析
+    # executor codes are resolvable via the plugin registry
     from nexus.registry.plugins import registry as plugin_registry
     for code in ("xianyu_router", "xianyu_reply", "xianyu_rule_reply"):
         assert plugin_registry.has("executor", code), code
 
-    # 意图级 NLG 模板在节点 config（拒绝节点以 answer_examples 承载话术）
+    # intent-level NLG templates live in node config (the refusal node
+    # carries its script via answer_examples)
     assert pattern.node_map["xy_menu_price"].get_prompt("base_nlg_prompt")
     assert pattern.node_map["xy_menu_tech"].get_prompt("base_nlg_prompt")
     assert pattern.node_map["xy_menu_default"].get_prompt("base_nlg_prompt")
     assert pattern.node_map["xy_menu_price_refuse"].answer_examples == [REFUSE_TEXT]
 
-    # AGENT 图不跑 stages（无骨架）
+    # an AGENT graph runs no stages (no skeleton)
     assert pattern.stages == []
 
 
@@ -191,8 +201,8 @@ def test_intent_routing_each_turn(pattern, sessions):
     reply = chat(sessions, "s1", "能便宜点吗")
     assert session.cxt.nlu_result["next_node"] == "xy_menu_price"
     assert session.cxt.nlu_result["intent"] == "price"
-    assert session.cxt.current_node_code == "xy_menu_price"  # 图位置镜像=命中的菜单节点
-    assert reply  # 生成执行器产出回复
+    assert session.cxt.current_node_code == "xy_menu_price"  # graph position mirrors the matched menu node
+    assert reply  # the generation executor produces a reply
 
     chat(sessions, "s1", "这个怎么用")
     assert session.cxt.nlu_result["next_node"] == "xy_menu_tech"
@@ -295,7 +305,7 @@ def test_price_prompt_contains_bargain_context(pattern, sessions):
     with _PromptSpy() as spy:
         chat(sessions, "s1", "能便宜点吗")
 
-    prompt = spy.prompts[-1]  # 最后一次调用是生成执行器的买家回复
+    prompt = spy.prompts[-1]  # the last call is the generation executor's buyer reply
     assert "议价" in prompt
     assert "商品信息" in prompt
     assert "item_id: item1" in prompt          # task_info product info injected
@@ -310,12 +320,12 @@ def test_intent_specific_prompt_selected(pattern, sessions):
     session = launch(pattern, sessions)
 
     with _PromptSpy() as spy:
-        chat(sessions, "s1", "这个怎么用")   # tech（本地命中，1 次生成调用）
-        chat(sessions, "s1", "今天发货吗")   # default（本地未命中 → LLM 分类兜底 + 生成）
+        chat(sessions, "s1", "这个怎么用")   # tech (local hit, one generation call)
+        chat(sessions, "s1", "今天发货吗")   # default (local miss → LLM classification fallback + generation)
 
     assert "技术专家" in spy.prompts[0]
-    assert "电商卖家" in spy.prompts[-1]  # 末次调用是 default 模板生成
-    # 中间那次是意图分类兜底提示词
+    assert "电商卖家" in spy.prompts[-1]  # the last call is the default-template generation
+    # the middle one is the intent-classification fallback prompt
     assert any("通用意图分类器" in p for p in spy.prompts)
 
 

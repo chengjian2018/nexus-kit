@@ -80,7 +80,7 @@ class TestMermaid:
             assert f"n_{code}[" in fsm_mermaid
 
     def test_no_subgraph_left(self, fsm_mermaid):
-        # 三层时代的 module subgraph 全部消失
+        # The three-layer era's module subgraphs are all gone
         assert "subgraph" not in fsm_mermaid
 
     def test_entry_edge_from_start(self, fsm_mermaid):
@@ -112,8 +112,9 @@ class TestMermaid:
         assert visualize._escape_label(None) == ""
 
     def test_escape_label_html(self):
-        # HTML 显著字符必须转义：标签文本会进入宽松模式的 SVG 渲染与
-        # HTML 导出，未转义的 <img onerror=...> 即存储型脚本
+        # HTML-significant characters must be escaped: label text enters
+        # lenient-mode SVG rendering and HTML export; an unescaped
+        # <img onerror=...> is a stored script
         assert visualize._escape_label(
             '<img src=x onerror="alert(1)">') == \
             "&lt;img src=x onerror=#quot;alert(1)#quot;&gt;"
@@ -121,8 +122,8 @@ class TestMermaid:
         assert visualize._escape_label("<script>") == "&lt;script&gt;"
 
     def test_label_html_never_reaches_output_raw(self):
-        # 节点名携带任意文本（LLM 生成的 pattern 同理）：mermaid 输出里
-        # 不允许出现未转义的标签起始
+        # Node names carry arbitrary text (same for LLM-generated patterns):
+        # unescaped tag openings must never appear in the mermaid output
         evil = Pattern(
             code="vis_evil", name="xss", description="d", pattern_type="fsm",
             entry_node_code="n_evil",
@@ -163,7 +164,7 @@ class TestRenderers:
         out = visualize.render_pattern_html(fsm_demo)
         for code in ("vis_ask_brand", "vis_ask_budget", "vis_confirm"):
             assert code in out
-        assert "brand" in out  # 槽位进详情
+        assert "brand" in out  # slots render in the details
 
     def test_markdown_basic(self, fsm_demo):
         out = visualize.render_pattern_markdown(fsm_demo)
@@ -176,13 +177,13 @@ class TestRenderers:
     def test_markdown_summary_fields(self, fsm_demo, agent_demo):
         fsm_md = visualize.render_pattern_markdown(fsm_demo)
         assert "FSM" in fsm_md
-        assert "`vis_ask_brand`" in fsm_md  # 入口节点
+        assert "`vis_ask_brand`" in fsm_md  # the entry node
         agent_md = visualize.render_pattern_markdown(agent_demo)
         assert "AGENT" in agent_md
         assert "knowledge" in agent_md        # allow_toolset
         assert "vis_router_exec" in agent_md  # plugins
         assert "6" in agent_md                # max_steps
-        assert "kb_search" in agent_md        # 节点 use_tools
+        assert "kb_search" in agent_md        # the node's use_tools
         assert "抱歉啦" in agent_md            # answer_examples
 
     def test_render_pattern_dispatch(self, fsm_demo):

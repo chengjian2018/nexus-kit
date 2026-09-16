@@ -1,31 +1,38 @@
-"""bash / run_python — shell 命令与 Python 代码执行（toolset: shell）.
+"""bash / run_python — shell command and Python code execution (toolset: shell).
 
-高权限工具集：授权仍是 deny-by-default 三层收口（注册 toolset →
-pattern.allow_toolset → node.use_tools）——
-只有 pattern 显式 ``allow_toolset: [shell, ...]`` 且节点
-``use_tools`` 点名的 agent 才能触达，注册即全局可用不等于默认暴露::
+High-privilege toolset: authorization is still the deny-by-default
+three-layer gate (registered toolset → pattern.allow_toolset →
+node.use_tools) — only agents whose pattern explicitly declares
+``allow_toolset: [shell, ...]`` AND whose node names the tools in
+``use_tools`` can reach them; registering globally-available does not mean
+exposed by default::
 
     pattern:
       allow_toolset: [shell, filesystem, knowledge]
     node:
-      use_tools: [bash, run_python]        # 只点本节点需要的
+      use_tools: [bash, run_python]        # only what this node needs
 
-两个工具共用一套子进程护栏：
+Both tools share one subprocess guardrail set:
 
-- ``timeout_seconds``（config ``shell_tool`` 节，默认 60s；args 只能调小）
-  —— 超时按进程组 SIGKILL（``start_new_session`` 独立会话，shell 里的
-  子孙进程一并回收），返回已产出的部分输出 + ``timed_out: true``。
-- ``max_output_chars``（默认 20000）—— stdout / stderr 各自截断回填，
-  防单条命令刷爆 agent 上下文。
+- ``timeout_seconds`` (config ``shell_tool`` section, default 60s; args may
+  only lower it) — timeout kills the whole process group with SIGKILL
+  (``start_new_session`` gives the proc its own session, so descendant
+  processes in the shell are reaped too) and returns the partial output
+  already produced + ``timed_out: true``.
+- ``max_output_chars`` (default 20000) — stdout / stderr each truncated
+  before backfill, so one command cannot flood the agent context.
 
-run_python 用 ``sys.executable -I`` 在临时文件中执行：与宿主同解释器
-（依赖可复用），``-I`` isolated mode 隔离 PYTHONPATH / user site，代码
-无法借用宿主进程环境做持久化；stdin 关闭（DEVNULL），读输入的代码立即
-EOF 而不是挂住等输入。
+run_python executes from a temp file via ``sys.executable -I``: the same
+interpreter as the host (dependencies reusable), ``-I`` isolated mode
+separates PYTHONPATH / user site so code cannot lean on the host process
+environment for persistence; stdin is closed (DEVNULL) — input-reading code
+hits EOF immediately instead of hanging.
 
-本工具集是"能力边界在授权层"的取舍：不对命令内容做黑名单过滤
-（形同虚设且误伤率极高），工作目录不设沙箱（本地个人 kit 的定位）；
-真正收口在 pattern 授权 + 资源护栏。
+This toolset embodies the "capability boundary at the authorization layer"
+trade-off: no blacklist filtering of command content (security theater with
+a huge false-positive rate) and no working-directory sandbox (a local
+personal kit by positioning); the real gate is pattern authorization +
+resource guardrails.
 """
 
 import asyncio
@@ -44,19 +51,21 @@ from nexus.settings import get_shell_tool_config
 
 logger = logging.getLogger(__name__)
 
-# 超时击杀后的收尸宽限（秒）：足够读回管道里的残余输出，又不会让
-# "已超时"的工具调用再挂住一个不可取消的 to_thread 线程
+# Post-kill reaping grace (seconds): enough to read back residual pipe
+# output, yet short enough that an already-timed-out tool call does not
+# occupy another uncancelled to_thread thread
 _POST_KILL_GRACE_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
-# 子进程执行核心（bash 与 run_python 共用）
+# Subprocess execution core (shared by bash and run_python)
 # ---------------------------------------------------------------------------
 
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
-    """SIGKILL 整个进程组（start_new_session 保证 proc 是组长）。
+    """SIGKILL the whole process group (start_new_session guarantees proc is the leader).
 
-    进程已退出 / 平台无 killpg 时静默降级到 proc.kill()。
+    Silently degrades to proc.kill() when the process already exited or the
+    platform lacks killpg.
     """
     try:
         if hasattr(os, "killpg") and proc.pid:
@@ -64,18 +73,19 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
         else:
             proc.kill()
     except (ProcessLookupError, PermissionError):
-        pass  # 已退出：communicate() 兜底收尸
+        pass  # already exited: communicate() reaps as a fallback
 
 
 async def _run_subprocess(argv: Tuple[str, ...], *, shell: bool = False,
                           timeout: float,
                           workdir: Optional[str] = None
                           ) -> Dict[str, Any]:
-    """跑一个子进程到结束（或超时），返回未截断的原始结果。
+    """Run a subprocess to completion (or timeout), returning the untruncated raw result.
 
-    argv 为完整参数表（shell=False，run_python 用）；shell=True 时
-    argv[0] 是整条命令串（bash 用）。stdin 恒为 DEVNULL——交互式命令
-    立即 EOF 而非挂住。
+    argv is the full argument vector (shell=False, used by run_python);
+    shell=True means argv[0] is the whole command string (used by bash).
+    stdin is always DEVNULL — interactive commands hit EOF immediately
+    instead of hanging.
     """
     kwargs: Dict[str, Any] = dict(
         stdout=asyncio.subprocess.PIPE,
@@ -96,9 +106,11 @@ async def _run_subprocess(argv: Tuple[str, ...], *, shell: bool = False,
     except asyncio.TimeoutError:
         timed_out = True
         _kill_process_group(proc)
-        # 收尸也带宽限：killpg 够不到 setsid 逃逸的孙进程（nohup/双 fork
-        # 守护），它们握着管道写端让 communicate 等不到 EOF——宽限过后
-        # 强制关闭 stdio transport 放弃残余输出，绝不在"超时之后"再挂死
+        # The reaping also gets a grace window: killpg cannot reach
+        # setsid-escaped grandchildren (nohup / double-fork daemons) — they
+        # hold the pipe write end and communicate never sees EOF. Past the
+        # grace, force-close the stdio transport and give up the residual
+        # output; never hang "after the timeout".
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=_POST_KILL_GRACE_SECONDS)
@@ -110,7 +122,7 @@ async def _run_subprocess(argv: Tuple[str, ...], *, shell: bool = False,
                 if stream is not None:
                     try:
                         stream.close()
-                    except Exception:  # noqa: BLE001 -- 尽力而为的收尾
+                    except Exception:  # noqa: BLE001 -- best-effort teardown
                         pass
             stdout_b, stderr_b = b"", b""
 
@@ -123,7 +135,7 @@ async def _run_subprocess(argv: Tuple[str, ...], *, shell: bool = False,
 
 
 def _resolve_workdir(args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """校验可选 workdir 参数；返回 (err, workdir)。"""
+    """Validate the optional workdir arg; returns (err, workdir)."""
     raw = args.get("workdir")
     if raw is None or str(raw).strip() == "":
         return None, None
@@ -135,7 +147,7 @@ def _resolve_workdir(args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]
 
 def _resolve_timeout(args: Dict[str, Any], guard: Dict[str, Any]
                      ) -> Tuple[Optional[str], Optional[float]]:
-    """超时参数：args 只能调小（与 delegate_task / run_workflow 同哲学）。"""
+    """Timeout arg: args may only lower it (same philosophy as delegate_task / run_workflow)."""
     timeout = float(guard["timeout_seconds"])
     if args.get("timeout_seconds") is not None:
         try:
@@ -149,7 +161,7 @@ def _resolve_timeout(args: Dict[str, Any], guard: Dict[str, Any]
 
 
 def _clip_output(text: str, limit: int) -> Tuple[str, bool]:
-    """输出截断：超限截到 limit 并加标记，返回 (text, truncated)。"""
+    """Output truncation: over-limit clips to limit with a marker; returns (text, truncated)."""
     if len(text) <= limit:
         return text, False
     marker = f"\n...[输出超长，已截断：完整 {len(text)} 字符，仅保留前 {limit} 字符]"
@@ -158,7 +170,7 @@ def _clip_output(text: str, limit: int) -> Tuple[str, bool]:
 
 def _payload(raw: Dict[str, Any], guard: Dict[str, Any],
              started: float, **extra: Any) -> str:
-    """组装回填 payload：stdout/stderr 各自截断 + 计时。"""
+    """Assemble the backfill payload: stdout/stderr each truncated + timing."""
     limit = int(guard["max_output_chars"])
     stdout, out_cut = _clip_output(raw["stdout"], limit)
     stderr, err_cut = _clip_output(raw["stderr"], limit)

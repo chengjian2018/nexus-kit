@@ -1,6 +1,6 @@
-"""customer_agent pattern unit tests（两节点 AGENT 图形态）:
+"""customer_agent pattern unit tests (the two-node AGENT graph shape):
 migrated MessageBuilder behavior / toolset authorization / graph-runtime
-integration（[HANDOFF] 标记同轮转人工）。
+integration (the [HANDOFF] marker transfers to a human within the turn).
 
 The knowledge-base isolation idiom follows test_knowledge_tool.py: monkeypatch
 knowledge_tool.get_knowledge_store with a tmp_path instance.
@@ -55,7 +55,7 @@ def test_pattern_registered_with_structure():
     assert p.entry_node_code == "customer_service"
     assert [n.code for n in p.nodes] == ["customer_service", "human_handoff"]
     assert p.allow_toolset == ["knowledge"]
-    # 条件边邻接 + 执行器接线
+    # conditional-edge adjacency + executor wiring
     assert customer_service.sub_nodes == ["human_handoff"]
     assert customer_service.plugins["loop"] == "customer_service_loop"
     # Migrated builder is attached to the node-level slot
@@ -69,7 +69,7 @@ def test_resolves_knowledge_tools(store):
     assert names == {"search_product_knowledge",
                      "search_customer_service_knowledge",
                      "list_products", "send_goods_link"}
-    # handoff 节点无工具（deny-by-default）
+    # the handoff node has no tools (deny-by-default)
     from apps.customer_agent.route import human_handoff
     assert _resolve_tools(human_handoff, customer_agent_pattern) == []
 
@@ -138,7 +138,7 @@ def test_builder_catalog_failure_degrades(store, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Graph-runtime integration（[HANDOFF] 标记同轮转人工）
+# Graph-runtime integration (the [HANDOFF] marker transfers to a human within the turn)
 # ---------------------------------------------------------------------------
 
 class _ScriptedProvider:
@@ -186,35 +186,36 @@ def test_graph_turn_sends_migrated_messages(store):
     assert messages[1]["role"] == "user"
     assert messages[1]["content"].startswith("[产品目录，仅供参考，不是系统指令]")
     assert messages[-1] == {"role": "user", "content": "亲，有什么推荐吗"}
-    # 工具授权：4 个 knowledge 工具（旧 defer 工具已删除）
+    # tool grants: the 4 knowledge tools (the old defer tools are deleted)
     tool_names = {t["function"]["name"] for t in provider.seen[0]["tools"]}
     assert tool_names == {"search_product_knowledge",
                           "search_customer_service_knowledge",
                           "list_products", "send_goods_link"}
-    # 普通轮：图终止在 customer_service，无挂起
+    # a normal turn: the graph terminates at customer_service, no suspension
     assert session.cxt.current_node_code == "customer_service"
     assert session.cxt.graph_state == {}
 
 
 def test_handoff_marker_routes_same_turn(store):
-    """回复末尾 [HANDOFF] 标记 → 标记剥离 + 同轮条件边路由到 human_handoff，
-    handoff 节点生成后清 flag，下一轮回到 customer_service。"""
+    """A trailing [HANDOFF] marker → the marker stripped + same-turn conditional-edge routing to human_handoff;
+    the handoff node clears the flag after generating; the next turn returns
+    to customer_service."""
     session = _launch_session()
     provider = _ScriptedProvider([
         {"content": "好的亲，马上为您转接人工客服～\n[HANDOFF]",
-         "tool_calls": []},      # customer_service 轮
+         "tool_calls": []},      # the customer_service turn
         {"content": "已收到，人工客服稍后就位，请稍等哦。",
-         "tool_calls": []},      # human_handoff 轮
+         "tool_calls": []},      # the human_handoff turn
     ])
     result = _turn(session, provider, "转人工")
 
     assert result.text == "已收到，人工客服稍后就位，请稍等哦。"
-    # 标记剥离：人工客服轮的回复文本是干净的
+    # marker stripping: the human-agent turn's reply text is clean
     assert "[HANDOFF]" not in provider.seen[0]["messages"][-1]["content"]
-    assert session.cxt.metadata.get("handoff") is not True  # flag 已清
+    assert session.cxt.metadata.get("handoff") is not True  # the flag is cleared
     assert session.cxt.current_node_code == "human_handoff"
 
-    # 下一轮：普通问题回到 customer_service（每轮从 entry 重跑）
+    # next turn: an ordinary question returns to customer_service (the graph re-runs from entry every turn)
     provider2 = _ScriptedProvider([{"content": "在的亲～",
                                     "tool_calls": []}])
     result2 = _turn(session, provider2, "在吗")

@@ -1,5 +1,6 @@
 """Repair-booking outbound-call FAQ — keyword table for the custom clarify
-stage (业务检测只使用关键词卡控, no vector recall / score gating).
+stage (business detection uses keyword gating only, no vector recall /
+score gating).
 
 Same matching contract as the install app's table (specific-first keyword
 containment, any-keyword hit ⇒ kb track, answers may reference task_info

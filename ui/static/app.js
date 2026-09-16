@@ -929,7 +929,8 @@ async function renderKbCollections(body) {
   $$("[data-del]", body).forEach((b) => b.onclick = () => {
     const c = cols.find((x) => String(x.id) === b.dataset.del);
     confirmDialog(`删除知识库「${c ? c.name : b.dataset.del}」及其全部记录？不可恢复。`, async () => {
-      await api(`/api/v1/console/knowledge/collections/${b.dataset.del}`, { method: "DELETE" });
+      await api(`/api/v1/console/knowledge/collections/${b.dataset.del}`,
+        { method: "DELETE", params: { scope: state.scope } });
       toast("已删除", true);
       renderKbCollections(body).catch(kbBodyError(body));
     });
@@ -1025,7 +1026,8 @@ function renderCollectionForm(body, existing) {
       let id = existing ? existing.id : null;
       if (isEdit) {
         await api(`/api/v1/console/knowledge/collections/${existing.id}`, {
-          method: "PUT", body: { name, description: desc, fields: defs } });
+          method: "PUT", params: { scope: state.scope },
+          body: { name, description: desc, fields: defs } });
         toast("已保存（字段与记录检索已同步）", true);
       } else {
         id = (await api("/api/v1/console/knowledge/collections", {
@@ -1042,7 +1044,7 @@ function renderCollectionForm(body, existing) {
 
 async function renderCollectionDetail(body, collId) {
   const data = await api(`/api/v1/console/knowledge/collections/${collId}/records`,
-    { params: { limit: 100 } });
+    { params: { scope: state.scope, limit: 100 } });
   const coll = data.collection;
   const fields = coll.fields || [];
   let currentRows = data.rows || [];
@@ -1061,7 +1063,7 @@ async function renderCollectionDetail(body, collId) {
     $$("#rec-tbody [data-del]").forEach((b) => b.onclick = () =>
       confirmDialog("删除该条记录？", async () => {
         await api(`/api/v1/console/knowledge/collections/${collId}/records/${b.dataset.del}`,
-          { method: "DELETE" });
+          { method: "DELETE", params: { scope: state.scope } });
         toast("已删除", true);
         reload();
       }));
@@ -1108,14 +1110,15 @@ async function renderCollectionDetail(body, collId) {
   $("#coll-edit").onclick = () => renderCollectionForm(body, coll);
   $("#coll-del").onclick = () =>
     confirmDialog(`删除知识库「${coll.name}」及其全部记录？不可恢复。`, async () => {
-      await api(`/api/v1/console/knowledge/collections/${collId}`, { method: "DELETE" });
+      await api(`/api/v1/console/knowledge/collections/${collId}`,
+        { method: "DELETE", params: { scope: state.scope } });
       toast("已删除", true);
       renderKbCollections(body).catch(kbBodyError(body));
     });
   $("#rec-add").onclick = () => recordForm(coll, null, reload);
   $("#rec-query").oninput = debounce(async (e) => {
     const d = await api(`/api/v1/console/knowledge/collections/${collId}/records`,
-      { params: { query: e.target.value.trim(), limit: 100 } });
+      { params: { scope: state.scope, query: e.target.value.trim(), limit: 100 } });
     currentRows = d.rows || [];
     renderTbody();
   }, 350);
@@ -1156,10 +1159,10 @@ function recordForm(coll, row, reload) {
       }
       if (isEdit) {
         await api(`/api/v1/console/knowledge/collections/${coll.id}/records/${row.id}`,
-          { method: "PUT", body: { data } });
+          { method: "PUT", params: { scope: state.scope }, body: { data } });
       } else {
         await api(`/api/v1/console/knowledge/collections/${coll.id}/records`,
-          { method: "POST", body: { data } });
+          { method: "POST", params: { scope: state.scope }, body: { data } });
       }
       toast(isEdit ? "已保存" : "已新增", true);
       reload();

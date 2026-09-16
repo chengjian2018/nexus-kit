@@ -9,9 +9,10 @@ declares what differs:
 - ``RepairBookingUnifiedNLU`` (stage code ``repair_unified``): rebinds the
   node-code class attributes (BOOKING_TARGETS → repair_specific_date /
   repair_nearest, RECOMMEND_NODE → repair_recommend, ...) and the
-  deterministic reply wording (师傅 → 维修师傅, 约安装 → 约维修);
+  deterministic reply wording (technician → repair technician,
+  book-an-installation → book-a-repair);
 - ``RepairRecommendNLG`` (code ``repair_recommend_nlg``): the recommend
-  reply speaks the 维修档期;
+  reply speaks the repair schedule;
 - ``RepairKeywordClarifyStage`` (code ``repair_clarify``): rebinds the FAQ
   keyword table (repair question families), the kb/fallback prompt
   templates and the generate-failure fallback line.

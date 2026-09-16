@@ -855,8 +855,9 @@ def test_callback_vague_or_missing_falls_back_to_default(pattern, sessions):
 
 
 def test_available_slots_string_shapes_normalized():
-    """parse_available_slots 的值形态容忍：除标准字符串列表外，JSON 数组
-    串与分隔符串也归一（渠道/表单路径可能以 Dict[str, str] 传入）。"""
+    """parse_available_slots tolerates value shapes: beyond the standard
+    list of strings, a JSON-array string and a delimiter-joined string are
+    normalized too (channel/form paths may pass a Dict[str, str])."""
     from apps.install_booking_agent.slots import parse_available_slots
 
     canonical = parse_available_slots(
@@ -874,19 +875,20 @@ def test_available_slots_string_shapes_normalized():
 
     assert parse_available_slots({"available_slots": ""}) == []
     assert parse_available_slots({}) == []
-    # 非法条目跳过不阻塞
+    # invalid entries are skipped without blocking
     assert parse_available_slots(
         {"available_slots": ["not a slot", "2026-09-10 09:00-12:00"]}) == [
         canonical[0]]
 
 
 def test_parse_available_slots_scalar_shapes_never_raise():
-    """任意 JSON 标量形态（int/bool/dict）按坏档期降级为空表——
-    TypeError 会穿透 _apply_booking_guard 炸掉整轮对话。"""
+    """Any JSON scalar shape (int/bool/dict) degrades to an empty table as
+    a bad schedule — a TypeError would pierce _apply_booking_guard and blow
+    up the whole dialogue turn."""
     from apps.install_booking_agent.slots import parse_available_slots
 
     assert parse_available_slots({"available_slots": 5}) == []
     assert parse_available_slots({"available_slots": True}) == []
-    # dict 迭代出的是 key 而非档期，同样降级
+    # iterating a dict yields keys, not slots — degrade likewise
     assert parse_available_slots(
         {"available_slots": {"2026-09-10 09:00-12:00": 1}}) == []

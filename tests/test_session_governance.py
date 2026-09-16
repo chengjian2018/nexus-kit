@@ -190,8 +190,8 @@ def test_concurrent_duplicate_launch(registry_guard):
 
 def test_governor_shields_sessions_with_running_turn(client, registry_guard,
                                                      monkeypatch):
-    """有进行中对话轮的 session 不被 TTL 清理/LRU 逐出（中途逐出会配上
-    新建的 Session/新锁，同 session 两轮真并发）。"""
+    """A session with an in-flight turn is never TTL-cleaned or LRU-evicted (a mid-turn eviction would pair
+    a fresh Session/new lock, putting two turns of one session into true concurrency)."""
     import asyncio
     import contextlib
 
@@ -204,7 +204,7 @@ def test_governor_shields_sessions_with_running_turn(client, registry_guard,
         task = asyncio.create_task(_never())
         main.turn_registry.register("gov-shield", task)
         try:
-            # 1) TTL 清理跳过
+            # 1) TTL cleanup skips
             monkeypatch.setattr(main.governor, "ttl_seconds", 60)
             with main.governor.lock:
                 main.governor.last_active["gov-shield"] = (
@@ -212,7 +212,7 @@ def test_governor_shields_sessions_with_running_turn(client, registry_guard,
             assert main.governor.get("gov-shield") is not None
             assert "gov-shield" in main.governor.sessions
 
-            # 2) LRU 逐出跳过（cap 压到 1，唯一候选受保护 → 放弃逐出）
+            # 2) LRU eviction skips (cap squeezed to 1, the sole candidate protected → eviction abandoned)
             monkeypatch.setattr(main.governor, "max_sessions", 1)
             assert launch(client, "gov-other")["status"] is True
             assert "gov-shield" in main.governor.sessions
@@ -226,7 +226,7 @@ def test_governor_shields_sessions_with_running_turn(client, registry_guard,
 
 
 def test_turn_registry_lifecycle():
-    """registry：注册即 has_running；done 回调自动注销；cancel_all 等待落定。"""
+    """registry: registration means has_running; the done callback auto-deregisters; cancel_all awaits settlement."""
     import asyncio
 
     from host.turns import TurnRegistry
@@ -244,10 +244,10 @@ def test_turn_registry_lifecycle():
 
         await reg.cancel_all()
         assert t.cancelled()
-        await asyncio.sleep(0)                 # done 回调执行
+        await asyncio.sleep(0)                 # the done callback runs
         assert reg.has_running("s1") is False
         assert reg.running_session_ids() == set()
-        # 注销幂等
+        # Deregistration is idempotent
         reg.unregister("s1", t)
 
     arun_run(_scenario())

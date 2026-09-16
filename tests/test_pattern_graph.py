@@ -106,7 +106,7 @@ def test_default_max_steps():
 
 
 def test_self_loop_edge_legal():
-    # 环是合法语义（AGENT 图环由 max_steps 预算防护；FSM 环是自然推进）
+    # Cycles are legal semantics (AGENT graph cycles are guarded by the max_steps budget; FSM cycles are natural advancement)
     p = Pattern(code="p", name="n", description="d",
                 nodes=[BaseNode(code="a", sub_nodes=["a"])])
     assert p.node_map["a"].sub_nodes == ["a"]

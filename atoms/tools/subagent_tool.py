@@ -1,31 +1,39 @@
-"""delegate_task — 单次子代理委托（toolset: subagent）。
+"""delegate_task — one-shot sub-agent delegation (toolset: subagent).
 
-一次 tool call = 一个自包含任务的完整子 ReAct 循环：子代理拥有独立的
-system prompt 与受限工具集，跑完把最终结论作为 tool result 返回主循环。
-v1 深度=1：子代理不可再委托，也不可在 workflow 叶子里被调用。
+One tool call = a full sub-ReAct loop for one self-contained task: the
+sub-agent gets its own system prompt and a restricted toolset, and returns
+its final conclusion to the main loop as the tool result. v1 depth=1: a
+sub-agent may not delegate again, nor be called inside a workflow leaf.
 
-授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
-node.use_tools）::
+Authorization (deny-by-default three-layer gate: registered toolset →
+pattern.allow_toolset → node.use_tools)::
 
     pattern:
-      allow_toolset: [subagent, knowledge]   # 子代理池 = knowledge 工具集
+      allow_toolset: [subagent, knowledge]   # sub-agent pool = knowledge toolset
     node:
-      use_tools: [delegate_task]             # 主节点只需点它自己要用的工具
+      use_tools: [delegate_task]             # the main node names only its own tools
 
-子代理可用工具池 = ``pattern.allow_toolset`` 各工具集下的工具，剔除
-``subagent`` 工具集自身（结构性防递归提权）；调用方还可在 args.tools 里
-点名收窄，越权项直接报错回填。llm_config 与授权边界由 default_loop 执行
-器经 ``nexus.engine.tool_context`` 注入；脱离 agent loop 直接 dispatch 时
-回退 ``get_llm_config()`` 且子代理无工具（纯推理循环）。
+The sub-agent's tool pool = the tools under each ``pattern.allow_toolset``
+toolset, minus the ``subagent`` toolset itself (structurally preventing
+recursive privilege escalation); the caller may narrow it via args.tools —
+out-of-pool entries get an error backfill. llm_config and the authorization
+boundary are injected by the default_loop executor via
+``nexus.engine.tool_context``; direct dispatch outside the agent loop falls
+back to ``get_llm_config()`` and the sub-agent runs tool-less (pure
+reasoning loop).
 
-护栏（config ``subagent_tool`` 节可调）：整体超时默认 120s（args 只能调
-小）、轮次上限 8、最终结论截断 8000 字符；子循环内单个工具结果截 4000
-字符防子上下文膨胀。超时/轮次耗尽返回部分结论 + status 标记，主 agent
-自行取舍；子循环内部工具错误走错误回填让子 agent 自纠，不打断循环。
+Guardrails (tunable via the config ``subagent_tool`` section): whole-loop
+timeout default 120s (args may only lower it), round cap 8, final-conclusion
+truncation at 8000 chars; a single tool result inside the sub-loop truncates
+at 4000 chars to keep the sub-context from bloating. Timeout / round
+exhaustion returns the partial conclusion + a status marker for the main
+agent to weigh; tool errors inside the sub-loop go through error backfill
+for the sub-agent to self-correct, never breaking the loop.
 
-子代理的 messages 只存在于本次调用内：不写 DialogueContext、不落会话
-历史（与 fanout ``_branch_cxt`` 的隔离哲学一致）。子循环引擎本体在
-atoms/tools/_subagent_core.py（与 workflow_tool 共享）。
+The sub-agent's messages exist only within this call: nothing is written to
+DialogueContext or session history (the same isolation philosophy as the
+fanout ``_branch_cxt``). The sub-loop engine itself lives in
+atoms/tools/_subagent_core.py (shared with workflow_tool).
 """
 
 import asyncio
@@ -49,8 +57,9 @@ from nexus.settings import get_llm_config, get_subagent_tool_config
 
 logger = logging.getLogger(__name__)
 
-# 子代理工具池永不包含 subagent 工具集自身（Q4 深度=1 的结构性保障；
-# subagent_scope 的标志位是第二道防线，run_workflow 另再排除 workflow）
+# The sub-agent tool pool never includes the subagent toolset itself (the
+# structural guarantee of the Q4 depth=1 rule; subagent_scope's flags are
+# the second line of defense; run_workflow additionally excludes workflow)
 _SELF_TOOLSETS = frozenset({"subagent"})
 _TRACE_CAP = 20
 
@@ -101,7 +110,8 @@ DELEGATE_TASK_SCHEMA = {
 async def _handle_delegate_task(args: Dict[str, Any]) -> str:
     ambient = current_tool_context()
 
-    # 深度=1：工具集已从子池结构性排除，这里再挡 workflow 叶子等绕道调用
+    # depth=1: the toolset is already structurally excluded from the pool;
+    # this blocks detour calls from workflow leaves etc.
     if ambient is not None and (ambient.in_subagent or ambient.in_workflow):
         return tool_error(
             "delegate_task 不允许嵌套调用（v1 深度=1）：子代理/workflow 内无法再委托子代理")
@@ -135,7 +145,8 @@ async def _handle_delegate_task(args: Dict[str, Any]) -> str:
             return tool_error("timeout_seconds 必须大于 0")
         timeout = min(requested, timeout)
 
-    # 子代理工具池：pattern 授权工具集 − subagent 自身（结构性防递归）
+    # Sub-agent tool pool: pattern-granted toolsets − subagent itself
+    # (structural anti-recursion)
     pool: Set[str] = set()
     if ambient is not None and ambient.allow_toolsets:
         pool = registry.names_in_toolsets(
@@ -177,7 +188,7 @@ async def _handle_delegate_task(args: Dict[str, Any]) -> str:
                    "rounds": state.get("rounds", 0), "trace": state.get("trace", []),
                    "usage": state.get("usage", {})}
 
-    # 最终结论截断（护栏：主 agent 上下文防爆）
+    # Final-conclusion truncation (guardrail: keep the main agent's context from exploding)
     content = payload.get("content") or ""
     limit = int(guard["max_result_chars"])
     payload["truncated"] = len(content) > limit

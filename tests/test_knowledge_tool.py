@@ -40,8 +40,8 @@ def test_tools_registered():
 
 
 def test_toolset_authorization_grant_and_deny():
-    """授权 = pattern.allow_toolset ∩ node.use_tools（双双
-    deny-by-default）。"""
+    """Authorization = pattern.allow_toolset ∩ node.use_tools (both
+    deny-by-default)."""
     from nexus.engine.loop import _resolve_tools
     from nexus.model.node import BaseNode
     from nexus.model.pattern import Pattern
@@ -57,7 +57,7 @@ def test_toolset_authorization_grant_and_deny():
                 for t in _resolve_tools(grant.node_map["main"], grant)}
     assert set(names) <= resolved
 
-    # deny-by-default：pattern 未授权该 toolset → 节点列了也没用
+    # deny-by-default: the pattern never granted the toolset → listing it on the node does nothing
     deny = Pattern(code="xianyu_agent", name="x", description="d",
                    allow_toolset=["mcp-websearch"],
                    nodes=[BaseNode(code="root", use_tools=list(names))])

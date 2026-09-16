@@ -1,7 +1,7 @@
 """The six-node topic-research executor — one node per pipeline station:
 
     tr_preplan ──next──> tr_plan ──sends──> tr_search ×N ──join──> tr_merge ──next──> tr_report ──next──> tr_polish
-     预规划/预检索          分主题规划          一实例一主题          结构化合并           报告草稿生成          格式美化(流式,终态)
+     pre-plan/pre-retrieve    per-topic planning    one instance per topic   structured merge        report draft          format polish (streaming, terminal)
 
 Station inventory:
 
@@ -170,7 +170,7 @@ class TopicResearchExecutor(DeepResearchExecutor):
     orchestration lives in the Tr* subclasses below."""
 
     # ------------------------------------------------------------------
-    # PLAN（分主题）
+    # PLAN (per-theme)
     # ------------------------------------------------------------------
 
     async def _themes_phase(self, provider,
@@ -237,7 +237,7 @@ class TopicResearchExecutor(DeepResearchExecutor):
         return plan
 
     # ------------------------------------------------------------------
-    # MERGE（join：纯结构合并，零 LLM 调用）
+    # MERGE (join: pure structural folding, zero LLM calls)
     # ------------------------------------------------------------------
 
     def _merge_phase(self, cxt,
@@ -290,7 +290,7 @@ class TopicResearchExecutor(DeepResearchExecutor):
         }
 
     # ------------------------------------------------------------------
-    # REPORT（报告草稿：无工具、不转发 delta）
+    # REPORT (report draft: tool-less, no delta forwarding)
     # ------------------------------------------------------------------
 
     async def _report_phase(self, provider, question: str,
@@ -348,7 +348,7 @@ class TopicResearchExecutor(DeepResearchExecutor):
         return draft
 
     # ------------------------------------------------------------------
-    # POLISH（格式美化：唯一转发 delta 的相位，终态）
+    # POLISH (format polish: the only phase forwarding deltas, terminal)
     # ------------------------------------------------------------------
 
     async def _polish_phase(self, provider, draft: str,

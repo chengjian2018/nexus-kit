@@ -53,7 +53,7 @@ def _install_chat(monkeypatch, *sessions: Session):
 
 def _make_stub_chat():
     async def stub_chat(query, session_id, all_sessions, store=None, **kw):
-        # 锁在引擎 turn task 内持有（session-persistence §5）——stub 镜像该契约
+        # The lock is held inside the engine's turn task (session-persistence §5) — the stub mirrors that contract
         session = all_sessions[session_id]
         async with session.turn_lock:
             cxt = session.cxt

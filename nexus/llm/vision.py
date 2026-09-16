@@ -6,7 +6,7 @@ helpers build those parts and answer "can this model read images?" from
 the provider registry — the only two things a vision-capable reviewer
 station needs.
 
-    content = multimodal_user_content("评审这几张截图", [p1, p2])
+    content = multimodal_user_content("review these screenshots", [p1, p2])
     messages = [{"role": "user", "content": content}]
 """
 
@@ -22,10 +22,28 @@ _MIME_BY_SUFFIX = {
     ".gif": "image/gif",
 }
 
+# Default per-image byte cap: base64 inflates 1.33x, and a tens-of-MB full-
+# page screenshot can push the request body past each API's per-request
+# limit (400/413) — a failure that lands in post-delivery stages like review
+# where silent breakage is very hard to diagnose. Pre-check before reading;
+# over the cap raises honestly.
+DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
-def image_data_url(path: Union[str, Path]) -> str:
-    """Read *path* and return a ``data:<mime>;base64,...`` URL."""
+
+def image_data_url(
+        path: Union[str, Path],
+        max_bytes: int = DEFAULT_MAX_IMAGE_BYTES) -> str:
+    """Read *path* and return a ``data:<mime>;base64,...`` URL.
+
+    Raises ValueError when the file exceeds *max_bytes* (pre-checked via
+    stat before any read), keeping the caller's honest-degradation contract.
+    """
     p = Path(path)
+    size = p.stat().st_size
+    if size > max_bytes:
+        raise ValueError(
+            f"图片 {p} 体积 {size} 字节超过上限 {max_bytes}"
+            f"(请压缩或降分辨率后重试)")
     mime = _MIME_BY_SUFFIX.get(p.suffix.lower(), "application/octet-stream")
     encoded = base64.b64encode(p.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"

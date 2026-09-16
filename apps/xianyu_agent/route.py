@@ -14,7 +14,7 @@ holds naturally, no extra code):
     xianyu_agent (Pattern)
     ├── xy_route_root      routing root ("xianyu_router"): intent detection
     │                      (local rules + LLM fallback) → conditional edge
-    │                      TurnResult(next=<menu node>)，路由轮 content 为空
+    │                      TurnResult(next=<menu node>); routing-turn content is empty
     ├── xy_menu_price      bargain menu ("xianyu_reply"): XIANYU_PRICE_NLG_PROMPT
     │                      + bargain-settings block + dynamic temperature
     ├── xy_menu_price_refuse  bargain refusal menu ("xianyu_rule_reply"):
@@ -41,7 +41,8 @@ from the ROUTE era, now carried by node executors):
         conditional edge
     TimeAugQueryRewriter (was the pattern-skeleton query slot "time_aug_query")
       → runs inside the routing executor at turn start (zero LLM): relative
-        times in buyer messages ("明天下午" etc.) are resolved into
+        times in buyer messages ("明天下午" [tomorrow afternoon] etc.) are
+        resolved into
         absolute-time annotations before entering the classification/NLG
         prompts; result lands in cxt.rewritten_queries
     ClassifyAgent classifies as no_reply (prompt flooding / unrelated to the
@@ -517,8 +518,9 @@ xy_route_root = BaseNode(
     name="闲鱼路由根节点",
     description="闲鱼卖家客服总入口，覆盖议价、技术问答与通用咨询三大场景",
     task_description="识别买家消息意图（本地规则 + LLM 兜底），分发到议价/技术/通用菜单节点",
-    # AGENT 静态邻接：根节点 → 四个菜单分支；实际走的条件边 = 路由执行器
-    # 的 TurnResult.next（必须在 sub_nodes 内，引擎校验）
+    # AGENT static adjacency: root → four menu branches; the actual
+    # conditional edge = the routing executor's TurnResult.next (must be
+    # within sub_nodes, engine-validated)
     sub_nodes=["xy_menu_price", "xy_menu_price_refuse", "xy_menu_tech",
                "xy_menu_default"],
     plugins={"loop": "xianyu_router"},
@@ -581,8 +583,9 @@ xy_menu_default = BaseNode(
 
 # ============================================================================
 # Pattern registration — module-level registry.register, auto-discovered by AST
-# scan. AGENT 图：每条买家消息从 entry 全图重跑（原 ROUTE 的"轮末回根"语义
-# 天然成立）；stages 不再声明（AGENT 节点行为走 plugins）。
+# scan. AGENT graph: every buyer message re-runs the whole graph from entry
+# (the old ROUTE "reset to root at turn end" semantics holds naturally);
+# stages are no longer declared (AGENT node behavior goes through plugins).
 # ============================================================================
 
 xianyu_agent_pattern = Pattern(

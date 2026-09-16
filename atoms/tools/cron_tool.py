@@ -1,35 +1,40 @@
-"""create_cron / list_crons / update_cron / delete_cron（toolset: cron）.
+"""create_cron / list_crons / update_cron / delete_cron (toolset: cron).
 
-定时调度四件套：把"到点跑一个自包含 agent 任务"注册成持久化作业
-（CronCreate/List/Update/Delete 等价物）。fire = 授权快照工具池上的
-delegate 式子代理执行（内核在 atoms/tools/_cron_core.py，与
-delegate_task 同一原语），适合每日简报、定期巡检、周期性数据整理等
-"无需人守着"的周期工作。
+The four cron-scheduling tools: register "run a self-contained agent task
+on schedule" as persistent jobs (the CronCreate/List/Update/Delete
+equivalents). fire = a delegate-style sub-agent execution over the
+authorization-snapshot tool pool (kernel in atoms/tools/_cron_core.py, the
+same primitive as delegate_task), suited to unattended recurring work such
+as daily briefings, periodic inspections, and recurring data housekeeping.
 
-授权（deny-by-default 三层收口：注册 toolset → pattern.allow_toolset →
-node.use_tools）::
+Authorization (deny-by-default three-layer gate: registered toolset →
+pattern.allow_toolset → node.use_tools)::
 
     pattern:
       allow_toolset: [cron, filesystem, knowledge]
     node:
       use_tools: [create_cron, list_crons, update_cron, delete_cron]
 
-作业权限 = 创建时刻 pattern 授权的冻结快照（剔除 subagent/workflow/
-cron 编排工具集，结构性防递归与自复制，args.tools 只能收窄；创建
-pattern 的 code 一并冻结——fire 期护栏与 LLM 配置按它解析 app 覆盖）。
-fire 在 host 进程内由 tick 循环驱动（默认 20s 一拍），同 job 不重入；
-停机期间错过的触发不补跑（重启后从下一个匹配点继续）。
+Job permissions = the frozen snapshot of the pattern's grants at creation
+(minus the subagent/workflow/cron orchestration toolsets — structural
+anti-recursion and anti-self-copying; args.tools may only narrow; the
+creating pattern's code is frozen too — fire-time guardrails and LLM
+config resolve app overlays through it). fire is driven by the tick loop
+inside the host process (20s cadence by default), with no re-entry per
+job; fires missed while down are not replayed (after restart, resume from
+the next matching point).
 
-调度表达：``schedule`` 传标准 5 字段 cron（分 时 日 月 周，宿主本地
-时间，支持 ``*``/``*/n``/``a``/``a-b``/``a-b/n`` 及逗号），或
-``interval_minutes`` 固定间隔（1-43200，即最长 30 天）——二选一。
+Schedule expression: ``schedule`` takes the standard 5-field cron (minute
+hour day month dow, host local time, supporting ``*``/``*/n``/``a``/
+``a-b``/``a-b/n`` and commas), or ``interval_minutes`` for a fixed
+interval (1-43200, i.e. up to 30 days) — mutually exclusive.
 
-护栏（config ``cron_tool`` 节）：max_jobs（默认 20）、fire_timeout_
-seconds 单次触发超时（默认 300s，args 只能调小）、max_rounds 子循环
-轮次（默认 8）、history_cap 每作业保留的历史条数（默认 10）、
-max_input_chars（默认 8000）、max_result_chars 单次结果截断（默认
-4000）、jobs_path 持久化文件（默认 data/cron_jobs.json）、tick_seconds
-调度拍长（默认 20）。
+Guardrails (config ``cron_tool`` section): max_jobs (default 20),
+fire_timeout_seconds per-fire timeout (default 300s, args may only lower
+it), max_rounds sub-loop rounds (default 8), history_cap per-job history
+entries (default 10), max_input_chars (default 8000), max_result_chars
+per-result truncation (default 4000), jobs_path persistence file (default
+data/cron_jobs.json), tick_seconds scheduler cadence (default 20).
 """
 
 import datetime
@@ -50,7 +55,7 @@ from nexus.settings import get_cron_tool_config
 
 logger = logging.getLogger(__name__)
 
-_MAX_INTERVAL_MINUTES = 43200   # 30 天
+_MAX_INTERVAL_MINUTES = 43200   # 30 days
 _MAX_NAME_CHARS = 100
 
 _SCHEDULE_DESC = (
@@ -63,7 +68,7 @@ _SCHEDULE_DESC = (
 
 def _resolve_schedule(args: Dict[str, Any]
                       ) -> tuple:  # (err, schedule, schedule_desc)
-    """调度参数解析：schedule（cron 串）与 interval_minutes 二选一。"""
+    """Schedule arg parsing: schedule (a cron string) and interval_minutes are mutually exclusive, one required."""
     cron = args.get("schedule")
     interval = args.get("interval_minutes")
     has_cron = cron is not None and str(cron).strip() != ""
@@ -75,7 +80,7 @@ def _resolve_schedule(args: Dict[str, Any]
                 " 至少其一", None, None)
     if has_cron:
         try:
-            parse_cron(str(cron).strip())   # 提前校验，坏表达式即刻报错
+            parse_cron(str(cron).strip())   # validate early; a bad expression errors immediately
         except ValueError as e:
             return (str(e), None, None)
         return None, {"cron": str(cron).strip()}, f"cron={cron!r}"
@@ -91,7 +96,7 @@ def _resolve_schedule(args: Dict[str, Any]
 
 def _resolve_tools(args: Dict[str, Any], pool: List[str]
                    ) -> tuple:  # (err, tools)
-    """args.tools 可选收窄：必须 ⊆ 快照池。"""
+    """args.tools optional narrowing: must be ⊆ the snapshot pool."""
     if args.get("tools") is None:
         return None, list(pool)
     requested = {str(t) for t in args["tools"]}
@@ -157,7 +162,8 @@ CREATE_CRON_SCHEMA = {
 
 
 def _handle_create_cron(args: Dict[str, Any]) -> str:
-    # 创建侧护栏按执行 pattern 的 app 覆盖解析（ambient；脱离调用 = 全局）
+    # Creation-side guardrails resolve through the executing pattern's app
+    # overlay (ambient; a detached call = global)
     ambient = current_tool_context()
     pattern_code = ambient.pattern_code if ambient is not None else ""
     guard = get_cron_tool_config(pattern_code)
@@ -180,9 +186,11 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
     if err:
         return tool_error(err)
 
-    # 授权快照：创建时刻 pattern 授权 − 编排工具集；args.tools 只能收窄。
-    # pattern_code 一并冻结（对齐"作业权限=创建时刻冻结快照"原则）——
-    # 触发期 fire 用它解析护栏与 LLM 配置的 app 覆盖
+    # Authorization snapshot: pattern grants at creation time − orchestration
+    # toolsets; args.tools may only narrow. pattern_code is frozen too
+    # (aligned with the "job permissions = frozen snapshot at creation"
+    # principle) — fire uses it to resolve the app overlays of guardrails
+    # and LLM config
     pool = snapshot_tool_pool(
         ambient.allow_toolsets if ambient is not None else [])
     err, tools = _resolve_tools(args, pool)
@@ -192,8 +200,9 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
     sched = get_scheduler()
     next_fire_at = compute_next_fire({"schedule": schedule})
     if next_fire_at is None:
-        # 死日期（如 2 月 30 日）：静默接受 = 永不触发的哑作业，且每次
-        # 排程都要白扫一整年（52 万分钟步）——创建即拒绝
+        # Dead dates (e.g. Feb 30): silently accepting = a zombie job that
+        # never fires, and every reschedule wastes a full year scan
+        # (520k minute steps) — reject at creation
         return tool_error(
             "调度表达式永不命中（如 2 月 30 日 / 非闰年 2 月 29 日），"
             "请修正 schedule")
@@ -206,8 +215,8 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
         "input": task_input,
         "system_prompt": str(args.get("system_prompt") or "").strip(),
         "tools": tools,
-        "_pool": pool,          # 授权快照池（内部字段，update 校验用）
-        "pattern_code": pattern_code,   # 创建时刻冻结（fire 期护栏/LLM 定位键）
+        "_pool": pool,          # authorization snapshot pool (internal field, used by update validation)
+        "pattern_code": pattern_code,   # frozen at creation (fire-time guardrail/LLM locator key)
         "timeout_seconds": timeout,
         "created_at": datetime.datetime.now().isoformat(
             timespec="seconds"),
@@ -217,7 +226,8 @@ def _handle_create_cron(args: Dict[str, Any]) -> str:
         "history": [],
     }
     try:
-        # max_jobs 在 add() 锁内检查（锁外先查后加在并发 create 下会超限）
+        # max_jobs is checked inside add()'s lock (check-then-add outside the
+        # lock overflows under concurrent creates)
         sched.add(job)
     except ValueError as e:
         return tool_error(str(e))
@@ -252,7 +262,7 @@ LIST_CRONS_SCHEMA = {
 
 
 def _job_public(job: Dict[str, Any]) -> Dict[str, Any]:
-    """对外视图：剔除内部 _pool，history 只带尾部 3 条。"""
+    """External view: internal _pool removed, history carries only the last 3 entries."""
     view = {k: v for k, v in job.items() if not k.startswith("_")}
     view["history"] = (job.get("history") or [])[-3:]
     return view
@@ -260,7 +270,7 @@ def _job_public(job: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_list_crons(args: Dict[str, Any]) -> str:
     sched = get_scheduler()
-    # 锁内快照后锁外排序渲染——不迭代活容器（add/remove/_fire 并发变更）
+    # Snapshot under the lock, sort/render outside it — never iterate a live container (add/remove/_fire mutate concurrently)
     jobs = [_job_public(job)
             for job in sorted(sched.list_jobs(),
                               key=lambda j: j.get("created_at", ""))]
@@ -300,8 +310,9 @@ UPDATE_CRON_SCHEMA = {
 def _handle_update_cron(args: Dict[str, Any]) -> str:
     sched = get_scheduler()
     job_id = str(args.get("job_id") or "")
-    # 校验阶段基于 get_job 快照读取（_pool 等只读字段）；变更阶段整体
-    # 收进 scheduler.update 的锁内 mutate——活字典不再锁外直改
+    # Validation reads the get_job snapshot (read-only fields like _pool);
+    # the mutation phase is entirely inside scheduler.update's lock-held
+    # mutate — the live dict is never directly modified outside the lock
     job = sched.get_job(job_id)
     if job is None:
         return tool_error("job_id 不存在，请用 list_crons 查询有效作业")
@@ -338,8 +349,9 @@ def _handle_update_cron(args: Dict[str, Any]) -> str:
         err, timeout = _resolve_timeout(args, guard)
         if err:
             return tool_error(err)
-        # "只能调小"的基准是系统上限（_resolve_timeout 已收口），作业可
-        # 在上限内自由改（含从更小值调回）
+        # The "may only lower" baseline is the system cap (already enforced
+        # by _resolve_timeout); the job may change freely within the cap
+        # (including raising back from a smaller value)
         updates["timeout_seconds"] = timeout
 
     reschedule = (args.get("schedule") is not None
@@ -356,19 +368,27 @@ def _handle_update_cron(args: Dict[str, Any]) -> str:
 
     def _mutate(live: Dict[str, Any]) -> None:
         if reschedule or updates.get("enabled") is True:
-            # 先在「合并视图」上排程、写穿前拒绝死日期——mutate 抛错时
-            # 作业保持原状（scheduler.update 的契约）
+            # Schedule on the "merged view" first and reject dead dates
+            # before write-through — if mutate raises, the job stays as it
+            # was (scheduler.update's contract)
             nxt = compute_next_fire({**live, **updates})
-            if nxt is None and reschedule:
+            if nxt is None:
+                if reschedule:
+                    raise ValueError(
+                        "调度表达式永不命中（如 2 月 30 日 / 非闰年 2 月 29 日），"
+                        "请修正 schedule")
+                # Re-enabling a legacy dead-date job is rejected too: otherwise the
+                # write produces an enabled job with next_fire_at=None that
+                # never fires
                 raise ValueError(
-                    "调度表达式永不命中（如 2 月 30 日 / 非闰年 2 月 29 日），"
-                    "请修正 schedule")
+                    "该作业的调度表达式永不命中（遗留死日期），无法启用；"
+                    "请先用 update_cron 修正 schedule 再启用")
             live.update(updates)
             live["next_fire_at"] = nxt
         else:
             live.update(updates)
             if updates.get("enabled") is False:
-                live["next_fire_at"] = None   # 暂停：不排下次；恢复时重排
+                live["next_fire_at"] = None   # paused: no next scheduling; rescheduled on resume
 
     try:
         updated = sched.update(job_id, _mutate)
@@ -416,7 +436,7 @@ def _handle_delete_cron(args: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------------------
 # Self-registration (registered on module import; AST scan auto-discovery —
-# 顶层 registry.register() 调用表达式，见 file_tool.py 的同类说明)
+# a top-level registry.register() call expression; see file_tool.py's note)
 # ---------------------------------------------------------------------------
 
 registry.register(

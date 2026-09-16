@@ -1,18 +1,26 @@
-"""archify_skill pattern — skill 说明书式运行的最小声明式配方。
+"""archify_skill pattern — a minimal declarative recipe for manual-style
+skill operation.
 
-一个 AGENT 单节点图（pattern code "archify_skill"），**零定制执行器**：
-节点挂 default_loop，靠两层声明把 archify 技能接进来——
+A single-node AGENT graph (pattern code "archify_skill"), **zero custom
+executors**: the node runs on default_loop, and two declaration layers
+wire the archify skill in —
 
-- 技能授权（deny-by-default 双层，nexus/skills.py 解析）：
-  ``allow_skills=["archify"]`` × ``use_skills=["archify"]``。生效集非空时
-  default_loop 自动获得 load_skill / read_skill_file 两个只读知识工具，
-  并在 system prompt 注入技能元数据（描述即触发器）；
-- 技能的执行面（跑 archify CLI、读写候选与产物）仍走工具三层收口：
-  ``allow_toolset=["shell", "filesystem"]`` × ``use_tools=[bash, 文件五件套]``。
+- Skill grants (deny-by-default two layers, resolved by nexus/skills.py):
+  ``allow_skills=["archify"]`` × ``use_skills=["archify"]``. When the
+  effective set is non-empty, default_loop automatically gains the two
+  read-only knowledge tools load_skill / read_skill_file, and skill
+  metadata is injected into the system prompt (the description is the
+  trigger);
+- The skill's execution surface (running the archify CLI, reading/writing
+  candidates and artifacts) still goes through the three-layer tool
+  narrowing: ``allow_toolset=["shell", "filesystem"]`` × ``use_tools``
+  (bash + the five file tools).
 
-与 apps/archify_agent（pattern "archify"，九节点 workflow 版）互相独立：
-那边把 SKILL.md 的验收纪律**编译**成图闸门与确定性回执站，这边把纪律
-留给手册本体，节点只负责装载与执行——同一条 skill 的两种消费档位。
+Independent of apps/archify_agent (pattern "archify", the nine-node
+workflow version): that one **compiles** SKILL.md's acceptance discipline
+into graph gates and deterministic receipt stations, while this one leaves
+the discipline to the manual itself and the node only loads and executes —
+two consumption tiers of the same skill.
 """
 
 from apps.archify_skill_agent.prompts import AS_BASE_PROMPT
@@ -51,8 +59,9 @@ archify_skill_pattern = Pattern(
     nodes=[as_work],
     allow_toolset=["shell", "filesystem"],
     allow_skills=["archify"],
-    # 技能已随仓库分发（skills/archify/），走 settings skills.dir 默认根；
-    # 部署想改用其它技能目录时在此覆盖（如 ~/.claude/skills）
+    # The skill ships with the repo (skills/archify/) and uses the settings
+    # skills.dir default root; a deployment wanting a different skill
+    # directory overrides it here (e.g. ~/.claude/skills)
 )
 
 registry.register(archify_skill_pattern)

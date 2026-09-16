@@ -1,7 +1,8 @@
-"""read_tasks / write_tasks（tasks tool）单测：写入读取往返、稳定 id、
-校验规则（非法 status / 两条 in_progress / 超长 / 条数上限 / 空数组）、
-会话隔离（contextvar 的 session_id；脱离 loop 落 _global 桶）、子代理
-继承父会话作用域，以及 registry 层面的注册归属（toolset: tasks）。
+"""read_tasks / write_tasks (tasks tool) unit tests: write-read round trips, stable ids,
+validation rules (illegal status / two in_progress / over-length / entry
+cap / empty array), session isolation (the contextvar's session_id; outside
+the loop lands in the _global bucket), sub-agents inheriting the parent
+session scope, and registry-level registration ownership (toolset: tasks).
 """
 
 import json
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from atoms.tools import task_list_tool  # noqa: F401 -- module import 即注册
+from atoms.tools import task_list_tool  # noqa: F401 -- the module import registers
 from atoms.tools.task_list_tool import _STORE
 from nexus.engine.tool_context import (
     ToolCallContext,
@@ -24,11 +25,11 @@ _GUARD = {"max_tasks": 50, "max_task_chars": 500}
 
 @pytest.fixture(autouse=True)
 def _fresh_store():
-    """每个测试独立的任务清单仓（模块级全局态，必须显式清理）。
+    """A per-test task-list store (module-level global state; must be cleaned explicitly).
 
-    注意不能用 ``with _STORE_LOCK`` 包住 yield——那会把锁占满整个测试，
-    handler 侧的 ``with _STORE_LOCK`` 直接死锁（测试串行执行，裸 clear
-    已足够安全）。
+    Never wrap the yield in ``with _STORE_LOCK`` — that would hold the lock
+    across the whole test and the handler-side ``with _STORE_LOCK`` would
+    deadlock outright (tests run serially, so a bare clear is safe enough).
     """
     _STORE.clear()
     yield
@@ -36,7 +37,7 @@ def _fresh_store():
 
 
 def _dispatch(name, args, session_id=None):
-    """经 registry.dispatch 执行；session_id 非空时发布 contextvar。"""
+    """Execute via registry.dispatch; publishes the contextvar when session_id is non-empty."""
     guard = patch("atoms.tools.task_list_tool.get_tasks_tool_config",
                   return_value=dict(_GUARD))
     if session_id is None:
@@ -70,7 +71,7 @@ def test_write_then_read_roundtrip():
     ]})
     assert r["count"] == 3
     assert [t["id"] for t in r["tasks"]] == [1, 2, 3]
-    # 未提供的字段按默认补全
+    # Missing fields are backfilled with defaults
     assert r["tasks"][0]["priority"] == "medium"
     assert r["tasks"][1]["priority"] == "high"
     assert r["tasks"][2]["status"] == "pending"
@@ -83,7 +84,7 @@ def test_write_then_read_roundtrip():
 def test_write_stable_ids_on_prefix_rewrite():
     _dispatch("write_tasks", {"tasks": [{"content": "任务A"},
                                         {"content": "任务B"}]})
-    # 全量重写：前缀条目保持原 id，追加的拿新 id
+    # Whole rewrite: prefix entries keep their ids, appended entries get new ids
     r = _dispatch("write_tasks", {"tasks": [
         {"content": "任务A", "status": "completed"},
         {"content": "任务B", "status": "completed"},
@@ -113,7 +114,7 @@ def test_write_validation_errors():
 
 
 def test_write_guard_caps():
-    # 条数上限 / 单条长度上限（收窄 guard 后经同一 dispatch 路径验证）
+    # Entry cap / per-entry length cap (verified through the same dispatch path with a narrowed guard)
     with patch("atoms.tools.task_list_tool.get_tasks_tool_config",
                return_value={"max_tasks": 2, "max_task_chars": 10}):
         r = json.loads(arun(tool_registry.dispatch(
@@ -135,13 +136,13 @@ def test_session_scoping():
     assert a["count"] == 1 and "会话1" in a["tasks"][0]["content"]
     assert b["count"] == 1 and "会话2" in b["tasks"][0]["content"]
     assert a["session"] == "sess-A"
-    # 脱离 agent loop（无 contextvar）→ 全局桶
+    # Outside the agent loop (no contextvar) → the global bucket
     g = _dispatch("read_tasks", {})
     assert g["session"] == "_global" and g["count"] == 0
 
 
 def test_subagent_inherits_session_scope():
-    """subagent_scope 的 replace() 保留 session_id —— 子代理共享父会话清单。"""
+    """subagent_scope's replace() keeps session_id — sub-agents share the parent session's list."""
     _dispatch("write_tasks", {"tasks": [{"content": "主会话任务"}]},
               session_id="sess-S")
     base = ToolCallContext(llm_config={}, allow_toolsets=frozenset(["tasks"]),
@@ -154,8 +155,9 @@ def test_subagent_inherits_session_scope():
 
 
 def test_store_scopes_lru_capped(monkeypatch):
-    """作用域仓 LRU 封顶：超过 _STORE_CAP 的最旧作用域先被清，活跃
-    作用域不受影响（长跑主机不再只增不减）。"""
+    """The scope store's LRU cap: scopes beyond _STORE_CAP evict oldest-first; active
+    scopes are untouched (a long-running host no longer grows without
+    bound)."""
     import atoms.tools.task_list_tool as tlt
 
     monkeypatch.setattr(tlt, "_STORE_CAP", 2)
@@ -170,7 +172,7 @@ def test_store_scopes_lru_capped(monkeypatch):
         _dispatch("write_tasks", {"tasks": [
             {"content": "t-s3", "status": "pending"}]})
 
-    assert set(tlt._STORE) == {"s2", "s3"}   # s1 最旧被淘汰
+    assert set(tlt._STORE) == {"s2", "s3"}   # s1, the oldest, was evicted
     with tool_call_context({"code": "x"}, set(), session_id="s2"):
         r = _dispatch("read_tasks", {})
-    assert r["count"] == 1                   # 活跃作用域完好
+    assert r["count"] == 1                   # the active scope is intact

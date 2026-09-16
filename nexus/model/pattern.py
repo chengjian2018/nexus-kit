@@ -64,14 +64,15 @@ class Pattern:
         self.description = description
 
         # ------------------------------------------------------------------
-        # config 单一真源：显式参数是语法糖（同键冲突时显式参数胜出），
-        # 其余 **kwargs 自由字段（prompt 资产等）一并进 config
+        # config as the single source of truth: explicit params are sugar
+        # (explicit wins on the same key); other **kwargs free fields
+        # (prompt assets etc.) go into config as well
         # ------------------------------------------------------------------
         cfg: Dict[str, Any] = dict(config or {})
         cfg.update(kwargs)
 
         # ------------------------------------------------------------------
-        # pattern_type（编译期校验的分流键）
+        # pattern_type (the compile-time-validated dispatch key)
         # ------------------------------------------------------------------
         ptype = pattern_type if pattern_type is not None else cfg.get("pattern_type")
         if ptype is None:
@@ -85,9 +86,10 @@ class Pattern:
         cfg["pattern_type"] = ptype
 
         # ------------------------------------------------------------------
-        # nodes：对象列表（Python 声明主路径）/ dict 列表（YAML 形态，就地
-        # 构造）；空 = 自动造一个 code=pattern.code 的默认节点（单节点
-        # AGENT 图的极简形态）
+        # nodes: a list of objects (the Python declaration main path) or
+        # dicts (the YAML shape, constructed in place); empty = auto-create
+        # one default node code=pattern.code (the minimal single-node AGENT
+        # graph)
         # ------------------------------------------------------------------
         node_list: List[BaseNode] = []
         for item in (nodes if nodes is not None else []):
@@ -115,7 +117,8 @@ class Pattern:
         self.nodes: List[BaseNode] = node_list
 
         # ------------------------------------------------------------------
-        # 编译期图校验（fail fast，沿仓库构造期校验传统）
+        # Compile-time graph validation (fail fast, per the repo's
+        # construction-time validation tradition)
         # ------------------------------------------------------------------
         for node in self.nodes:
             for target in node.sub_nodes:
@@ -139,7 +142,7 @@ class Pattern:
                 )
 
         # ------------------------------------------------------------------
-        # stages 骨架（FSM 专属；agent 恒为空）
+        # stages skeleton (FSM only; agent is always empty)
         # ------------------------------------------------------------------
         if ptype == "fsm":
             declared_stages = stages if stages is not None else cfg.get("stages")
@@ -149,8 +152,8 @@ class Pattern:
         cfg["stages"] = self.stages
 
         # ------------------------------------------------------------------
-        # plugins（槽位表 loop/fsm/messages_builder/agent_hooks，值收窄为
-        # str/None；agent_hooks 顶级参数是语法糖）
+        # plugins (slot table loop/fsm/messages_builder/agent_hooks, values
+        # narrowed to str/None; the top-level agent_hooks param is sugar)
         # ------------------------------------------------------------------
         declared_plugins = plugins if plugins is not None else cfg.get("plugins")
         self.plugins = normalize_plugins(
@@ -160,7 +163,8 @@ class Pattern:
         cfg["plugins"] = self.plugins
 
         # ------------------------------------------------------------------
-        # allow_toolset（工具集级授权：空 = 无任何工具集，见 §4 三层收口）
+        # allow_toolset (toolset-level authorization: empty = no toolsets at
+        # all; see the three-layer tool authorization)
         # ------------------------------------------------------------------
         declared_toolsets = (allow_toolset if allow_toolset is not None
                              else cfg.get("allow_toolset"))
@@ -168,8 +172,9 @@ class Pattern:
         cfg["allow_toolset"] = self.allow_toolset
 
         # ------------------------------------------------------------------
-        # allow_skills（技能资产级授权：空 = 无任何技能，node.use_skills
-        # 在其上收口；扫描与解析见 nexus/skills.py——数据资产，无注册表）
+        # allow_skills (skill-asset-level authorization: empty = no skills
+        # at all; node.use_skills narrows on top of it; scanning and
+        # resolution live in nexus/skills.py — a data asset, no registry)
         # ------------------------------------------------------------------
         declared_skills = (allow_skills if allow_skills is not None
                            else cfg.get("allow_skills"))
@@ -177,7 +182,7 @@ class Pattern:
         cfg["allow_skills"] = self.allow_skills
 
         # ------------------------------------------------------------------
-        # entry_node_code：空 = nodes[0].code
+        # entry_node_code: empty = nodes[0].code
         # ------------------------------------------------------------------
         entry = entry_node_code if entry_node_code is not None else cfg.get("entry_node_code")
         if entry is None:
@@ -190,13 +195,15 @@ class Pattern:
         self.entry_node_code = entry
         cfg["entry_node_code"] = entry
 
-        # max_steps 钉进 config（缺省 DEFAULT_MAX_STEPS；AGENT 图步数预算）
+        # max_steps pinned into config (default DEFAULT_MAX_STEPS; AGENT
+        # graph step budget)
         if not isinstance(cfg.get("max_steps"), int):
             cfg["max_steps"] = DEFAULT_MAX_STEPS
 
-        # max_fanout 钉进 config（缺省 DEFAULT_MAX_FANOUT；运行时扇出宽度
-        # 预算——同构实例数上限，max_steps/max_fanout/executor
-        # 内部轮次三层守卫中的宽度维度）
+        # max_fanout pinned into config (default DEFAULT_MAX_FANOUT;
+        # runtime fan-out width budget — the instance-count cap of one
+        # sends, the width dimension of the max_steps / max_fanout /
+        # executor-internal-rounds three-layer guards)
         if not isinstance(cfg.get("max_fanout"), int) or cfg["max_fanout"] < 1:
             cfg["max_fanout"] = DEFAULT_MAX_FANOUT
 
@@ -208,12 +215,12 @@ class Pattern:
 
     @property
     def max_steps(self) -> int:
-        """AGENT 图步数预算（FSM 不消费此值——每轮恰好一个节点）。"""
+        """AGENT graph step budget (FSM never consumes it — exactly one node per turn)."""
         return int(self.config.get("max_steps", DEFAULT_MAX_STEPS))
 
     @property
     def max_fanout(self) -> int:
-        """运行时扇出宽度上限（一次 sends 的同构实例数）。"""
+        """Runtime fan-out width cap (homogeneous instance count of one sends)."""
         return int(self.config.get("max_fanout", DEFAULT_MAX_FANOUT))
 
     @property

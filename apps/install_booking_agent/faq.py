@@ -1,8 +1,10 @@
 """Install-booking outbound-call FAQ — keyword table for the custom clarify
-stage (业务检测只使用关键词卡控, no vector recall / score gating).
+stage (business detection uses keyword gating only, no vector recall /
+score gating).
 
 The customer on an outbound install-booking call asks off-flow questions
-mid-negotiation ("安装要钱吗", "保修多久", "我自己装行不行"...). The clarify
+mid-negotiation ("does installation cost money", "how long is the
+warranty", "can I install it myself"...). The clarify
 stage answers from this table and pulls the call back to the booking main
 line. Detection is pure keyword containment on the assembled search text
 (user query + topic + keywords from the unify stage's clarify signal);

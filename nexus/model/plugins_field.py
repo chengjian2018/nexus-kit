@@ -12,28 +12,33 @@ Slot table (slot name → resolution target):
 =================  ===================  =================================
 slot               target               meaning
 =================  ===================  =================================
-loop               executor            AGENT 节点执行器（ReAct 工具循环 /
-                                        自定义 / 规则 executor）
-fsm                executor            FSM 执行器（pattern_type="fsm"）
-messages_builder   messages_builder    AGENT 消息构建器
-agent_hooks        agent_hooks          agent 循环 hooks 包
+loop               executor            AGENT node executor (ReAct tool
+                                        loop / custom / rule executor)
+fsm                executor            FSM executor (pattern_type="fsm")
+messages_builder   messages_builder    AGENT messages builder
+agent_hooks        agent_hooks         agent loop hooks package
 =================  ===================  =================================
 
 Resolution chains (node over pattern, the two-layer successor of the old
 module > pattern):
 
-- executor（AGENT 节点）: ``node.plugins["loop"]`` >
+- executor (AGENT node): ``node.plugins["loop"]`` >
   ``pattern.plugins["loop"]`` > default_loop
-- executor（FSM pattern）: ``pattern.plugins["fsm"]`` > default_fsm
+- executor (FSM pattern): ``pattern.plugins["fsm"]`` > default_fsm
 - messages_builder / agent_hooks: ``node.plugins[key]`` >
   ``pattern.plugins[key]`` > kernel default / empty passthrough
 
 LLM selection is NOT a plugins slot: it lives in settings
-（llm_default ⊕ app config ⊕ metadata override，见 nexus.settings.
-get_llm_config——per-app config 接管了旧的 plugins["llm"] 声明位）。
+(llm_default ⊕ app config ⊕ metadata override, see nexus.settings.
+get_llm_config — the per-app config took over the old plugins["llm"]
+declaration slot).
 """
 
 from typing import Any, Dict, Optional
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # slot name → plugin-registry kind (a new extension point is one line here).
 PLUGIN_KINDS: Dict[str, str] = {
@@ -41,6 +46,16 @@ PLUGIN_KINDS: Dict[str, str] = {
     "fsm": "executor",
     "messages_builder": "messages_builder",
     "agent_hooks": "agent_hooks",
+}
+
+# Legacy slots: removals after the app-config takeover. Unlike truly
+# unknown slots, these appear in pattern YAMLs persisted before the upgrade
+# — raising at construction would turn existing loadable files into broken
+# ones. They get warn+dropped (one version cycle of migration grace); truly
+# unknown slots stay fail-fast.
+_RETIRED_PLUGIN_SLOTS: Dict[str, str] = {
+    "llm": "模型选择已迁移到 apps/<name>/config.yaml 的 llm/nodes 段"
+           "（nexus.settings.get_llm_config）",
 }
 
 # executor-family slots (mirror the pattern_type dispatch: loop drives AGENT
@@ -76,6 +91,13 @@ def normalize_plugins(plugins: Optional[Dict[str, Any]],
         if value is None:
             continue
         merged.setdefault(slot, value)
+
+    retired = [slot for slot in merged if slot in _RETIRED_PLUGIN_SLOTS]
+    for slot in retired:
+        logger.warning(
+            "plugins 槽位 '%s' 已废弃（%s），已从声明中剔除", slot,
+            _RETIRED_PLUGIN_SLOTS[slot])
+        del merged[slot]
 
     for slot, value in merged.items():
         if slot not in PLUGIN_KINDS:

@@ -1,6 +1,6 @@
 """Prompt constants of topic_research_agent.
 
-Six-station division of labor (preplan → plan/分主题 → search worker →
+Six-station division of labor (preplan → plan/per-topic → search worker →
 merge → report → polish):
 - ``TOPIC_BASE_PROMPT``: node.base_prompt (into the system base) — role
   and citation discipline, shared by all stations

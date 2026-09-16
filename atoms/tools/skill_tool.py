@@ -1,35 +1,47 @@
-"""load_skill / read_skill_file（技能知识面，随技能启用自动授予）.
+"""load_skill / read_skill_file (the skill knowledge surface, auto-granted
+with skill enablement).
 
-技能（skill）是数据资产：扫描根下的一个目录 + SKILL.md 手册 + 可选参考
-文件（扫描与声明解析见 nexus/skills.py）。本模块只提供两个**只读知识面
-工具**，让节点把已启用技能的手册按需装进上下文：
+A skill is a data asset: one directory under the scan root + a SKILL.md
+manual + optional reference files (scanning and declaration resolution in
+nexus/skills.py). This module provides only two **read-only knowledge
+tools**, letting a node pull an enabled skill's manual into context on
+demand:
 
-- ``load_skill(name)``：返回 SKILL.md 全文（头部附技能目录路径，手册里
-  的相对路径据此解析）；
-- ``read_skill_file(name, rel_path)``：读技能目录内的参考文件（resolve
-  后必须落在该技能目录内，防路径穿越）。
+- ``load_skill(name)``: returns the SKILL.md full text (the header carries
+  the skill directory path — relative paths referenced by the manual
+  resolve against it);
+- ``read_skill_file(name, rel_path)``: reads a reference file inside the
+  skill directory (after resolve it must land inside that skill directory —
+  path-traversal guard).
 
-授权（不走 toolset 三层收口，而是技能自己的双层 deny-by-default）::
+Authorization (NOT the toolset three-layer gate but the skill's own
+two-layer deny-by-default)::
 
     pattern:
-      allow_skills: [archify]        # 技能池（空 = 无）
+      allow_skills: [archify]        # the skill pool (empty = none)
     node:
-      use_skills: [archify]          # 本节点启用（空 = 无）
+      use_skills: [archify]          # enabled on this node (empty = none)
 
-生效集 = use_skills ∩ allow_skills。default_loop 执行器在该集非空时把本
-模块的两个 schema 自动追加进本轮工具列表（``SKILL_TOOL_SCHEMAS``），并经
-``tool_call_context`` 发布 skills_dir / enabled_skills——handler 侧据此
-拦截越权名（错误回填供模型自纠，同幻觉工具名语义）。因此声明方不需要
-（也不应该）把 load_skill 写进 use_tools。
+Effective set = use_skills ∩ allow_skills. When the set is non-empty the
+default_loop executor appends this module's two schemas to the round's tool
+list automatically (``SKILL_TOOL_SCHEMAS``) and publishes skills_dir /
+enabled_skills via ``tool_call_context`` — the handler side rejects
+out-of-pool names on that basis (error backfill for model self-correction,
+same semantics as hallucinated tool names). Declarers therefore need not
+(and should not) write load_skill into use_tools.
 
-红线：**技能给知识不给权限**——手册指引下跑脚本/读写工作区文件仍走
-bash / read_text 等执行面工具的既有授权；技能内容来自 operator 配置的
-扫描根（与 base_prompt 同级信任，可进 system role），运行期绝不接受
-路径入参（两个工具都只收技能名）。
+Red line: **skills grant knowledge, not permissions** — running scripts /
+reading-writing workspace files under manual guidance still goes through
+the existing authorization of execution-surface tools (bash / read_text
+etc.); skill content comes from the operator-configured scan root (trusted
+at the same level as base_prompt, may enter the system role), and at
+runtime the tools never accept path arguments (both take a skill name
+only).
 
-脱离 agent loop 直接 dispatch（ambient 上下文为 None）时回退全局配置的
-扫描根、允许任意已扫描技能——只读知识面，与 subagent_tool 的 detached
-回退同姿态。
+Direct dispatch outside the agent loop (ambient context None) falls back to
+the globally configured scan root and allows any scanned skill — a
+read-only knowledge surface, the same stance as subagent_tool's detached
+fallback.
 """
 
 import logging
@@ -42,9 +54,10 @@ from nexus.skills import resolve_skills_dir, scan_skills
 
 logger = logging.getLogger(__name__)
 
-# SKILL.md 全文回填上限（手册是纪律本体，截断会让流程不可读，给足余量）
+# SKILL.md full-text backfill cap (the manual IS the discipline — truncation
+# would make the process unreadable, so give it ample headroom)
 _MAX_SKILL_DOC_CHARS = 80000
-# 技能目录内参考文件的单次回填上限
+# Per-read backfill cap for reference files inside the skill directory
 _MAX_SKILL_FILE_CHARS = 20000
 
 
@@ -80,8 +93,8 @@ READ_SKILL_FILE_SCHEMA = {
     },
 }
 
-# default_loop 在生效技能集非空时追加进工具列表的形态（与
-# registry.get_definitions 的包裹形状一致）
+# The shape default_loop appends to the tool list when the effective skill
+# set is non-empty (same wrapper shape as registry.get_definitions)
 SKILL_TOOL_SCHEMAS = [
     {"type": "function", "function": LOAD_SKILL_SCHEMA},
     {"type": "function", "function": READ_SKILL_FILE_SCHEMA},
@@ -89,10 +102,11 @@ SKILL_TOOL_SCHEMAS = [
 
 
 def _resolve_skill(name: str) -> Tuple[Optional[Any], Optional[str]]:
-    """Ambient 上下文 → (SkillEntry, None) 或 (None, 错误回填串)。
+    """Ambient context → (SkillEntry, None) or (None, error backfill string).
 
-    越权（不在 enabled_skills）与不存在（扫描根里没有）分别回填，均列出
-    可选项供模型自纠。"""
+    Out-of-pool (not in enabled_skills) and not-found (absent from the scan
+    root) get separate backfills, each listing the options for model
+    self-correction."""
     if not str(name or "").strip():
         return None, tool_error("name 必填：要装载的技能名")
     name = str(name).strip()
@@ -162,9 +176,10 @@ def _handle_read_skill_file(args: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Self-registration（registered on module import; AST scan auto-discovery —
-# 注意必须是顶层 registry.register() 调用表达式：扫描器只匹配 module body
-# 的 Expr，for 循环体内的调用不可见）
+# Self-registration (registered on module import; AST scan auto-discovery —
+# note this must be a top-level registry.register() call expression: the
+# scanner only matches module-body Exprs; calls inside for loops are
+# invisible)
 # ---------------------------------------------------------------------------
 
 registry.register(

@@ -74,7 +74,7 @@ not business code. Restart the process when needed.
 
 Host mount points: the ``POST /api/v1/reload`` endpoint in
 ``host/main.py`` (baseline established at startup via
-:func:`init_baseline`); the studio 系统插件页's selective replay
+:func:`init_baseline`); the studio system-plugins page's selective replay
 (``POST /api/v1/system/reload``); the
 :class:`ReloadWatcher` background poller when ``NEXUS_RELOAD_WATCH=1``.
 """
@@ -98,7 +98,7 @@ def _discover_module_names() -> List[str]:
     nesting counts too — prompts and other non-registering support modules
     are tracked alongside), ``atoms.executors.<mod>`` and
     ``atoms.hooks.<mod>`` (agent_hooks plugins register from module level
-    like executors; the studio 系统插件 page classifies them as
+    like executors; the studio system-plugins page classifies them as
     hot-reloadable code, so discovery must track them or their reload
     silently lands in "unknown"). nexus/ is not
     scanned (the kernel does not reload) nor is atoms/stages (stage
@@ -342,7 +342,7 @@ def reload_all() -> Dict[str, List[str]]:
 
 
 def reload_modules(selected: List[str]) -> Dict[str, Any]:
-    """Selective module reload (studio「系统插件」页): replay the selected
+    """Selective module reload (the studio system-plugins page): replay the selected
     tracked modules **plus their tracked consumers**, in dependency order.
 
     Consumers are pulled in because importlib.reload does not cascade — a

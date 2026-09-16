@@ -66,7 +66,7 @@ def test_pattern_agent_hooks_sugar_folds_in():
     assert p.plugins["agent_hooks"] == "pkg_a"
     p2 = Pattern(code="ph2", name="n", description="d",
                  plugins={"agent_hooks": "pkg_b"}, agent_hooks="pkg_a")
-    assert p2.plugins["agent_hooks"] == "pkg_b"  # dict 值胜出
+    assert p2.plugins["agent_hooks"] == "pkg_b"  # the dict value wins
 
 
 def test_node_plugins_normalized():
@@ -78,11 +78,17 @@ def test_node_plugins_normalized():
         BaseNode(code="x", plugins={"loop": {"model": "m"}})
 
 
-def test_llm_slot_died_with_app_config():
+def test_llm_slot_died_with_app_config(caplog):
     """The plugins["llm"] declaration was replaced by the app-config
-    overlay: the slot is no longer in the vocabulary (fail fast)."""
+    overlay. Retired slots (pre-migration persisted YAML can still carry
+    them) warn + strip so old files load; truly unknown slots fail fast."""
+    with caplog.at_level("WARNING"):
+        result = normalize_plugins({"llm": "openai"})
+    assert result == {}                        # stripped, not carried
+    assert any("llm" in r.message and "废弃" in r.message
+               for r in caplog.records)
     with pytest.raises(ValueError, match="槽位名非法"):
-        normalize_plugins({"llm": "openai"})
+        normalize_plugins({"totally_unknown": "x"})
 
 
 def test_slot_label():

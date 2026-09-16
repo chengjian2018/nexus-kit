@@ -1,27 +1,38 @@
-"""Studio API —— /api/v1/studio/*（编排工作台的后端面）。
+"""Studio API — /api/v1/studio/* (backend surface of the orchestration workbench).
 
-端点分四组（详见 README·studio 节）：
+Endpoints fall into four groups (see the README studio section for details):
 
-1. pattern 管理面：列表（source=code|console 徽标）/ 详情 / 校验 / 发布 /
-   fork / 删除。发布与 CLI ``pattern-load`` 同一条三段式通路
-   （from_yaml → validate → register），落盘到 store.py 的托管目录。
-2. agent 生成：``POST /generate`` SSE 流（status/step/delta/result 事件）——
-   驱动本地 Claude Code（``claude -p --output-format stream-json --verbose
-   --allowedTools Read,Grep,Glob,LS``，stdin 喂提示词，cwd 固定项目根仅供
-   只读探索），工具调用以 step 事件、文本增量以 delta 事件实时回传；最终
-   答复解析出 pattern YAML + 插件模块，插件先经临时文件导入验证（注册但
-   未持久化），用户预览后 ``POST /apply`` 一键落盘。应用顺序固定「先插件
-   后 pattern」（pattern 校验要解析插件 code）。
-3. AI 助手：``POST /assist`` 非流式（节点话术 / 回答范式 / 执行器生成）。
-4. 目录：catalog（流程编排下拉数据源）。
+1. Pattern management: list (with source=code|console badge) / detail /
+   validate / publish / fork / delete. Publishing goes through the same
+   three-stage pipeline as the CLI ``pattern-load``
+   (from_yaml → validate → register), persisting into store.py's hosted
+   directories.
+2. Agent generation: the ``POST /generate`` SSE stream (status/step/delta/
+   result events) — drives the local Claude Code (``claude -p
+   --output-format stream-json --verbose --allowedTools Read,Grep,Glob,LS``;
+   the prompt is fed via stdin and cwd is pinned to the project root for
+   read-only exploration only); tool calls stream back live as step events
+   and text increments as delta events; the final reply is parsed into a
+   pattern YAML + plugin modules, with plugins first verified via a
+   temporary-file import (registered but not persisted); after the user
+   previews, ``POST /apply`` persists them in one go. The apply order is
+   fixed "plugins first, then patterns" (pattern validation needs to resolve
+   plugin codes).
+3. AI assistant: ``POST /assist``, non-streaming (node scripts / answer
+   examples / executor generation).
+4. Catalog: catalog (data source for the flow-orchestration dropdown).
 
-约定与 ui/api.py 一致：响应 {code, message, status, data} 包裹；挂 /api/v1/
-下天然被 NEXUS_API_KEY 中间件覆盖；除 generate/assist（子进程/LLM I/O）外
-全部同步 def。assist 取服务配置 llm_default（nexus.settings.get_llm_config），
-generate 用本机 claude CLI（可用环境变量 NEXUS_STUDIO_CLAUDE_BIN 覆盖二进制
-路径），页面不提供模型/提供商选择。插件落盘前一律先临时导入验证——托管
-目录里永远不会出现未经验证的代码；临时导入的注册副作用是进程级的，未
-apply 的插件重启后自然消失。
+Conventions match ui/api.py: responses use the {code, message, status, data}
+envelope; routes mounted under /api/v1/ are naturally covered by the
+NEXUS_API_KEY middleware; everything is sync def except generate/assist
+(subprocess/LLM I/O). assist takes the service config llm_default
+(nexus.settings.get_llm_config); generate uses the local claude CLI (the
+binary path can be overridden via the NEXUS_STUDIO_CLAUDE_BIN environment
+variable); the page offers no model/provider selection. Plugins are always
+verified via a temporary import before being persisted — unverified code
+never appears in the hosted directories; the registration side effects of a
+temporary import are process-level, so plugins that are never applied simply
+vanish on restart.
 """
 
 from __future__ import annotations
@@ -62,26 +73,30 @@ router = APIRouter(prefix="/api/v1/studio")
 
 _discovered = False
 
-# Claude Code（自动编排生成引擎）：二进制可经环境变量覆盖（测试/开发用）
+# Claude Code (the auto-orchestration generation engine): the binary is overridable via env var (tests/dev)
 _CLAUDE_BIN = environ.get("NEXUS_STUDIO_CLAUDE_BIN", "claude")
 
-# 只读探索白名单：产物契约是「围栏文本经 stdout 返回」，一切落盘统一走
-# /apply 的托管目录（store.py）。子进程因此不授任何写权限——未列入白名单
-# 的工具（Write/Edit/Bash/WebFetch…）在 -p 非交互模式下自动拒绝，生成产物
-# 不可能经子进程散落进仓库。刻意不用 --dangerously-skip-permissions：它会
-# 绕过包括 deny 规则在内的一切权限检查，无法收敛写入面。
+# Read-only exploration whitelist: the artifact contract is "fenced text
+# returned via stdout"; every write lands through /apply's hosted directory
+# (store.py). The subprocess therefore gets NO write permissions — tools
+# outside the whitelist (Write/Edit/Bash/WebFetch…) are auto-rejected in -p
+# non-interactive mode, so generated artifacts cannot scatter into the repo
+# via the subprocess. --dangerously-skip-permissions is deliberately not
+# used: it bypasses every permission check including deny rules and cannot
+# converge the write surface.
 _CLAUDE_ALLOWED_TOOLS = ("Read", "Grep", "Glob", "LS")
 
-# claude 子进程的工作目录：本仓库根（ui/studio/api.py 上溯两级）——
-# 「自动编排」的读写面即当前项目
+# The claude subprocess's working directory: this repo root (two levels up
+# from ui/studio/api.py) — the auto-orchestration read/write face IS the
+# current project
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# step 事件 detail 的截断长度（工具入参/结果只做过程展示，不搬全量）
+# step-event detail truncation length (tool args/results are process display only, never the full text)
 _STEP_DETAIL_MAX = 240
 
 
 def _ensure_discovery() -> None:
-    """首次请求前暖注册表（host.main import 时已做过；独立挂载/测试懒触发）。"""
+    """Warm the registries before the first request (host.main's import already did it; lazy in standalone mounts/tests)."""
     global _discovered
     if _discovered:
         return
@@ -104,7 +119,7 @@ def _fail(status_code: int, code: str, message: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Pattern 管理面
+# Pattern management
 # ---------------------------------------------------------------------------
 
 def _pattern_meta(pattern: Any, source: str = "code") -> Dict[str, Any]:
@@ -134,7 +149,7 @@ def list_patterns() -> Dict[str, Any]:
         _pattern_meta(p, source="console" if p.code in console_codes else "code")
         for p in pattern_registry.list_patterns()
     ]
-    # 已落盘但装载失败（注册表里没有）的 console pattern 也要露出错误态
+    # Console patterns persisted but failed-to-load (absent from the registry) must also surface the error state
     registered = {p["code"] for p in patterns}
     for code in sorted(console_codes - registered):
         patterns.append({
@@ -172,10 +187,11 @@ class YamlIn(BaseModel):
 
 @router.post("/patterns/validate")
 def validate_pattern_yaml(body: YamlIn):
-    """dry-run：构造 + 收集式校验，不注册不落盘。
+    """Dry-run: construction + collected validation; no registration, no
+    persistence.
 
-    工具面宽松（见 agent.validate_pattern_text）：未注册/越集工具进
-    warnings 不进 errors。"""
+    The tool surface is lenient (see agent.validate_pattern_text):
+    unregistered/out-of-set tools go into warnings, not errors."""
     _ensure_discovery()
     pattern, errors, warnings = agent.validate_pattern_text(body.yaml)
     data: Dict[str, Any] = {"errors": errors, "warnings": warnings,
@@ -191,10 +207,12 @@ def validate_pattern_yaml(body: YamlIn):
 
 @router.post("/patterns/publish")
 def publish_pattern(body: YamlIn):
-    """发布：三段式（from_yaml → validate → register）+ 落盘托管目录。
+    """Publish: the three stages (from_yaml → validate → register) + persist to the hosted directory.
 
-    新会话即生效（运行中会话持旧引用跑完当前轮，与 /reload 语义一致）。
-    工具面宽松：引用未注册的新工具不阻塞发布（warnings 透出）。
+    Effective for new sessions immediately (running sessions keep old
+    references through their current turn — the same semantics as /reload).
+    Lenient tool surface: referencing an unregistered new tool does not
+    block publishing (the warnings are surfaced).
     """
     _ensure_discovery()
     pattern, errors, warnings = agent.validate_pattern_text(body.yaml)
@@ -221,7 +239,7 @@ class ForkIn(BaseModel):
 
 @router.post("/patterns/fork")
 def fork_pattern(body: ForkIn):
-    """把代码内置 pattern 导出为 console 托管副本（fork-to-edit）。"""
+    """Export a code-builtin pattern into a console-hosted copy (fork-to-edit)."""
     _ensure_discovery()
     pattern = pattern_registry.get(body.code)
     if pattern is None:
@@ -239,9 +257,10 @@ def fork_pattern(body: ForkIn):
 
 @router.delete("/patterns/{code}")
 def delete_pattern(code: str):
-    """删除 console 托管 pattern（仅 console；注销注册 + 删文件）。
+    """Delete a console-hosted pattern (console-only; deregister + delete the file).
 
-    若该 code 存在代码内置版本，重启/重载后内置版自动恢复。
+    If a code-builtin version of the code exists, it comes back automatically
+    after a restart/reload.
     """
     _ensure_discovery()
     if code not in store.console_pattern_codes():
@@ -257,12 +276,12 @@ def delete_pattern(code: str):
 
 
 # ---------------------------------------------------------------------------
-# 目录与模型选项
+# Catalog and model options
 # ---------------------------------------------------------------------------
 
 @router.get("/catalog")
 def catalog() -> Dict[str, Any]:
-    """流程编排下拉数据源：已注册插件 codes（按 kind）+ 工具集。"""
+    """The flow-editing dropdown data source: registered plugin codes (by kind) + toolsets."""
     _ensure_discovery()
     return _ok({
         "executor": plugin_registry.list_codes("executor"),
@@ -273,7 +292,7 @@ def catalog() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SSE 工具 / Claude Code（本地 CLI）驱动
+# SSE helpers / Claude Code (local CLI) driving
 # ---------------------------------------------------------------------------
 
 def _sse(payload: Dict[str, Any]) -> str:
@@ -281,7 +300,7 @@ def _sse(payload: Dict[str, Any]) -> str:
 
 
 def _tool_detail(name: str, tool_input: Dict[str, Any]) -> str:
-    """挑工具入参里最能代表「正在做什么」的一个字段做单行摘要。"""
+    """Pick the tool-input field that best represents "what is happening" for a one-line summary."""
     for key in ("command", "file_path", "path", "pattern", "query", "url",
                 "description", "prompt"):
         value = tool_input.get(key)
@@ -291,7 +310,7 @@ def _tool_detail(name: str, tool_input: Dict[str, Any]) -> str:
 
 
 def _tool_result_text(content: Any) -> str:
-    """tool_result 的 content 可能是 str / 文本块列表 / dict，拍平成纯文本。"""
+    """A tool_result's content may be a str / a list of text blocks / a dict — flatten it to plain text."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -304,22 +323,27 @@ def _tool_result_text(content: Any) -> str:
 
 
 async def run_claude_code(prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
-    """驱动本地 Claude Code（print 模式）并把执行过程翻译成 studio 事件。
+    """Drive the local Claude Code (print mode) and translate the execution process into studio events.
 
-    子进程：``claude -p --output-format stream-json --verbose
-    --include-partial-messages --allowedTools Read,Grep,Glob,LS``（cwd =
-    项目根，只读探索；未白名单的写类工具在非交互 -p 模式下自动拒绝），
-    提示词经 stdin 喂入。stream-json 每行一个 JSON 事件，映射关系：
+    Subprocess: ``claude -p --output-format stream-json --verbose
+    --include-partial-messages --allowedTools Read,Grep,Glob,LS`` (cwd =
+    project root, read-only exploration; non-whitelisted write tools are
+    auto-rejected in non-interactive -p mode); the prompt is fed via stdin.
+    stream-json emits one JSON event per line, mapped as:
 
-    - system/init           → status（模型 + session）
-    - stream_event 文本增量 → delta（--include-partial-messages）
-    - assistant/tool_use    → step{phase: run}（工具名 + 入参摘要）
-    - user/tool_result      → step{phase: result}（结果摘要，出错标 err）
-    - result                → status（轮数/耗时）+ final{text}（最终答复，
-                              供上层做围栏解析；空时回退累计增量文本）
+    - system/init           → status (model + session)
+    - stream_event text delta → delta (--include-partial-messages)
+    - assistant/tool_use    → step{phase: run} (tool name + argument summary)
+    - user/tool_result      → step{phase: result} (result summary, flagged
+                              err on failure)
+    - result                → status (turn count / elapsed time) +
+                              final{text} (the final reply, for the caller's
+                              fence parsing; falls back to the accumulated
+                              delta text when empty)
 
-    任何失败（CLI 不存在 / 非零退出 / result.subtype 非 success）yield 一个
-    error 事件后结束。客户端断开（generator 被 close）时 kill 子进程。
+    Any failure (CLI missing / nonzero exit / result.subtype not success)
+    yields one error event and ends. When the client disconnects (the
+    generator is closed), the subprocess is killed.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -343,7 +367,7 @@ async def run_claude_code(prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
     assert proc.stdin is not None and proc.stdout is not None
     proc.stdin.write(prompt.encode("utf-8"))
     await proc.stdin.drain()
-    proc.stdin.close()  # EOF：claude 把整段 stdin 当作本次任务提示词
+    proc.stdin.close()  # EOF: claude treats the entire stdin as this run's task prompt
 
     stderr_tail: deque = deque(maxlen=30)
 
@@ -358,7 +382,7 @@ async def run_claude_code(prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
     yield {"kind": "status", "stage": "claude",
            "message": f"Claude Code 执行中（只读探索 · {_PROJECT_ROOT.name}/）…"}
 
-    assistant_text: List[str] = []  # 完整 assistant 文本块（final 兜底用）
+    assistant_text: List[str] = []  # full assistant text blocks (fallback source for final)
     final_text = ""
     result_meta: Dict[str, Any] = {}
     try:
@@ -444,17 +468,18 @@ async def run_claude_code(prompt: str) -> AsyncGenerator[Dict[str, Any], None]:
 
 
 def _explanation_of(raw: str) -> str:
-    """围栏之前的说明文字。"""
+    """The prose before the fence."""
     match = re.search(r"```", raw)
     return (raw[:match.start()] if match else raw).strip()
 
 
 def _preview_plugins(parsed_plugins: List[Dict[str, Any]],
                      ) -> List[Dict[str, Any]]:
-    """逐个临时导入验证生成插件（注册但未持久化）。
+    """Import-verify the generated plugins one by one (registered but not persisted).
 
-    模块 exec 即注册（替换窗口内），后续 pattern 校验因此能解析这些 code；
-    未 apply 的注册是进程级的，重启后自然消失。
+    A module's exec registers it (inside the replacement window), so the
+    later pattern validation can resolve those codes; an un-applied
+    registration is process-level and disappears naturally on restart.
     """
     results: List[Dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="studio_plugin_") as td:
@@ -494,7 +519,7 @@ def _preview_plugins(parsed_plugins: List[Dict[str, Any]],
 
 
 # ---------------------------------------------------------------------------
-# 自动编排：生成（SSE）与应用
+# Auto-orchestration: generate (SSE) and apply
 # ---------------------------------------------------------------------------
 
 class GenerateIn(BaseModel):
@@ -508,12 +533,15 @@ class GenerateIn(BaseModel):
 
 @router.post("/generate")
 async def generate(body: GenerateIn):
-    """自动编排生成（SSE）：status → (status|step|delta)* → result | error。
+    """Auto-orchestration generation (SSE): status → (status|step|delta)* → result | error.
 
-    生成引擎是本地 Claude Code：build_generate_messages 产出的提示词
-    （schema + 插件目录 + 范例 + 用户需求）喂给 run_claude_code（claude
-    -p，完全权限，项目根执行），执行步骤与文本增量实时回传；最终答复
-    走与旧 LLM 通路相同的围栏解析 → 插件预览导入 → pattern 校验。
+    The generation engine is the local Claude Code: the prompt produced by
+    build_generate_messages (schema + plugin catalog + exemplar + the
+    user's requirement) feeds run_claude_code (claude -p, the read-only
+    exploration whitelist, running at the project root); execution steps
+    and text deltas stream back in real time; the final answer goes through
+    the same fence parsing → plugin preview-import → pattern validation as
+    the earlier LLM path.
     """
     _ensure_discovery()
 
@@ -553,8 +581,9 @@ async def generate(body: GenerateIn):
                 "pattern_warnings": [],
                 "ok": False,
             }
-            # 插件先预览导入（exec 即注册）——pattern 若引用了生成插件的
-            # code，校验必须在注册之后跑，否则误报「未注册」
+            # Preview-import plugins first (exec registers) — if the pattern
+            # references a generated plugin's code, validation must run after
+            # registration or it would falsely report "unregistered"
             result["plugins"] = _preview_plugins(parsed["plugins"])
             if parsed["yaml"] is None:
                 result["pattern_errors"] = [
@@ -595,9 +624,11 @@ class ApplyIn(BaseModel):
 
 
 def _verify_plugin_text(filename: str, code_text: str) -> Tuple[str, str]:
-    """(stem, error)：临时导入验证一个待应用插件；error 空 = 通过。
+    """(stem, error): verify a plugin pending apply via a temporary import;
+    empty error = pass.
 
-    验证通过前不写托管目录——目录里永远不会出现未经验证的代码。
+    The hosted directories are never written before verification passes —
+    unverified code never appears there.
     """
     stem = re.sub(r"\.py$", "", filename).lower()
     try:
@@ -622,20 +653,21 @@ def _verify_plugin_text(filename: str, code_text: str) -> Tuple[str, str]:
 
 @router.post("/apply")
 def apply_artifacts(body: ApplyIn):
-    """应用生成结果：插件先验证再落盘+装载，pattern 三段式+落盘。
+    """Apply the generated artifacts: plugins verified first, then persisted + loaded; pattern three-stage + persisted.
 
-    顺序固定先插件后 pattern（pattern 校验要解析插件 code）；任何插件
-    验证失败都在落盘前中止（400），不会留下半套产物。
+    The order is fixed — plugins before the pattern (pattern validation must
+    resolve plugin codes); any plugin verification failure aborts before
+    persisting (400), never leaving half a set of artifacts behind.
     """
     _ensure_discovery()
-    # pass 1：全部插件先临时验证（注册副作用进程级，未落盘）
+    # pass 1: temporarily verify all plugins first (the registration side effect is process-level, nothing persisted)
     verified: List[Tuple[str, str]] = []
     for pl in body.plugins:
         stem, error = _verify_plugin_text(pl.filename, pl.code)
         if error:
             return _fail(400, "400", f"插件 {pl.filename} 验证失败: {error}")
         verified.append((stem, pl.code))
-    # pass 2：落盘 + 从托管路径重新装载（fresh exec + 替换窗口重注册）
+    # pass 2: persist + reload from the hosted path (fresh exec + re-register inside the replacement window)
     applied: List[str] = []
     try:
         for stem, code_text in verified:
@@ -644,7 +676,7 @@ def apply_artifacts(body: ApplyIn):
             applied.append(f"{stem}.py")
     except Exception as e:
         return _fail(500, "500", f"插件落盘失败: {e}")
-    # pattern：校验 → 落盘 → 注册（工具面宽松：未注册的新工具不阻塞应用）
+    # pattern: validate → persist → register (lenient tool surface: unregistered new tools do not block apply)
     pattern, errors, warnings = agent.validate_pattern_text(body.yaml)
     if pattern is None or errors:
         return _fail(400, "400",
@@ -666,7 +698,7 @@ def apply_artifacts(body: ApplyIn):
 
 
 # ---------------------------------------------------------------------------
-# 流程编排 AI 助手（非流式）
+# Flow-editing AI assistant (non-streaming)
 # ---------------------------------------------------------------------------
 
 class AssistIn(BaseModel):
@@ -676,7 +708,7 @@ class AssistIn(BaseModel):
 
 @router.post("/assist")
 async def assist(body: AssistIn):
-    """非流式小助手：node_prompt / node_examples / plugin_generate。"""
+    """Non-streaming mini assistant: node_prompt / node_examples / plugin_generate."""
     _ensure_discovery()
     try:
         messages = agent.build_assist_messages(body.mode, body.payload)

@@ -1,11 +1,15 @@
-"""cron 定时调度（cron tool + _cron_core 内核）单测：
+"""Unit tests for cron scheduling (cron tool + _cron_core kernel):
 
-- cron 表达式子集解析与 next_fire 计算（含死日期、dow 归一、OR 语义）
-- CRUD 四工具：cron/interval 双调度、授权快照（剔除编排工具集）、
-  args.tools 只能收窄、护栏上限、update 局部更新与暂停/恢复
-- CronStore JSON 持久化 roundtrip（原子写、损坏文件降级为空）
-- fire 路径：注入 stub 执行器（不打真 LLM）验证 history 记录、
-  next 重排、超时与异常路径、重入跳过、_pool 不外泄
+- Cron-expression subset parsing and next_fire computation (dead dates,
+  dow normalization, OR semantics)
+- CRUD four tools: cron/interval dual scheduling, authorization snapshot
+  (orchestration toolsets stripped), args.tools may only narrow, guardrail
+  caps, update partial updates and pause/resume
+- CronStore JSON persistence roundtrip (atomic writes, corrupt files
+  degrade to empty)
+- fire path: a stub executor is injected (no real LLM) to verify history
+  records, next-fire rescheduling, timeout and exception paths, reentry
+  skipping, and that _pool does not leak
 """
 
 import asyncio
@@ -15,8 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
-from atoms.tools import cron_tool  # noqa: F401 -- module import 即注册
-from atoms.tools import knowledge_tool  # noqa: F401 -- 快照池断言依赖其注册
+from atoms.tools import cron_tool  # noqa: F401 -- module import performs the registration
+from atoms.tools import knowledge_tool  # noqa: F401 -- the snapshot-pool assertions depend on its registration
 from atoms.tools import _cron_core
 from atoms.tools._cron_core import (
     CronScheduler,
@@ -41,7 +45,8 @@ _GUARD = {"max_jobs": 20, "fire_timeout_seconds": 300, "max_rounds": 8,
 
 @pytest.fixture(autouse=True)
 def _fresh_scheduler():
-    """独立调度器单例 + 统一护栏 patch（两个引用命名空间都盖住）。"""
+    """Isolated scheduler singleton + uniform guardrail patch (both
+    reference namespaces covered)."""
     reset_scheduler()
     with patch("atoms.tools._cron_core.get_cron_tool_config",
                return_value=dict(_GUARD)), \
@@ -59,37 +64,37 @@ def _dispatch(name, args, allow_toolsets=None):
 
 
 # =========================================================================
-# cron 解析与 next_fire
+# cron parsing and next_fire
 # =========================================================================
 
 def test_parse_cron_shapes():
     assert parse_cron("* * * * *")["minute"] == set(range(60))
     assert parse_cron("*/15 * * * *")["minute"] == {0, 15, 30, 45}
     assert parse_cron("0 9 * * 1-5")["day_of_week"] == {1, 2, 3, 4, 5}
-    # dow 7 归一为 0（周日）
+    # dow 7 normalizes to 0 (Sunday)
     assert parse_cron("0 0 * * 7")["day_of_week"] == {0}
     assert parse_cron("1-10/3 * * * *")["minute"] == {1, 4, 7, 10}
 
 
 def test_parse_cron_errors():
-    for bad in ("0 9 * *",                # 4 字段
-                "61 * * * *",             # 分钟越界
-                "* 24 * * *",             # 小时越界
-                "a b c d e",              # 非数字
-                "*/0 * * * *",            # 步长 0
-                "5-2 * * * *"):           # 区间倒置
+    for bad in ("0 9 * *",                # 4 fields
+                "61 * * * *",             # minute out of range
+                "* 24 * * *",             # hour out of range
+                "a b c d e",              # non-numeric
+                "*/0 * * * *",            # step of 0
+                "5-2 * * * *"):           # inverted range
         with pytest.raises(ValueError):
             parse_cron(bad)
 
 
 def test_next_fire_weekday_morning():
-    # 2026-09-11 是周五：周五 10:00 之后 → 下一个工作日 9 点是下周一
+    # 2026-09-11 is a Friday: after Fri 10:00 -> the next weekday 9am is the following Monday
     parsed = parse_cron("0 9 * * 1-5")
     after = datetime(2026, 9, 11, 10, 0)
     fire = next_fire(parsed, after)
     assert (fire.year, fire.month, fire.day, fire.hour, fire.minute) == \
         (2026, 9, 14, 9, 0)
-    assert fire.weekday() == 0   # 周一
+    assert fire.weekday() == 0   # Monday
 
 
 def test_next_fire_minute_step_and_month_day():
@@ -97,14 +102,14 @@ def test_next_fire_minute_step_and_month_day():
     fire = next_fire(parsed, datetime(2026, 9, 11, 9, 7))
     assert (fire.hour, fire.minute) == (9, 15)
 
-    # 每月 1 号 4:30
+    # 1st of every month at 4:30
     parsed = parse_cron("30 4 1 * *")
     fire = next_fire(parsed, datetime(2026, 9, 2, 0, 0))
     assert (fire.month, fire.day, fire.hour, fire.minute) == (10, 1, 4, 30)
 
 
 def test_next_fire_dead_date_returns_none():
-    # 2 月 30 日不存在 → 扫描一年后放弃
+    # Feb 30 does not exist -> gives up after scanning a year
     parsed = parse_cron("0 0 30 2 *")
     assert next_fire(parsed, datetime(2026, 9, 1)) is None
 
@@ -137,7 +142,7 @@ def test_create_and_list_cron():
     assert r["count"] == 1
     job = r["jobs"][0]
     assert job["name"] == "每日简报"
-    assert "_pool" not in job          # 内部字段不外泄
+    assert "_pool" not in job          # internal fields do not leak
 
 
 def test_create_cron_interval_and_validation():
@@ -146,45 +151,46 @@ def test_create_cron_interval_and_validation():
                                   "input": "巡检磁盘水位"})
     assert r["schedule"] == {"interval_minutes": 30}
 
-    # schedule 与 interval 二选一
+    # schedule and interval are mutually exclusive
     r = _dispatch("create_cron", {"name": "x", "schedule": "0 9 * * *",
                                   "interval_minutes": 5, "input": "t"})
     assert "二选一" in r["error"]
-    # 缺调度表达
+    # missing schedule expression
     r = _dispatch("create_cron", {"name": "x", "input": "t"})
     assert "调度" in r["error"]
-    # 坏 cron 表达式即刻报错
+    # a bad cron expression errors immediately
     r = _dispatch("create_cron", {"name": "x", "schedule": "not cron",
                                   "input": "t"})
     assert "cron" in r["error"]
-    # interval 越界
+    # interval out of range
     r = _dispatch("create_cron", {"name": "x", "interval_minutes": 0,
                                   "input": "t"})
     assert "interval_minutes" in r["error"]
-    # input 缺失
+    # missing input
     r = _dispatch("create_cron", {"name": "x", "schedule": "0 9 * * *"})
     assert "input" in r["error"]
 
 
 def test_create_cron_tool_snapshot_excludes_orchestration():
-    """授权快照：ambient 授权 - subagent/workflow/cron；args.tools 只能收窄。"""
+    """Authorization snapshot: ambient grants minus subagent/workflow/cron;
+    args.tools may only narrow."""
     r = _dispatch("create_cron", {"name": "带工具",
                                   "interval_minutes": 60, "input": "查资料"},
                   allow_toolsets=["cron", "knowledge", "subagent"])
     job = get_scheduler().get_job(r["job_id"])
-    # cron/subagent 被剔除，knowledge 的工具保留
+    # cron/subagent stripped, knowledge tools retained
     pool = set(job["_pool"])
     assert "delegate_task" not in pool
     assert "create_cron" not in pool
     assert pool >= {"search_product_knowledge", "search_customer_service_knowledge",
                     "list_products", "send_goods_link"}
 
-    # 收窄到不存在的工具 → 报错并列出可用池
+    # narrowing to a non-existent tool -> error listing the available pool
     r = _dispatch("create_cron", {
         "name": "x", "interval_minutes": 60, "input": "t",
         "tools": ["bash", "not_in_pool"]})
     assert "不在本作业可用池中" in r["error"]
-    # 合法收窄
+    # valid narrowing
     r = _dispatch("create_cron", {
         "name": "y", "interval_minutes": 60, "input": "t",
         "tools": ["search_product_knowledge"]})
@@ -208,25 +214,25 @@ def test_update_and_delete_cron():
     job_id = _dispatch("create_cron", {
         "name": "原名", "schedule": "0 9 * * *", "input": "原任务"})["job_id"]
 
-    # 局部更新：改名 + 暂停
+    # partial update: rename + pause
     r = _dispatch("update_cron", {"job_id": job_id, "name": "新名",
                                   "enabled": False})
     assert r["updated"] == ["enabled", "name"]
     assert r["enabled"] is False and r["next_fire_at"] is None
-    # 恢复 + 换 interval 调度 → 重排 next
+    # resume + switch to interval scheduling -> next_fire rescheduled
     r = _dispatch("update_cron", {"job_id": job_id, "enabled": True,
                                   "interval_minutes": 15})
     assert r["next_fire_at"] is not None
     job = get_scheduler().get_job(job_id)
     assert job["schedule"] == {"interval_minutes": 15}
-    # tools 收窄仍受快照池约束
+    # tools narrowing is still constrained by the snapshot pool
     r = _dispatch("update_cron", {"job_id": job_id,
                                   "tools": ["not_in_pool"]})
     assert "可用池" in r["error"]
-    # 无字段可更新
+    # no fields to update
     r = _dispatch("update_cron", {"job_id": job_id})
     assert "没有" in r["error"]
-    # 幽灵 job_id
+    # ghost job_id
     r = _dispatch("update_cron", {"job_id": "job_ghost", "name": "x"})
     assert "不存在" in r["error"]
 
@@ -238,7 +244,7 @@ def test_update_and_delete_cron():
 
 
 # =========================================================================
-# 持久化仓
+# Persistence store
 # =========================================================================
 
 def test_cron_store_roundtrip(tmp_path):
@@ -246,19 +252,19 @@ def test_cron_store_roundtrip(tmp_path):
     jobs = {"job_a": {"id": "job_a", "name": "a", "runs": 1}}
     store.save(jobs)
     assert store.load() == jobs
-    # 父目录不存在也能写（自动创建）
+    # writable even when the parent directory does not exist (auto-created)
     store2 = CronStore(str(tmp_path / "deep" / "sub" / "jobs.json"))
     store2.save(jobs)
     assert store2.load() == jobs
-    # 损坏文件 → 空
+    # corrupt file -> empty
     (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
     assert CronStore(str(tmp_path / "broken.json")).load() == {}
-    # 不存在 → 空
+    # missing file -> empty
     assert CronStore(str(tmp_path / "missing.json")).load() == {}
 
 
 # =========================================================================
-# fire 路径（注入 stub 执行器，不打真 LLM）
+# fire path (stub executor injected, no real LLM)
 # =========================================================================
 
 def _make_job(**overrides):
@@ -266,7 +272,7 @@ def _make_job(**overrides):
            "schedule": {"interval_minutes": 60}, "input": "task",
            "system_prompt": "", "tools": [], "_pool": [],
            "timeout_seconds": 5, "created_at": "2026-09-14T00:00:00",
-           "runs": 0, "next_fire_at": 1.0,   # 已过期
+           "runs": 0, "next_fire_at": 1.0,   # already overdue
            "last_run": None, "history": []}
     job.update(overrides)
     return job
@@ -290,7 +296,7 @@ def test_fire_records_history_and_reschedules():
     assert job["last_run"]["status"] == "ok"
     assert job["last_run"]["content"] == "结果内容"
     assert len(job["history"]) == 1
-    # interval 调度：next = fire 时刻 + 60min（不再是过期值）
+    # interval scheduling: next = fire time + 60min (no longer the stale value)
     assert job["next_fire_at"] > 1_000_000
 
 
@@ -331,7 +337,7 @@ def test_fire_history_cap():
 
 
 def test_tick_once_skips_firing_and_disabled_jobs():
-    """重入保护 + enabled=false 不触发 + next 未到不触发。"""
+    """Reentry protection + enabled=false not fired + next not due not fired."""
     calls = []
 
     async def stub(job):
@@ -346,25 +352,26 @@ def test_tick_once_skips_firing_and_disabled_jobs():
         future = _make_job(name="future", next_fire_at=9999999999.0)
         for j in (due, firing, disabled, future):
             sched.jobs[j["id"]] = j
-        sched._firing.add(firing["id"])   # 模拟正在执行
+        sched._firing.add(firing["id"])   # simulate already executing
         sched._tick_once()
-        await asyncio.sleep(0.2)          # 等 spawn 出的 fire task 完成
+        await asyncio.sleep(0.2)          # wait for the spawned fire task to finish
         return sched, due["id"]
 
     sched, due_id = arun(scenario())
-    assert calls == ["due"]               # 只有 due 被触发
+    assert calls == ["due"]               # only "due" gets fired
     assert sched.jobs[due_id]["runs"] == 1
     assert "firing" not in str(calls)
 
 
 def test_disabled_env_keeps_scheduler_inert(monkeypatch, tmp_path):
-    """NEXUS_CRON_DISABLED=1：get_scheduler 空仓 + ensure no-op。"""
+    """NEXUS_CRON_DISABLED=1: get_scheduler returns an empty store and
+    ensure is a no-op."""
     monkeypatch.setenv("NEXUS_CRON_DISABLED", "1")
     reset_scheduler()
     sched = arun(_cron_core.ensure_scheduler())
     assert sched.jobs == {}
     assert sched._tick_task is None
-    # CRUD 仍可用但不落盘
+    # CRUD still works but nothing is persisted
     with patch("atoms.tools._cron_core.get_cron_tool_config",
                return_value={**_GUARD,
                              "jobs_path": str(tmp_path / "j.json")}), \
@@ -379,7 +386,7 @@ def test_disabled_env_keeps_scheduler_inert(monkeypatch, tmp_path):
 
 
 # =========================================================================
-# 锁纪律 / 死日期 / fire 作用域 / stop 回收
+# Lock discipline / dead dates / fire scoping / stop reclamation
 # =========================================================================
 
 def test_create_rejects_dead_date_schedule():
@@ -394,7 +401,7 @@ def test_update_dead_date_keeps_original_schedule():
     jid = r["job_id"]
     r2 = _dispatch("update_cron", {"job_id": jid, "schedule": "0 0 29 2 *"})
     assert "永不命中" in r2["error"]
-    # mutate 抛错时作业保持原状（写穿前拒绝）
+    # when mutate raises, the job keeps its original state (rejected before write-through)
     assert get_scheduler().get_job(jid)["schedule"] == {
         "interval_minutes": 60}
 
@@ -407,8 +414,8 @@ def test_add_enforces_max_jobs_under_lock():
         sched.add({"id": "a"})
         sched.add({"id": "b"})
         with pytest.raises(ValueError):
-            sched.add({"id": "c"})       # 锁内检查：并发 create 不再双双通过
-        sched.add({"id": "b"})           # 覆盖已有（update 复用）不受限
+            sched.add({"id": "c"})       # checked under the lock: concurrent creates no longer both pass
+        sched.add({"id": "b"})           # overwriting an existing job (update reuse) is not capped
 
 
 def test_scheduler_update_missing_job_returns_none():
@@ -430,7 +437,7 @@ def test_fire_scopes_tool_context_per_job():
     sched.jobs[j2["id"]] = j2
     arun(sched._fire(j1["id"]))
     arun(sched._fire(j2["id"]))
-    # 每作业独立会话作用域——不再全体共享 _global 任务清单桶
+    # per-job session scope — no longer everyone sharing the _global task-list bucket
     assert seen == {j1["id"]: f"cron:{j1['id']}",
                     j2["id"]: f"cron:{j2['id']}"}
 
@@ -444,10 +451,10 @@ def test_stop_cancels_inflight_fire_tasks():
         sched = CronScheduler(execute_job=sleepy)
         job = _make_job()
         sched.jobs[job["id"]] = job
-        sched._tick_once()               # 到点 → fire 任务被追踪
+        sched._tick_once()               # due -> the fire task gets tracked
         await asyncio.sleep(0.05)
         assert sched._fire_tasks
-        await sched.stop()               # 停机取消在途 fire 并等收尾
+        await sched.stop()               # shutdown cancels in-flight fires and waits for them
         assert not sched._fire_tasks
 
     arun(scenario())

@@ -1,10 +1,11 @@
-"""Runtime fan-out contract tests (含异构扇出修订): sends dispatch /
-barrier join / results board (completion order) / branch workspace
-isolation / heterogeneous targets / merge 交集解析（离群 worker 忽略、
-不可唯一解析拒绝执行）/ guards (next+sends 互斥、宽度、未声明目标) /
-branch failure tolerance / budget accounting (workers 不占图步数) / FSM
-不收 sends / event vocabulary (fanout_* + branch_id tagging +
-graph_compile).
+"""Runtime fan-out contract tests (including the heterogeneous fan-out
+revision): sends dispatch / barrier join / results board (completion
+order) / branch workspace isolation / heterogeneous targets / merge
+intersection resolution (outlier workers ignored, non-uniquely-resolvable
+targets rejected) / guards (next+sends mutual exclusion, width,
+undeclared targets) / branch failure tolerance / budget accounting
+(workers do not consume graph steps) / FSM rejects sends / event
+vocabulary (fanout_* + branch_id tagging + graph_compile).
 
 Drives chat_turn / chat_turn_stream with a scripted node executor (no LLM);
 get_llm_config patched at the chat namespace (the R1/R4 patch-anchor
@@ -27,8 +28,8 @@ from nexus.model.node import BaseNode
 from nexus.model.pattern import Pattern
 from nexus.registry.plugins import registry as plugin_registry
 
-# Shared script: node_code -> handler(ec) -> TurnResult（同步或 async 均可）；
-# _CALLS 记录执行轨迹
+# Shared script: node_code -> handler(ec) -> TurnResult (sync or async both OK);
+# _CALLS records the execution trace
 _CALLS = []
 _SCRIPT = {}
 
@@ -49,9 +50,10 @@ plugin_registry.register("executor", "gft_script", _ScriptExecutor)
 
 
 def _fanout_pattern(**kwargs) -> Pattern:
-    """disp --sends--> work (sub_nodes=[join]) --> join（终节点）。
+    """disp --sends--> work (sub_nodes=[join]) --> join (terminal node).
 
-    disp.sub_nodes 同时声明 join（孤儿降级直路由的合法边，deep_research 同型）。
+    disp.sub_nodes also declares join (a legal edge for the orphan-degradation
+    direct route, same shape as deep_research).
     """
     defaults = dict(
         code="gft_graph",
@@ -105,7 +107,7 @@ def _reset():
 
 
 # ---------------------------------------------------------------------------
-# 主路径：派发 → 并发实例 → 结果板 → join
+# Main path: dispatch -> concurrent instances -> results board -> join
 # ---------------------------------------------------------------------------
 
 def test_fanout_runs_workers_and_joins():
@@ -127,20 +129,21 @@ def test_fanout_runs_workers_and_joins():
     assert codes[0] == "disp" and codes[-1] == "join"
     assert sorted(codes[1:-1]) == ["work", "work", "work"]
 
-    # 结果板条目：branch_id / ok / content（worker content 只进板，不当图回复）
+    # results board entries: branch_id / ok / content (worker content only
+    # lands on the board, never becomes the graph reply)
     board = seen["board"]
     assert len(board) == 3 and all(e["ok"] for e in board)
     assert {(e["branch_id"], e["content"]) for e in board} == {
         ("work#1", "结果:任务1"), ("work#2", "结果:任务2"),
         ("work#3", "结果:任务3"),
     }
-    assert s.cxt.graph_state == {}  # 图终止清空状态板
+    assert s.cxt.graph_state == {}  # graph termination clears the state board
 
 
 def test_branch_input_delivery_and_workspace_isolation():
     _SCRIPT["disp"] = lambda ec: TurnResult(
-        sends=[Send("work", {"q": "子问题"}),   # dict → JSON 序列化为显式查询
-               Send("work", "纯文本任务")])     # str → 原样
+        sends=[Send("work", {"q": "子问题"}),   # dict -> JSON-serialized as an explicit query
+               Send("work", "纯文本任务")])     # str -> passed through as-is
     seen = []
 
     async def _work(ec):
@@ -154,7 +157,8 @@ def test_branch_input_delivery_and_workspace_isolation():
     queries = {bid: q for bid, q, _ in seen}
     assert queries["work#1"] == '{"q": "子问题"}'
     assert queries["work#2"] == "纯文本任务"
-    # 私有工作区：分支起步历史为空；分支写入不落主会话历史
+    # private workspaces: branches start with empty history; branch writes
+    # never land in the main session history
     assert all(h == 0 for _, _, h in seen)
     assert all(row.content != "分支内部产物" for row in s.cxt.history)
 
@@ -183,7 +187,7 @@ def test_board_records_completion_order():
 
 
 def test_workers_do_not_consume_graph_steps():
-    # max_steps=3：disp(1 步) + join(1 步)；4 个 worker 不占步数 → 预算内完成
+    # max_steps=3: disp (1 step) + join (1 step); 4 workers consume no steps -> completes within budget
     _SCRIPT["disp"] = lambda ec: TurnResult(
         sends=[Send("work", i) for i in range(4)])
     _SCRIPT["work"] = lambda ec: TurnResult(content="w")
@@ -196,13 +200,15 @@ def test_workers_do_not_consume_graph_steps():
 
 
 # ---------------------------------------------------------------------------
-# 异构扇出与 merge 交集解析（§9 修订）
+# Heterogeneous fan-out and merge intersection resolution (§9 revision)
 # ---------------------------------------------------------------------------
 
 def _hetero_pattern(**kwargs) -> Pattern:
-    """disp --sends--> work / agg（各自 sub_nodes=[join]）--> join（终节点）。
+    """disp --sends--> work / agg (each with sub_nodes=[join]) --> join
+    (terminal node).
 
-    异构形状：work = 检索型 worker，agg = 归纳型 worker，共享 join。
+    Heterogeneous shape: work = retrieval-type worker, agg = synthesis-type
+    worker, sharing one join.
     """
     defaults = dict(
         code="gft_hetero",
@@ -225,7 +231,8 @@ def _hetero_pattern(**kwargs) -> Pattern:
 
 
 def test_heterogeneous_targets_run_and_join():
-    # 不同 worker 节点混选扇出：各自执行、结果板按 node_code 区分、join 一次
+    # mixed fan-out across different worker nodes: each executes, the results
+    # board distinguishes by node_code, join fires once
     _SCRIPT["disp"] = lambda ec: TurnResult(
         sends=[Send("work", "检索任务"), Send("agg", "归纳任务")])
     _SCRIPT["work"] = lambda ec: TurnResult(content=f"检索:{ec.branch_input}")
@@ -246,13 +253,14 @@ def test_heterogeneous_targets_run_and_join():
     assert len(board) == 2 and all(e["ok"] for e in board)
     assert {(e["node_code"], e["content"]) for e in board} == {
         ("work", "检索:检索任务"), ("agg", "归纳:归纳任务")}
-    # branch_id 仍为 {node_code}#{全局序}，跨 worker 唯一
+    # branch_id stays {node_code}#{global sequence}, unique across workers
     assert {e["branch_id"] for e in board} == {"work#1", "agg#2"}
     assert s.cxt.graph_state == {}
 
 
 def test_heterogeneous_mixed_width_runs_each_target():
-    # 同一 worker 多实例 + 另一 worker 单实例混排，宽度按总实例数计
+    # multiple instances of one worker mixed with a single instance of
+    # another; width counted by total instance count
     _SCRIPT["disp"] = lambda ec: TurnResult(
         sends=[Send("work", 1), Send("agg", "a"), Send("work", 2)])
     _SCRIPT["work"] = lambda ec: TurnResult(content=f"w{ec.branch_input}")
@@ -274,7 +282,8 @@ def test_heterogeneous_mixed_width_runs_each_target():
 
 
 def test_join_target_send_dropped_as_outlier():
-    # 直接向 join（无后继 → 无共同 merge）send：唯一离群 → 忽略，剩余照常
+    # sending directly to join (no successors -> no common merge): the sole
+    # outlier -> ignored, the rest proceed as usual
     _SCRIPT["disp"] = lambda ec: TurnResult(
         sends=[Send("work", "a"), Send("join", "b")])
     _SCRIPT["work"] = lambda ec: TurnResult(content="结果a")
@@ -282,7 +291,7 @@ def test_join_target_send_dropped_as_outlier():
     result = _turn(s, "跑")
     assert result.text == "done:join"
     assert [c[0] for c in _CALLS] == ["disp", "work", "join"]
-    # 离群忽略落在 fanout_start actions 快照
+    # outlier drops land in the fanout_start actions snapshot
     assert any(a.get("fanout_start", {}).get("dropped") == ["join"]
                for a in result.actions)
     assert any(a.get("fanout_start", {}).get("branches") == 1
@@ -290,7 +299,7 @@ def test_join_target_send_dropped_as_outlier():
 
 
 def test_outlier_worker_with_foreign_merge_dropped():
-    # w1/w2 → join，w3 → other：w3 离群被忽略，w1/w2 执行，join 正常触发
+    # w1/w2 -> join, w3 -> other: w3 is dropped as an outlier, w1/w2 execute, join fires normally
     pattern = Pattern(
         code="gft_outlier", name="离群忽略", description="d",
         pattern_type="agent",
@@ -319,14 +328,15 @@ def test_outlier_worker_with_foreign_merge_dropped():
     s = _session(pattern)
     result = _turn(s, "跑")
     assert result.text == "join 完成"
-    assert [c[0] for c in _CALLS] == ["disp", "w1", "w2", "join"]  # w3 未执行
+    assert [c[0] for c in _CALLS] == ["disp", "w1", "w2", "join"]  # w3 never executed
     assert {e["node_code"] for e in seen["board"]} == {"w1", "w2"}
     assert any(a.get("fanout_start", {}).get("dropped") == ["w3"]
                for a in result.actions)
 
 
 def test_disjoint_merges_raise():
-    # 两个 worker 各指向不同 merge（两个离群）→ 拒绝执行，提醒模板正确性
+    # the two workers point at different merges (two outliers) -> refuse to
+    # execute, flagging the template bug
     pattern = Pattern(
         code="gft_disjoint", name="无共同merge", description="d",
         pattern_type="agent",
@@ -346,11 +356,11 @@ def test_disjoint_merges_raise():
     s = _session(pattern)
     result = _turn(s, "跑")
     assert result.text == "对话处理异常，请稍后重试"
-    assert [c[0] for c in _CALLS] == ["disp"]  # 任何 worker 都不执行
+    assert [c[0] for c in _CALLS] == ["disp"]  # no worker executes at all
 
 
 def test_ambiguous_common_merge_raises():
-    # 共同后继不唯一（w1/w2 都声明 join+extra）→ 拒绝执行
+    # the common successor is not unique (w1/w2 both declare join+extra) -> refuse to execute
     pattern = Pattern(
         code="gft_ambiguous", name="merge不唯一", description="d",
         pattern_type="agent",
@@ -374,7 +384,7 @@ def test_ambiguous_common_merge_raises():
 
 
 # ---------------------------------------------------------------------------
-# 守卫：互斥 / 宽度 / 未声明目标 / join 可解析 / FSM
+# Guards: mutual exclusion / width / undeclared targets / join resolvability / FSM
 # ---------------------------------------------------------------------------
 
 def test_next_and_sends_mutex_raises():
@@ -396,7 +406,8 @@ def test_fanout_width_over_max_raises():
 
 
 def test_undeclared_target_terminates_tolerantly():
-    # 目标不在 sub_nodes → 与 next 未声明边同族的宽容终止（不 raise）
+    # target not in sub_nodes -> tolerant termination of the same family as
+    # an undeclared next edge (no raise)
     _SCRIPT["disp"] = lambda ec: TurnResult(
         content="派发前的话", sends=[Send("ghost", "x")])
     s = _session(_fanout_pattern())
@@ -407,7 +418,8 @@ def test_undeclared_target_terminates_tolerantly():
 
 
 def test_join_unresolvable_raises():
-    # 单 worker 声明了两个后继 → 共同后继不唯一，merge 不可解析
+    # a single worker declaring two successors -> the common successor is
+    # not unique, the merge is unresolvable
     pattern = _fanout_pattern(nodes=[
         BaseNode(code="disp", sub_nodes=["work"],
                  plugins={"loop": "gft_script"}),
@@ -441,12 +453,13 @@ def test_fsm_rejects_sends():
 def test_pattern_max_fanout_defaults_and_folding():
     assert _fanout_pattern().max_fanout == 8
     assert _fanout_pattern(config={"max_fanout": 3}).max_fanout == 3
-    assert _fanout_pattern(max_fanout=5).max_fanout == 5     # kwargs 语法糖
-    assert _fanout_pattern(max_fanout=0).max_fanout == 8     # 非法值回默认
+    assert _fanout_pattern(max_fanout=5).max_fanout == 5     # kwargs sugar
+    assert _fanout_pattern(max_fanout=0).max_fanout == 8     # invalid values fall back to the default
 
 
 # ---------------------------------------------------------------------------
-# 失败语义：分支失败 = error 条目，join 照常；wait_human/嵌套 = 分支失败
+# Failure semantics: a failed branch = an error entry, join still fires;
+# wait_human / nesting count as branch failures
 # ---------------------------------------------------------------------------
 
 def test_branch_failure_settles_error_and_join_fires():
@@ -468,7 +481,7 @@ def test_branch_failure_settles_error_and_join_fires():
     _SCRIPT["join"] = _join
     s = _session(_fanout_pattern())
     result = _turn(s, "跑")
-    assert result.text == "部分成功"  # 单分支失败不杀图
+    assert result.text == "部分成功"  # a single branch failure does not kill the graph
     board = {(e["branch_id"]): e for e in seen["board"]}
     bad = [e for e in seen["board"] if not e["ok"]]
     assert len(bad) == 1 and "工具炸了" in bad[0]["error"]
@@ -495,14 +508,14 @@ def test_branch_wait_human_is_branch_failure():
     _SCRIPT["join"] = _join
     s = _session(_fanout_pattern())
     result = _turn(s, "跑")
-    assert result.text == "join 完成"          # 不挂起
-    assert s.cxt.graph_state == {}             # 无暂停游标
+    assert result.text == "join 完成"          # does not pause
+    assert s.cxt.graph_state == {}             # no paused cursor
     bad = [e for e in seen["board"] if not e["ok"]]
     assert len(bad) == 1 and "wait_human" in bad[0]["error"]
 
 
 # ---------------------------------------------------------------------------
-# 事件面：fanout_* 词汇 + branch_id tagging + graph_compile + actions 快照
+# Event surface: fanout_* vocabulary + branch_id tagging + graph_compile + actions snapshot
 # ---------------------------------------------------------------------------
 
 def test_fanout_event_vocabulary_and_branch_tagging():

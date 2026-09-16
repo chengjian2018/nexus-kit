@@ -183,8 +183,8 @@ def test_pattern_auto_discovered_and_structure(pattern):
 
 
 def test_stage_wiring(pattern):
-    """Pattern 骨架绑 app-local repair codes；节点级 stages 只带 clarify
-    准入开关（同 install 形态）。"""
+    """The pattern skeleton binds app-local repair codes; node-level stages
+    carry only the clarify admission switch (same shape as install)."""
     skeleton_values = {slot: code for e in pattern.stages
                        for slot, code in e.items()}
     assert skeleton_values == {"query": "time_aug_query",

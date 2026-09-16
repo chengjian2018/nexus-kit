@@ -4,7 +4,7 @@ project) shop customer service, in the two-layer AGENT-graph form.
 Graph (pattern_type="agent"; the whole graph runs from entry per user
 message):
 
-    customer_service ──条件边(next="human_handoff")──> human_handoff (is_end)
+    customer_service ──conditional edge (next="human_handoff")──> human_handoff (is_end)
 
 - ``customer_service``: the ReAct tool loop (default_loop, wrapped by the
   custom ``customer_service_loop`` executor) over the four knowledge tools;
@@ -305,7 +305,8 @@ _HANDOFF_FALLBACK_REPLY = "好的亲，马上为您转接人工客服，请稍�
 
 
 class CustomerServiceLoopExecutor(NodeExecutor):
-    """customer_service 节点执行器：默认 ReAct 工具循环 + 转人工条件边。
+    """Executor of the customer_service node: the default ReAct tool loop +
+    the handoff conditional edge.
 
     Runs the default loop (tools / messages / hooks / streaming all come
     along), then post-processes the final content:
@@ -343,7 +344,8 @@ class CustomerServiceLoopExecutor(NodeExecutor):
 
 
 class HumanHandoffReplyExecutor(NodeExecutor):
-    """human_handoff 节点执行器：tool-less 默认循环生成安抚话术 + 清转人工 flag。
+    """Executor of the human_handoff node: a tool-less default loop generates
+    the reassurance reply + clears the handoff flag.
 
     The node declares no tools, so the default loop is a plain LLM reply
     over the handoff base_prompt. The flag is cleared in a finally — it is a

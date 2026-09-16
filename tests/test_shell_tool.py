@@ -1,6 +1,7 @@
-"""bash / run_python（shell tool）单测：子进程执行、退出码/stdout/stderr
-回填、超时进程组击杀、输出截断、timeout 只能调小、workdir 校验、护栏
-config 读取，以及 registry 层面的注册归属（toolset: shell）。
+"""bash / run_python (shell tool) unit tests: subprocess execution, exit code/stdout/stderr
+backfill, timeout process-group kill, output truncation, args-may-only-lower
+timeout, workdir validation, guardrail config reads, and registry-level
+registration ownership (toolset: shell).
 """
 
 import json
@@ -10,14 +11,14 @@ from unittest.mock import patch
 
 from async_utils import arun
 
-from atoms.tools import shell_tool  # noqa: F401 -- module import 即注册
+from atoms.tools import shell_tool  # noqa: F401 -- the module import registers
 from nexus.registry.tools import registry as tool_registry
 
 _GUARD = {"timeout_seconds": 8, "max_output_chars": 20000}
 
 
 def _dispatch(name, args, guard=None):
-    """经 registry.dispatch 执行（异步 handler 被 await，契约同生产路径）。"""
+    """Execute via registry.dispatch (async handlers get awaited — the same contract as the production path)."""
     with patch("atoms.tools.shell_tool.get_shell_tool_config",
                return_value=dict(guard or _GUARD)):
         return json.loads(arun(tool_registry.dispatch(name, args)))
@@ -32,7 +33,7 @@ def _py(args, guard=None):
 
 
 # ---------------------------------------------------------------------------
-# 注册归属
+# Registration ownership
 # ---------------------------------------------------------------------------
 
 def test_registered_in_shell_toolset():
@@ -60,7 +61,7 @@ def test_bash_nonzero_exit_and_stderr():
 
 
 def test_bash_timeout_kills_process():
-    # 超时（args 1s < guard 8s）：timed_out 标记 + 进程被杀（非零退出）
+    # Timeout (args 1s < guard 8s): the timed_out marker + the process killed (non-zero exit)
     r = _bash({"command": "sleep 30", "timeout_seconds": 1})
     assert r["timed_out"] is True
     assert r["exit_code"] != 0
@@ -68,7 +69,7 @@ def test_bash_timeout_kills_process():
 
 
 def test_bash_timeout_args_cannot_exceed_config_cap():
-    # args 超过 config 上限时按 config 收口（sleep 5 在 2s 处被杀）
+    # args over the config cap are clamped to it (sleep 5 is killed at 2s)
     r = _bash({"command": "sleep 5", "timeout_seconds": 60},
               guard={"timeout_seconds": 2, "max_output_chars": 20000})
     assert r["timed_out"] is True
@@ -86,7 +87,7 @@ def test_bash_workdir():
     with tempfile.TemporaryDirectory() as td:
         r = _bash({"command": "pwd", "workdir": td})
         assert r["exit_code"] == 0
-        # macOS 的 /var 是 /private/var 的 symlink：按 resolved 路径断言
+        # macOS's /var is a symlink to /private/var: assert against the resolved path
         assert r["stdout"].strip() == str(Path(td).resolve())
 
 
@@ -138,16 +139,17 @@ def test_run_python_empty_code_rejected():
 
 
 def test_run_python_no_stdin_hang():
-    # stdin 为 DEVNULL：input() 立即 EOF 报错，而不是挂住等输入
+    # stdin is DEVNULL: input() fails immediately on EOF instead of hanging for input
     r = _py({"code": "input()"})
     assert r["exit_code"] != 0
     assert r["timed_out"] is False
 
 
 def test_bash_timeout_returns_despite_detached_grandchild(monkeypatch):
-    """setsid 逃逸的孙进程握住管道写端：超时击杀后的收尸宽限兜底，
-    调用必须返回（exit_code/输出可缺），而不是在"超时之后"永久挂死
-    一个不可取消的 to_thread 线程。"""
+    """A setsid-escaped grandchild holds the pipe write end: the post-kill reaping grace is the backstop —
+    the call must return (exit_code/output may be missing) instead of
+    hanging forever "after the timeout" on an uncancelable to_thread
+    thread."""
     import atoms.tools.shell_tool as st
 
     monkeypatch.setattr(st, "_POST_KILL_GRACE_SECONDS", 0.5)

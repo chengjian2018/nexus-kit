@@ -5,7 +5,8 @@ Data sources:
 - ``available_slots`` in task_info: the installer's bookable visit windows,
   each "YYYY-MM-DD HH:MM-HH:MM" (e.g. "2026-09-10 09:00-12:00");
 - the customer's spoken time: arrives time-augmented (the pattern-level
-  query slot rewrites "明天下午3点" -> "明天下午3点(2026-09-10 15:00)"), so
+  query slot rewrites e.g. "明天下午3点" [tomorrow 3pm] ->
+  "明天下午3点(2026-09-10 15:00)"), so
   extraction parses the parenthesized annotations of the rewritten query,
   not the raw utterance.
 """
@@ -62,8 +63,9 @@ def parse_available_slots(task_info: dict) -> List[Slot]:
         else:
             raw_slots = [s.strip() for s in re.split(r"[;；，,、\n]+", text) if s.strip()]
     if not isinstance(raw_slots, (list, tuple)):
-        # 标量（int/bool）等任意 JSON 形态：or [] 不收编 truthy 标量，
-        # dict 迭代出的 key 也不是档期——一律按坏档期降级为空表
+        # Any other JSON shape (scalar int/bool etc.): `or []` does not
+        # absorb truthy scalars, and iterating a dict yields keys, not
+        # slots — uniformly degrade to an empty table as bad slots
         logger.warning(
             "[install_booking] available_slots 形态非法（按空档期处理）: %r",
             raw_slots)
@@ -120,7 +122,8 @@ def extract_requested_time(rewritten_query: str,
     """Extract the customer's requested time from the time-augmented query.
 
     jionlp may split one utterance into several entities ("10月1号(2026-10-01)
-    下午3点(15:00)"), so preference order: a date+clock annotation > a date-only
+    下午3点(15:00)" [Oct 1 (2026-10-01), 3pm (15:00)]), so preference order: a
+    date+clock annotation > a date-only
     combined with a following clock-only > date-only (whole day) > clock-only
     (today). Returns None when the utterance carries no time annotation.
     """

@@ -1,18 +1,25 @@
-"""技能资产机制离线测试（nexus/skills.py + atoms/tools/skill_tool.py）。
+"""Offline tests for the skill asset mechanism (nexus/skills.py +
+atoms/tools/skill_tool.py).
 
-覆盖:
-1. 目录扫描:frontmatter 解析（description / requires_toolsets / metadata）、
-   缺 SKILL.md 的目录跳过、frontmatter name 与目录名不一致以目录名为准
-2. mtime 指纹缓存:同指纹返回同一份结果;SKILL.md 内容/时间戳变更后重扫;
-   根不存在 = 空结果静默
-3. 双层 deny-by-default:use_skills ∩ allow_skills;越权与缺失告警降级
-4. L0 元数据块:含名称与描述;无技能时 None
-5. validate_skills:缺失名/越权 use_skills/requires_toolsets 未授权 →
-   strict 报错;lenient 放行;扫描根不存在整体延后
-6. YAML round-trip:allow_skills / use_skills / config.skills_dir 保真
-7. skill 工具:enabled 集拦截越权名、手册全文+目录头、参考文件读取、
-   路径穿越拒绝、detached 调用回退全局根、注册表形态
-8. settings skills 节:缺省 = skills 约定目录,显式配置直达
+Covers:
+1. Directory scan: frontmatter parsing (description / requires_toolsets /
+   metadata), directories missing SKILL.md skipped, frontmatter name vs
+   directory name mismatch resolved by the directory name
+2. mtime fingerprint cache: same fingerprint returns the same snapshot;
+   rescan after SKILL.md content/mtime changes; missing root = silent
+   empty result
+3. Two-layer deny-by-default: use_skills ∩ allow_skills; unauthorized and
+   missing entries warn and degrade
+4. L0 metadata block: contains name and description; None when no skills
+5. validate_skills: missing name / unauthorized use_skills / unauthorized
+   requires_toolsets → strict raises; lenient passes; missing scan root
+   deferred entirely
+6. YAML round-trip: allow_skills / use_skills / config.skills_dir preserved
+7. Skill tools: enabled-set blocks unauthorized names, manual full text +
+   directory header, reference file reads, path traversal rejected,
+   detached calls fall back to the global root, registration shape
+8. settings skills section: default = the conventional skills directory,
+   explicit config wins
 """
 
 import os
@@ -34,7 +41,7 @@ from nexus.skills import (
 
 @pytest.fixture()
 def skill_root(tmp_path):
-    """两个技能 + 一个缺 SKILL.md 的目录。alpha 声明 requires_toolsets。"""
+    """Two skills + one directory missing SKILL.md. alpha declares requires_toolsets."""
     root = tmp_path / "root"
     alpha = root / "alpha"
     (alpha / "references").mkdir(parents=True)
@@ -55,7 +62,7 @@ def skill_root(tmp_path):
     (beta / "SKILL.md").write_text(
         "---\ndescription: beta 技能，无执行面依赖\n---\nBeta 手册正文\n",
         encoding="utf-8")
-    (root / "hollow").mkdir(parents=True)  # 缺 SKILL.md → 跳过
+    (root / "hollow").mkdir(parents=True)  # missing SKILL.md -> skipped
     invalidate_skills_cache()
     return root
 
@@ -75,7 +82,7 @@ def make_node(use_skills=None, use_tools=None):
 
 
 # ============================================================================
-# 1-2. 扫描 + 指纹缓存
+# 1-2. Scan + fingerprint cache
 # ============================================================================
 
 def test_scan_parses_frontmatter_and_skips_hollow(skill_root):
@@ -83,7 +90,7 @@ def test_scan_parses_frontmatter_and_skips_hollow(skill_root):
     assert sorted(entries) == ["alpha", "beta"]
     alpha = entries["alpha"]
     assert isinstance(alpha, SkillEntry)
-    assert alpha.name == "alpha"  # 目录名为准（frontmatter 写的是 alpha-alias）
+    assert alpha.name == "alpha"  # directory name wins (frontmatter says alpha-alias)
     assert "alpha 技能" in alpha.description
     assert alpha.requires_toolsets == ("filesystem",)
     assert alpha.metadata.get("version") == "1.0"
@@ -94,9 +101,9 @@ def test_scan_parses_frontmatter_and_skips_hollow(skill_root):
 def test_scan_cached_by_fingerprint(skill_root):
     first = scan_skills(skill_root)
     second = scan_skills(skill_root)
-    assert first is second  # 同指纹 → 同一快照（零重扫）
+    assert first is second  # same fingerprint -> same snapshot (zero rescan)
 
-    # 内容变更（size + mtime 变化）→ 重扫
+    # content changed (size + mtime changed) -> rescan
     doc = skill_root / "beta" / "SKILL.md"
     doc.write_text("---\ndescription: beta 更新了\n---\n新正文\n",
                    encoding="utf-8")
@@ -104,7 +111,7 @@ def test_scan_cached_by_fingerprint(skill_root):
     third = scan_skills(skill_root)
     assert third is not first
     assert third["beta"].description == "beta 更新了"
-    assert third["alpha"] == first["alpha"]  # 未变更的技能快照值不变
+    assert third["alpha"] == first["alpha"]  # the unchanged skill's snapshot value stays the same
 
 
 def test_scan_missing_root_is_silent(tmp_path):
@@ -113,20 +120,20 @@ def test_scan_missing_root_is_silent(tmp_path):
 
 
 # ============================================================================
-# 3-4. 双层解析 + L0 元数据块
+# 3-4. Two-layer resolution + L0 metadata block
 # ============================================================================
 
 def test_enabled_intersection_and_warnings(skill_root):
     pattern = make_pattern(skill_root)
-    # 空声明 = 无技能
+    # empty declaration = no skills
     assert resolve_enabled_skills(make_node(), pattern) == {}
-    # allow_skills 空 = 整体无
+    # empty allow_skills = none at all
     empty_pool = make_pattern(skill_root, allow_skills=())
     assert resolve_enabled_skills(make_node(["alpha"]), empty_pool) == {}
-    # 交集生效
+    # intersection takes effect
     enabled = resolve_enabled_skills(make_node(["alpha", "beta"]), pattern)
     assert sorted(enabled) == ["alpha", "beta"]
-    # 越权项丢弃（只剩交集）+ 缺失项告警降级
+    # unauthorized entries dropped (only the intersection remains) + missing ones warn and degrade
     partial = make_pattern(skill_root, allow_skills=["alpha", "ghost"])
     enabled = resolve_enabled_skills(make_node(["alpha", "beta", "ghost"]),
                                      partial)
@@ -135,7 +142,7 @@ def test_enabled_intersection_and_warnings(skill_root):
 
 def test_prompt_block_contains_metadata(skill_root):
     pattern = make_pattern(skill_root)
-    assert skill_prompt_block(make_node(), pattern) is None  # 无声明零成本
+    assert skill_prompt_block(make_node(), pattern) is None  # zero cost without a declaration
     block = skill_prompt_block(make_node(["alpha"]), pattern)
     assert "可用技能" in block
     assert "alpha" in block and "load_skill" in block
@@ -146,7 +153,7 @@ def test_prompt_block_contains_metadata(skill_root):
 def test_resolve_skills_dir_pattern_overrides_global(skill_root):
     pattern = make_pattern(skill_root)
     assert resolve_skills_dir(pattern) == skill_root.resolve()
-    # 无覆盖 → 走全局配置（读不到配置回退默认 skills 约定目录）
+    # no override -> global config (falls back to the default conventional skills dir when no config is found)
     fallback = resolve_skills_dir(None)
     assert fallback.is_absolute()
 
@@ -158,21 +165,21 @@ def test_resolve_skills_dir_pattern_overrides_global(skill_root):
 def test_validate_skills_strict_findings(skill_root):
     from nexus.model.validation import validate_skills
 
-    # 幽灵名 → 报错
+    # ghost name -> error
     pattern = make_pattern(skill_root, allow_skills=["alpha", "ghost"])
     assert any("ghost" in f for f in validate_skills(pattern))
 
-    # 越权 use_skills → 报错
+    # unauthorized use_skills -> error
     pattern = make_pattern(skill_root, allow_skills=["alpha"],
                            node=make_node(["beta"]))
     assert any("越权" in f and "beta" in f for f in validate_skills(pattern))
 
-    # requires_toolsets 未授权 → 报错（alpha 要 filesystem，授空）
+    # unauthorized requires_toolsets -> error (alpha needs filesystem, toolsets granted empty)
     pattern = make_pattern(skill_root, allow_skills=["alpha"],
                            allow_toolset=(), node=make_node(["alpha"]))
     assert any("filesystem" in f for f in validate_skills(pattern))
 
-    # 全部合规 → 零 findings
+    # all compliant -> zero findings
     pattern = make_pattern(skill_root, node=make_node(["alpha"]))
     assert validate_skills(pattern) == []
 
@@ -181,11 +188,11 @@ def test_validate_skills_lenient_and_missing_root(skill_root):
     from nexus.model.validation import validate_skills
 
     pattern = make_pattern(skill_root, allow_skills=["ghost"])
-    assert validate_skills(pattern, strict=False) == []  # 宽松放行
+    assert validate_skills(pattern, strict=False) == []  # lenient passes
 
     pattern = make_pattern(skill_root, allow_skills=["ghost"])
     pattern.config["skills_dir"] = str(skill_root.parent / "nope")
-    assert validate_skills(pattern) == []  # 根不存在 → 延后运行期
+    assert validate_skills(pattern) == []  # root missing -> deferred to runtime
 
 
 def test_validate_pattern_integrates_skills(skill_root):
@@ -218,7 +225,7 @@ def test_yaml_roundtrip_preserves_skill_fields(skill_root):
 
 
 # ============================================================================
-# 7. skill 工具（handler 语义 + 注册形态）
+# 7. Skill tools (handler semantics + registration shape)
 # ============================================================================
 
 def test_skill_tools_registered():
@@ -238,7 +245,7 @@ def test_load_skill_enabled_set_and_manual(skill_root):
     from atoms.tools import skill_tool
     from nexus.engine.tool_context import tool_call_context
 
-    # handler 是同步函数（registry 侧经 to_thread 桥接），直调即可
+    # the handler is a sync function (bridged via to_thread on the registry side); call it directly
     with tool_call_context(
             {}, [], session_id="s", skills_dir=str(skill_root),
             enabled_skills=frozenset({"alpha", "stale"})):
@@ -248,11 +255,12 @@ def test_load_skill_enabled_set_and_manual(skill_root):
         blank = skill_tool._handle_load_skill({"name": ""})
 
     assert "[skill: alpha]" in ok
-    assert str(skill_root / "alpha") in ok  # 目录头（手册相对路径的基准）
+    assert str(skill_root / "alpha") in ok  # directory header (base for manual relative paths)
     assert "Alpha 手册" in ok
-    # 未启用名一律"未授权"（不向未授权节点泄露扫描内容）,列出已授权项
+    # disabled names always get "unauthorized" (scan content is not leaked to
+    # unauthorized nodes), listing the authorized ones
     assert "未授权给本节点" in denied and "alpha" in denied
-    # 已启用但磁盘缺失 → "不存在"（错误回填供模型自纠）
+    # enabled but missing on disk -> "not found" (error backfill lets the model self-correct)
     assert "不存在" in stale and "alpha" in stale
     assert "name 必填" in blank
 
@@ -277,8 +285,9 @@ def test_read_skill_file_and_traversal_guard(skill_root):
 
 
 def test_detached_call_falls_back_to_global_root(skill_root, monkeypatch):
-    """脱离 agent loop 直接 dispatch：回退 resolve_skills_dir(None) 的全局
-    根（monkeypatch 钉到 tmp），允许任意已扫描技能（只读知识面）。"""
+    """Dispatching directly outside the agent loop: falls back to the global
+    root of resolve_skills_dir(None) (monkeypatched to tmp), allowing any
+    scanned skill (read-only knowledge surface)."""
     from atoms.tools import skill_tool
 
     monkeypatch.setattr(skill_tool, "resolve_skills_dir",
@@ -288,7 +297,7 @@ def test_detached_call_falls_back_to_global_root(skill_root, monkeypatch):
 
 
 # ============================================================================
-# 8. settings skills 节
+# 8. settings skills section
 # ============================================================================
 
 def test_settings_skills_node(tmp_path):

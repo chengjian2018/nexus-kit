@@ -1,33 +1,43 @@
-"""Cron 调度共享内核 —— cron_tool 的执行原语（无顶层 registry.register，
-AST 发现不 import 本模块；由 atoms/tools/cron_tool.py 引入）。
+"""Cron scheduling shared kernel — the execution primitives behind cron_tool
+(no top-level registry.register, so AST discovery never imports this module;
+it is imported by atoms/tools/cron_tool.py).
 
-三件事：
+Three things:
 
-1. **cron 表达式子集解析 + next_fire 计算**：标准 5 字段（分 时 日 月
-   周，宿主本地时间），每字段支持 ``*`` / ``*/n`` / ``a`` / ``a-b`` /
-   ``a-b/n`` 及逗号组合；dow 0-7（7≡0=周日）。日/周同时受限时按 Vixie
-   cron 的 OR 语义。next_fire 从给定时刻起逐分钟推进（上限一年，防
-   2/30 这类死日期死循环）。不支持秒级、时区名与 @alias——LLM 生成
-   5 字段串即可覆盖常见调度；更复杂的语义交给宿主 crontab。
-2. **JSON 持久化仓**：data/cron_jobs.json（config ``cron_tool.jobs_path``
-   可改），原子写（tmp+rename）；启动时加载并跳过停机期间错过的触发
-   （重算 next_fire，不补跑）。
-3. **调度器单例**：host 启动时 ``ensure_scheduler()`` 拉起 tick 循环
-   （默认 20s 一拍，只比较 next_fire_at，到点 spawn fire 任务）；fire
-   = 授权快照工具池上的 delegate 式子代理执行（_subagent_core，与
-   delegate_task 同一原语），整体受 fire_timeout 包裹，同一 job 不
-   重入（前一跑未结束则本拍跳过）。
+1. **Cron-expression subset parsing + next_fire computation**: the standard
+   5 fields (minute hour day month dow, host local time), each field
+   supporting ``*`` / ``*/n`` / ``a`` / ``a-b`` / ``a-b/n`` and comma
+   combinations; dow 0-7 (7≡0=Sunday). When day and weekday are both
+   restricted, Vixie cron's OR semantics apply. next_fire advances
+   minute-by-minute from the given moment (capped at one year, preventing
+   infinite loops on dead dates like 2/30). No seconds, timezone names, or
+   @alias — an LLM-generated 5-field string covers common scheduling;
+   more complex semantics belong to the host crontab.
+2. **JSON persistence store**: data/cron_jobs.json (config
+   ``cron_tool.jobs_path``), atomic write (tmp+rename); loaded at startup,
+   skipping fires missed while down (next_fire recomputed, no replay).
+3. **Scheduler singleton**: the host startup calls ``ensure_scheduler()``
+   to start the tick loop (20s cadence by default, only comparing
+   next_fire_at, spawning a fire task when due); fire = a delegate-style
+   sub-agent execution over the authorization-snapshot tool pool
+   (_subagent_core, the same primitive as delegate_task), wrapped by
+   fire_timeout, with no re-entry per job (a still-running job skips this
+   tick).
 
-授权模型：job 创建时刻把当时 pattern 的 ``allow_toolset`` 解析成具体
-工具名冻结进 job（剔除 subagent/workflow/cron 三个编排工具集，结构性
-防"编排套编排/自复制"），并一并冻结创建 pattern 的 ``pattern_code``
-（fire 期护栏与 LLM 配置的 app 覆盖定位键；旧作业文件缺字段回退 ""=
-全局）；fire 时按快照池执行，权限永不越出创建者的授权边界。
-llm_config 在 fire 时刻现解析（配置热更新生效）。
+Authorization model: at job creation the pattern's ``allow_toolset`` is
+resolved into concrete tool names and frozen into the job (minus the
+subagent/workflow/cron orchestration toolsets, structurally preventing
+"orchestration inside orchestration" / self-copying), and the creating
+pattern's ``pattern_code`` is frozen too (the app-overlay locator key for
+fire-time guardrails and LLM config; old job files missing the field fall
+back to "" = global); fire executes against the snapshot pool — permissions
+never exceed the creator's granted boundary.
+llm_config is resolved fresh at fire time (config hot-reload applies).
 
-测试隔离：环境变量 ``NEXUS_CRON_DISABLED=1``（tests/conftest.py 与
-NEXUS_MCP_DISABLED 同款模式）让 ensure_scheduler 直接 no-op、仓不读
-不写真实文件——测试进程绝不会真触发 LLM 调用或碰宿主的 jobs 文件。
+Test isolation: the env var ``NEXUS_CRON_DISABLED=1`` (same pattern as
+NEXUS_MCP_DISABLED in tests/conftest.py) makes ensure_scheduler a no-op and
+keeps the store from reading/writing real files — the test process never
+actually triggers LLM calls or touches the host's jobs file.
 """
 
 import asyncio
@@ -48,10 +58,11 @@ from nexus.settings import get_cron_tool_config
 
 logger = logging.getLogger(__name__)
 
-# fire 子代理的工具池永不包含这三个编排工具集（防递归/自复制）
+# The fire sub-agent's tool pool never includes these three orchestration toolsets (anti-recursion / self-copying)
 _EXCLUDED_TOOLSETS = frozenset({"subagent", "workflow", "cron"})
 
-# 逐分钟扫描的硬上限（一年）：2/30、2/29（非闰年）这类死日期到头即放弃
+# Hard cap for the minute-by-minute scan (one year): dead dates like 2/30 or
+# 2/29 (non-leap) give up at the end
 _MAX_SCAN_MINUTES = 366 * 24 * 60
 
 _CRON_FIELD_RANGES = (
@@ -59,7 +70,7 @@ _CRON_FIELD_RANGES = (
     ("hour", 0, 23),
     ("day_of_month", 1, 31),
     ("month", 1, 12),
-    ("day_of_week", 0, 7),   # 7 ≡ 0 ≡ 周日，存集合时归一到 0-6
+    ("day_of_week", 0, 7),   # 7 ≡ 0 ≡ Sunday, normalized to 0-6 when stored
 )
 
 _CRON_FIELD_RE = re.compile(r"^(?:\*|\d+|\d+-\d+)(?:/\d+)?$")
@@ -70,13 +81,13 @@ def _disabled() -> bool:
 
 
 # =========================================================================
-# 1. cron 表达式解析 + next_fire
+# 1. cron expression parsing + next_fire
 # =========================================================================
 
 def parse_cron_field(field: str, low: int, high: int,
                      name: str) -> Set[int]:
-    """解析单个字段为合法值集合（``*`` / ``*/n`` / ``a`` / ``a-b`` /
-    ``a-b/n`` 及逗号组合）。day_of_week 的 7 归一为 0。"""
+    """Parse one field into its legal value set (``*`` / ``*/n`` / ``a`` /
+    ``a-b`` / ``a-b/n`` and comma combinations). day_of_week's 7 normalizes to 0."""
     values: Set[int] = set()
     for part in str(field).split(","):
         part = part.strip()
@@ -97,7 +108,7 @@ def parse_cron_field(field: str, low: int, high: int,
             start, end = int(start_s), int(end_s)
         else:
             start = end = int(body)
-            if "/" in part:   # "a/n" 语义上等于 a..high/n（Vixie 允许，罕见）
+            if "/" in part:   # "a/n" semantically equals a..high/n (Vixie allows it; rare)
                 end = high
         if start < low or end > high or start > end:
             raise ValueError(
@@ -112,7 +123,7 @@ def parse_cron_field(field: str, low: int, high: int,
 
 
 def parse_cron(expr: str) -> Dict[str, Set[int]]:
-    """解析 5 字段 cron 表达式 → {field: 合法值集合}。"""
+    """Parse a 5-field cron expression → {field: legal value set}."""
     parts = str(expr).split()
     if len(parts) != 5:
         raise ValueError(
@@ -125,10 +136,12 @@ def parse_cron(expr: str) -> Dict[str, Set[int]]:
 
 def next_fire(parsed: Dict[str, Set[int]],
               after: datetime) -> Optional[datetime]:
-    """从 after 起逐分钟找下一个命中时刻（秒归零；不含 after 本身）。
+    """Find the next hit minute-by-minute from after (seconds zeroed; after itself excluded).
 
-    日/周同时受限时按 Vixie cron 的 OR 语义（其一为全集时另一个独立
-    生效）。扫描上限一年，超限返回 None（死日期）。
+    When day and weekday are both restricted, Vixie cron's OR semantics
+    apply (either being the full set makes the other independently
+    effective). The scan caps at one year; past it returns None (a dead
+    date).
     """
     dom_open = len(parsed["day_of_month"]) == 31
     dow_open = len(parsed["day_of_week"]) == 7
@@ -148,7 +161,7 @@ def next_fire(parsed: Dict[str, Set[int]],
 
 def next_fire_at(parsed: Dict[str, Set[int]], now: Optional[float] = None
                  ) -> Optional[float]:
-    """next_fire 的 epoch 包装（None 传导）。"""
+    """Epoch wrapper of next_fire (None propagates)."""
     fire = next_fire(parsed, datetime.fromtimestamp(
         now if now is not None else time.time()))
     return fire.timestamp() if fire is not None else None
@@ -156,7 +169,7 @@ def next_fire_at(parsed: Dict[str, Set[int]], now: Optional[float] = None
 
 def compute_next_fire(job: Dict[str, Any], now: Optional[float] = None
                       ) -> Optional[float]:
-    """按 job 的调度方式（cron / interval）算下一次触发时刻。"""
+    """Compute the next fire time per the job's schedule kind (cron / interval)."""
     ts = now if now is not None else time.time()
     schedule = job.get("schedule") or {}
     if "cron" in schedule:
@@ -168,14 +181,15 @@ def compute_next_fire(job: Dict[str, Any], now: Optional[float] = None
 
 
 # =========================================================================
-# 2. JSON 持久化仓
+# 2. JSON persistence store
 # =========================================================================
 
 class CronStore:
-    """jobs JSON 文件仓：load（不存在/损坏 → 空）+ save（原子写）。
+    """jobs JSON file store: load (missing/corrupt → empty) + save (atomic write).
 
-    文件极小（≤ max_jobs 条），同步 IO 直写（handler 跑在 to_thread；
-    fire 侧在事件循环上写毫秒级小文件，可接受）。
+    The file is tiny (≤ max_jobs entries), so synchronous IO is written
+    directly (handlers run on to_thread; the fire side writes a
+    millisecond-scale file on the event loop — acceptable).
     """
 
     def __init__(self, path: str):
@@ -205,17 +219,18 @@ class CronStore:
 
 
 # =========================================================================
-# 3. 调度器
+# 3. Scheduler
 # =========================================================================
 
 async def default_execute_job(job: Dict[str, Any]) -> Dict[str, Any]:
-    """fire 默认执行器：授权快照池上的 delegate 式子代理循环。
+    """The default fire executor: a delegate-style sub-agent loop over the authorization-snapshot pool.
 
-    llm_config 与护栏在 fire 时刻按作业冻结的 ``pattern_code`` 解析
-    （app 覆盖热更新生效，定位键是创建时刻冻结值）；工具池是 job.tools
-    冻结快照（创建时已剔除编排工具集）。
+    llm_config and guardrails resolve at fire time via the job's frozen
+    ``pattern_code`` (app-overlay hot-reload applies; the locator key is the
+    creation-time frozen value); the tool pool is the job.tools frozen
+    snapshot (orchestration toolsets already removed at creation).
     """
-    from atoms.tools._subagent_core import (  # 延迟导入防环
+    from atoms.tools._subagent_core import (  # lazy import against a cycle
         _DEFAULT_SYSTEM_PROMPT,
         _run_sub_agent,
     )
@@ -240,10 +255,11 @@ async def default_execute_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class CronScheduler:
-    """tick 循环 + fire 编排（jobs 存内存态 dict，每次变更即持久化）。
+    """Tick loop + fire orchestration (jobs live in an in-memory dict, persisted on every change).
 
-    无事件循环也能用（CRUD 直改 jobs + save）；tick 循环只在
-    ensure_scheduler 后存在。同 job 不重入：fire 进行中本拍跳过。
+    Usable without an event loop (CRUD mutates jobs + saves directly); the
+    tick loop exists only after ensure_scheduler. No re-entry per job: a
+    fire in progress skips this tick.
     """
 
     def __init__(self, execute_job: Callable = default_execute_job):
@@ -254,10 +270,10 @@ class CronScheduler:
         self._fire_tasks: Set[asyncio.Task] = set()
         self._lock = threading.Lock()
 
-    # -- 生命周期 --------------------------------------------------------
+    # -- lifecycle --------------------------------------------------------
 
     def load(self) -> None:
-        """启动加载：读仓 + 跳过错过的触发（重算 next，不补跑）。"""
+        """Startup load: read the store + skip fires missed while down (recompute next, no replay)."""
         guard = get_cron_tool_config()
         self.jobs = CronStore(guard["jobs_path"]).load()
         now = time.time()
@@ -275,8 +291,8 @@ class CronScheduler:
             self._tick_loop(), name="nexus-cron-tick")
 
     async def stop(self) -> None:
-        """停机回收：等 tick 退出，并取消在途 fire（LLM 调用）——
-        fire 任务被追踪，不再在宿主拆除时无人认领地继续跑。"""
+        """Shutdown reclamation: wait for the tick to exit and cancel in-flight fires (LLM calls) —
+        fire tasks are tracked, no longer running unclaimed through host teardown."""
         tick, self._tick_task = self._tick_task, None
         if tick is not None:
             tick.cancel()
@@ -327,11 +343,14 @@ class CronScheduler:
                 job = self.jobs.get(job_id)
                 if job is None or not job.get("enabled", True):
                     return
-                # fire 期护栏按作业冻结的 pattern_code 解析（无冻结值 =
-                # 旧作业文件，回退全局段）；调度器循环本体（tick/load）在
-                # 会话外运行，保持全局解析是正确行为
+                # Fire-time guardrails resolve via the job's frozen
+                # pattern_code (no frozen value = an old job file, falling
+                # back to the global section); the scheduler loop body
+                # (tick/load) runs outside any session, so global resolution
+                # is the correct behavior
                 guard = get_cron_tool_config(str(job.get("pattern_code") or ""))
-                # 触发即排下一次（先排后跑：跑挂了也不丢后续调度）
+                # Schedule the next fire immediately (schedule-then-run: a
+                # crashed run never loses subsequent scheduling)
                 job["next_fire_at"] = compute_next_fire(job)
                 job["runs"] = int(job.get("runs", 0)) + 1
                 started = time.time()
@@ -344,11 +363,14 @@ class CronScheduler:
             timed_out = False
             error: Optional[str] = None
             try:
-                # 挂起会话作用域：fire 的子代理工具调用（如 task_list）
-                # 以 cron:<job_id> 隔离——否则全部无上下文调用共享 _global
-                # 桶，并发 fire 的 write_tasks 全量替换会互踩（llm/授权
-                # 字段留空：fire 子代理池按冻结快照名字直发，不读这两项；
-                # 同步 with 即可——contextvar 在同一 Task 内跨 await 生效）
+                # Suspend a session scope: the fire sub-agent's tool calls
+                # (e.g. task_list) are isolated under cron:<job_id> —
+                # otherwise all context-less calls would share the _global
+                # bucket and concurrent fires' write_tasks whole-replacements
+                # would stomp each other (llm/authorization fields left
+                # empty: the fire sub-agent pool dispatches by the frozen
+                # snapshot names and never reads those two; a plain with is
+                # enough — the contextvar lives across awaits within one Task)
                 from nexus.engine.tool_context import tool_call_context
                 with tool_call_context(
                         llm_config={}, allow_toolsets=set(),
@@ -396,7 +418,7 @@ class CronScheduler:
             with self._lock:
                 self._firing.discard(job_id)
 
-    # -- CRUD（工具 handler 走这里） ------------------------------------
+    # -- CRUD (the tool handlers go through here) ------------------------------------
 
     def _persist_locked(self, guard: Dict[str, Any]) -> None:
         if _disabled():
@@ -404,11 +426,13 @@ class CronScheduler:
         CronStore(guard["jobs_path"]).save(self.jobs)
 
     def add(self, job: Dict[str, Any]) -> None:
-        """新增/覆盖一个作业（update_cron 复用覆盖语义）。
+        """Add or overwrite a job (update_cron reuses the overwrite semantics).
 
-        max_jobs 上限在锁内检查：锁外的先查后加在并发 create 下会双双
-        通过、超限写入。新增（id 不存在）超限时抛 ValueError。护栏按
-        调用方（create handler）所在 pattern 的 app 覆盖解析。"""
+        The max_jobs cap is checked inside the lock: a check-then-add
+        outside the lock would double-pass under concurrent creates and
+        write over the cap. A new (absent id) job over the cap raises
+        ValueError. Guardrails resolve via the calling handler's pattern
+        app overlay."""
         with self._lock:
             guard = get_cron_tool_config(ambient_pattern_code())
             if (job["id"] not in self.jobs
@@ -422,10 +446,12 @@ class CronScheduler:
     def update(self, job_id: str,
                mutate: Callable[[Dict[str, Any]], None]
                ) -> Optional[Dict[str, Any]]:
-        """锁内「读取-变更-持久化」：活字典不再在锁外被直改——半更新
-        状态若被并发的 _fire 持久化，会把过期的 next_fire_at 固化到盘上
-        （重启后 load 只在 nxt < now 时重算，作业会沉睡到旧的未来时刻）。
-        mutate 抛 ValueError 视为校验失败，作业保持原状。"""
+        """Lock-held "read-mutate-persist": the live dict is never modified outside the lock —
+        a half-updated state persisted by a concurrent _fire would bake a
+        stale next_fire_at to disk (after restart, load only recomputes when
+        nxt < now, so the job would sleep until that old future moment).
+        A ValueError from mutate counts as failed validation; the job stays
+        as it was."""
         with self._lock:
             job = self.jobs.get(job_id)
             if job is None:
@@ -435,8 +461,9 @@ class CronScheduler:
             return job
 
     def list_jobs(self) -> List[Dict[str, Any]]:
-        """锁内快照（history 单独拷贝）：CRUD 与 tick/fire 并发变更时，
-        调用方在锁外排序/渲染不再迭代活容器。"""
+        """Lock-held snapshot (history copied separately): callers sort/render outside the lock
+        without iterating a live container while CRUD and tick/fire mutate
+        concurrently."""
         with self._lock:
             snapshot = []
             for job in self.jobs.values():
@@ -458,7 +485,7 @@ class CronScheduler:
 
 
 # =========================================================================
-# 单例管理
+# Singleton management
 # =========================================================================
 
 _SCHEDULER: Optional[CronScheduler] = None
@@ -466,7 +493,7 @@ _SINGLETON_LOCK = threading.Lock()
 
 
 def get_scheduler() -> CronScheduler:
-    """惰性单例：首次创建即 load（NEXUS_CRON_DISABLED 时空仓不读文件）。"""
+    """Lazy singleton: created with load (an empty store, no file read, when NEXUS_CRON_DISABLED)."""
     global _SCHEDULER
     with _SINGLETON_LOCK:
         if _SCHEDULER is None:
@@ -478,7 +505,7 @@ def get_scheduler() -> CronScheduler:
 
 
 async def ensure_scheduler() -> CronScheduler:
-    """host 启动接线：取单例并拉起 tick 循环（DISABLED 时 no-op）。"""
+    """Host startup wiring: take the singleton and start the tick loop (a no-op when DISABLED)."""
     sched = get_scheduler()
     if not _disabled():
         await sched.start()
@@ -492,7 +519,7 @@ async def stop_scheduler() -> None:
 
 
 def reset_scheduler() -> None:
-    """测试辅助：丢弃单例（下次 get_scheduler 重新 load）。"""
+    """Test helper: drop the singleton (the next get_scheduler reloads)."""
     global _SCHEDULER
     with _SINGLETON_LOCK:
         _SCHEDULER = None
@@ -503,6 +530,6 @@ def new_job_id() -> str:
 
 
 def snapshot_tool_pool(allow_toolsets) -> List[str]:
-    """把 pattern 授权工具集冻结成工具名快照（剔除编排工具集）。"""
+    """Freeze the pattern's granted toolsets into a tool-name snapshot (orchestration toolsets removed)."""
     wanted = set(allow_toolsets or []) - _EXCLUDED_TOOLSETS
     return sorted(tool_registry.names_in_toolsets(wanted))

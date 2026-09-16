@@ -10,7 +10,8 @@ usable on the next turn, same story as the llm-config mtime cache
 
 - ``resolve_enabled_skills(node, pattern)`` — the declaration intersection
   (``node.use_skills ∩ pattern.allow_skills``) resolved against the scan
-  (both deny-by-default; the model-layer analogue of the tool 三层收口).
+  (both deny-by-default; the model-layer analogue of the tool three-layer
+  gate).
 - ``skill_prompt_block(node, pattern)`` — the L0 metadata block (one line
   per enabled skill) appended to the system prompt by the loop executor
   via ``extra_blocks``; the description is the trigger — the model cannot
@@ -67,8 +68,9 @@ _CACHE_LOCK = threading.Lock()
 
 
 def _absolutize(raw: str) -> Path:
-    """Pin a declared root to an absolute path (相对根按服务启动目录解析，
-    与 file 工具的相对路径语义一致；~ 展开）。"""
+    """Pin a declared root to an absolute path (a relative root resolves
+    against the service startup directory — same semantics as the file
+    tool's relative paths; ~ is expanded)."""
     p = Path(str(raw)).expanduser()
     return p if p.is_absolute() else (Path.cwd() / p).resolve()
 
@@ -213,7 +215,7 @@ def invalidate_skills_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Declaration intersection (the skill 双层 deny-by-default)
+# Declaration intersection (the skill's two-layer deny-by-default)
 # ---------------------------------------------------------------------------
 
 def resolve_enabled_skills(node: Any, pattern: Any = None

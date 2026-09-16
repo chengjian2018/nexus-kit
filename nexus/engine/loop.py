@@ -13,9 +13,9 @@ module keeps:
   one-directional (atoms → nexus) and existing import anchors hold
 - framework-enforced prompt items (force-close suffix, prompt-length warning)
 
-Tool authorization (deny-by-default 三层收口):
+Tool authorization (deny-by-default, three-layer gate):
 
-1. toolset 标签 — every registered tool carries one (builtin: knowledge /
+1. toolset tag — every registered tool carries one (builtin: knowledge /
    mcp; MCP servers register under ``mcp-<server>``)
 2. ``pattern.allow_toolset`` — the toolset-level grant (empty = nothing)
 3. ``node.use_tools`` — the concrete tool-name grant (**empty = no tools**)

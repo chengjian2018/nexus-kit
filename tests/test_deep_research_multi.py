@@ -1,17 +1,25 @@
-"""deep_research（扇出版四节点 AGENT 图）离线测试。
+"""Offline tests for deep_research (fan-out, four-node AGENT graph).
 
-ScriptedProvider 与相位检测（请求特征锚点）自包含于本文件；图版机制覆盖：
-1. 图结构 + AST 自动发现 + 四相位 executor 插件注册 + validate_pattern
-2. 全研究轮：PLAN 按子问题 sends 扇出（search×N 并行 worker）→ join 综合 /
-   工具真实派发 / 终态 trace 与旧版同构（+additive branches 摘要）/
-   history 无 tool 行 / 图终止清空 graph_state
-3. 预检索相位：工具结果进入 PLAN 请求；findings 汇入 join
-4. PLAN 降级 / 自纠重试（相位级回归锚点）；子问题数超过 max_fanout 截断
-5. SEARCH 每分支轮次封顶后综合仍完成；单分支失败降级不阻塞 join
-6. 流式：delta 只来自 SYNTHESIZE；fanout_*/branch_* 事件 + branch_id tagging
-7. 第二轮从首站重跑（每轮全图重跑语义）
-8. 孤儿入口防御：挂起游标落在 dr_plan（无在途状态）→ 跳过规划检索直奔综合
-   （引擎 resume 机制 + 相位孤儿防御的复合回归）
+ScriptedProvider and phase detection (request-feature anchors) are
+self-contained in this file; coverage of the graph-based mechanism:
+1. Graph structure + AST auto-discovery + four-phase executor plugin
+   registration + validate_pattern
+2. Full research turn: PLAN fans out sends per sub-question (search x N
+   parallel workers) -> join synthesis / real tool dispatch / final trace
+   isomorphic with the legacy version (+ additive branches summary) /
+   no tool rows in history / graph termination clears graph_state
+3. Pre-retrieval phase: tool results feed the PLAN request; findings
+   flow into join
+4. PLAN degradation / self-correction retry (phase-level regression
+   anchors); sub-question count beyond max_fanout is truncated
+5. SEARCH: synthesis still completes after per-branch round capping;
+   single-branch failure degrades without blocking join
+6. Streaming: deltas come only from SYNTHESIZE; fanout_*/branch_* events
+   + branch_id tagging
+7. Second turn reruns from the entry node (full-graph rerun semantics)
+8. Orphan entry defense: a paused cursor landing on dr_plan (no in-flight
+   state) -> skips planning/pre-retrieval and goes straight to synthesis
+   (compound regression of engine resume + phase orphan defense)
 """
 
 import json
@@ -35,8 +43,9 @@ from apps.deep_research_agent.prompts import PLAN_ANCHOR, PREPLAN_ANCHOR
 
 @pytest.fixture(autouse=True)
 def _no_query_interval(monkeypatch):
-    """查询限速归零：_dispatch_research_round 每次真实查询后的 sleep 只在
-    生产生效，离线测试不等待。"""
+    """Zero out the query rate limit: the sleep after each real query in
+    _dispatch_research_round only applies in production; offline tests
+    do not wait."""
     monkeypatch.setattr(executor_multi, "_QUERY_INTERVAL_SECONDS", 0.0)
 
 
@@ -54,7 +63,8 @@ def pattern():
 @pytest.fixture()
 def fake_mcp_tools():
     """Register the fake MCP search tool under the pattern's declared name
-    (web_search_prime, toolset mcp-websearch——节点的 use_tools 声明名）。"""
+    (web_search_prime, toolset mcp-websearch — the node's use_tools
+    declared name)."""
     from nexus.registry.tools import registry as tool_registry
 
     calls = {"n": 0, "queries": []}
@@ -82,9 +92,11 @@ def fake_mcp_tools():
 
 
 def test_query_budget_and_rate_limit(monkeypatch):
-    """查询预算与限速契约：SEARCH 轮次封顶 5；同一轮内第 2 个及之后的
-    真实查询执行前 sleep _QUERY_INTERVAL_SECONDS（synthetic 错误回填不
-    算查询不睡；单查询后不睡——消除收尾轮前的死 5s 尾延迟）。"""
+    """Query budget and rate-limit contract: SEARCH rounds are capped at 5;
+    from the 2nd real query onward within a round, sleep
+    _QUERY_INTERVAL_SECONDS before executing (synthetic error backfill
+    does not count as a query and does not sleep; no sleep after a single
+    query — removes the dead 5s tail latency before the closing round)."""
     import asyncio as _asyncio
 
     import apps.deep_research_agent.executor_multi as em
@@ -102,7 +114,7 @@ def test_query_budget_and_rate_limit(monkeypatch):
 
     monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
     monkeypatch.setattr(em, "_execute_tool", _fake_execute_tool)
-    # 本测试关心的就是生产间隔值——抵消 autouse 的归零 fixture
+    # What this test cares about is the production interval value — cancels out the autouse zeroing fixture
     monkeypatch.setattr(em, "_QUERY_INTERVAL_SECONDS", 5.0)
 
     class _Cxt:
@@ -116,7 +128,7 @@ def test_query_budget_and_rate_limit(monkeypatch):
         {"id": "c1", "function": {"name": "web_search_prime",
                                   "arguments": '{"query": "第一条"}'}},
         {"id": "c2", "function": {"name": "ghost_tool",
-                                  "arguments": "{}"}},  # 拦截回填，不睡
+                                          "arguments": "{}"}},  # intercepted and backfilled, no sleep
         {"id": "c3", "function": {"name": "web_search_prime",
                                   "arguments": '{"query": "第二条"}'}},
     ]
@@ -125,10 +137,10 @@ def test_query_budget_and_rate_limit(monkeypatch):
         allowed_names={"web_search_prime"}, round_idx=0,
         cxt=_Cxt(), node=_Node(), findings=[], tool_stats={}, stream=None))
 
-    assert len(findings) == 2            # 两条真实查询进 findings
-    assert sleeps == [5.0]               # 仅第二条查询前一次限速暂停
+    assert len(findings) == 2            # two real queries enter findings
+    assert sleeps == [5.0]               # one rate-limit pause, before the second query only
 
-    # 单查询收尾：无尾延迟睡眠
+    # single-query close-out: no tail-latency sleep
     sleeps.clear()
     arun(em.DeepResearchExecutor()._dispatch_research_round(
         [], [tool_calls[0]], hooks=None,
@@ -138,14 +150,17 @@ def test_query_budget_and_rate_limit(monkeypatch):
 
 
 class DeepResearchScriptedProvider:
-    """按相位特征脚本化的 provider(记录调用与请求特征供断言)。
+    """Provider scripted by phase signature (records calls and request
+    signatures for assertions).
 
-    请求识别(与 executor 的 prompt 布局一一对应):
-    - PREPLAN:最后一条 user 消息含 PREPLAN_ANCHOR
-    - PLAN:最后一条 user 消息含 PLAN_ANCHOR
-    - SEARCH:tools 参数非空（扇出 worker 的请求——分支以其工作区 user
-      行(子问题)标识，轮次按分支独立计数，并发互不干扰）
-    - SYNTHESIZE:system 或 user 含 ``撰写最终研究报告``
+    Request identification (one-to-one with the executor's prompt layout):
+    - PREPLAN: the last user message contains PREPLAN_ANCHOR
+    - PLAN: the last user message contains PLAN_ANCHOR
+    - SEARCH: the tools argument is non-empty (fan-out worker requests —
+      a branch is identified by its workspace user line (sub-question);
+      rounds are counted per branch independently, concurrency does not
+      interfere)
+    - SYNTHESIZE: system or user contains ``撰写最终研究报告``
     """
 
     def __init__(self, plan_json=None, search_rounds=1, report="# 研究报告",
@@ -159,11 +174,12 @@ class DeepResearchScriptedProvider:
         self.preplan_rounds = preplan_rounds
         self.plan_fail_first = plan_fail_first
         self.fail_sub_question = fail_sub_question
-        # 模型输出的工具名（可故意写成泛化名 web_search，测分派前归一）
+        # Tool name the model emits (may deliberately use the generic name
+        # web_search to test pre-dispatch normalization)
         self.tool_name = tool_name
         self.call_count = 0
         self.search_calls = 0
-        self.search_branches = {}   # 子问题 -> {"tool_rounds", "calls"}
+        self.search_branches = {}   # sub-question -> {"tool_rounds", "calls"}
         self.plan_calls = 0
         self.synth_calls = 0
         self.preplan_calls = 0
@@ -335,17 +351,17 @@ def test_pattern_structure_and_executor_binding(pattern):
 
     codes = [n.code for n in pattern.nodes]
     assert codes == ["dr_preplan", "dr_plan", "dr_search", "dr_synthesize"]
-    # 静态邻接 = 流水线拓扑；综合站终态
+    # static adjacency = pipeline topology; the synthesis node is terminal
     assert pattern.node_map["dr_preplan"].sub_nodes == ["dr_plan"]
     assert pattern.node_map["dr_plan"].sub_nodes == ["dr_search",
-                                                    "dr_synthesize"]  # 含孤儿逃生边
+                                                    "dr_synthesize"]  # includes the orphan escape edge
     assert pattern.node_map["dr_search"].sub_nodes == ["dr_synthesize"]
     assert pattern.node_map["dr_synthesize"].sub_nodes == []
     assert pattern.node_map["dr_synthesize"].is_end is True
 
     for node in pattern.nodes:
-        assert node.plugins["loop"] == node.code  # 相位 code 即执行器 code
-    # 工具授权面：toolset 级 + 检索节点静态列名
+        assert node.plugins["loop"] == node.code  # phase code doubles as the executor code
+    # tool authorization surface: toolset level + retrieval nodes' static name lists
     assert pattern.allow_toolset == ["mcp-websearch", "mcp-zai"]
     assert pattern.node_map["dr_preplan"].use_tools == ["web_search_prime"]
     assert pattern.node_map["dr_search"].use_tools == ["web_search_prime"]
@@ -364,36 +380,41 @@ def test_phase_executor_plugins_registered():
 
 
 # ============================================================================
-# 1b. Tool-name alias normalization（flash 级模型的泛化名护栏前归一）
+# 1b. Tool-name alias normalization (normalized ahead of the generic-name
+# guardrail for flash-tier models)
 # ============================================================================
 
 def test_normalize_tool_name_unit():
     from apps.deep_research_agent.executor_multi import _normalize_tool_name
 
     allowed = {"web_search_prime"}
-    # 原名可用 / 别名命中
+    # canonical name allowed / alias hit
     assert _normalize_tool_name("web_search_prime", allowed) == \
         ("web_search_prime", False)
     assert _normalize_tool_name("web_search", allowed) == \
         ("web_search_prime", True)
-    # 未命中别名、或别名目标不在本轮集合 → 原样返回（仍走拦截护栏）
+    # no alias hit, or the alias target is not in this round's set -> return
+    # as-is (still goes through the interception guardrail)
     assert _normalize_tool_name("no_such_tool", allowed) == ("no_such_tool", False)
     assert _normalize_tool_name("web_search", {"other"}) == ("web_search", False)
 
 
 def test_tool_name_alias_dispatches_canonical_tool(pattern, fake_mcp_tools):
-    """模型全程把 web_search_prime 写成泛化名 web_search：分派前就地归一，
-    工具真实执行、findings/统计落在规范名下——不再浪费「拦截→回喂→自纠」
-    一轮（归一失效时会表现为 fake 工具零调用、研究降级）。"""
+    """The model writes web_search_prime as the generic name web_search
+    throughout: it is normalized in place before dispatch, the tool really
+    executes, and findings/stats land under the canonical name — no longer
+    wasting an "intercept -> feed-back -> self-correct" round (if
+    normalization broke, this would show up as zero calls to the fake tool
+    and degraded research)."""
     provider = DeepResearchScriptedProvider(
         report="# 研究报告\n归一检索生效 [S1]。",
-        tool_name="web_search")            # 模型每轮都叫错名字
+        tool_name="web_search")            # the model gets the name wrong every round
     session, reply = run_research(pattern, provider)
 
     assert "研究报告" in reply
-    assert fake_mcp_tools["n"] >= 2         # 假工具被真实分派（每分支 ≥1 次）
+    assert fake_mcp_tools["n"] >= 2         # fake tool really dispatched (>=1 per branch)
     trace = session.cxt.metadata["deep_research"]
-    assert trace["tool_stats"].get("web_search_prime") == 2   # 统计在规范名下
+    assert trace["tool_stats"].get("web_search_prime") == 2   # stats under the canonical name
     assert trace["sources"][0]["tool"] == "web_search_prime"
     assert not trace["degraded"]
 
@@ -663,8 +684,10 @@ def test_second_turn_restarts_pipeline(pattern, fake_mcp_tools):
 # ============================================================================
 
 def test_orphan_paused_plan_bails_to_synthesize(pattern, fake_mcp_tools):
-    """挂起游标落在 dr_plan 且无在途状态（异常遗留）→ 引擎 resume 该节点，
-    相位孤儿防御跳过规划检索直奔综合；综合降级产出「证据不足」报告。"""
+    """A paused cursor lands on dr_plan with no in-flight state (left over
+    from an exception) -> the engine resumes that node, and the phase
+    orphan defense skips planning/pre-retrieval and goes straight to
+    synthesis; synthesis degrades into an "insufficient evidence" report."""
     sessions = {}
     session = launch(pattern, sessions)
     session.cxt.graph_state["__paused_node__"] = "dr_plan"
@@ -683,15 +706,16 @@ def test_orphan_paused_plan_bails_to_synthesize(pattern, fake_mcp_tools):
     trace = session.cxt.metadata["deep_research"]
     assert "orphan" in " ".join(trace["phases"])
     assert trace["degraded"] is True
-    # 图终止后状态板清空（挂起游标不复存在）
+    # state board cleared after graph termination (the paused cursor no longer exists)
     assert session.cxt.graph_state == {}
     assert session.cxt.current_node_code == "dr_synthesize"
 
 
 def test_tool_call_trace_carries_rewrite_audit_keys():
-    """分支 trace 与内核路径契约对齐：P4 改写过的调用，tool_call 事件
-    携带 rewritten=True 与 original_call（原先 rewrite_audits 收集后被
-    丢弃，分支侧改写审计无数据）。"""
+    """Branch trace aligns with the kernel-path contract: for calls
+    rewritten by P4, the tool_call event carries rewritten=True and
+    original_call (previously rewrite_audits were collected and then
+    dropped, leaving the branch-side rewrite audit with no data)."""
     import apps.deep_research_agent.executor_multi as em
 
     emitted = []
@@ -700,7 +724,7 @@ def test_tool_call_trace_carries_rewrite_audit_keys():
         def emit_trace(self, event, **data):
             emitted.append((event, data))
 
-    def _rewrite(event):                       # P4 改写：名字 + 参数
+    def _rewrite(event):                       # P4 rewrite: name + args
         return {"name": "web_search_prime", "args": {"query": "改写后"}}
 
     class _Cxt:
@@ -724,7 +748,8 @@ def test_tool_call_trace_carries_rewrite_audit_keys():
     calls = [d for ev, d in emitted if ev == "tool_call"]
     assert len(calls) == 1
     assert calls[0]["rewritten"] is True
-    # original_call = hook 改写前的调用（别名归一化已先于此发生）
+    # original_call = the call as it was before the hook rewrote it (alias
+    # normalization already happened before this point)
     assert calls[0]["original_call"]["name"] == "web_search_prime"
     assert calls[0]["original_call"]["args"] == {"query": "原始"}
     assert calls[0]["args"] == {"query": "改写后"}

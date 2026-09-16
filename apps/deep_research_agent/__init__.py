@@ -1,9 +1,13 @@
-"""deep_research_agent — 结构化深度研究配方(四节点 AGENT 图)。
+"""deep_research_agent — a structured deep-research recipe (a four-node
+AGENT graph).
 
-图拓扑(route_multi.py):dr_preplan(预检索/初始化) → dr_plan(子问题规划)
-→ dr_search(经 MCP 工具迭代检索,研究状态板反思) → dr_synthesize(带引用
-的研究报告);每条用户消息从 entry 跑全图,同轮经 TurnResult.next 接力。
-MCP 工具由 atoms/tools/mcp_tool.py 按 local_config.yaml 的 ``mcp_servers:``
-动态注册(toolset=mcp-<server>);本 pattern 经 ``allow_toolset`` 授权
-mcp-websearch / mcp-zai 工具集,携带工具的节点经 ``use_tools`` 收窄。
+Graph topology (route_multi.py): dr_preplan (pre-retrieval/init) →
+dr_plan (sub-question planning) → dr_search (iterative retrieval via MCP
+tools, research state-board reflection) → dr_synthesize (the cited
+research report); every user message runs the whole graph from entry,
+relaying within the turn via TurnResult.next. MCP tools are registered
+dynamically by atoms/tools/mcp_tool.py per local_config.yaml's
+``mcp_servers:`` (toolset=mcp-<server>); this pattern grants the
+mcp-websearch / mcp-zai toolsets via ``allow_toolset``, and tool-carrying
+nodes narrow via ``use_tools``.
 """

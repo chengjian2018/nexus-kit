@@ -2,8 +2,8 @@
 
 The former three-layer structure (Pattern → Module → Node) collapsed into
 Pattern → Node: everything a module used to carry that still matters lives
-here (``use_tools`` / prompt 资产 / stages 覆写 / plugins 槽位)。One field,
-two compile-time semantics selected by ``pattern.pattern_type``:
+here (``use_tools`` / prompt assets / stages overrides / plugins slots).
+One field, two compile-time semantics selected by ``pattern.pattern_type``:
 
 - ``sub_nodes``: FSM = the next_node legal-value set (state-machine
   transitions, advanced one node per turn); AGENT = the static graph's
@@ -14,9 +14,9 @@ two compile-time semantics selected by ``pattern.pattern_type``:
   keep business state in ``config`` free fields instead, outside the
   filled_slots lifecycle).
 
-Prompt 资产 (base_prompt / base_nlu_prompt / base_nlg_prompt / llm 覆写等)
-ride ``config`` — the dict built from the ``config`` param plus ``**kwargs``
-(explicit kwargs win on the same key).
+Prompt assets (base_prompt / base_nlu_prompt / base_nlg_prompt / llm
+overrides etc.) ride ``config`` — the dict built from the ``config`` param
+plus ``**kwargs`` (explicit kwargs win on the same key).
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ class BaseNode:
         stages: pipeline slot config ``{slot_name: stage_code}`` — the node
             layer of the two-layer resolution (node > pattern skeleton);
             FSM patterns only.
-        slots: business-slot definitions ``{slot_name: 描述}`` (FSM only).
+        slots: business-slot definitions ``{slot_name: description}`` (FSM only).
         use_tools: tool names this node may call — **empty = no tools**
             (deny-by-default; intersected with pattern.allow_toolset).
         use_skills: skill names this node may load — **empty = no skills**
@@ -162,8 +162,8 @@ class BaseNode:
         return json.dumps(self.slots, ensure_ascii=False)
 
     def format_sub_nodes(self, node_map: Dict[str, "BaseNode"]) -> str:
-        """Format the successor list as prompt-ready text (FSM 转移目标 /
-        AGENT 邻接说明，均可作为 NLU 的 next 候选）。"""
+        """Format the successor list as prompt-ready text (FSM transition
+        targets / AGENT adjacency — both serve as NLU's next candidates)."""
         if not self.sub_nodes:
             return "暂无后续节点信息"
 

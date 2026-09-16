@@ -3,15 +3,16 @@ override.
 
 ``INSTALL_UNIFIED_PROMPT`` customizes ``FSM_UNIFIED_DEFAULT_PROMPT``
 (atoms/stages/_prompts.py) for an OUTBOUND call: the assistant is the caller
-(客服主动外呼), not an inbound responder. Two changes matter:
+(outbound proactive call), not an inbound responder. Two changes matter:
 
 - a ### 任务信息 section — the opening / address-confirm / time-negotiation
   nodes ground their lines in the task_basic_info fields (agent_name /
   product_name / address / user_name / order_id / available_slots) injected
   by the launch layer; the default template has no task_info section, so
   the model would have to fabricate them;
-- a special-intent section — the generic decline intents (不想预约/已安装/
-  质量问题/退货/非本人) and the 现在没空 callback intent, which may be heard
+- a special-intent section — the generic decline intents (does not want to
+  book / already installed / quality issue / already returned / not the
+  owner) and the "busy right now" callback intent, which may be heard
   at ANY node and route to install_decline / install_ask_callback;
 - the persona/instructions are phone-call shaped: speak in short turns,
   confirm each step before moving on, and hang up politely at the end.

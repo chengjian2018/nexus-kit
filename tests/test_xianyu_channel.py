@@ -279,7 +279,7 @@ def fake_chat(monkeypatch):
 
     calls = []
 
-    # on_settled/turn_task_out：宿主层轮次托管的新契约参数（stub 不消费）
+    # on_settled/turn_task_out: the new contract parameters of host-level turn custody (the stub ignores them)
     async def _chat(query, session_id, all_sessions, store=None, **kwargs):
         calls.append((session_id, query))
         session = all_sessions[session_id]

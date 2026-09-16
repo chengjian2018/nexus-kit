@@ -1,13 +1,17 @@
-"""子代理叶子循环共享内核 —— delegate_task 与 run_workflow 的执行原语。
+"""Sub-agent leaf-loop shared kernel — the execution primitive behind
+delegate_task and run_workflow.
 
-被 atoms/tools/subagent_tool.py（单次委托）与 atoms/tools/workflow_tool.py
-（六种拓扑编排）共享：一个只操作本地 messages 列表的瘦身 ReAct 循环
-（不写 DialogueContext、不落会话历史，与 fanout ``_branch_cxt`` 的隔离
-哲学一致）+ 若干结果整形辅助。本模块没有顶层 ``registry.register`` 调用，
-AST 发现（nexus/registry/discovery.py）不会 import 它。
+Shared by atoms/tools/subagent_tool.py (one-shot delegation) and
+atoms/tools/workflow_tool.py (six-topology orchestration): a slimmed ReAct
+loop operating purely on a local messages list (nothing written to
+DialogueContext or session history — the same isolation philosophy as the
+fanout ``_branch_cxt``) plus a few result-shaping helpers. This module has
+no top-level ``registry.register`` call, so AST discovery
+(nexus/registry/discovery.py) never imports it.
 
-provider 由调用方注入（不在内核内 build）：各 tool 模块自己 import
-``build_provider``，测试的 patch 点保持在各 tool 模块命名空间。
+The provider is injected by the caller (not built inside the kernel): each
+tool module imports ``build_provider`` itself, keeping the tests' patch
+points in each tool module's namespace.
 """
 
 import json
@@ -19,11 +23,13 @@ from nexus.registry.tools import registry
 
 logger = logging.getLogger(__name__)
 
-# 子循环内单个工具结果的截断长度（deep_research _PER_RESULT_CHARS 先例：
-# 防子上下文被单次工具输出撑爆）
+# Per-tool-result truncation inside the sub-loop (the deep_research
+# _PER_RESULT_CHARS precedent: one tool output must not blow up the
+# sub-context)
 _INNER_RESULT_CHARS = 4000
 
-# 叶子子代理的内置默认 system prompt（调用方可经 args.system_prompt 覆盖）
+# The leaf sub-agent's builtin default system prompt (callers may override
+# via args.system_prompt)
 _DEFAULT_SYSTEM_PROMPT = (
     "你是一个独立执行子任务的助手。你会收到一个自包含的任务描述；"
     "请使用可用工具完成它，并给出最终结论。\n"
@@ -115,7 +121,7 @@ async def _run_sub_agent(*, provider, llm_config: Dict[str, Any],
         for tc in tool_calls:
             name = tc.get("function", {}).get("name", "")
             if name not in granted:
-                # 幻觉名拦截（与主循环 loop.py 同款自纠哲学）
+                # Hallucinated-name interception (same self-correction philosophy as the main loop in loop.py)
                 inner = json.dumps(
                     {"error": f"工具 '{name}' 不在子代理可用集合中。"
                               f"可用：{sorted(granted)}。"},

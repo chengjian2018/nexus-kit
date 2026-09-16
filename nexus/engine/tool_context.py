@@ -49,8 +49,8 @@ class ToolCallContext:
                     allow_skills) — the load-side authorization boundary:
                     a skill name outside it is rejected with an error
                     backfill. None (never set) = detached call, any scanned
-                    skill may be loaded (read-only knowledge; the执行面
-                    authorization still lives in the tool 三层收口).
+                    skill may be loaded (read-only knowledge; execution-surface
+                    authorization still lives in the tool three-layer gate).
     """
 
     llm_config: Dict[str, Any]

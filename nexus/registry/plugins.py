@@ -18,8 +18,8 @@ registry API changes):
 - ``messages_builder``: AGENT messages builders (the kernel registers the
                        "default" builder; apps may register their own).
 - ``agent_hooks``     : hooks packages (atoms/hooks/tool_guard.py is the
-                       in-repo package — P4 危险操作播报; further packages
-                       register the same way).
+                       in-repo package — P4 dangerous-op announce; further
+                       packages register the same way).
 
 Registration idiom (same as the four domain registries, discovered by the
 shared AST scanner in nexus/registry/discovery.py):
@@ -64,8 +64,9 @@ class PluginRegistry:
         self._instances: Dict[tuple, Any] = {}
         # Owner module per (kind, code) — the factory's defining module
         # (``factory.__module__``). Observability metadata for the ops UI
-        # (studio「系统插件」页)：studio_plugin_<stem> → 托管插件；apps.* /
-        # atoms.executors.* → 代码模块（可选择性热重载）；nexus.* → 内核。
+        # (the studio "system plugins" page): studio_plugin_<stem> → hosted
+        # plugins; apps.* / atoms.executors.* → code modules (selectively
+        # hot-reloadable); nexus.* → kernel.
         self._owners: Dict[tuple, str] = {}
         self._lock = threading.RLock()
         # Hot-reload window switch: when open, registering a

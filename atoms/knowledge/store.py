@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS kb_meta (
 );
 """
 
-# Console 默认空间（前端预选 + host 启动种子都指向它）
+# Console default scope (the frontend preselect and the host startup seed both point at it)
 DEFAULT_DEMO_SCOPE = "seller:001"
 
 _FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -291,6 +291,18 @@ class KnowledgeStore:
             ).fetchone()
             if done is not None:
                 return
+            try:
+                # The marker pre-claims the exclusive ticket (check-then-insert
+                # in one transaction): with multiple processes sharing one db,
+                # the second process exits on IntegrityError here; after a
+                # mid-seed crash there is no replay either — a replay would
+                # double-insert the non-idempotent add_cs rows (upsert_product
+                # is idempotent; CS entries are not)
+                self._conn.execute(
+                    "INSERT INTO kb_meta(key, value) VALUES (?, ?)",
+                    (marker, str(time.time())))
+            except sqlite3.IntegrityError:
+                return  # a concurrent contender already seeded
 
         products = [
             (1001, "iPhone 13 128G 黑色 国行在保", "2699",
@@ -377,14 +389,9 @@ class KnowledgeStore:
                 "示例自定义知识库（演示数据，可编辑字段或删除）", demo_fields)
             for record in demo_records:
                 self.add_record(cid, record)
-        except ValueError as exc:  # e.g. 同名库已存在（半种子状态）——不阻塞标记写入
+        except ValueError as exc:  # e.g. same-name collection exists (half-seeded state) — never blocks the marker write
             logger.warning("种子自定义知识库跳过: scope=%s err=%s", scope, exc)
 
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO kb_meta(key, value) VALUES (?, ?)",
-                (marker, str(time.time())),
-            )
         logger.info("知识库种子完成: scope=%s, products=%d, cs=%d",
                     scope, len(products), len(cs_entries))
 
@@ -692,10 +699,16 @@ class KnowledgeStore:
         """Partial update: only present keys are updated (name/description/
         fields). A fields change rewrites the records' search_text and prunes
         values of removed fields. Returns whether the collection exists."""
+        patch = dict(patch)  # the normalized result is not written back into the caller's dict
         allowed = {"name", "description", "fields"}
         unknown = set(patch) - allowed
         if unknown:
             raise ValueError(f"未知字段: {sorted(unknown)}（合法: {sorted(allowed)}）")
+        if not patch:
+            # An empty patch equals an existence check only (same semantics as
+            # the empty-fields guard in update_product/update_cs); otherwise
+            # the SET clause would be empty and generate illegal SQL
+            return self.get_collection(collection_id) is not None
         if "name" in patch:
             patch["name"] = str(patch["name"] or "").strip()
             if not patch["name"]:
@@ -773,11 +786,18 @@ class KnowledgeStore:
         search_text (per-word AND) / latest rows without a query."""
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
+        words = _cut_query(query) if query and query.strip() else []
+        if query and query.strip() and not words:
+            # Tokenization yielded nothing (single chars / pure punctuation etc.) —
+            # never silently degrade to "return everything": callers with
+            # filtering semantics would present the whole table as hits,
+            # misleading troubleshooting
+            return []
         with self._lock:
-            if query and query.strip():
+            if words:
                 conditions = ["collection_id = ?"]
                 params: List[Any] = [collection_id]
-                for word in _cut_query(query):
+                for word in words:
                     conditions.append("search_text LIKE ?")
                     params.append(f"%{word}%")
                 rows = self._conn.execute(

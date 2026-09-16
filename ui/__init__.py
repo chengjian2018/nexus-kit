@@ -1,11 +1,14 @@
-"""ui — 运营配置台（ops-console，PRD: docs/design/ops-console-prd.md）。
+"""ui — the ops console (PRD: docs/design/ops-console-prd.md).
 
-自包含的组装包：后端 router（ui.api，挂在 /api/v1/console/*，由
-host.main include）+ 无构建前端静态资产（ui/static/，由 host.main 挂在
-/console）。分层契约（host → apps → atoms → nexus）不覆盖 ui/——它的
-依赖方向与 host 层一致（只 import atoms/nexus），由 host 统一装配。
+A self-contained assembly package: the backend router (ui.api, mounted at
+/api/v1/console/* and included by host.main) + the build-less frontend
+static assets (ui/static/, mounted at /console by host.main). The layering
+contract (host → apps → atoms → nexus) does not cover ui/ — its dependency
+direction matches the host layer (imports atoms/nexus only) and is
+assembled by the host.
 
-P0 范围：pattern 只读视图（列表 / 详情：yml + mermaid + 声明树）、
-插件与工具目录、知识库 CRUD / 空间 / 试搜台。编辑与发布流（P1）不在
-本包内。
+P0 scope: pattern read-only views (list / detail: yml + mermaid +
+declaration tree), the plugin and tool catalogs, knowledge-base CRUD /
+scopes / the search preview. The edit and publish flows (P1) are outside
+this package.
 """

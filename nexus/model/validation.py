@@ -13,10 +13,10 @@ Entry points:
 - validate_plugin_declarations(pattern): executor / stages / skeleton /
     messages_builder / agent_hooks codes resolve in the plugin registry.
 - validate_tools(pattern): every node.use_tools name is registered AND its
-  toolset ∈ pattern.allow_toolset (deny-by-default 三层收口).
+  toolset ∈ pattern.allow_toolset (the deny-by-default three-layer gate).
 - validate_skills(pattern): skill declarations resolve against the
-  nexus/skills.py scan (missing names / 越权 use_skills / requires_toolsets
-  not granted by allow_toolset).
+  nexus/skills.py scan (missing names / use_skills exceeding the allow pool /
+  requires_toolsets not granted by allow_toolset).
 
 Callers: host/main startup validates every registered pattern; yml loading
 validates after construction. The structural graph checks (dangling
@@ -259,10 +259,12 @@ def validate_tools(pattern: Pattern, strict: bool = True) -> List[str]:
     ``allow_toolset=["mcp-<server>"]`` + ``use_tools=[MCP tool name]``
     usage bootable.
 
-    ``strict=False``（宽松模式，生成工作台装载路径）: 未注册/越集整体
-    降级为警告日志并放行——新生成的 pattern 可能引用尚未注册的新工具，
-    阻塞校验会让「生成 → 应用」必然失败；运行期仍由 deny-by-default
-    解析兜底。放行清单经 tool_check_notices 取（预览展示用）。
+    ``strict=False`` (lenient mode, the generation-workbench load path):
+    unregistered / cross-toolset findings all downgrade to a warning log and
+    pass — a newly generated pattern may reference tools not yet registered;
+    strict validation would make "generate → apply" always fail. Runtime
+    deny-by-default resolution remains the backstop. The pass list is
+    available via tool_check_notices (for preview display).
     """
     findings = _tool_check_findings(pattern)
     if strict:
@@ -279,7 +281,8 @@ def validate_skills(pattern: Pattern, strict: bool = True) -> List[str]:
     Findings:
     - a declared name (pattern.allow_skills / node.use_skills) missing from
       the scan root;
-    - a node use_skills name outside pattern.allow_skills (越权声明);
+    - a node use_skills name outside pattern.allow_skills (a declaration
+      exceeding the allow pool);
     - an enabled skill whose ``requires_toolsets`` is not a subset of
       ``pattern.allow_toolset`` (the skill needs tool surfaces the pattern
       never granted — it would load but not function).
@@ -289,9 +292,10 @@ def validate_skills(pattern: Pattern, strict: bool = True) -> List[str]:
     — skill roots are deployment-local (e.g. ~/.claude/skills) and must
     not block a portable boot.
 
-    ``strict=False``（宽松模式，生成工作台装载路径）: findings downgrade to
-    warnings and pass — same rationale as validate_tools (newly generated
-    patterns may reference resources dropped in later).
+    ``strict=False`` (lenient mode, the generation-workbench load path):
+    findings downgrade to warnings and pass — same rationale as
+    validate_tools (newly generated patterns may reference resources dropped
+    in later).
     """
     from nexus.skills import resolve_skills_dir, scan_skills
 
@@ -324,7 +328,7 @@ def validate_skills(pattern: Pattern, strict: bool = True) -> List[str]:
         for name in sorted(use & allowed):
             entry = entries.get(name)
             if entry is None:
-                continue  # allow_skills 缺失已在上面报过
+                continue  # missing from allow_skills already reported above
             missing = set(entry.requires_toolsets) - granted
             if missing:
                 findings.append(
@@ -344,10 +348,11 @@ def validate_pattern(pattern: Pattern, strict_tools: bool = True) -> None:
     authorization + skill declarations; collects ALL errors then raises one
     numbered ValueError (empty list = valid, silent return).
 
-    ``strict_tools=False``：工具面与技能面走宽松校验（见 validate_tools /
-    validate_skills）——生成工作台（studio 生成/发布/应用/托管目录重放）
-    允许引用后补注册的新工具与新投放的技能；内置 pattern 装配与 CLI
-    pattern-load 保持严格默认。
+    ``strict_tools=False``: the tool surface and the skill surface use lenient
+    validation (see validate_tools / validate_skills) — the generation
+    workbench (studio generate / publish / apply / hosted-dir replay) allows
+    references to tools registered later and skills dropped in later; builtin
+    pattern assembly keeps the strict default.
     """
     errors = (validate_base_info(pattern)
               + validate_plugin_declarations(pattern)

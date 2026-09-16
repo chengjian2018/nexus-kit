@@ -15,15 +15,15 @@ zero-LLM slot arithmetic (slots.py):
        guard: the model's illegal pick never reaches the node graph — the
        customer is never promised an unbookable time;
 2. ANY transition into install_recommend (guarded reroute or the model's own
-   都不知道 pick) gets its reply deterministically rewritten from the
+   "neither works" pick) gets its reply deterministically rewritten from the
    schedule (InstallRecommendNLG) — the recommendation the customer hears is
    always the real available_slots, never a model re-roll. This rewrite MUST
    live in the unified stage: FSM node transitions happen end-of-turn, so a
    node-level nlg on install_recommend would only fire on the NEXT turn
    (after the transition) and would clobber that turn's confirmation reply;
-3. install_ask_callback (下次联系时间) answers are NOT visit times — the
-   guard skips them (a "周二下午再打给我" callback time is none of the
-   installer's business).
+3. install_ask_callback (next contact time) answers are NOT visit times — the
+   guard skips them (a "call me back Tuesday afternoon" callback time is
+   none of the installer's business).
 
 ``InstallRecommendNLG`` (code ``install_recommend_nlg``) is the deterministic
 zero-LLM NLG behind rule 2 — a plain class invoked by the unified stage (and
@@ -173,8 +173,8 @@ class InstallBookingUnifiedNLU(FSMUnifiedNLU):
         requested = self._requested_slot(ctx)
         if requested is None:
             # No time entity in the utterance: not guardable, model's pick
-            # stands (e.g. "就要最近的" — install_nearest picks the schedule's
-            # head by construction)
+            # stands (e.g. "就要最近的" [just give me the nearest] —
+            # install_nearest picks the schedule's head by construction)
             self._write_back(ctx, slots_out)
             return
 
@@ -255,7 +255,7 @@ class InstallBookingUnifiedNLU(FSMUnifiedNLU):
     #     2 weeks: keep the transition to install_end and restate the
     #     customer's time in the goodbye (branch ②, one beat);
     #   no annotation                          → too far (beyond 2 weeks) /
-    #     in the past / vague ("都行") / not given: REROUTE to
+    #     in the past / vague ("都行" [whatever works]) / not given: REROUTE to
     #     install_callback_default (branch ①③) — the reply proposes the
     #     default 3-days-later callback and asks; the customer's answer on
     #     that node closes the call (two beats, same shape as the decline
@@ -433,7 +433,7 @@ INSTALL_CLARIFY_PROMPTS = {
 
 class KeywordClarifyStage(ClarifyStage):
     """Dual-track clarify with the recall layer replaced by pure keyword
-    gating (业务检测只使用关键词来卡控).
+    gating (business detection is gated by keywords only).
 
     What changes vs the builtin ClarifyStage:
 

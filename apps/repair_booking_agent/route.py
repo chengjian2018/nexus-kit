@@ -1,40 +1,44 @@
 """repair_booking_agent pattern — the install-booking outbound-call FSM
-adapted to a REPAIR scenario (上门维修预约外呼).
+adapted to a REPAIR scenario (outbound repair-visit booking).
 
 Business background: the customer's furniture / appliance is broken; the
-service desk calls THEM to book the technician's visit (上门维修服务).
+service desk calls THEM to book the technician's visit (the on-site repair
+service).
 Same outbound semantics as install_booking_agent (the assistant is always
 the caller), with three deliberate differences:
 
-1. NO arrival subtree — the customer already owns the item (到货确认/
-   到货时间询问/时间段询问/上门方便确认 are all gone): after the address
+1. NO arrival subtree — the customer already owns the item (the arrival
+   check / arrival-time / time-window / availability-confirmation nodes
+   are all gone): after the address
    check the flow goes straight into visit-time negotiation;
-2. decline intents drop the quality-complaint / return exits (商品质量
-   问题 IS the repair reason here, 退货 is out of scope) and add the
-   repair-specific ones (已自行修好 / 已找别人修过);
+2. decline intents drop the quality-complaint / return exits (the quality
+   complaint IS the repair reason here, returns are out of scope) and add
+   the repair-specific ones (already fixed it myself / someone else fixed
+   it);
 3. after the visit time is CONFIRMED the call does not close — the
-   assistant keeps asking for the item's fault information (师傅要带对
-   配件工具), records it, and only then hangs up.
+   assistant keeps asking for the item's fault information (so the
+   technician brings the right parts and tools), records it, and only then
+   hangs up.
 
 Flow (14 nodes, one FSM pattern):
 
-    repair_greet          外呼开场          Yes→地址核对 / No→结束
-    repair_confirm_addr   地址核对          一致→时间协商 / 否→结束
-    repair_ask_time       上门时间协商      具体日期→repair_specific_date /
-                                              最近→repair_nearest /
-                                              都不知道→推荐 /
-                                              现在没空→下次联系时间
-    repair_recommend      档期推荐          客户选定→具体日期/最近 / 回环再协商
-    repair_specific_date  具体日期约定      可约→时间确认（守卫校验）/ 不可约守卫改道推荐
-    repair_nearest        最近档期安排      可约→时间确认 / 不可约守卫改道推荐
-    repair_confirm_time   上门时间确认      客户确认→故障信息询问 / 改约→改约重协商
-    repair_reschedule     改约重协商        重新进入时间协商
-    repair_ask_fault      故障信息询问      描述故障→故障信息确认 / 说不清→留待继续问
-    repair_confirm_fault  故障信息确认      复述故障要点→通话结束
-    repair_ask_callback   下次联系时间      客户时间→结束 / 不可用→默认改约三天
-    repair_callback_default 默认改约三天    客户应答→通话结束
-    repair_decline        通用拒绝承接      共情回应→通话结束
-    repair_end            通话结束语        is_end（获得故障信息后礼貌挂机）
+    repair_greet          outbound opening     Yes→address check / No→end
+    repair_confirm_addr   address check        match→time negotiation / no→end
+    repair_ask_time       visit-time negotiation  specific date→repair_specific_date /
+                                                  nearest→repair_nearest /
+                                                  neither→recommend /
+                                                  busy now→callback time
+    repair_recommend      schedule recommendation  customer picks→specific date/nearest / loop back to negotiate
+    repair_specific_date  specific-date booking  bookable→time confirm (guard check) / not bookable→guard reroutes to recommend
+    repair_nearest        nearest-slot booking  bookable→time confirm / not bookable→guard reroutes to recommend
+    repair_confirm_time   visit-time confirm   customer confirms→fault-info ask / reschedule→reschedule renegotiation
+    repair_reschedule     reschedule renegotiation  re-enter time negotiation
+    repair_ask_fault      fault-info ask       describes fault→fault-info confirm / can't describe→stay and keep asking
+    repair_confirm_fault  fault-info confirm   restate fault key points→call end
+    repair_ask_callback   next contact time    customer time→end / unusable→default 3-day reschedule
+    repair_callback_default default 3-day reschedule  customer answers→call end
+    repair_decline        generic decline      empathetic reply→call end
+    repair_end            closing line         is_end (polite hang-up after fault info is captured)
 
 task_info contract (injected by the launch layer): same shape as the
 install app — product_name / address / user_name / order_id / available_slots
@@ -51,9 +55,12 @@ import):
     node.stages         {"clarify": "repair_clarify"} on every node
 
 Known deliberate simplifications (beyond the install app's):
-    - 故障信息只做口径采集（fault_description 槽位），不接诊断知识库；
-      客户说不清时留在故障信息询问节点继续引导，不设 clarify 分支。
-    - 无商品质量类拒绝出口（质量诉求就是维修诉求本身）。
+    - Fault info is only captured verbatim (the fault_description slot); it
+      does not connect to a diagnosis knowledge base; when the customer
+      cannot describe it clearly, the flow stays on the fault-info node and
+      keeps guiding — no clarify branch.
+    - No quality-complaint decline exit (the quality demand IS the repair
+      demand itself).
 
 Registration: module-level ``registry.register(Pattern(...))``, auto-discovered
 by AST scan (apps/repair_booking_agent/route.py).

@@ -3,7 +3,7 @@
 **Status: mechanism live with one in-repo package.** The 7 loop points
 stay wired (see atoms/executors/loop_executor.py); ``atoms/hooks/
 tool_guard.py`` is the first shipped hooks package (kind="agent_hooks",
-code="tool_guard" — P4 危险操作播报, observe-only). A pattern declares it
+code="tool_guard" — P4 dangerous-op announce, observe-only). A pattern declares it
 via ``plugins={"agent_hooks": "tool_guard"}``; with no declaration every
 point remains a zero-overhead pass-through (the tested contract in
 tests/test_agent_hooks_contract.py).

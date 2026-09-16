@@ -5,7 +5,8 @@ The declarative model (all fields are str/bool/list/dict) makes a pattern
 fully serializable. The dict/yml shape mirrors the constructor kwargs;
 ``from_dict`` goes through the same construction path (normalization +
 compile fail-fast), then validation (model/validation.py) is the caller's
-duty — the host assembly and CLI wiring call validate_pattern after loading.
+duty — the host assembly and the studio publish/apply path call
+validate_pattern after loading.
 
 Nodes serialize inline (the complete field list per node dict); the YAML
 form is exactly this dict shape. No node registry — cross-file node reuse

@@ -1,8 +1,10 @@
-"""Toolset authorization tests (deny-by-default 三层收口).
+"""Toolset authorization tests (the deny-by-default three-layer gate).
 
-- _resolve_tools: node.use_tools 空 = 无工具；pattern.allow_toolset 空 =
-  无工具集；生效集 = use_tools ∩ allowed-toolsets 的工具
-- validate_tools: use_tools 悬空 / 越集在注册期 fail-fast
+- _resolve_tools: an empty node.use_tools = no tools; an empty
+  pattern.allow_toolset = no toolsets; the effective set =
+  use_tools ∩ tools-of-allowed-toolsets
+- validate_tools: dangling / cross-toolset use_tools fail fast at
+  registration time
 """
 
 import pytest
@@ -23,7 +25,7 @@ def _register_tool(name, toolset):
     )
 
 
-# 三个工具集：knowledge（2 个）/ mcp-zai（1 个）/ 裸 mcp（1 个）
+# Three toolsets: knowledge (2 tools) / mcp-zai (1) / bare mcp (1)
 for _name, _ts in [("perm_kb_search", "knowledge"),
                    ("perm_kb_list", "knowledge"),
                    ("perm_zai_vision", "mcp-zai"),
@@ -58,13 +60,14 @@ def test_intersection_of_layers():
     p = _pattern(allow_toolset=["knowledge", "mcp-zai"],
                  use_tools=["perm_kb_search", "perm_zai_vision",
                             "perm_mcp_list"])
-    # perm_mcp_list 的 toolset（mcp）不在 allow_toolset → 被滤掉
+    # perm_mcp_list's toolset (mcp) is not in allow_toolset → filtered out
     assert _names(p) == {"perm_kb_search", "perm_zai_vision"}
 
 
 def test_names_in_toolsets():
-    # 全量跑套时各 toolset 还含其它测试注册的工具（knowledge 的真实工具、
-    # mcp-zai 的离线快照工具）——断言一律用子集而非全等
+    # Under a full-suite run each toolset also carries other test-registered
+    # tools (knowledge's real tools, mcp-zai's offline-snapshot tools) —
+    # assertions use subsets, never equality
     assert {"perm_kb_search", "perm_kb_list"} <= \
         tool_registry.names_in_toolsets({"knowledge"})
     assert "perm_zai_vision" in tool_registry.names_in_toolsets({"mcp-zai"})

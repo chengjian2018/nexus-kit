@@ -3,7 +3,8 @@ transcribed into a declarative FSM pattern for OUTBOUND install-booking
 calls.
 
 Business background: the customer just bought furniture / an appliance;
-the service desk calls THEM to book the installer's visit (上门安装服务).
+the service desk calls THEM to book the installer's visit (the on-site
+installation service).
 The assistant is always the caller — the opening is a connect-event-driven
 greeting (self-introduction + purpose), and the flow walks the sketch:
 confirm address → check arrival → negotiate visit time → book → close.
@@ -23,32 +24,39 @@ task_info contract (injected by the launch layer):
 Source: a hand-drawn dialogue-flow sketch (photo) + the supplemented
 scenarios. Transcription mapping (sketch oval → node code → branches):
 
-    开始后（问候+确认服务）       install_greet          Yes→地址核对 / No→结束
-    询问地址是XX是否一致          install_confirm_addr   一致→到货确认 / 否→结束
-    你是否已到货                 install_check_arrival  是→时间协商 / 否→到货时间
-    是否知道到货时间             install_ask_eta        知道→时间段 / 不知道→方便确认
-    询问时间段                   install_time_window    提供时间→时间协商 / 不提供→方便确认
-    是否方便                     install_available      是→时间协商 / 否→下次联系时间
-    询问他什么时间上门           install_ask_time       具体日期→install_specific_date /
-                                                       最近→install_nearest /
-                                                       都不知道→推荐
-    推荐                         install_recommend      客户选定→具体日期/最近 / 回环再协商
-    具体日期                     install_specific_date  可约→时间确认（守卫校验）/ 不可约守卫改道推荐
-    最近                         install_nearest        可约→时间确认 / 不可约守卫改道推荐
-    门时间（确定时间）           install_confirm_time   客户确认→结束 / 改约→时间协商
-    结束                         install_end            is_end（通话收尾）
+    after start (greeting + confirm service)
+                                 install_greet          Yes→address check / No→end
+    ask if address XX matches    install_confirm_addr   match→arrival check / no→end
+    have you received the goods  install_check_arrival  yes→time negotiation / no→ETA
+    do you know the arrival time install_ask_eta        knows→time window / doesn't→availability
+    ask for a time window        install_time_window    offers time→negotiation / not→availability
+    is now convenient            install_available      yes→time negotiation / no→callback time
+    ask when he wants the visit  install_ask_time       specific date→install_specific_date /
+                                                       nearest→install_nearest /
+                                                       neither→recommend
+    recommend                    install_recommend      customer picks→specific date/nearest / loop back to negotiate
+    specific date                install_specific_date  bookable→time confirm (guard check) / not bookable→guard reroutes to recommend
+    nearest                      install_nearest        bookable→time confirm / not bookable→guard reroutes to recommend
+    visit time (confirm time)    install_confirm_time   customer confirms→end / reschedule→time negotiation
+    end                          install_end            is_end (call wrap-up)
 
 Supplemented nodes (beyond the sketch, per the follow-up requirements):
 
-    install_decline     通用拒绝节点：用户不想预约/已安装/质量问题/退货/
-                        非本人等意图，共情回应后转结束（每个业务节点都
-                        有指向它的边——草图外的通用退出通道）
-    install_ask_callback 下次联系时间：现在没空/不想现在预约时，询问并
-                        记录下次来电时间，约好后礼貌收尾
-    install_reschedule   改约节点：时间确认后客户反悔改期，重新进入时间
-                        协商（保留原时间槽位，允许被新时间覆盖）
+    install_decline     generic decline node: user does not want to book /
+                        already installed / quality issue / return /
+                        not-the-owner etc. intents; empathetic reply then to
+                        end (every business node has an edge to it — the
+                        generic exit channel outside the sketch)
+    install_ask_callback next contact time: when the user is busy now /
+                        does not want to book now, ask for and record the
+                        next call time, then close politely
+    install_reschedule  reschedule node: after time confirmation the client
+                        changes their mind; re-enter time negotiation
+                        (keeping the original time slot, allowed to be
+                        overwritten by the new time)
 
-The sketch's two terminal ovals (地址不符/客户拒绝结束、预约完成结束) merge
+The sketch's two terminal ovals (address mismatch / customer-declined end,
+booking-completed end) merge
 into one ``install_end`` node — both are "polite phone close, hang up"; the
 reply paradigm for the closing turn comes from install_end's answer_examples
 (the unified stage styles the reply after the CHOSEN next node). The generic
@@ -72,16 +80,20 @@ bottom import):
     rewrite must ride the unified stage that chose the transition.
 
 Known deliberate simplifications:
-    - 双轨 clarify 未启用（the sketch has no off-topic branch）: off-topic
-      turns are handled by the unified stage's empty next_node (stay +
-      re-confirm), not a clarify round.
-    - 物流到货信息没有外部系统对接：install_ask_eta 的"是否知道到货时间"
-      由客户口径给出；task_info 可注入 logistics_eta 字段增强（预留）。
-    - 无人接听/占线/挂断等外呼电信事件不在对话层处理（channel 层职责），
-      这里只覆盖接通后的对话流。
-    - 改约轮次不设上限：install_reschedule → install_ask_time 的回环由
-      自然对话收敛（FSM 无预算——每轮恰好推进一个节点；每次改约都会
-      重新过可约守卫）。
+    - The dual-track clarify is not enabled (the sketch has no off-topic
+      branch): off-topic turns are handled by the unified stage's empty
+      next_node (stay + re-confirm), not a clarify round.
+    - Logistics arrival info has no external system integration: the
+      install_ask_eta "do you know the arrival time" is taken from the
+      customer's own account; a task_info logistics_eta field could enrich
+      this (reserved).
+    - Outbound telecom events such as no-answer / busy / hang-up are not
+      handled at the dialogue layer (the channel layer's job); only the
+      post-connect dialogue flow is covered here.
+    - Reschedule rounds are uncapped: the install_reschedule →
+      install_ask_time loop converges through natural dialogue (the FSM
+      has no budget — each turn advances exactly one node; every reschedule
+      re-passes the bookable guard).
 
 Registration: module-level ``registry.register(Pattern(...))``, auto-discovered
 by AST scan (apps/install_booking_agent/route.py).

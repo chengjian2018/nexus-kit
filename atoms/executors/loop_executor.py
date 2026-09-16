@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 
 class DefaultLoopExecutor(NodeExecutor):
     """AGENT node executor: ReAct tool loop, replies directly. Tool
-    availability = node.use_tools ∩ pattern.allow_toolset 工具集（both
-    deny-by-default，见 nexus/engine/loop.py::_resolve_tools）。
+    availability = node.use_tools ∩ the toolsets granted by
+    pattern.allow_toolset (both deny-by-default, see
+    nexus/engine/loop.py::_resolve_tools).
 
     Skills: when the node's resolved skill set (use_skills ∩ allow_skills,
     nexus/skills.py) is non-empty, the read-only knowledge tools
@@ -234,11 +235,14 @@ async def _stream_round(provider, messages, model, temperature, max_tokens,
         return await acollect_stream(chunks)
 
     async def _tap():
+        # Duck-typed emitter compatibility (test stubs / older custom emitters may implement only
+        # emit_delta/emit_round): thinking dispatch probes capability and skips when absent
+        emit_thinking = getattr(stream_emitter, "emit_thinking", None)
         async for chunk in chunks:
             if forward_text and chunk.text:
                 stream_emitter.emit_delta(chunk.text)
-            if getattr(chunk, "reasoning", ""):
-                stream_emitter.emit_thinking(chunk.reasoning)
+            if getattr(chunk, "reasoning", "") and emit_thinking is not None:
+                emit_thinking(chunk.reasoning)
             yield chunk
 
     return await acollect_stream(_tap())

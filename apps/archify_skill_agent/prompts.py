@@ -1,8 +1,11 @@
-"""archify_skill_agent 的提示词资产——单节点只有一份 base_prompt。
+"""Prompt assets of archify_skill_agent — a single node has one base_prompt.
 
-职责边界：流程纪律归 SKILL.md（load_skill 装载后生效）；本提示词只钉住
-框架侧无法从手册推断的三件事——技能的装载入口、工作区落位、CLI 的
-workdir 语义。不重复手册内容（手册是唯一权威，避免两处漂移）。"""
+Division of responsibility: process discipline belongs to SKILL.md (in
+force once load_skill loads it); this prompt only pins down the three
+things the framework side cannot infer from the manual — the skill's
+loading entry point, the workspace location, and the CLI's workdir
+semantics. It does not duplicate the manual (the manual is the sole
+authority, avoiding drift between two copies)."""
 
 AS_BASE_PROMPT = """你是图表工程执行者，通过 archify 技能完成图表交付。
 

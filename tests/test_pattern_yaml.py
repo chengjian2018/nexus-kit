@@ -120,4 +120,4 @@ def test_empty_stages_default_skeleton():
 
 def test_agent_pattern_serializes_without_stages():
     data = pattern_to_dict(_agent_pattern())
-    assert "stages" not in data  # AGENT 无骨架，不出现在序列化形态
+    assert "stages" not in data  # an AGENT pattern has no skeleton — it never appears in the serialized form

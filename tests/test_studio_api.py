@@ -1,14 +1,16 @@
 """Studio API / store / agent tests (ui/studio) — offline.
 
-- store: 托管目录装载器（插件先于 pattern、坏文件降级跳过、重放幂等）
-- agent: 围栏解析 / 插件块解析 / pattern 文本校验
-- api: pattern 管理面（publish/fork/delete/source 徽标）+ generate SSE
-  （打桩 claude runner 流式产出 step/delta/「yaml + python 插件」）+ apply
-  + assist + catalog
+- store: hosted-directory loader (plugins before patterns, bad files
+  degrade and are skipped, replay is idempotent)
+- agent: fenced-block parsing / plugin-block parsing / pattern text
+  validation
+- api: pattern management surface (publish/fork/delete/source badge)
+  + generate SSE (stubbed claude runner streaming step/delta/
+  "yaml + python plugin") + apply + assist + catalog
 
-托管目录全部指向 tmp_path（monkeypatch store.PLUGINS_DIR / PATTERNS_DIR），
-不污染仓库 host/config/。generate 打桩 run_claude_code、assist 打桩
-provider，零真实子进程 / LLM。
+Hosted directories all point at tmp_path (monkeypatch store.PLUGINS_DIR /
+PATTERNS_DIR), so the repo's host/config/ is not polluted. generate stubs
+run_claude_code and assist stubs the provider — zero real subprocesses / LLM.
 """
 
 import asyncio
@@ -24,7 +26,8 @@ import ui.studio.store as studio_store
 from nexus.registry.patterns import registry as pattern_registry
 from nexus.registry.plugins import registry as plugin_registry
 
-# 一个最小合法 agent pattern（引用生成插件 gen_demo_router 的形态）
+# A minimal valid agent pattern (in the shape that references the generated
+# plugin gen_demo_router)
 GOOD_PATTERN_YAML = """\
 code: gen_demo
 name: 生成演示
@@ -97,7 +100,7 @@ def _isolate_registry():
 
 
 # ---------------------------------------------------------------------------
-# store：托管目录装载器
+# store: hosted-directory loader
 # ---------------------------------------------------------------------------
 
 def test_store_load_order_plugins_before_patterns(hosted_dirs):
@@ -109,7 +112,8 @@ def test_store_load_order_plugins_before_patterns(hosted_dirs):
 
     assert report["plugins"]["loaded"] == ["gen_demo_router.py"]
     assert report["patterns"]["loaded"] == ["gen_demo"]
-    # 插件已注册且 pattern 引用它校验通过（装载顺序正确性即在此断言）
+    # plugin registered and the pattern referencing it validates (load-order
+    # correctness is asserted right here)
     assert plugin_registry.has("executor", "gen_demo_router")
     assert pattern_registry.get("gen_demo") is not None
     assert studio_store.console_pattern_codes() == {"gen_demo"}
@@ -120,7 +124,8 @@ def test_store_reload_replay_is_idempotent(hosted_dirs):
     studio_store.write_plugin_file("gen_demo_router", GOOD_PLUGIN_PY)
     studio_store.write_pattern_file("gen_demo", GOOD_PATTERN_YAML)
     studio_store.load_console_artifacts()
-    # 模拟全量 reload 冲掉注册：重放必须能恢复（重复 exec 走替换窗口）
+    # simulate a full reload wiping registrations: the replay must restore
+    # them (repeated exec goes through the replace window)
     pattern_registry.deregister("gen_demo")
     report = studio_store.load_console_artifacts()
     assert report["patterns"]["loaded"] == ["gen_demo"]
@@ -149,7 +154,7 @@ def test_store_stem_whitelist(hosted_dirs):
 
 
 # ---------------------------------------------------------------------------
-# agent：围栏解析 / 校验
+# agent: fenced-block parsing / validation
 # ---------------------------------------------------------------------------
 
 def test_parse_generation_output_fenced_and_bare():
@@ -165,16 +170,18 @@ def test_parse_generation_output_fenced_and_bare():
     assert parsed["plugins"][0]["filename"] == "gen_x.py"
     assert parsed["plugins"][0]["declarations"] == [("executor", "gen_x")]
 
-    # 无语言标签的启发式
+    # heuristic for blocks without a language tag
     bare = "说明\n```\ncode: b\nnodes: []\n```\n"
     parsed2 = studio_agent.parse_generation_output(bare)
     assert parsed2["yaml"] == "code: b\nnodes: []"
 
 
 def test_parse_generation_output_inline_fence_marks_in_yaml():
-    # 自动编排线上故障回归：base_prompt 抄进了提示词原文，其中行中的
-    # ``` 记号不得提前闭合外层 yaml 围栏（否则 pattern 被截成半份，
-    # 后半节点定义丢失 → 悬空边），插件围栏也不得被挤成空围栏
+    # production incident regression: base_prompt copied a verbatim prompt
+    # text in which an inline ``` marker must not close the outer yaml fence
+    # early (otherwise the pattern is cut in half, the latter node
+    # definitions are lost -> dangling edges), and the plugin fence must not
+    # be squeezed into an empty fence
     raw = (
         "设计说明。\n"
         "```yaml\n"
@@ -209,9 +216,11 @@ def test_parse_generation_output_inline_fence_marks_in_yaml():
 
 
 def test_parse_generation_output_yaml_with_inner_standalone_fence():
-    # 更深的嵌套：base_prompt 里抄进了完整的独立成行 ```yaml 范例围栏——
-    # 最短候选会把 pattern 截在范例围栏处（构造失败），级联须放宽到
-    # 外层真实闭合，拿到含全部节点的完整 YAML
+    # deeper nesting: base_prompt copies in a complete standalone ```yaml
+    # example fence on its own line — the shortest candidate would cut the
+    # pattern at the example fence (construction fails), so the cascade must
+    # relax up to the real outer close and get the complete YAML with all
+    # nodes
     raw = (
         "```yaml\n"
         "code: cascade_demo\n"
@@ -260,13 +269,14 @@ def test_parse_plugin_block_filename_fallback_to_code():
 
 
 def test_validate_pattern_text_requires_plugin_registered(hosted_dirs):
-    # 插件未注册 → 校验报「未注册」；构造本身成功（工具面宽松默认下
-    # 返回 (pattern, errors, warnings) 三元组）
+    # plugin not registered -> validation reports "unregistered"; construction
+    # itself succeeds (with the lenient tool-surface default it returns the
+    # (pattern, errors, warnings) triple)
     pattern, errors, warnings = studio_agent.validate_pattern_text(
         GOOD_PATTERN_YAML)
     assert pattern is not None and errors
     assert any("gen_demo_router" in e for e in errors)
-    assert warnings == []  # GOOD_PATTERN_YAML 不声明 use_tools
+    assert warnings == []  # GOOD_PATTERN_YAML does not declare use_tools
     try:
         path = studio_store.write_plugin_file("gen_demo_router", GOOD_PLUGIN_PY)
         studio_store.import_plugin_module(path)
@@ -278,7 +288,7 @@ def test_validate_pattern_text_requires_plugin_registered(hosted_dirs):
 
 
 # ---------------------------------------------------------------------------
-# api：pattern 管理面
+# api: pattern management surface
 # ---------------------------------------------------------------------------
 
 def test_publish_validate_delete_lifecycle(client, hosted_dirs):
@@ -286,13 +296,13 @@ def test_publish_validate_delete_lifecycle(client, hosted_dirs):
     studio_store.write_plugin_file("gen_demo_router", GOOD_PLUGIN_PY)
     studio_store.import_plugin_module(plugins_dir / "gen_demo_router.py")
 
-    # validate：引用已注册插件 → 通过
+    # validate: references a registered plugin -> passes
     data = _ok_data(client.post("/api/v1/studio/patterns/validate",
                                 json={"yaml": GOOD_PATTERN_YAML}))
     assert data["errors"] == [] and data["constructed"] is True
     assert data["mermaid"].lstrip().startswith("flowchart")
 
-    # publish：落盘 + 注册 + source=console
+    # publish: persisted + registered + source=console
     data = _ok_data(client.post("/api/v1/studio/patterns/publish",
                                 json={"yaml": GOOD_PATTERN_YAML}))
     assert data["meta"]["source"] == "console"
@@ -308,7 +318,7 @@ def test_publish_validate_delete_lifecycle(client, hosted_dirs):
     assert detail["meta"]["source"] == "console"
     assert "code: gen_demo" in detail["yaml"]
 
-    # delete：仅 console 可删
+    # delete: only console-sourced patterns are deletable
     data = _ok_data(client.delete("/api/v1/studio/patterns/gen_demo"))
     assert pattern_registry.get("gen_demo") is None
     assert not (patterns_dir / "gen_demo.yml").exists()
@@ -340,14 +350,16 @@ def test_catalog(client):
 
 
 # ---------------------------------------------------------------------------
-# api：generate SSE + apply（打桩 claude runner）
+# api: generate SSE + apply (stubbed claude runner)
 # ---------------------------------------------------------------------------
 
 def _install_stub_claude(monkeypatch, final_text):
-    """把 run_claude_code 换成离线脚本：init status → step(工具调用) →
-    step(工具返回) → 两段 delta（模拟 --include-partial-messages）→ final。
+    """Replace run_claude_code with an offline script: init status ->
+    step (tool call) -> step (tool result) -> two delta segments
+    (simulating --include-partial-messages) -> final.
 
-    返回 captured dict：fake 收到的完整提示词（可断言用户需求已组入）。"""
+    Returns the captured dict: the full prompt the fake received (so it can
+    be asserted that the user requirement was composed in)."""
     captured = {}
 
     async def _fake_run(prompt):
@@ -397,7 +409,8 @@ def test_generate_sse_full_pipeline(client, hosted_dirs, monkeypatch):
     assert "error" not in kinds
     deltas = "".join(e["text"] for e in events if e["kind"] == "delta")
     assert deltas == GEN_OUTPUT
-    # 提示词确实喂给了 claude runner（系统契约 + 用户需求都在）
+    # the prompt really was fed to the claude runner (system contract + user
+    # requirement both present)
     assert "pattern" in captured["prompt"]
     assert "测试背景" in captured["prompt"] and "功能A" in captured["prompt"]
 
@@ -407,11 +420,11 @@ def test_generate_sse_full_pipeline(client, hosted_dirs, monkeypatch):
     assert result["explanation"].startswith("两个节点")
     assert len(result["plugins"]) == 1
     assert result["plugins"][0]["imported"] is True
-    # 预览导入已注册插件但未落盘（apply 才落盘）
+    # preview imports and registers the plugin but does not persist it (only apply persists)
     assert plugin_registry.has("executor", "gen_demo_router")
     assert not (plugins_dir / "gen_demo_router.py").exists()
 
-    # apply：插件 + pattern 一次性落盘注册
+    # apply: plugin + pattern persisted and registered in one shot
     plugin_code = next(
         b for b in GEN_OUTPUT.split("```")
         if "plugin_registry.register" in b
@@ -436,7 +449,8 @@ def test_generate_sse_bad_output_flags_not_ok(client, monkeypatch):
 
 
 def test_generate_sse_claude_error_aborts_without_result(client, monkeypatch):
-    """claude CLI 失败（不可用/非零退出）→ error 事件且不产 result。"""
+    """claude CLI failure (unavailable / non-zero exit) -> an error event
+    and no result."""
     async def _fake_run(prompt):
         yield {"kind": "error", "message": "本地 Claude Code CLI 不可用（claude 不在 PATH 或不可执行）"}
 
@@ -448,7 +462,8 @@ def test_generate_sse_claude_error_aborts_without_result(client, monkeypatch):
 
 
 class _FakeClaudeProc:
-    """最小 subprocess 协议桩：stdin 可写可关，stdout 吐 init + success result。"""
+    """Minimal subprocess-protocol stub: stdin writable and closeable,
+    stdout emits init + a success result."""
 
     def __init__(self):
         class _Stdin:
@@ -486,8 +501,10 @@ class _FakeClaudeProc:
 
 
 def test_run_claude_code_argv_is_read_only(monkeypatch):
-    """子进程 argv 收敛写入面：不带 --dangerously-skip-permissions，
-    只授只读工具白名单（Write/Edit/Bash 等未白名单工具在 -p 模式自动拒绝）。"""
+    """Subprocess argv keeps a read-only write surface: no
+    --dangerously-skip-permissions, only a read-only tool whitelist is
+    granted (non-whitelisted tools like Write/Edit/Bash are auto-denied in
+    -p mode)."""
     argv = {}
 
     async def _fake_exec(*args, **kwargs):
@@ -514,8 +531,10 @@ def test_run_claude_code_argv_is_read_only(monkeypatch):
 
 
 def test_generate_allows_unregistered_new_tools(client, hosted_dirs, monkeypatch):
-    """新生成模版声明未注册的新工具：工具面宽松校验——不阻塞生成/应用，
-    软警告（pattern_warnings）透出；托管目录重放（重启语义）同样宽松。"""
+    """A newly generated template declares an unregistered new tool: the
+    tool surface is validated leniently — generation/apply is not blocked,
+    a soft warning surfaces (pattern_warnings); hosted-directory replay
+    (restart semantics) is equally lenient."""
     plugins_dir, patterns_dir = hosted_dirs
     yaml_new_tool = GOOD_PATTERN_YAML.replace(
         "    loop: gen_demo_router\n  config:",
@@ -531,13 +550,14 @@ def test_generate_allows_unregistered_new_tools(client, hosted_dirs, monkeypatch
     assert result["ok"] is True
     assert any("gen_brand_new_tool" in w for w in result["pattern_warnings"])
 
-    # dry-run 校验端点同样宽松：errors 空、warnings 带新工具
+    # the dry-run validate endpoint is equally lenient: errors empty,
+    # warnings carry the new tool
     data = _ok_data(client.post("/api/v1/studio/patterns/validate",
                                 json={"yaml": result["yaml"]}))
     assert data["errors"] == []
     assert any("gen_brand_new_tool" in w for w in data["warnings"])
 
-    # 应用落盘注册成功
+    # apply persists and registers successfully
     data = _ok_data(client.post("/api/v1/studio/apply", json={
         "yaml": result["yaml"],
         "plugins": [{"filename": "gen_demo_router.py", "code": GOOD_PLUGIN_PY}],
@@ -546,7 +566,7 @@ def test_generate_allows_unregistered_new_tools(client, hosted_dirs, monkeypatch
     assert (patterns_dir / "gen_demo.yml").is_file()
     assert any("gen_brand_new_tool" in w for w in data["warnings"])
 
-    # 托管目录重放（重启装载）不因未注册工具失败
+    # hosted-directory replay (restart load) does not fail on the unregistered tool
     _cleanup_generated()
     report = studio_store.load_console_artifacts()
     assert report["patterns"]["loaded"] == ["gen_demo"]
@@ -560,13 +580,13 @@ def test_apply_rejects_plugin_before_any_write(client, hosted_dirs, monkeypatch)
         "plugins": [{"filename": "gen_demo_router.py", "code": bad_plugin}],
     })
     assert resp.status_code == 400
-    # 验证失败 → 任何托管文件都不该出现
+    # validation failed -> no hosted file should have appeared
     assert not (plugins_dir / "gen_demo_router.py").exists()
     assert not (patterns_dir / "gen_demo.yml").exists()
 
 
 # ---------------------------------------------------------------------------
-# api：assist（非流式小助手）
+# api: assist (non-streaming helper)
 # ---------------------------------------------------------------------------
 
 class StubChatProvider:

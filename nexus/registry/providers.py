@@ -84,7 +84,8 @@ class LLMProviderRegistry:
         code:
             Unique provider code (e.g. ``"dashscope"``, ``"zai"``).
         name:
-            Human-readable name (e.g. ``"阿里云百炼 (DashScope)"``).
+            Human-readable name (e.g. ``"阿里云百炼 (DashScope)"``
+            ("Alibaba Cloud Bailian (DashScope)")).
         description:
             Short description of the provider.
         provider_class:

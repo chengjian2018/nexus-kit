@@ -98,7 +98,8 @@ def _expand_mcp_env_refs(value: str, where: str) -> str:
 
 def _expand_entry_env_refs(name: str, entry: Dict[str, Any]) -> None:
     """Expand env references across an entry's string values in place:
-    command / url / args 列表项 / env 值 / headers 值(键名不展开)。"""
+    command / url / args list items / env values / headers values (keys are
+    not expanded)."""
     for field in ("command", "url"):
         if isinstance(entry.get(field), str):
             entry[field] = _expand_mcp_env_refs(entry[field], f"{name}.{field}")
@@ -181,8 +182,9 @@ def _validate_mcp_servers(raw: Any) -> Dict[str, Any]:
 # ReAct loop guard (config ``loop`` section)
 # ============================================================================
 
-# 工具轮次预算默认（全局 ``loop.max_tool_rounds``；每轮对话现读，app 配置
-# 可按 pattern / node 细化覆盖——见 get_loop_limits 三层解析）
+# Default tool-round budget (global ``loop.max_tool_rounds``; re-read every
+# turn — app configs may refine per pattern / node, see get_loop_limits'
+# three-layer resolution)
 DEFAULT_LOOP_MAX_TOOL_ROUNDS = 10
 
 
@@ -259,22 +261,27 @@ DEFAULT_CRON_MAX_RESULT_CHARS = 4000
 DEFAULT_CRON_JOBS_PATH = "data/cron_jobs.json"
 DEFAULT_CRON_TICK_SECONDS = 20
 
-# Skill 资产扫描根（config ``skills`` 节；nexus/skills.py）。dir 为相对
-# 路径时按服务启动目录解析（与 file 工具同语义），~ 展开；根不存在时
-# 整条技能链静默（镜像 mcp_servers: {} 的姿态）。pattern 可用
-# config.skills_dir 覆盖（app 自带技能的场景）。
+# Skill-asset scan root (config ``skills`` section; consumed by
+# nexus/skills.py). A relative dir resolves against the service startup
+# directory (same semantics as the file tool) with ~ expansion; a missing
+# root silences the whole skill chain (mirroring the mcp_servers: {} stance).
+# A pattern may override it via config.skills_dir (app-bundled skills).
 DEFAULT_SKILLS_DIR = "skills"
 
-# Tool guard（config ``tool_guard`` 节，P4 工具执行前危险操作播报——
-# atoms/hooks/tool_guard.py）。enabled 总开关；llm_fallback 控制旁路的
-# 轻量 LLM 判读（规则未命中高危但信号可疑时送审）；llm_max_input_chars
-# 截断送审参数；llm_max_queue 有界队列（满则丢弃新条）；llm_timeout_
-# seconds 单次判读超时；llm 为叠加在 ambient 连接之上的 judge 模型
-# 覆盖（code/model/max_tokens/...，推荐指向便宜小模型）。
+# Tool guard (config ``tool_guard`` section — P4 pre-execution announce of
+# dangerous tool calls; atoms/hooks/tool_guard.py). ``enabled`` is the master
+# switch; ``llm_fallback`` controls the bypass lightweight LLM review (rule
+# miss but suspicious signals → send for adjudication); ``llm_max_input_chars``
+# truncates the submitted args; ``llm_max_queue`` bounds the review queue
+# (full queue drops new entries); ``llm_timeout_seconds`` is the per-review
+# timeout; ``llm`` is a judge-model override layered on top of the ambient
+# connection (code/model/max_tokens/... — point it at a cheap small model).
 DEFAULT_TOOL_GUARD_ENABLED = True
-# LLM 判读默认关（显式 opt-in）：配置缺失 tool_guard 节时静默走环境
-# provider 会把工具参数送出进程，与配置读失败回退的"规则开、LLM 关"
-# 保守姿态对齐；需要判读的部署显式写 llm_fallback: true
+# LLM review defaults to OFF (explicit opt-in): when the config lacks a
+# tool_guard section, silently falling through to the ambient provider would
+# ship tool args out of process — aligned with the conservative "rules on,
+# LLM off" stance taken when config reads fail; deployments that want the
+# review write llm_fallback: true explicitly.
 DEFAULT_TOOL_GUARD_LLM_FALLBACK = False
 DEFAULT_TOOL_GUARD_LLM_MAX_INPUT_CHARS = 2000
 DEFAULT_TOOL_GUARD_LLM_MAX_QUEUE = 64
@@ -395,33 +402,39 @@ def _validate_llm_providers(providers: Dict[str, Any]) -> None:
 # App-level config overlay: apps/*/config.yaml (spec 2026-09-15)
 # ============================================================================
 
-# 顶层词表（pattern 为必填的显式绑定键——目录名 ≠ pattern code，绑定出错早爆）
+# Top-level vocabulary (``pattern`` is the required explicit binding key —
+# the directory name ≠ pattern code; a wrong binding fails fast)
 _APP_TOP_FIELDS = {
     "pattern", "llm", "nodes", "loop", "compression",
     "guardrails", "skills", "config",
 }
 
-# 连接字段在 app 文件中出现即 fail-fast：app 配置入库（git），连接层
-# （含密钥）只允许出现在全局 llm_providers——校验层硬拒，warn 不够
+# Connection fields appearing in an app file fail fast: app configs are
+# committed to git, the connection layer (with secrets) may only live in the
+# global llm_providers — the validation layer hard-rejects; a warn is not enough
 _APP_LLM_CONNECTION_FIELDS = {"api_base", "api_key", "api_key_env"}
 
-# nodes 条目词表：只开放 llm 与 loop.max_tool_rounds
+# Per-node entry vocabulary: only llm and loop.max_tool_rounds are open
 _APP_NODE_FIELDS = {"llm", "loop"}
 _APP_NODE_LOOP_FIELDS = {"max_tool_rounds"}
 
-# pattern 级 loop 词表（node 级只有 max_tool_rounds——max_steps/max_fanout
-# 是图级预算，没有 node 维度）
+# Pattern-level loop vocabulary (node level only has max_tool_rounds —
+# max_steps/max_fanout are graph-level budgets with no node dimension)
 _APP_LOOP_FIELDS = {"max_tool_rounds", "max_steps", "max_fanout"}
 
-# compression 词表（会话级；threshold 0 = 该应用关闭压缩）
+# compression vocabulary (session-level; threshold 0 = compression off for the app)
 _APP_COMPRESSION_FIELDS = {"threshold", "retain_count"}
 
-# 护栏段词表：段名与全局 6 段同名，字段校验复用全局对应段的 int()/str()
-# 收口（global local_config.yaml 各段解析的字段集在此处成表，二者同源）。
-# 唯一例外 cron_tool：词表刻意窄于全局段——jobs_path / tick_seconds 是
-# 进程级基础设施（作业仓路径 / 调度拍长），app 覆盖会让作业在多文件间分裂
-# （add 用 ambient、fire 用冻结、update/remove 用全局），故 app 侧不可覆盖
-# （写了 warn+剔除，与非法值同姿态），只能配在全局 cron_tool 段
+# Guardrail section vocabulary: section names match the global 6 guardrail
+# sections and field validation reuses the global sections' int()/str()
+# coercion (the field sets parsed by each global local_config.yaml section
+# are tabulated here — single source of truth for both). One exception,
+# cron_tool: its vocabulary is deliberately narrower than the global section —
+# jobs_path / tick_seconds are process-level infrastructure (jobs repo path /
+# scheduler cadence); an app override would split jobs across files (add uses
+# ambient, fire uses frozen, update/remove use global), so apps may not
+# override them (written values get warn+dropped, same stance as illegal
+# values); configure them in the global cron_tool section only.
 _GUARDRAIL_FIELD_COERCERS: Dict[str, Dict[str, Any]] = {
     "subagent_tool": {
         "timeout_seconds": int, "max_rounds": int, "max_result_chars": int,
@@ -444,15 +457,17 @@ _GUARDRAIL_FIELD_COERCERS: Dict[str, Dict[str, Any]] = {
     "cron_tool": {
         "max_jobs": int, "fire_timeout_seconds": int, "max_rounds": int,
         "history_cap": int, "max_input_chars": int, "max_result_chars": int,
-        # jobs_path / tick_seconds 刻意不在 app 词表：进程级基础设施，
-        # 见表头注释（全局 cron_tool 段仍可配）
+        # jobs_path / tick_seconds deliberately absent from the app
+        # vocabulary: process-level infrastructure, see the table header
+        # comment (the global cron_tool section can still configure them)
     },
 }
 
 
 def _positive_int(value: Any, default: int, field: str) -> int:
-    """int ≥ 1 收口：bool / 非 int / 越界值告警并回落默认（bool 是 int 的
-    子类，yaml 手写的 true 必须按非法处理而不是 1）。"""
+    """Coerce to int ≥ 1: bool / non-int / out-of-range values warn and fall
+    back to the default (bool is an int subclass — a hand-written yaml true
+    must be treated as illegal, not as 1)."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         if value is not None:
             logging.getLogger(__name__).warning(
@@ -462,8 +477,8 @@ def _positive_int(value: Any, default: int, field: str) -> int:
 
 
 def _non_negative_int(value: Any, field: str) -> Optional[int]:
-    """int ≥ 0 收口（app compression 覆盖层用）：非法值告警并剔除，读取期
-    回退全局（None = 未覆盖）。"""
+    """Coerce to int ≥ 0 (used by the app compression overlay): illegal values
+    warn and get dropped; reads fall back to the global (None = no override)."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         logging.getLogger(__name__).warning(
             "%s 应为 int ≥ 0，实际为 %r，已忽略", field, value)
@@ -472,11 +487,13 @@ def _non_negative_int(value: Any, field: str) -> Optional[int]:
 
 
 def _validate_app_llm(llm_cfg: Any, where: str) -> Dict[str, Any]:
-    """app 侧 llm 词表校验：复用 ``_LLM_ALL_FIELDS``；连接字段 fail-fast。
+    """Validate the app-side llm vocabulary: reuses ``_LLM_ALL_FIELDS``;
+    connection fields fail fast.
 
-    词表内的未知字段 warn+剔除（与全局 yaml 一致）。``code`` 出现而
-    ``model`` 缺席时沿用分层合并的回填语义——浅层的 model 自然保留，换
-    provider 的场景两者必须一起写（见设计文档 §4.1 注释）。
+    Unknown in-vocabulary fields get warn+dropped (same as the global yaml).
+    A ``code`` without ``model`` keeps the layered merge's backfill semantics —
+    the shallower layer's model naturally survives; switching provider
+    requires writing both together (see the design doc §4.1 note).
     """
     if llm_cfg is None:
         return {}
@@ -495,8 +512,9 @@ def _validate_app_llm(llm_cfg: Any, where: str) -> Dict[str, Any]:
 
 
 def _validate_app_loop(loop_cfg: Any, vocab, where: str) -> Dict[str, int]:
-    """app 侧 loop 段校验：词表内 int ≥ 1，非法值 warn+剔除（读取期回退
-    更浅层——全局 loop 段或 pattern 级）。"""
+    """Validate the app-side loop section: in-vocabulary int ≥ 1; illegal
+    values warn+drop (reads fall back to the shallower layer — the global
+    loop section or the pattern level)."""
     if loop_cfg is None:
         return {}
     if not isinstance(loop_cfg, dict):
@@ -516,8 +534,9 @@ def _validate_app_loop(loop_cfg: Any, vocab, where: str) -> Dict[str, int]:
 
 
 def _validate_app_compression(comp_cfg: Any, where: str) -> Dict[str, int]:
-    """app 侧 compression 段校验：threshold / retain_count int ≥ 0，非法值
-    warn+剔除（字段级覆盖，缺席字段维持全局 session_compress_*）。"""
+    """Validate the app-side compression section: threshold / retain_count
+    int ≥ 0; illegal values warn+drop (field-level override — absent fields
+    keep the global session_compress_*)."""
     if comp_cfg is None:
         return {}
     if not isinstance(comp_cfg, dict):
@@ -535,9 +554,10 @@ def _validate_app_compression(comp_cfg: Any, where: str) -> Dict[str, int]:
 
 
 def _validate_app_guardrails(gr_cfg: Any, where: str) -> Dict[str, Dict[str, Any]]:
-    """app 侧 guardrails 段校验：段名 ∈ 全局 6 护栏段，字段校验复用全局段
-    的 int()/str() 收口；未知段 / 未知字段 / 非法值 warn+剔除（读取期回退
-    全局段）。"""
+    """Validate the app-side guardrails section: section names ∈ the global 6
+    guardrail sections; field validation reuses the global sections' int()/str()
+    coercion; unknown sections / fields / values warn+drop (reads fall back
+    to the global section)."""
     if gr_cfg is None:
         return {}
     if not isinstance(gr_cfg, dict):
@@ -570,12 +590,15 @@ def _validate_app_guardrails(gr_cfg: Any, where: str) -> Dict[str, Dict[str, Any
 
 
 def _parse_app_config_file(path: Path) -> Dict[str, Any]:
-    """读单份 app 配置 + 校验 + 归一化（_load_app_configs 的无缓存核心）。
+    """Read one app config + validate + normalize (the cache-free core of
+    _load_app_configs).
 
-    归一化视图固定八键：pattern / llm / nodes / loop / compression /
-    guardrails / skills / config（缺席段为空 dict，读取期回退全局）。
-    未知键 warn+忽略；缺失 pattern、连接字段、结构错误（段非字典）按
-    fail-fast raise——app 配置是显式声明的部署物，出错早爆。
+    The normalized view always has eight keys: pattern / llm / nodes / loop /
+    compression / guardrails / skills / config (absent sections are empty
+    dicts; reads fall back to global). Unknown keys warn+ignore; a missing
+    pattern, connection fields, or structural errors (section not a dict)
+    fail fast with a raise — an app config is an explicitly declared
+    deployment artifact; errors surface early.
     """
     with open(path, "r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
@@ -647,20 +670,22 @@ def _parse_app_config_file(path: Path) -> Dict[str, Any]:
     }
 
 
-# resolved apps dir -> (指纹, {pattern_code: 规范化视图})；与 _CONFIG_CACHE
-# 同锁同策略（parse 在锁外，只有 dict swap 原子；解析失败不落缓存）
+# resolved apps dir -> (fingerprint, {pattern_code: normalized view}); same
+# lock and policy as _CONFIG_CACHE (parse outside the lock, only the dict
+# swap is atomic; parse failures do not populate the cache)
 _APP_CONFIGS_CACHE: Dict[str, Tuple[Tuple[Tuple[str, int, int], ...],
                                     Dict[str, Dict[str, Any]]]] = {}
 
-# 测试 / 嵌套部署可用环境变量改锚点（默认与 discovery 同锚：
-# nexus/registry/patterns.py 的 repo-root apps/）
+# Tests / nested deployments can repoint the anchor via env var (default
+# anchors with discovery: the repo-root apps/ of
+# nexus/registry/patterns.py)
 _APPS_DIR_ENV = "NEXUS_APPS_DIR"
 
 
 def _get_apps_dir() -> Path:
-    """app 配置扫描根：``$NEXUS_APPS_DIR`` > 仓库根 apps/（与
-    discover_builtin_patterns 同锚法，settings.py 少一层目录所以是
-    parents[1]）。"""
+    """App config scan root: ``$NEXUS_APPS_DIR`` > repo-root apps/ (same
+    anchoring as discover_builtin_patterns; settings.py sits one directory
+    shallower so it is parents[1])."""
     env = os.environ.get(_APPS_DIR_ENV)
     if env:
         return Path(env)
@@ -668,15 +693,18 @@ def _get_apps_dir() -> Path:
 
 
 def _load_app_configs() -> Dict[str, Dict[str, Any]]:
-    """扫描 ``apps/*/config.yaml`` → ``{pattern_code: 规范化视图}``。
+    """Scan ``apps/*/config.yaml`` → ``{pattern_code: normalized view}``.
 
-    整体 (mtime_ns, size) 指纹缓存（文件数 ≤ 8，整表指纹足够；文件集合
-    本身编进指纹——删文件 / 换文件必然失效）。无文件 = 空 dict（未配置
-    app 的应用零改动照跑）。两份文件绑定同一 pattern code：fail-fast。
-    每轮对话现读，与全局 yaml 的热重载语义一致。
+    Whole-table (mtime_ns, size) fingerprint cache (≤ 8 files, a whole-table
+    fingerprint is enough; the file set itself is encoded into the
+    fingerprint — deleting / swapping a file necessarily invalidates it).
+    No files = empty dict (unconfigured apps run unchanged on defaults).
+    Two files bound to the same pattern code: fail fast. Re-read every turn,
+    matching the global yaml's hot-reload semantics.
 
     Raises:
-        ValueError: 任一文件结构非法 / 缺 pattern / 含连接字段 / 重复绑定。
+        ValueError: any file structurally illegal / missing pattern /
+            containing connection fields / duplicate binding.
     """
     apps_dir = _get_apps_dir()
     files = (sorted(apps_dir.glob("*/config.yaml"))
@@ -711,7 +739,8 @@ def _load_app_configs() -> Dict[str, Dict[str, Any]]:
 
 
 def _get_app_config(pattern_code: str) -> Optional[Dict[str, Any]]:
-    """按 pattern code 取 app 配置视图；空 code / 未绑定 → None（回退全局）。"""
+    """App config view by pattern code; empty code / unbound → None (fall
+    back to global)."""
     if not pattern_code:
         return None
     return _load_app_configs().get(pattern_code)
@@ -817,6 +846,16 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
             f"配置文件顶层应为字典，实际为: {type(raw).__name__}"
         )
 
+    # The deprecated per-pattern model pick (pattern_llm, pre-app-config era):
+    # silently dropped after the migration — an existing deployment upgrading
+    # with real content would quietly fall back to llm_default; this warns
+    # loudly, turning the silent fallback into an actionable migration signal
+    if raw.get("pattern_llm"):
+        logging.getLogger(__name__).warning(
+            "配置文件 %s 的顶层 'pattern_llm' 已废弃且不再生效(模型选择请"
+            "迁移到 apps/<name>/config.yaml 的 llm/nodes 段)，当前按 "
+            "llm_default 回退处理", path)
+
     # Extract LLM config: new structure (llm_providers/llm_default) or legacy llm node
     has_legacy = raw.get("llm") is not None
     has_new = raw.get("llm_providers") is not None or raw.get("llm_default") is not None
@@ -885,8 +924,10 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
     skills_cfg = raw.get("skills") or {}
     if not isinstance(skills_cfg, dict):
         raise ValueError("skills 应为字典")
-    # judge 覆盖的未知字段只告警并剔除——打错的键（如 modle）若静默流进
-    # build_provider，失败会被判读层 DEBUG 吞掉，judge 永远不跑且无人知晓
+    # Unknown judge-override fields only warn and get dropped — a typo'd key
+    # (e.g. modle) silently flowing into build_provider would have its
+    # failure swallowed by the review layer's DEBUG logging: the judge never
+    # runs and nobody knows
     _tg_llm_unknown = set(tool_guard_llm.keys()) - _LLM_ALL_FIELDS
     if _tg_llm_unknown:
         logging.getLogger(__name__).warning(
@@ -1000,13 +1041,15 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
             "tick_seconds": int(cron_tool.get(
                 "tick_seconds", DEFAULT_CRON_TICK_SECONDS)),
         },
-        # Skill 资产扫描根（可选；默认 skills 目录，nexus/skills.py 消费）
+        # Skill-asset scan root (optional; default skills dir, consumed by
+        # nexus/skills.py)
         "skills": {
             "dir": str(skills_cfg.get("dir", DEFAULT_SKILLS_DIR) or ""),
         },
-        # tool guard（可选；defaults see DEFAULT_TOOL_GUARD_* constants）。
-        # 布尔字段经 _strict_bool 收口——YAML 手写的 "false" 字符串按
-        # bool(...) 是 truthy，会把想关掉的守卫/判读悄悄打开
+        # Tool guard (optional; defaults see DEFAULT_TOOL_GUARD_* constants).
+        # Boolean fields go through _strict_bool — a hand-written yaml
+        # "false" string is truthy under bool(...) and would silently turn a
+        # guard / review the operator meant to disable back on
         "tool_guard": {
             "enabled": _strict_bool(tool_guard.get("enabled"),
                                     DEFAULT_TOOL_GUARD_ENABLED,
@@ -1027,9 +1070,11 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
 
 
 def _strict_bool(value: Any, default: bool, field: str) -> bool:
-    """布尔配置收口：真布尔直通；常见的 "true"/"false"/"yes"/"no"/"on"/
-    "off"/1/0 字符串与整数按语义转换；其余形态告警并回落默认值——
-    bool("false") 是 truthy，裸强转会把想关的开关悄悄打开。"""
+    """Boolean config coercion: a real bool passes through; common
+    "true"/"false"/"yes"/"no"/"on"/"off"/1/0 strings and ints convert by
+    semantics; anything else warns and falls back to the default —
+    bool("false") is truthy and a bare cast would silently turn a switch
+    the operator meant to disable back on."""
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and value in (0, 1):
@@ -1085,8 +1130,8 @@ def get_llm_config(pattern_code: str = "", node_code: str = "",
                    config_path: str = "") -> Dict[str, Any]:
     """Resolve the LLM config for the current position (layered merge).
 
-    override not None (``cxt.metadata["llm_override"]`` — the CLI's explicit
-    pick / test seam; it sits ABOVE the whole layered chain): skip the
+    override not None (``cxt.metadata["llm_override"]`` — the caller's /
+    tests' explicit pick; it sits ABOVE the whole layered chain): skip the
     layered resolution and only try to merge in the
     llm_providers[override.code] connection section; a yaml load failure
     silently degrades to an empty connection section (keeps offline tests
@@ -1110,9 +1155,9 @@ def get_llm_config(pattern_code: str = "", node_code: str = "",
         if not code and default.get("code"):
             merged["code"] = default["code"]
         if not merged.get("model") and default.get("model"):
-            # When the CLI picks "维持 config 配置", override carries only code;
-            # a missing model would make the loop executor raise KeyError on
-            # llm_config["model"], so backfill it just like code
+            # When the caller picks "keep the config as-is", override carries
+            # only code; a missing model would make the loop executor raise
+            # KeyError on llm_config["model"], so backfill it just like code
             merged["model"] = default["model"]
         return _merge_connection(merged, cfg.get("llm_providers", {}))
     cfg = load_config(config_path)
@@ -1148,11 +1193,13 @@ def get_mcp_servers(config_path: str = "") -> Dict[str, Any]:
 
 
 def get_loop_limits(pattern_code: str = "", node_code: str = "") -> Dict[str, Any]:
-    """ReAct 工具轮次预算，三层解析：全局 ``loop`` 段 → app pattern 级 →
-    app node 级（深者赢；pattern_code 未绑定 app 配置时即全局值）。
+    """ReAct tool-round budget, three-layer resolution: global ``loop``
+    section → app pattern level → app node level (deeper wins; an unbound
+    pattern_code is just the global value).
 
     Returns:
-        ``{"max_tool_rounds": N}`` — dict 形状便于后续预算维度扩展。
+        ``{"max_tool_rounds": N}`` — a dict shape so future budget
+        dimensions can be added.
     """
     cfg = load_config()
     rounds = cfg["loop"]["max_tool_rounds"]
@@ -1170,12 +1217,13 @@ def get_loop_limits(pattern_code: str = "", node_code: str = "") -> Dict[str, An
 
 
 def resolve_max_steps(pattern) -> int:
-    """图级步数预算：app ``loop.max_steps`` 赢，缺省回退 ``pattern.max_steps``
-    （代码声明为默认，app yaml 为部署者覆盖——两不亏欠）。
+    """Graph-level step budget: app ``loop.max_steps`` wins, falling back to
+    ``pattern.max_steps`` (the code declaration is the default, the app yaml
+    is the deployer's override — neither owes the other).
 
-    ``pattern`` 是 ``nexus.model.pattern.Pattern`` 对象（duck-typed 取
-    ``code`` / ``max_steps``；此处不 import 该类型避免 registry 链路引入
-    循环依赖）。
+    ``pattern`` is a ``nexus.model.pattern.Pattern`` object (duck-typed for
+    ``code`` / ``max_steps``; the type is deliberately not imported here to
+    keep the registry import chain free of cycles).
     """
     app = _get_app_config(getattr(pattern, "code", "") or "")
     if app is not None and app["loop"].get("max_steps") is not None:
@@ -1184,8 +1232,8 @@ def resolve_max_steps(pattern) -> int:
 
 
 def resolve_max_fanout(pattern) -> int:
-    """运行时扇出宽度上限：app ``loop.max_fanout`` 赢，缺省回退
-    ``pattern.max_fanout``（语义同 resolve_max_steps）。"""
+    """Runtime fan-out width cap: app ``loop.max_fanout`` wins, falling back
+    to ``pattern.max_fanout`` (same semantics as resolve_max_steps)."""
     app = _get_app_config(getattr(pattern, "code", "") or "")
     if app is not None and app["loop"].get("max_fanout") is not None:
         return app["loop"]["max_fanout"]
@@ -1196,8 +1244,9 @@ def get_session_compress_config(pattern_code: str = "",
                                 config_path: str = "") -> tuple:
     """Convenience method: return (compression token threshold, retain count); threshold 0 = off.
 
-    app ``compression`` 字段级覆盖全局 ``session_compress_*``（app 里只写
-    要改的字段，其余继承全局）。
+    The app ``compression`` fields override the global ``session_compress_*``
+    field by field (write only the fields to change in the app file; the rest
+    inherit global).
     """
     cfg = load_config(config_path)
     threshold = cfg["session_compress_token_threshold"]
@@ -1212,9 +1261,10 @@ def get_session_compress_config(pattern_code: str = "",
 
 def _guardrail_section(section: str, pattern_code: str,
                        config_path: str) -> Dict[str, Any]:
-    """全局护栏段 ⊕ app guardrails 同名段（字段级合并，app 字段赢；方向
-    自由——app config 是部署者意志的表达，安全边界在授权与 args-only-
-    lower 不变式，不在这里）。"""
+    """Global guardrail section ⊕ the app guardrails section of the same name
+    (field-level merge, app fields win; direction-free — an app config is the
+    deployer's will, the security boundary lives in tool authorization and
+    the args-only-lower invariant, not here)."""
     merged = dict(load_config(config_path)[section])
     app = _get_app_config(pattern_code)
     if app:
@@ -1306,18 +1356,19 @@ def get_skills_config(config_path: str = "") -> Dict[str, Any]:
 
 
 def get_pattern_custom_config(pattern_code: str = "") -> Dict[str, Any]:
-    """app ``config`` 自由 bag（执行器自定义参数的家，如 archify 的
-    author_rounds / workspace_root）；未绑定 app 配置 → 空 dict。
+    """The app ``config`` free bag (home of executor custom params, e.g.
+    archify's author_rounds / workspace_root); unbound app → empty dict.
 
-    刻意不与 ``pattern.config`` 合并：代码级默认值留在执行器里（``.get``
-    回退），yaml 值由此处赢——单一覆盖来源，不出现两层各写一半的键。
+    Deliberately NOT merged with ``pattern.config``: code-level defaults stay
+    in the executor (``.get`` fallback), the yaml value wins here — a single
+    override source, never a key half-written in both layers.
     """
     app = _get_app_config(pattern_code)
     return dict(app["config"]) if app else {}
 
 
 def get_tool_guard_config(config_path: str = "") -> Dict[str, Any]:
-    """Return the tool guard config (P4 危险操作播报).
+    """Return the tool guard config (P4 dangerous-op announce).
 
     Equivalent to ``load_config(config_path)["tool_guard"]`` —
     ``{"enabled", "llm_fallback", "llm_max_input_chars", "llm_max_queue",

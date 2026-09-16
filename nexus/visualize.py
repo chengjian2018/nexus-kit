@@ -20,7 +20,7 @@ Three output formats (all sharing the same Mermaid generator, zero third-party d
 Diagram-to-structure mapping conventions:
 - Node   -> node, labeled with code, name, and slots (FSM); terminal nodes colored separately
 - node.sub_nodes -> solid arrow (FSM transitions / AGENT adjacency)
-- entry_node_code -> a 「⏵ 开始」 virtual node pointing at the entry node
+- entry_node_code -> a 「⏵ 开始」 ("Start") virtual node pointing at the entry node
 
 Usage:
     python -m nexus.visualize --list

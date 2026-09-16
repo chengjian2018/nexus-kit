@@ -1,28 +1,39 @@
-"""Studio agent —— LLM 提示词构建 / 围栏输出解析 / 生成插件验证。
+"""Studio agent — LLM prompt building / fence output parsing / generated-plugin validation.
 
-自动编排与流程编排 AI 助手共用的生成层：
+The generation layer shared by the auto-orchestration and flow-orchestration
+AI assistants:
 
-- ``build_generate_messages``：把用户表单（流程背景/功能/实现案例/…）+ 框架
-  契约（pattern schema、TurnResult/NodeExecutor、已注册插件目录、范例 YAML）
-  组装成 chat messages。系统提示词是生成质量的全部来源——schema、执行语义、
-  插件契约、输出格式四块缺一不可。
-- ``pick_exemplar_yaml``：从注册表现场导出一个体量最小的 agent 型 pattern 作
-  格式范例（无 agent 型时退回任意最小 pattern）。
-- ``parse_generation_output``：解析 LLM 输出的 ```yaml / ```python 围栏。
-  开口=行首 `````lang`、闭合=独立成行的 ````` ``——字符串值里行中的围栏
-  记号（如被抄进 base_prompt 的提示词原文「恰好一个 ```yaml 围栏」）不再
-  提前闭合外层围栏；yaml 候选闭合级联（最短候选构造失败时逐级放宽，防
-  内嵌完整围栏把 pattern 截成半份）。插件块从首行注释
-  ``# studio-plugin: file=<stem>.py`` 取文件名，缺失时从首个注册声明的
-  code 推导；再正则抽取全部 (kind, code) 注册声明。
-- ``validate_pattern_text``：from_yaml + validate_pattern（工具面默认宽松：
-  未注册/越集工具降级为 warnings——新生成的模版可能声明新工具），把收集式
-  报错/软警告拆成逐条列表（前端逐行展示）。
-- ``build_assist_messages``：流程编排 AI 助手（话术/回答范式/执行器）的
-  提示词。
+- ``build_generate_messages``: assembles the user form (flow background /
+  features / implementation examples / ...) plus the framework contract
+  (pattern schema, TurnResult/NodeExecutor, the registered plugin catalog,
+  exemplar YAML) into chat messages. The system prompt is the sole source of
+  generation quality — schema, execution semantics, plugin contracts, and
+  output format: all four are indispensable.
+- ``pick_exemplar_yaml``: exports on the spot the smallest agent-type pattern
+  from the registry as a format exemplar (falls back to any minimal pattern
+  when no agent-type one exists).
+- ``parse_generation_output``: parses the ```yaml / ```python fences the LLM
+  emits. Opening = `````lang` at line start, closing = a standalone ````` `` —
+  fence markers mid-line inside string values (e.g. prompt text copied
+  verbatim into base_prompt containing "exactly one ```yaml fence") no longer
+  close the outer fence prematurely; yaml candidates close in a cascade (the
+  shortest candidate is relaxed level by level on construction failure, so an
+  embedded complete fence cannot cut the pattern in half). The plugin block
+  takes its filename from the first-line comment
+  ``# studio-plugin: file=<stem>.py``, falling back to the first registered
+  declaration's code when missing; then all (kind, code) registration
+  declarations are extracted via regex.
+- ``validate_pattern_text``: from_yaml + validate_pattern (the tool surface
+  defaults to lenient: unregistered/out-of-set tools degrade to warnings —
+  freshly generated templates may declare new tools), splitting the collected
+  errors/soft warnings into per-item lists (displayed line by line in the
+  frontend).
+- ``build_assist_messages``: prompts for the flow-orchestration AI assistant
+  (node scripts / answer examples / executors).
 
-这里不做任何落盘/注册——那是 api.py 调 store.py 的事（预览态插件经
-``store.import_plugin_module`` 于临时文件导入，属于注册但非持久化）。
+Nothing here persists to disk or registers — that is api.py calling store.py
+(preview-state plugins are imported from a temporary file through
+``store.import_plugin_module``: registered, but not persisted).
 """
 
 from __future__ import annotations
@@ -43,32 +54,36 @@ from nexus.registry.plugins import registry as plugin_registry
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 输出围栏解析
+# Output fence parsing
 # ---------------------------------------------------------------------------
 #
-# 闭合必须「独立成行」：生成的 pattern 常在字符串值（base_prompt 等）里
-# 内嵌提示词原文，其中行中的 ``` 记号（「恰好一个 ```yaml 围栏」）若被
-# 当作闭合，外层 yaml 围栏会被静默截断——截断处落在块标量内部时 YAML
-# 仍合法，于是构造出一张缺了后半节点的图，报出难定位的悬空边。
+# The close must "stand alone on its line": generated patterns often embed
+# prompt text verbatim inside string values (base_prompt etc.), where an
+# inline ``` marker (from "exactly one ```yaml fence") would — if treated as
+# a close — silently truncate the outer yaml fence. When the truncation
+# lands inside a block scalar the YAML still parses, yielding a graph
+# missing its second half that fails with a hard-to-locate dangling edge.
 
-# 围栏开口：行首（或串首）的 ```lang 换行；行中的 ``` 记号不构成开口
+# Fence open: a line-start (or string-start) ```lang followed by a newline;
+# an inline ``` marker does not open
 _FENCE_OPEN_RE = re.compile(
     r"(?:^|\n)[ \t]*```([A-Za-z0-9_+-]*)[ \t]*\r?\n")
 
-# 围栏闭合：独立成行的 ```（前后仅限空白至行尾）。不消费行尾换行——
-# 紧邻的下一个围栏开口还需要它
+# Fence close: a ``` standing alone on its line (only whitespace before it
+# through end of line). The trailing newline is not consumed — the very next
+# fence open needs it
 _FENCE_CLOSE_RE = re.compile(r"\n[ \t]*```[ \t]*(?=\r?\n|$)")
 
-# 插件模块的注册声明：plugin_registry.register("executor", "code", Factory)
+# A plugin module's registration declaration: plugin_registry.register("executor", "code", Factory)
 _REGISTER_DECL_RE = re.compile(
     r"plugin_registry\.register\(\s*['\"]([a-z_]+)['\"]\s*,\s*"
     r"['\"]([A-Za-z0-9_-]+)['\"]")
 
-# 插件块首行的文件名声明：# studio-plugin: file=gen_xxx.py
+# The plugin block's first-line filename declaration: # studio-plugin: file=gen_xxx.py
 _PLUGIN_FILE_RE = re.compile(
     r"^\s*#\s*studio-plugin:\s*file=([A-Za-z0-9_.-]+)", re.IGNORECASE)
 
-# 可生成插件的合法 kind（stage_factory 是内核内部存储，不开放生成）
+# Legal plugin kinds for generation (stage_factory is internal kernel storage, not open for generation)
 GENERATABLE_PLUGIN_KINDS = ("executor", "stage", "messages_builder",
                             "agent_hooks")
 
@@ -86,8 +101,8 @@ def _looks_like_python(text: str) -> bool:
 
 
 def _next_fence(text: str, pos: int):
-    """(open_match, closes)：从 pos 起的下一个围栏开口 + 其后全部独立成行
-    闭合候选（位置升序）。closes 为空 = 该开口未闭合（尾部截断输出）。"""
+    """(open_match, closes): the next fence open from pos plus every standalone-line close candidate after it (ascending position).
+    Empty closes = the open is unclosed (a tail-truncated output)."""
     m = _FENCE_OPEN_RE.search(text, pos)
     if m is None:
         return None, []
@@ -95,10 +110,10 @@ def _next_fence(text: str, pos: int):
 
 
 def _iter_fences(text: str):
-    """产出 (lang, body)：开口=行首 ```lang，闭合=最近的独立成行 ```。
+    """Yield (lang, body): open = line-start ```lang, close = the nearest standalone-line ```.
 
-    语义对齐旧 ``findall`` 正则：每个围栏体取首个闭合，未闭合的尾部围栏
-    整体丢弃；行中 ``` 记号既不开也不闭。"""
+    Semantics aligned with the old ``findall`` regex: each fence body takes its first close, an unclosed tail fence
+    is dropped whole; an inline ``` marker neither opens nor closes."""
     pos = 0
     while True:
         m, closes = _next_fence(text, pos)
@@ -109,12 +124,13 @@ def _iter_fences(text: str):
 
 
 def _pick_pattern_yaml(text: str) -> Optional[str]:
-    """提取 pattern YAML 围栏体（候选闭合级联）。
+    """Extract the pattern-YAML fence body (cascading close candidates).
 
-    先按现行语义取最短候选（首个独立成行闭合）；若它构造失败——围栏体
-    内嵌了独立成行的 ``` 围栏（提示词范例被整个抄进 base_prompt）把
-    pattern 截成半份——则逐级放宽到更长候选，取第一个能完整构造的。
-    全部失败时返回最短候选，具体错误交给上层校验去报。"""
+    First take the shortest candidate per current semantics (the first standalone-line close); if constructing from
+    it fails — the fence body embeds its own standalone-line ``` fence (a prompt exemplar copied whole into
+    base_prompt) splitting the pattern in half — relax to longer candidates step by step, taking the first that
+    constructs completely. When everything fails, return the shortest candidate and let the upper validation layer
+    report the specific error."""
     pos = 0
     while True:
         m, closes = _next_fence(text, pos)
@@ -138,7 +154,7 @@ def _pick_pattern_yaml(text: str) -> Optional[str]:
 
 
 def parse_plugin_block(code_text: str) -> Dict[str, Any]:
-    """解析一个插件围栏块：文件名 + 全部 (kind, code) 注册声明。"""
+    """Parse one plugin fence block: the filename + all (kind, code) registration declarations."""
     filename = None
     match = _PLUGIN_FILE_RE.match(code_text)
     if match:
@@ -166,12 +182,13 @@ def parse_plugin_block(code_text: str) -> Dict[str, Any]:
 
 
 def parse_generation_output(text: str) -> Dict[str, Any]:
-    """解析 LLM 完整输出：{yaml, plugins[], fenced_count}。
+    """Parse the LLM's full output: {yaml, plugins[], fenced_count}.
 
-    宽容策略：语言标签缺失时按内容启发式判定（yaml 以 code: 起头 /
-    python 含 plugin_registry.register）；多个 yaml 围栏取第一个，
-    其余忽略（模型偶发复读）。围栏开闭的行级规则与 yaml 候选级联见
-    ``_iter_fences`` / ``_pick_pattern_yaml``。
+    Lenient policy: a missing language tag is decided by content heuristics
+    (yaml starts with code: / python contains plugin_registry.register); of
+    several yaml fences the first is taken and the rest ignored (an
+    occasional model stutter). The line-level fence open/close rules and the
+    yaml candidate cascade live in ``_iter_fences`` / ``_pick_pattern_yaml``.
     """
     yaml_text = _pick_pattern_yaml(text or "")
     plugins: List[Dict[str, Any]] = []
@@ -187,25 +204,28 @@ def parse_generation_output(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 校验
+# Validation
 # ---------------------------------------------------------------------------
 
 def validate_pattern_text(yaml_text: str, strict_tools: bool = False
                           ) -> Tuple[Optional[Pattern], List[str], List[str]]:
-    """from_yaml + validate_pattern；返回 (pattern, errors, warnings)。
+    """from_yaml + validate_pattern; returns (pattern, errors, warnings).
 
-    pattern 非 None 但 errors 非空 = 构造成功、校验失败（meta 仍可展示）；
-    pattern None = YAML/构造期就失败。
+    pattern non-None but errors non-empty = constructed OK, validation
+    failed (the meta can still be displayed); pattern None = YAML/construction
+    already failed.
 
-    默认宽松工具校验（strict_tools=False）：生成工作台的产物可能引用
-    尚未注册的新工具（新生成模版声明新 tool 是常态），未注册/越集降级为
-    warnings 透出给预览，不阻塞应用；运行期由 deny-by-default 解析兜底。
+    Lenient tool validation by default (strict_tools=False): generation
+    workbench artifacts may reference not-yet-registered new tools (a fresh
+    template declaring a new tool is normal); unregistered/cross-toolset
+    findings downgrade to warnings surfaced in the preview without blocking
+    apply; runtime deny-by-default resolution is the backstop.
     """
     try:
         pattern = pattern_from_yaml(yaml_text)
     except ValueError as e:
         return None, [str(e)], []
-    except Exception as e:  # yaml 语法错等
+    except Exception as e:  # e.g. a YAML syntax error
         return None, [f"YAML 解析失败: {e}"], []
     warnings: List[str] = ([] if strict_tools
                            else tool_check_notices(pattern))
@@ -217,14 +237,14 @@ def validate_pattern_text(yaml_text: str, strict_tools: bool = False
 
 
 def _split_validation_errors(message: str) -> List[str]:
-    """把 validate_pattern 的编号多行报错拆成逐条列表。"""
+    """Split validate_pattern's numbered multi-line error into a per-item list."""
     lines = [ln.strip() for ln in message.splitlines()]
     items = [ln for ln in lines if re.match(r"^\[\d+\]", ln)]
     return items or [message]
 
 
 def declared_codes_registered(declarations) -> List[str]:
-    """返回尚未注册的 (kind, code) 描述（空列表 = 全部就位）。"""
+    """Return the not-yet-registered (kind, code) descriptions (empty list = all in place)."""
     missing = []
     for kind, code in declarations:
         if not plugin_registry.has(kind, code):
@@ -233,11 +253,11 @@ def declared_codes_registered(declarations) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# 范例与目录
+# Exemplars and catalog
 # ---------------------------------------------------------------------------
 
 def pick_exemplar_yaml() -> str:
-    """从注册表现场导一个体量最小的 pattern YAML 作格式范例。"""
+    """Export the smallest live registered pattern YAML as a format exemplar."""
     patterns = pattern_registry.list_patterns()
     if not patterns:
         return ""
@@ -250,12 +270,12 @@ def pick_exemplar_yaml() -> str:
         logger.exception("范例 pattern 导出失败: %s", chosen.code)
         return ""
     if len(text) > _EXEMPLAR_MAX_CHARS:
-        text = text[:_EXEMPLAR_MAX_CHARS] + "\n# （超长截断，仅作格式参照）"
+        text = text[:_EXEMPLAR_MAX_CHARS] + "\n# (truncated for length, format reference only)"
     return text
 
 
 def plugin_catalog() -> Dict[str, List[str]]:
-    """按 kind 列出已注册插件 code（提示词里引导优先复用）。"""
+    """List registered plugin codes by kind (the prompts steer toward reuse first)."""
     return {
         kind: plugin_registry.list_codes(kind)
         for kind in ("executor", "stage", "messages_builder")
@@ -263,7 +283,7 @@ def plugin_catalog() -> Dict[str, List[str]]:
 
 
 # ---------------------------------------------------------------------------
-# 自动编排：提示词
+# Auto-orchestration: prompts
 # ---------------------------------------------------------------------------
 
 _GENERATE_SYSTEM_PROMPT = """你是 nexus-kit 的 pattern / 插件生成 agent。nexus-kit 是一个声明式对话 Agent 编排框架：pattern（二层模型 Pattern → BaseNode）声明一张对话流图，运行时按 pattern_type 分流执行。
@@ -334,7 +354,7 @@ __EXEMPLAR_YAML__
 
 
 def build_generate_messages(req: Dict[str, Any]) -> List[Dict[str, str]]:
-    """组装自动编排的 chat messages（系统提示词 + 用户需求）。"""
+    """Assemble the auto-orchestration chat messages (system prompt + the user's requirement)."""
     catalog = plugin_catalog()
     system = (_GENERATE_SYSTEM_PROMPT
               .replace("__EXECUTOR_CODES__", ", ".join(catalog["executor"]) or "（无）")
@@ -366,7 +386,7 @@ def build_generate_messages(req: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 流程编排 AI 助手：提示词
+# Flow-editing AI assistant: prompts
 # ---------------------------------------------------------------------------
 
 _ASSIST_MODES = {
@@ -402,8 +422,8 @@ _ASSIST_MODES = {
 
 def build_assist_messages(mode: str, payload: Dict[str, Any],
                           ) -> List[Dict[str, str]]:
-    """组装 AI 助手 messages；mode ∈ node_prompt / node_examples /
-    plugin_generate，payload 为节点上下文 + hints。"""
+    """Assemble the AI-assistant messages; mode ∈ node_prompt / node_examples /
+    plugin_generate, payload = node context + hints."""
     system = _ASSIST_MODES.get(mode)
     if system is None:
         raise ValueError(
@@ -425,7 +445,7 @@ def build_assist_messages(mode: str, payload: Dict[str, Any],
 
 
 def parse_assist_json(text: str) -> Optional[Dict[str, Any]]:
-    """解析助手输出的 ```json 围栏（宽容：无围栏时尝试整段 JSON）。"""
+    """Parse the assistant's ```json fence (lenient: without a fence, try the whole text as JSON)."""
     for _, body in _iter_fences(text or ""):
         if body.strip():
             try:

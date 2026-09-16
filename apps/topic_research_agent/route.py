@@ -1,5 +1,5 @@
 """topic_research pattern — the six-node AGENT-graph deep-research recipe
-(preplan → plan/分主题 → search fan-out → merge → report → polish).
+(preplan → plan/per-topic → search fan-out → merge → report → polish).
 
 One AGENT node per pipeline station, adjacency expressed by ``sub_nodes``
 — each user message runs the whole pipeline from the entry node, the
@@ -8,7 +8,7 @@ stations relaying **within the same turn** via the executor outputs
 dispatch):
 
     tr_preplan ──next──> tr_plan ──sends──> tr_search ×N ──join──> tr_merge ──next──> tr_report ──next──> tr_polish
-     预规划/预检索          分主题规划          一实例一主题           结构化合并           报告草稿生成          格式美化(终态)
+     pre-plan/pre-retrieve    per-topic planning    one instance per topic    structured merge         report draft           format polish (terminal)
 
 - ``pattern code "topic_research"``: a sibling recipe of deep_research —
   where deep_research folds merge+report+polish into one synthesize

@@ -1,14 +1,20 @@
-"""topic_research（六站 AGENT 图：preplan → plan/分主题 → search×N sends
-扇出 → merge → report → polish）离线测试。
+"""Offline tests for topic_research (six-station AGENT graph: preplan →
+plan/per-theme → search×N sends fanout → merge → report → polish).
 
-TopicScriptedProvider 与站点检测（请求特征锚点）自包含于本文件；机制覆盖：
-1. 图结构 + AST 自动发现 + 六站点 executor 插件注册 + validate_pattern
-2. 全流水线：PLAN 按主题 sends 扇出（search×N 并行 worker）→ merge 结构化
-   合并（零 LLM 调用）→ report 草稿 → polish 流式交付 / 工具真实派发 /
-   终态 trace / history 无 tool 行 / 图终止清空 graph_state
-3. 主题规划自纠重试与降级（坏 JSON → 原问题单主题）
-4. 单分支失败降级不阻塞 merge（failed 计数 + degraded 标记）
-5. 流式：delta 只来自 POLISH；fanout_*/branch_* 事件 + join=tr_merge
+TopicScriptedProvider and station detection (request-shape anchors) are
+self-contained in this file; coverage:
+1. Graph structure + AST auto-discovery + six-station executor plugin
+   registration + validate_pattern
+2. Full pipeline: PLAN fans out sends per theme (search×N parallel workers)
+   → merge structured merging (zero LLM calls) → report draft → polish
+   streaming delivery / real tool dispatch / terminal trace / no tool rows
+   in history / graph termination clears graph_state
+3. Theme-planning self-correcting retry and degradation (bad JSON → original
+   question as a single theme)
+4. Single-branch failure degrades without blocking merge (failed count +
+   degraded flag)
+5. Streaming: deltas come only from POLISH; fanout_*/branch_* events +
+   join=tr_merge
 """
 
 import json
@@ -36,8 +42,9 @@ from apps.topic_research_agent.prompts import (
 
 @pytest.fixture(autouse=True)
 def _no_query_interval(monkeypatch):
-    """查询限速归零：复用的 _dispatch_research_round 每次真实查询后的
-    sleep 只在生产生效，离线测试不等待。"""
+    """Zero out the query interval: the sleep after each real query in the
+    reused _dispatch_research_round only takes effect in production, so
+    offline tests do not wait."""
     from apps.deep_research_agent import executor_multi
     monkeypatch.setattr(executor_multi, "_QUERY_INTERVAL_SECONDS", 0.0)
 
@@ -56,7 +63,8 @@ def pattern():
 @pytest.fixture()
 def fake_mcp_tools():
     """Register the fake MCP search tool under the pattern's declared name
-    (web_search_prime, toolset mcp-websearch——节点的 use_tools 声明名）。"""
+    (web_search_prime, toolset mcp-websearch — the name declared by the
+    node's use_tools)."""
     from nexus.registry.tools import registry as tool_registry
 
     calls = {"n": 0, "queries": []}
@@ -84,15 +92,18 @@ def fake_mcp_tools():
 
 
 class TopicScriptedProvider:
-    """按站点特征脚本化的 provider(记录调用与请求特征供断言)。
+    """Provider scripted by station shape (records calls and request shapes
+    for assertions).
 
-    请求识别(与 executor 的 prompt 布局一一对应):
-    - PREPLAN:最后一条 user 消息含 PREPLAN_ANCHOR（复用 deep_research 相位）
-    - PLAN:最后一条 user 消息含 THEMES_ANCHOR
-    - POLISH:最后一条 user 消息含 POLISH_ANCHOR
-    - REPORT:最后一条 user 消息含 REPORT_ANCHOR
-    - SEARCH:tools 参数非空（扇出 worker 的请求——分支以其工作区 user
-      行(主题)标识，轮次按分支独立计数）
+    Request identification (one-to-one with the executor's prompt layout):
+    - PREPLAN: the last user message contains PREPLAN_ANCHOR (reuses the
+      deep_research phase)
+    - PLAN: the last user message contains THEMES_ANCHOR
+    - POLISH: the last user message contains POLISH_ANCHOR
+    - REPORT: the last user message contains REPORT_ANCHOR
+    - SEARCH: the tools argument is non-empty (fanout worker requests —
+      branches are identified by their workspace user row (theme); rounds
+      are counted per branch independently)
     """
 
     def __init__(self, themes_json=None, search_rounds=1,
@@ -111,7 +122,7 @@ class TopicScriptedProvider:
         self.call_count = 0
         self.themes_calls = 0
         self.search_calls = 0
-        self.search_branches = {}    # 主题 -> {"tool_rounds", "calls"}
+        self.search_branches = {}    # theme -> {"tool_rounds", "calls"}
         self.report_calls = 0
         self.polish_calls = 0
         self.preplan_calls = 0
@@ -276,11 +287,11 @@ def test_pattern_structure_and_executor_binding(pattern):
     codes = [n.code for n in pattern.nodes]
     assert codes == ["tr_preplan", "tr_plan", "tr_search",
                      "tr_merge", "tr_report", "tr_polish"]
-    # 静态邻接 = 流水线拓扑；美化站终态
+    # static adjacency = pipeline topology; polish station is terminal
     nm = pattern.node_map
     assert nm["tr_preplan"].sub_nodes == ["tr_plan"]
-    assert nm["tr_plan"].sub_nodes == ["tr_search", "tr_merge"]  # 含孤儿逃生边
-    assert nm["tr_search"].sub_nodes == ["tr_merge"]             # join 唯一后继
+    assert nm["tr_plan"].sub_nodes == ["tr_search", "tr_merge"]  # orphan escape edge included
+    assert nm["tr_search"].sub_nodes == ["tr_merge"]             # join is the unique successor
     assert nm["tr_merge"].sub_nodes == ["tr_report"]
     assert nm["tr_report"].sub_nodes == ["tr_polish"]
     assert nm["tr_polish"].sub_nodes == []
@@ -295,35 +306,38 @@ def test_pattern_structure_and_executor_binding(pattern):
 
 
 # ============================================================================
-# 2. Full pipeline: 分主题 sends 扇出 → merge(零 LLM) → report → polish
+# 2. Full pipeline: per-theme sends fanout → merge (zero LLM) → report → polish
 # ============================================================================
 
 def test_full_pipeline_fanout_merge_report_polish(pattern, fake_mcp_tools):
     provider = TopicScriptedProvider()
     session, reply = run_research(pattern, provider)
 
-    # 最终回复 = 美化站产物（草稿不是回复）
+    # final reply = the polish station's product (the draft is not the reply)
     assert reply == provider.polished
 
-    # LLM 调用清单：preplan(跳过) + themes + search×2分支×2轮 + report + polish
-    # （merge 是纯结构合并，零 LLM 调用——不在清单中出现）
+    # LLM call list: preplan (skipped) + themes + search×2 branches×2 rounds
+    # + report + polish (merge is a pure structural merge with zero LLM
+    # calls — it does not appear in the list)
     kinds = [k for k, _ in provider.requests]
     assert kinds == ["preplan", "themes", "search", "search",
                      "search", "search", "report", "polish"]
     assert provider.report_calls == 1 and provider.polish_calls == 1
-    assert fake_mcp_tools["n"] == 2  # 每分支一轮工具调用
+    assert fake_mcp_tools["n"] == 2  # one tool round per branch
 
-    # 工具真实派发过（两分支的查询来自 worker 的 ReAct 决策）
+    # tools were actually dispatched (both branches' queries come from the
+    # workers' ReAct decisions)
     assert len(fake_mcp_tools["queries"]) == 2
 
-    # report 请求吃到两分支的合并资料；polish 请求吃到草稿
+    # the report request receives both branches' merged material; the polish
+    # request receives the draft
     report_req = next(m for k, m in provider.requests if k == "report")[-1]
     polish_req = next(m for k, m in provider.requests if k == "polish")[-1]
     assert "主题A资料检索" in report_req["content"]
     assert "主题B资料检索" in report_req["content"]
     assert provider.draft in polish_req["content"]
 
-    # 终态 trace
+    # terminal trace
     trace = session.cxt.metadata["topic_research"]
     assert trace["phases"] == ["plan", "search", "merge", "report", "polish"]
     assert trace["themes"] == ["主题A", "主题B"]
@@ -331,9 +345,10 @@ def test_full_pipeline_fanout_merge_report_polish(pattern, fake_mcp_tools):
     assert trace["degraded"] is False
     assert trace["tool_call_count"] == 2
     assert set(trace["per_theme"]) == {"主题A", "主题B"}
-    assert len(trace["sources"]) == 2  # 每分支一条 finding
+    assert len(trace["sources"]) == 2  # one finding per branch
 
-    # history 只有 user → 最终报告，无 tool 行；图终止清空状态板
+    # history holds only user → final report, no tool rows; graph termination
+    # clears the state board
     roles = [m.role for m in session.cxt.history]
     assert "tool" not in roles
     assert session.cxt.graph_state == {}
@@ -357,14 +372,14 @@ def test_fanout_actions_snapshot(pattern, fake_mcp_tools):
 
 
 # ============================================================================
-# 3. 主题规划：自纠重试 / 降级
+# 3. Theme planning: self-correcting retry / degradation
 # ============================================================================
 
 def test_themes_self_correcting_retry(pattern, fake_mcp_tools):
     provider = TopicScriptedProvider(themes_fail_first=True)
     session, reply = run_research(pattern, provider)
 
-    assert provider.themes_calls == 2  # 坏输出 → 带错误反馈重试 → 成功
+    assert provider.themes_calls == 2  # bad output → retry with error feedback → success
     trace = session.cxt.metadata["topic_research"]
     assert trace["themes"] == ["主题A", "主题B"]
     assert trace["degraded"] is False
@@ -376,16 +391,16 @@ def test_themes_degrade_to_single_topic(pattern, fake_mcp_tools):
     session, reply = run_research(pattern, provider,
                                   query="固态电池的产业化进展?")
 
-    assert provider.themes_calls == 2  # 初次 + 自纠重试均失败
+    assert provider.themes_calls == 2  # both the first try and the self-correcting retry fail
     trace = session.cxt.metadata["topic_research"]
-    assert trace["themes"] == ["固态电池的产业化进展?"]  # 降级为原问题单主题
+    assert trace["themes"] == ["固态电池的产业化进展?"]  # degraded to the original question as a single theme
     assert trace["degraded"] is True
     assert trace["branches"]["total"] == 1
-    assert reply == provider.polished  # 降级不阻塞流水线
+    assert reply == provider.polished  # degradation does not block the pipeline
 
 
 # ============================================================================
-# 4. 分支失败：error 条目进板，merge 降级不阻塞
+# 4. Branch failure: error entries land on the board, merge degrades without blocking
 # ============================================================================
 
 def test_branch_failure_degrades_but_completes(pattern, fake_mcp_tools):
@@ -396,16 +411,16 @@ def test_branch_failure_degrades_but_completes(pattern, fake_mcp_tools):
     trace = session.cxt.metadata["topic_research"]
     assert trace["branches"] == {"total": 2, "failed": 1}
     assert trace["degraded"] is True
-    assert set(trace["per_theme"]) == {"主题A"}  # 失败分支无资料进合并
+    assert set(trace["per_theme"]) == {"主题A"}  # the failed branch contributes no material to the merge
     assert len(trace["sources"]) == 1
-    # report 仍执行且只吃到存活分支的资料
+    # report still runs and only receives the surviving branch's material
     report_req = next(m for k, m in provider.requests if k == "report")[-1]
     assert "主题A资料检索" in report_req["content"]
     assert "主题B资料检索" not in report_req["content"]
 
 
 # ============================================================================
-# 5. 流式：delta 只来自 POLISH；fanout 事件词汇
+# 5. Streaming: deltas come only from POLISH; fanout event vocabulary
 # ============================================================================
 
 def test_streaming_deltas_only_from_polish(pattern, fake_mcp_tools):

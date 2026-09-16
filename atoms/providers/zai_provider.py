@@ -32,12 +32,25 @@ Register pattern: call ``registry.register(...)`` at module level so
 
 from typing import Any, Dict, List
 
+import os
+
 from atoms.providers.dashscope_provider import OpenAICompatibleProvider
 from nexus.registry.providers import registry
 
 
 class ZaiProvider(OpenAICompatibleProvider):
     """LLM provider for the GLM (Z.ai / BigModel) OpenAI-compatible API."""
+
+    def resolve_api_key(self) -> str:
+        # The registry default env name migrated from ZAI_API_KEY to
+        # Z_AI_API_KEY; the old name stays as a fallback for one version
+        # cycle — existing deployments (exporting the old name with no
+        # explicit api_key_env in local_config) must not turn into silent
+        # 401s after upgrading
+        key = super().resolve_api_key()
+        if key:
+            return key
+        return os.environ.get("ZAI_API_KEY", "")
 
     def _build_payload(
         self,

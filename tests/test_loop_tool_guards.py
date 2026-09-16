@@ -59,7 +59,7 @@ tool_registry.register(
 
 
 def _mk_session():
-    # 节点只授权 guard_echo_tool；guard_locked_tool 越出 use_tools（新版 ACL 语义）
+    # The node grants only guard_echo_tool; guard_locked_tool exceeds use_tools (the current ACL semantics)
     node = BaseNode(code="main", name="主节点", use_tools=["guard_echo_tool"])
     p = Pattern(code="pg", name="t", description="t",
                 allow_toolset=["test_loop_guards"], nodes=[node])
@@ -129,7 +129,7 @@ def test_hallucinated_name_backfills_error_with_tools_list():
 
 
 def test_registered_but_unauthorized_name_intercepted():
-    """已注册但不在 use_tools 授权内的工具：handler 不执行，错误回填。"""
+    """A registered tool outside the use_tools grant: the handler never runs; an error is backfilled."""
     s = _mk_session()
     provider = ScriptedProvider([
         {"content": None, "tool_calls": [
@@ -142,7 +142,7 @@ def test_registered_but_unauthorized_name_intercepted():
     assert len(rows) == 1
     assert json.loads(rows[0].content).get("error")
     assert rows[0].metadata.get("synthetic") is True
-    # 模型实际可见的工具列表里没有 guard_locked_tool
+    # guard_locked_tool is absent from the model's actually-visible tool list
     names = {t["function"]["name"] for t in provider.seen[0]["tools"]}
     assert names == {"guard_echo_tool"}
 
@@ -161,7 +161,7 @@ def test_synthetic_error_row_replays_paired():
     _run(s, provider)
     from nexus.engine.messages import _replay_segment
     replayed = _replay_segment(s.cxt.history)
-    # assistant(tool_calls) + tool 行成对回放（合成错误行同样是协议行）
+    # assistant(tool_calls) + tool rows replay in pairs (a synthetic error row is a protocol row too)
     assistant_rows = [m for m in replayed if m.get("role") == "assistant"]
     tool_rows_replay = [m for m in replayed if m.get("role") == "tool"]
     assert any(r.get("tool_calls") for r in assistant_rows)
@@ -197,5 +197,5 @@ def test_max_tool_rounds_forced_termination():
     provider = ScriptedProvider(rounds)
     result = _run(s, provider)
     assert result.text == "抱歉，处理超时，请稍后重试。"
-    # 恰好执行 10 轮（第 11 个脚本未被消费）
+    # Exactly 10 rounds executed (the 11th script was never consumed)
     assert len(provider.seen) == 10
