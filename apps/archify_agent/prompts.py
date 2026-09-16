@@ -11,10 +11,11 @@ Division of labor (mirrors deep_research_agent/prompts.py):
 - ``AUTHOR_PHASE_TMPL``: the af_author workspace framing (``format`` of
   request / schema paths / candidate path); carries the skill's authoring
   contract (artifact first, ≤12 primary nodes, showcase, automatic routes);
-  the closing line doubles as a design memo (布局意图/枢纽位置/标签取舍)
-  that travels to af_repair via state — the original skill repairs inside
+  the closing line doubles as a design memo that travels to af_repair via
+  state — the original skill repairs inside
   the same conversation, the graph splits author/repair into two amnesiac
-  workspaces, the memo is the bridge
+  workspaces, the memo (layout intent / hub placement / label trade-offs)
+  is the bridge
 - ``PLACEMENT_HINTS``: per-diagram-type placement discipline distilled from
   the skill's authoring-contract.md (mode placement + spacing math), handed
   to af_repair so layout-level repairs follow the type's canonical layout
@@ -151,9 +152,12 @@ AUTHOR_PHASE_TMPL = f"""\
 """
 
 # ---------------------------------------------------------------------------
-# af_repair — one focused round per visit (graph is the loop). 创作上下文
-# (原始需求/设计备忘/修复履历/类型放置纪律)由执行器从状态板注入:原 skill
-# 的修复发生在创作同会话,图配方拆站后靠这些区块补回那部分记忆
+# af_repair — one focused round per visit (graph is the loop). The authoring
+# context (original request / design memo / repair history / per-type
+# placement discipline) is injected by the executor from the state board: in
+# the original skill, repair happened in the same conversation as authoring;
+# after the graph recipe was split into stations, these blocks restore that
+# portion of memory
 # ---------------------------------------------------------------------------
 
 PLACEMENT_HINTS = {
@@ -256,9 +260,10 @@ REPAIR_PHASE_TMPL = f"""\
 
 # ---------------------------------------------------------------------------
 # af_percept — one tool-less multimodal call: the perceptual delivery gate
-# over the visual-check PNG sidecars (both themes × viewports). 机器测量
-# (visual-check) 与感知审查分开陈述:这里产出的是"图像能力评审的判断",
-# 不是浏览器证据,更不是确定性检查
+# over the visual-check PNG sidecars (both themes × viewports). Machine
+# measurement (visual-check) and perceptual review are stated separately:
+# what is produced here is the "image-capability review's judgment" — not
+# browser evidence, and even less a deterministic check
 # ---------------------------------------------------------------------------
 
 PERCEPT_PHASE_TMPL = f"""\

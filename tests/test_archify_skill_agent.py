@@ -1,19 +1,26 @@
-"""archify_skill（skill 说明书式单节点版）离线测试。
+"""Offline tests for archify_skill (the skill-manual single-node variant).
 
-与 test_archify_agent.py（九节点 workflow 版）平行、互相独立：本文件验证
-「skill 作为数据资产 + 单 default_loop 节点」的完整链路——
+Parallel to and independent from test_archify_agent.py (the nine-node
+workflow variant): this file verifies the full chain of "skill as a data
+asset + a single default_loop node" —
 
-1. 图结构:单节点 AGENT 图 + default_loop 显式绑定 + validate_pattern
-   （含 validate_skills:requires_toolsets ⊆ allow_toolset）
-2. L0 元数据注入:system prompt 出现「可用技能」区块（名称+描述）
-3. 知识工具自动追加:load_skill / read_skill_file 无需 use_tools 声明
-   即在工具列表;执行面工具（bash/文件五件套）仍走三层收口
-4. 全链路一轮:装载手册 → 读 schema → 写候选 → bash validate → bash
-   deliver → 收口;手册内容进入模型上下文（第 2 轮请求可见 load_skill
-   回执）;候选真实落盘;CLI workdir=技能目录
-5. 越权拦截:load_skill 请求未启用技能 → 错误回填（列出已授权）→ 模型
-   自纠后继续
-6. 独立性:不依赖 archify workflow 版的任何执行器/模块
+1. Graph structure: single-node AGENT graph + explicit default_loop binding
+   + validate_pattern (incl. validate_skills: requires_toolsets ⊆
+   allow_toolset)
+2. L0 metadata injection: the system prompt carries an "available skills"
+   block (name + description)
+3. Knowledge tools auto-appended: load_skill / read_skill_file appear in
+   the tool list with no use_tools declaration; execution-side tools
+   (bash / the file five) still go through the three-layer funnel
+4. One full turn: load the manual → read the schema → write the candidate
+   → bash validate → bash deliver → close out; the manual content enters
+   model context (the round-2 request shows the load_skill receipt); the
+   candidate really lands on disk; CLI workdir = skill directory
+5. Unauthorized interception: a load_skill request for a disabled skill →
+   error backfill (listing authorized skills) → the model self-corrects
+   and continues
+6. Independence: depends on no executor/module of the archify workflow
+   variant
 """
 
 import json
@@ -27,7 +34,8 @@ from async_utils import arun
 
 logging.basicConfig(level=logging.WARNING)
 
-# 宿主装载顺序是"工具先发现、pattern 后装载"(validate_tools 注册期校验)
+# Host load order is "tools discovered first, patterns loaded after"
+# (validate_tools checks at registration time)
 from nexus.registry.tools import discover_builtin_tools
 
 discover_builtin_tools()
@@ -52,8 +60,8 @@ def pattern():
 
 @pytest.fixture()
 def skill_root(tmp_path, monkeypatch, pattern):
-    """最小 archify 形态的技能目录（schemas/examples/references + 手册），
-    pattern.config.skills_dir 钉到它。"""
+    """Minimal archify-shaped skill directory (schemas/examples/references
+    + manual); pattern.config.skills_dir is pinned to it."""
     root = tmp_path / "skills" / "archify"
     (root / "schemas").mkdir(parents=True)
     (root / "examples").mkdir(parents=True)
@@ -105,7 +113,7 @@ def chat(sessions, session_id, query):
 
 
 # ============================================================================
-# Scripted provider（轮次脚本:load → read → write → validate → deliver → 收口）
+# Scripted provider (round script: load → read → write → validate → deliver → close-out)
 # ============================================================================
 
 _CANDIDATE = json.dumps({
@@ -116,8 +124,9 @@ _CANDIDATE = json.dumps({
 
 
 class SkillScriptedProvider:
-    """固定轮次脚本;记录每次请求的 messages 与 tools 供断言。first_call
-    可注入越权调用（先试未启用技能,错误回填后自纠）。"""
+    """Fixed round script; records each request's messages and tools for
+    assertions. first_call can inject an unauthorized call (tries a disabled
+    skill first; after the error backfill it self-corrects)."""
 
     def __init__(self, workspace, skill_root, first_call=None):
         self.workspace = workspace
@@ -175,9 +184,10 @@ class SkillScriptedProvider:
 
 
 def make_bash_stub(calls):
-    """bash 出票桩:validate → showcase 通过回执;deliver → ok;非 bash 工具
-    放行真实注册表（文件读写/技能装载落 tmp 工作区）。"""
-    real = loop_mod._execute_tool  # patch 前的原实现（闭包钉住）
+    """bash receipt stub: validate → a passing showcase receipt; deliver →
+    ok; non-bash tools go through the real registry (file read/write /
+    skill loading land in the tmp workspace)."""
+    real = loop_mod._execute_tool  # original implementation before patching (pinned in the closure)
 
     async def fake(name, args):
         if name != "bash":
@@ -209,7 +219,7 @@ def run_turn(pattern, provider, bash_stub, query="画一个 CI 发布工作流�
 
 
 # ============================================================================
-# 1. 图结构与校验
+# 1. Graph structure and validation
 # ============================================================================
 
 def test_pattern_structure_and_validation(pattern, skill_root):
@@ -220,29 +230,30 @@ def test_pattern_structure_and_validation(pattern, skill_root):
     node = pattern.node_map["as_work"]
     assert node.is_end is True
     assert node.sub_nodes == []
-    # 技能双层声明 + 执行面三层声明
+    # two-layer skill declaration + three-layer execution-side declaration
     assert pattern.allow_skills == ["archify"]
     assert node.use_skills == ["archify"]
     assert pattern.allow_toolset == ["shell", "filesystem"]
     assert node.use_tools == ["bash", "read_text", "write_text",
                               "edit_file", "find_files"]
-    assert "load_skill" not in node.use_tools  # 知识工具自动授予,不进声明
-    assert node.plugins["loop"] == "default_loop"  # 零定制执行器
+    assert "load_skill" not in node.use_tools  # knowledge tool auto-granted, not in the declaration
+    assert node.plugins["loop"] == "default_loop"  # zero custom executors
 
     from nexus.model.validation import validate_pattern
-    validate_pattern(pattern)  # 含 validate_skills（桩技能 requires
-    # toolsets=[shell, filesystem] ⊆ allow_toolset）
+    validate_pattern(pattern)  # includes validate_skills (the stub skill
+        # requires toolsets=[shell, filesystem] ⊆ allow_toolset)
 
 
 def test_independent_from_workflow_version(pattern):
-    """与 archify workflow 版互相独立:不绑任何 af_* 执行器,节点只用
-    default_loop;registry 里两 pattern 并存互不影响;app 源码零引用
-    archify_agent。"""
+    """Independent from the archify workflow variant: binds no af_* executors,
+    the node uses only default_loop; the two patterns coexist in the registry
+    without affecting each other; the app source has zero references to
+    archify_agent."""
     from nexus.registry.patterns import registry
 
-    assert "archify" in registry.list_codes()  # workflow 版原样存在
+    assert "archify" in registry.list_codes()  # the workflow variant still exists as-is
     assert pattern.node_map["as_work"].plugins["loop"] == "default_loop"
-    # route.py 的 import 面:仅 prompts + nexus 声明模型（无 archify_agent）
+    # route.py's import surface: only prompts + nexus declaration models (no archify_agent)
     app_dir = Path(__file__).resolve().parents[1] / "apps" / \
         "archify_skill_agent"
     for path in app_dir.glob("*.py"):
@@ -251,7 +262,7 @@ def test_independent_from_workflow_version(pattern):
 
 
 # ============================================================================
-# 2. 全链路一轮
+# 2. One full-turn run
 # ============================================================================
 
 def test_full_turn_skill_driven(pattern, skill_root, tmp_path):
@@ -263,37 +274,37 @@ def test_full_turn_skill_driven(pattern, skill_root, tmp_path):
     assert provider.rounds == 6
     sys0, tools0 = provider.requests[0]
     system0 = next(m["content"] for m in sys0 if m["role"] == "system")
-    # L0 元数据注入（描述即触发器）
+    # L0 metadata injection (the description is the trigger)
     assert "可用技能" in system0
     assert "archify" in system0
     assert "演示用 archify 手册" in system0
-    # 知识工具自动追加 + 执行面工具并存
+    # knowledge tools auto-appended, coexisting with execution-side tools
     assert "load_skill" in tools0 and "read_skill_file" in tools0
     assert "bash" in tools0 and "write_text" in tools0
 
-    # 手册内容进入模型上下文（第 2 轮请求携带 load_skill 回执行）
+    # manual content enters model context (the round-2 request carries the load_skill receipt)
     sys1, _ = provider.requests[1]
     joined1 = json.dumps(sys1, ensure_ascii=False)
     assert "load_skill" in joined1 and "Archify（测试桩）" in joined1
 
-    # bash 执行面:validate + deliver,workdir=技能目录
+    # bash execution side: validate + deliver, workdir = skill directory
     assert [c for c, _ in calls if "validate" in c]
     assert [c for c, _ in calls if "deliver" in c]
     assert {wd for _, wd in calls} == {str(skill_root)}
 
-    # 候选真实落盘;回复为模型收口文案
+    # candidate really written to disk; the reply is the model's closing copy
     assert json.loads((ws / "ci-release.json").read_text(
         encoding="utf-8"))["meta"]["quality_profile"] == "showcase"
     assert "图表已交付" in reply
 
-    # default_loop 语义:工具轨迹入会话历史;单节点图跑完即终
+    # default_loop semantics: tool trace goes into session history; the single-node graph ends when done
     assert "tool" in [m.role for m in session.cxt.history]
     assert session.cxt.graph_state == {}
     assert session.cxt.current_node_code == "as_work"
 
 
 # ============================================================================
-# 3. 越权拦截与自纠
+# 3. Unauthorized interception and self-correction
 # ============================================================================
 
 def test_unenabled_skill_rejected_then_self_corrects(
@@ -305,12 +316,12 @@ def test_unenabled_skill_rejected_then_self_corrects(
     calls = []
     session, reply = run_turn(pattern, provider, make_bash_stub(calls))
 
-    # 第 2 轮请求里可见错误回执（列出已授权技能）,随后自纠装载 archify
+    # the error receipt is visible in the round-2 request (listing authorized skills), then archify is loaded in self-correction
     sys1, _ = provider.requests[1]
     joined1 = json.dumps(sys1, ensure_ascii=False)
     assert "未授权给本节点" in joined1
     assert provider.rounds == 7
     assert "图表已交付" in reply
-    # 越权调用没有产出手册内容:第 2 轮之后（自纠轮）才出现手册
+    # the unauthorized call produced no manual content: the manual appears only after round 2 (the self-correction round)
     assert "Archify（测试桩）" not in json.dumps(
         provider.requests[0][0], ensure_ascii=False)

