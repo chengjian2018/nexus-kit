@@ -60,7 +60,7 @@
 
 ![nexus-kit 运行时全景图](img/nexus-kit.png)
 
-> 🖱️ 交互式版本：[diagrams/runtime-architecture.html](diagrams/runtime-architecture.html) —— 可探索的独立 HTML 图（点选节点查看细节、明暗主题切换）。
+> 🖱️ 交互式版本：[diagrams/runtime-architecture-v2.html](diagrams/runtime-architecture-v2.html) —— 可探索的独立 HTML 图：19 个核心组件，一条加粗主路径贯穿请求旅程，双层边界标出进程与工具执行面信任边界，外部 LLM / MCP 依赖置于界外；点选节点可跳转对应源码，附说明卡片与引导视图（明暗主题切换、导出）。
 
 **静态分层**——四层单向依赖：
 
