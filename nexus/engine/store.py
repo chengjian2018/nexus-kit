@@ -29,8 +29,9 @@ from nexus.context import SessionMessage
 
 logger = logging.getLogger(__name__)
 
-# 单事件 payload 上限（序列化后字符数；超出截断存 preview + truncated 标记），
-# 并拒绝 base64 data-URI（二进制不进 trace 行——审计trail保持轻量文本形态）
+# Per-event payload cap (serialized char count; overflow stores a preview +
+# truncated marker), and base64 data-URIs are rejected (no binary in trace
+# rows — the audit trail stays a lightweight text shape)
 _TRACE_PAYLOAD_LIMIT = 8 * 1024
 _DATA_URI_RE = re.compile(r"data:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+;base64,")
 
@@ -210,32 +211,66 @@ class SessionStore:
         session.cxt.trace_sink = (
             lambda ev: self.append_trace(session, ev))
 
-    async def save_snapshot(self, session: Session) -> None:
+    async def save_snapshot(
+            self, session: Session,
+            expected_epoch: Optional[int] = None) -> None:
         """Write back the end-of-turn sessions state snapshot
         (module/node/slots/last-active time).
 
         Message appending has moved to ``append_message`` (per-message
         write-through once attached); this method no longer touches the
         messages table — one end-of-turn transaction to write back state.
+
+        ``expected_epoch``: generation guard — pass the session's
+        launch_epoch as of the start of this turn; if the row's epoch has
+        since been bumped by a relaunch (the session was evicted and then
+        re-registered), abandon the write — a stale-generation end-of-turn
+        snapshot must not overwrite the new generation's state. ``None``
+        keeps the old semantics (unconditional write).
         """
         now = time.time()
         filled_slots = json.dumps(session.cxt.filled_slots or {}, ensure_ascii=False)
         graph_state = json.dumps(session.cxt.graph_state or {},
                                  ensure_ascii=False)
-        await self._conn.execute(
-            """UPDATE sessions
-               SET current_node_code = ?, graph_state = ?,
-                   filled_slots = ?, last_active_at = ?
-               WHERE session_id = ?""",
-            (
-                session.cxt.current_node_code,
-                graph_state,
-                filled_slots,
-                now,
-                session.session_id,
-            ),
-        )
+        if expected_epoch is None:
+            await self._conn.execute(
+                """UPDATE sessions
+                   SET current_node_code = ?, graph_state = ?,
+                       filled_slots = ?, last_active_at = ?
+                   WHERE session_id = ?""",
+                (
+                    session.cxt.current_node_code,
+                    graph_state,
+                    filled_slots,
+                    now,
+                    session.session_id,
+                ),
+            )
+        else:
+            cursor = await self._conn.execute(
+                """UPDATE sessions
+                   SET current_node_code = ?, graph_state = ?,
+                       filled_slots = ?, last_active_at = ?
+                   WHERE session_id = ? AND launch_epoch = ?""",
+                (
+                    session.cxt.current_node_code,
+                    graph_state,
+                    filled_slots,
+                    now,
+                    session.session_id,
+                    expected_epoch,
+                ),
+            )
+            if cursor.rowcount == 0:
+                logger.debug(
+                    "跳过陈旧代际的轮末快照: session=%s expected_epoch=%s",
+                    session.session_id, expected_epoch)
+                return
         await self._conn.commit()
+
+    async def current_epoch(self, session_id: str) -> int:
+        """Public read of the session's current launch generation (0 if no row)."""
+        return await self._current_epoch(session_id)
 
     # ------------------------------------------------------------------
     # Per-message write-through (DB is the source of truth) + compression primitives

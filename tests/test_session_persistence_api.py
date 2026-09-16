@@ -329,11 +329,11 @@ def test_restore_failure_does_not_block(client, store, registry_guard, monkeypat
 
 
 # ============================================================================
-# Trace 审计端点 + 在跑轮次守卫（docs/design/session-persistence.md §4.3 / §5.4）
+# Trace audit endpoints + in-flight turn guards (docs/design/session-persistence.md §4.3 / §5.4)
 # ============================================================================
 
 def test_trace_endpoint_and_turn_filter(client, store, registry_guard):
-    """GET /sessions/{id}/trace: 过程轨迹可回放（engine trace + turn 过滤）。"""
+    """GET /sessions/{id}/trace: the process trail is replayable (engine traces + turn filtering)."""
     register_fake_provider()
     launch(client, "trace-1")
     _use_fake_llm("trace-1")
@@ -349,7 +349,7 @@ def test_trace_endpoint_and_turn_filter(client, store, registry_guard):
     assert all(e["turn_id"].startswith("req-chat-") for e in events)
     assert all(isinstance(e["payload"], dict) for e in events)
 
-    # turn 过滤 + 分页游标
+    # turn filtering + the pagination cursor
     some_id = events[-1]["id"]
     resp2 = client.get(f"/api/v1/sessions/trace-1/trace?after_id={some_id}")
     assert [e["id"] for e in resp2.json()["data"]["events"]] == []
@@ -358,13 +358,13 @@ def test_trace_endpoint_and_turn_filter(client, store, registry_guard):
         params={"turn_id": events[0]["turn_id"]})
     assert resp3.json()["data"]["events"]
 
-    # 未知会话 → 404 envelope
+    # unknown session → the 404 envelope
     resp4 = client.get("/api/v1/sessions/no-such/trace")
     assert resp4.json()["code"] == "404"
 
 
 def test_trace_endpoint_degraded_without_store(client, registry_guard):
-    """store 未启用：trace 端点降级为 500 envelope（与 messages 端点同款）。"""
+    """store disabled: the trace endpoint degrades to a 500 envelope (same as the messages endpoint)."""
     import host.main as main
 
     prev = main.store
@@ -376,8 +376,8 @@ def test_trace_endpoint_degraded_without_store(client, registry_guard):
 
 
 def test_launch_rejected_while_turn_running(client, store, registry_guard):
-    """同 session 有进行中对话轮（含后台 detach 轮）时重新 launch → 409
-    （epoch 翻代会孤儿化在跑轮次的写入）。"""
+    """Relaunching while the same session has an in-flight turn (including a detached background turn) → 409
+    (an epoch bump would orphan the in-flight turn's writes)."""
     import asyncio
 
     import host.main as main
@@ -395,15 +395,15 @@ def test_launch_rejected_while_turn_running(client, store, registry_guard):
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-            main.turn_registry.unregister("trace-busy", task)  # 手工注册无 done 回调
-        # 轮次结束后 launch 恢复正常
+            main.turn_registry.unregister("trace-busy", task)  # a manual registration has no done callback
+        # after the turn ends, launch works again
         assert launch(client, "trace-busy")["status"] is True
 
     arun(_scenario())
 
 
 def test_sessions_list_carries_turn_running(client, store, registry_guard):
-    """GET /sessions 每行带 turn_running（后端字段就位；前端下期消费）。"""
+    """GET /sessions rows carry turn_running (the backend field is in place; the frontend consumes it later)."""
     register_fake_provider()
     launch(client, "flag-1")
     rows = client.get("/api/v1/sessions").json()["data"]["sessions"]

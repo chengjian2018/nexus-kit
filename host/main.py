@@ -185,9 +185,17 @@ def _cross_check_app_configs() -> None:
 
     try:
         app_configs = _load_app_configs()
-    except Exception:
-        logger.exception("加载 app 配置失败，跳过 app 配置交叉校验")
-        return
+    except Exception as e:
+        # A structurally invalid / validation-failing app config file makes
+        # EVERY pattern's per-turn get_llm_config raise (global blast
+        # radius) — boot must hard-fail, not fake-green and defer the alarm
+        # to the worst possible spot. The lenient warn for unregistered
+        # pattern/node below is different: a normal transient of the studio
+        # reload ordering.
+        logger.exception("apps/*/config.yaml 加载失败")
+        raise SystemExit(
+            f"apps/*/config.yaml 存在结构非法配置(每轮对话都会因此出错,"
+            f"拒绝启动): {e}") from e
     for pcode, app_cfg in app_configs.items():
         pattern = pattern_registry.get(pcode)
         if pattern is None:
@@ -325,9 +333,10 @@ class DialogueRequest(BaseModel):
     request_id: str = Field(max_length=128)
     session_id: str = Field(max_length=256)
     pattern_code: str = Field(max_length=128)
-    # 值放宽为任意 JSON 标量/数组：install/repair 预约类应用的
-    # available_slots 是 "YYYY-MM-DD HH:MM-HH:MM" 字符串列表（纯字符串
-    # 值的应用不受影响；store 快照走 json.dumps 天然兼容）
+    # Values widened to any JSON scalar/array: the install/repair booking
+    # apps' available_slots is a list of "YYYY-MM-DD HH:MM-HH:MM" strings
+    # (apps with plain string values are unaffected; store snapshots go
+    # through json.dumps and are naturally compatible)
     task_info: Dict[str, Any]
 
 
@@ -473,15 +482,26 @@ def _get_session(session_id: str) -> Optional[Session]:
     return governor.get(session_id)
 
 
-def _turn_settled_callback(session: Session):
+async def _turn_settled_callback(session: Session):
     """End-of-turn audit callback handed to the engine (invoked once per
     settled turn, inside the turn task under the session lock — also for
     turns detached from a disconnected SSE consumer). Audit parity with the
-    pre-detach host-side logic: state snapshot + sink-failure visibility."""
+    pre-detach host-side logic: state snapshot + sink-failure visibility.
+
+    Generation guard: the callback anchors launch_epoch at creation time
+    (i.e. when this turn started) — after the session is evicted, a
+    re-launch bumps the epoch, and a late-settling old-generation turn must
+    never write stale graph_state/filled_slots back into the new
+    generation's row.
+    """
+    expected_epoch = (await store.current_epoch(session.session_id)
+                      if store is not None else 0)
+
     async def _settled() -> None:
         if store is not None:
             try:
-                await store.save_snapshot(session)
+                await store.save_snapshot(session,
+                                          expected_epoch=expected_epoch)
             except Exception:
                 logger.exception("会话轮末快照失败: session=%s",
                                  session.session_id)
@@ -529,7 +549,7 @@ async def _run_chat_turn_core(
             session_id=session.session_id,
             all_sessions=governor.sessions,
             store=store,
-            on_settled=_turn_settled_callback(session),
+            on_settled=await _turn_settled_callback(session),
             turn_task_out=holder,
         )
 
@@ -599,7 +619,7 @@ async def chat_dialogue(chat_request: ChatRequest) -> ChatResponse:
     )
 
 
-# func2b (streaming chat via SSE — the studio 模版测试 page's dialogue
+# func2b (streaming chat via SSE — the studio template-test page's dialogue
 # channel; formerly a NEXUS_STREAM_DEBUG-gated debug tool, now first-class)
 async def _chat_dialogue_stream(chat_request: ChatRequest):
     """SSE streaming chat: forwards the engine's chat_turn_stream events.
@@ -647,17 +667,26 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
             all_sessions=governor.sessions,
             store=store,
             detach_on_close=True,
-            on_settled=_turn_settled_callback(session),
+            on_settled=await _turn_settled_callback(session),
             turn_task_out=holder,
+            # Register before the first event: a queued turn may take minutes
+            # to produce its first event — a disconnect inside that window
+            # must not leave an unregistered orphan turn (the 409 guard /
+            # eviction shield / shutdown cancel / strong reference all hang
+            # off the registration). on_task fires synchronously right after
+            # the engine's create_task, so a disconnect-cancel cannot slip
+            # into that gap.
+            on_task=lambda t: _register_turn_task(
+                chat_request.session_id, t),
         )
         try:
             iterator = agen.__aiter__()
             event = await iterator.__anext__()   # starts the engine turn task
-            # Track the turn from its first event on: strong ref + eviction
-            # shield + shutdown cancel. Unregistration happens via the task's
-            # done callback, so a detached (still-running) turn stays
-            # shielded until it settles.
-            _register_turn_task(chat_request.session_id, holder.get("task"))
+            # Unregistration happens via the task's done callback, so a
+            # detached (still-running) turn stays shielded until it settles.
+            if holder.get("task") is not None:
+                _register_turn_task(chat_request.session_id,
+                                    holder["task"])
             while True:
                 if event.kind == "done":
                     result = event.result
@@ -677,11 +706,15 @@ async def _chat_dialogue_stream(chat_request: ChatRequest):
                         "kind": "thinking", "text": event.text,
                     }, ensure_ascii=False) + "\n\n"
                 elif event.kind == "trace":
+                    # default=str shares the persistence path's contract
+                    # (the store's trace serialization): a single
+                    # non-serializable object must not kill the whole event
+                    # stream mid-flight
                     yield "data: " + _json.dumps({
                         "kind": "trace",
                         "trace": (event.trace.to_dict()
                                   if event.trace is not None else {}),
-                    }, ensure_ascii=False) + "\n\n"
+                    }, ensure_ascii=False, default=str) + "\n\n"
                 else:
                     yield "data: " + _json.dumps({
                         "kind": "delta", "text": event.text,
@@ -742,8 +775,9 @@ app.mount(
 
 
 # ---------------------------------------------------------------------------
-# Studio (ui/studio) — the orchestration workbench (自动编排 / 流程编排 /
-# 模版测试), a standalone page independent of the ops console above. API at
+# Studio (ui/studio) — the orchestration workbench (auto-orchestration /
+# flow editing / template testing), a standalone page independent of the ops
+# console above. API at
 # /api/v1/studio/* (same NEXUS_API_KEY middleware); build-less static
 # frontend at /studio. Its console-managed artifacts (hosted plugin modules
 # + pattern YAMLs) were loaded at import time above and are replayed by the
@@ -803,26 +837,31 @@ async def reload_modules() -> DialogueResponse:
 
 
 # ---------------------------------------------------------------------------
-# System hot-reload surface (studio「系统插件」页)——/api/v1/reload 之外的可
-# 视化选择性重载面。插件按归属模块重载：studio 托管插件按文件重放（自包含
-# 模块，store.import_plugin_module 自带 replace 窗口）；代码插件走
-# host.reload.reload_modules（所选模块 + 其 consumer 按依赖序重放）。MCP 工
-# 具跟随连接生命周期而非文件 mtime：reload = 重读配置 → shutdown（注销
-# mcp-* 工具）→ 按新配置重建连接重注册。
+# System hot-reload surface (the studio "system plugins" page) — a visual
+# selective-reload face beyond /api/v1/reload. Plugins reload by owner
+# module: studio hosted plugins replay by file (self-contained modules;
+# store.import_plugin_module carries its own replace window); code plugins
+# go through host.reload.reload_modules (the selected modules + their
+# consumers replay in dependency order). MCP tools follow the connection
+# lifecycle rather than file mtime: reload = re-read config → shutdown
+# (deregister mcp-* tools) → rebuild connections per the new config and
+# re-register.
 # ---------------------------------------------------------------------------
 
 _system_reload_lock: Optional[asyncio.Lock] = None
 
-# 系统面展示 / 可选择重载的插件 kind（与 plugin_registry 的业务 kind 集合一致）
+# Plugin kinds shown / selectively reloadable on the system page (the same
+# set as plugin_registry's business kinds)
 _SYSTEM_PLUGIN_KINDS = ("executor", "stage", "messages_builder", "agent_hooks")
 
 
 def _plugin_source(owner: str) -> Tuple[str, str]:
-    """(source, module)：归属模块名 → 展示来源。
+    """(source, module): owner module name → display source.
 
-    ``studio_plugin_<stem>`` → studio 托管（module = stem，按文件重放）；
-    ``apps.*`` / ``atoms.executors.*`` → code（module = 模块名，走依赖序
-    重放）；其余（nexus.* 内核默认实现）→ kernel，不可热重载。
+    ``studio_plugin_<stem>`` → studio hosted (module = stem, replayed by
+    file); ``apps.*`` / ``atoms.executors.*`` → code (module = the module
+    name, replayed in dependency order); everything else (nexus.* kernel
+    defaults) → kernel, not hot-reloadable.
     """
     if owner.startswith("studio_plugin_"):
         return "studio", owner[len("studio_plugin_"):]
@@ -832,8 +871,8 @@ def _plugin_source(owner: str) -> Tuple[str, str]:
 
 
 def _system_payload() -> Dict[str, Any]:
-    """系统面状态数据：插件（kind/code/来源/归属模块）+ MCP server 连接
-    列表 + ToolRegistry toolset 概览。"""
+    """System-page state data: plugins (kind/code/source/owner module) +
+    the MCP server connection list + the ToolRegistry toolset overview."""
     from atoms.mcp.manager import get_mcp_manager
     from nexus.registry.plugins import registry as plugin_registry
     from nexus.registry.tools import registry as tool_registry
@@ -851,29 +890,35 @@ def _system_payload() -> Dict[str, Any]:
 
 @app.get("/api/v1/system/status")
 def system_status() -> Dict[str, Any]:
-    """系统面状态：插件（kind/code/来源/归属模块）+ MCP server 连接态 +
-    toolset 概览（studio「系统插件」页数据源）。"""
+    """System-page state: plugins (kind/code/source/owner module) + MCP
+    server connection states + the toolset overview (the studio "system
+    plugins" page's data source)."""
     return {"code": "0", "status": True, "message": "success",
             "data": _system_payload()}
 
 
 class SystemReloadIn(BaseModel):
-    # 勾选的插件引用列表（"kind:code" 形态，UI 复选框直接产出）
+    # Checked plugin references ("kind:code" shape, produced directly by UI checkboxes)
     plugin_codes: List[str] = Field(default_factory=list, max_length=200)
     mcp: bool = False
 
 
 @app.post("/api/v1/system/reload")
 async def system_reload(body: SystemReloadIn) -> Dict[str, Any]:
-    """选择性热重载：勾选的插件（按归属分流）+ 可选的 MCP 工具面。
+    """Selective hot-reload: the checked plugins (routed by owner) + an
+    optional MCP tool surface.
 
-    - studio 托管插件：按 stem 从托管目录重放（自包含模块，重新 exec +
-      replace 窗口重注册）；
-    - 代码插件（apps.* / atoms.executors.*）：host.reload.reload_modules
-      依赖序重放所选模块及其 consumer，完成后重绑内存会话（与 /reload
-      语义一致：进行中的轮次持旧引用跑完）；
-    - mcp：重读 mcp_servers 配置 → 断开重连 → 重注册 mcp-* 工具。配置
-      先读后拆——非法配置在拆掉现有连接之前就失败，保持现状可用。
+    - studio hosted plugins: replayed from the hosted directory by stem
+      (self-contained modules — re-exec + a replace window for
+      re-registration);
+    - code plugins (apps.* / atoms.executors.*): host.reload.reload_modules
+      replays the selected modules and their consumers in dependency order,
+      then rebinds in-memory sessions (the same semantics as /reload:
+      in-flight turns finish on their old references);
+    - mcp: re-read the mcp_servers config → disconnect → reconnect →
+      re-register mcp-* tools. Config is read before tearing down — an
+      illegal config fails before the existing connections are broken,
+      keeping the current state usable.
     """
     global _system_reload_lock
     from host.reload import reload_modules, rebind_sessions
@@ -907,7 +952,7 @@ async def system_reload(body: SystemReloadIn) -> Dict[str, Any]:
                 try:
                     studio_store.import_plugin_module(path)
                     reloaded_stems.append(stem)
-                except Exception as e:  # noqa: BLE001 -- 单文件失败不拦其余
+                except Exception as e:  # noqa: BLE001 -- one file failing never blocks the rest
                     logger.exception("studio 插件重放失败: %s", stem)
                     failed_stems.append(f"{stem}: {e}")
             report["studio_plugins"] = {"reloaded": reloaded_stems,
@@ -953,6 +998,19 @@ async def system_reload(body: SystemReloadIn) -> Dict[str, Any]:
             report["mcp"] = {"servers": servers,
                              "ready": sum(1 for s in servers if s.get("ready"))}
 
+        # App-config surface probe: a bad file (structurally invalid /
+        # validation-failing) makes every pattern's per-turn get_llm_config
+        # raise — the reload report must reflect it honestly; reporting
+        # success just because the mcp/plugin faces are green is not enough.
+        try:
+            from nexus.settings import _load_app_configs
+            _load_app_configs()
+        except Exception as e:
+            return {"code": "500", "status": False,
+                    "message": (f"重载动作已完成，但 apps/*/config.yaml "
+                                f"配置面非法，对话轮将失败，请立即修复: {e}"),
+                    "data": {"report": report}}
+
     parts: List[str] = []
     sp = report.get("studio_plugins")
     if sp:
@@ -975,8 +1033,9 @@ async def system_reload(body: SystemReloadIn) -> Dict[str, Any]:
 
 @app.on_event("startup")
 async def _startup_reload_watcher():
-    """建立热重载 mtime 基线（首个 /reload 即可检测开机以来的变更）；
-    NEXUS_RELOAD_WATCH=1 时启动后台 watcher（开发期便利，默认关）。"""
+    """Establish the hot-reload mtime baseline (so the first /reload already
+    detects changes made since boot); with NEXUS_RELOAD_WATCH=1 also starts
+    the background watcher (a development convenience, off by default)."""
     from host.reload import init_baseline, start_watcher
 
     init_baseline()

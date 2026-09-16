@@ -1,7 +1,7 @@
 """Engine streaming protocol tests — chat_turn_stream event sequences, the
 aggregation-equivalence safety net (done.result == chat_turn return), round
 markers on the agent loop, and the always-mounted SSE endpoint (the studio
-模版测试 page's dialogue channel; formerly NEXUS_STREAM_DEBUG-gated)."""
+template-test page's dialogue channel; formerly NEXUS_STREAM_DEBUG-gated)."""
 
 import json
 from unittest.mock import patch
@@ -89,7 +89,7 @@ def test_delta_then_round_then_done_sequence():
                return_value=provider):
         events = arun(_collect_events(chat_turn_stream("q", "ss", {"ss": s})))
     kinds = [(e.kind, getattr(e.trace, "event", None)) for e in events]
-    # graph_compile opens every fresh run (编译形状可观测), deltas arrive as streamed (inside the node execution, wrapped
+    # graph_compile opens every fresh run (compile-shape observability), deltas arrive as streamed (inside the node execution, wrapped
     # by the graph runtime's node_start/node_end/graph_done traces), then done
     assert kinds == [("trace", "graph_compile"),
                      ("trace", "node_start"),
@@ -239,7 +239,7 @@ def test_turn_error_trace_before_generic_done():
 
 
 # ============================================================================
-# SSE endpoint (always mounted — the studio 模版测试 dialogue channel)
+# SSE endpoint (always mounted — the studio template-test dialogue channel)
 # ============================================================================
 
 def test_sse_endpoint_streams_events(_host_main, monkeypatch):
@@ -271,8 +271,9 @@ def test_sse_endpoint_streams_events(_host_main, monkeypatch):
 
 
 def test_sse_endpoint_forwards_thinking_events(_host_main):
-    """thinking 增量经 /chat/stream 以 {"kind": "thinking"} 原样转发
-    （studio 模版测试页据此渲染思考块）。"""
+    """thinking deltas are forwarded verbatim over /chat/stream as
+    {"kind": "thinking"} (the studio template-test page renders thinking
+    blocks from this)."""
     from fastapi.testclient import TestClient
     from nexus.llm.types import LLMChunk
 
@@ -309,9 +310,12 @@ def _host_main():
 
 
 def test_sse_disconnect_detaches_turn_snapshot_on_settle(_host_main, monkeypatch):
-    """断连只解除消费，不取消轮次（docs/design/session-persistence.md §5）：
-    turn 转后台继续跑（gate 尚未放行时快照不落 → 证明轮次没被取消），真正
-    落定后 on_settled 快照照常写、完整回复进 history；正常消费到底一样快照。"""
+    """Disconnecting only detaches the consumer; it does not cancel the turn
+    (docs/design/session-persistence.md §5): the turn keeps running in the
+    background (no snapshot while the gate is still closed proves the turn
+    was not cancelled); once it truly settles, on_settled writes the snapshot
+    as usual and the full reply lands in history; consuming to the end
+    snapshots the same way."""
     import asyncio
 
     from nexus.llm.types import LLMChunk
@@ -320,7 +324,10 @@ def test_sse_disconnect_detaches_turn_snapshot_on_settle(_host_main, monkeypatch
     saved = []
 
     class _Store:
-        async def save_snapshot(self, session):
+        async def current_epoch(self, session_id):
+            return 0
+
+        async def save_snapshot(self, session, expected_epoch=None):
             saved.append(session.session_id)
 
     monkeypatch.setattr(host_main, "store", _Store())
@@ -348,7 +355,7 @@ def test_sse_disconnect_detaches_turn_snapshot_on_settle(_host_main, monkeypatch
             resp = await host_main._chat_dialogue_stream(req)
             body = resp.body_iterator
             if close_early:
-                first = await body.__anext__()    # 收到首个事件后断连
+                first = await body.__anext__()    # disconnect after the first event arrives
                 assert first.startswith("data: ")
                 await body.aclose()
                 return s
@@ -356,25 +363,26 @@ def test_sse_disconnect_detaches_turn_snapshot_on_settle(_host_main, monkeypatch
             assert any('"kind": "done"' in c for c in chunks)
             return s
 
-    # 1) 断连：轮次转后台，gate 放行前不落定、不快照
+    # 1) Disconnect: the turn moves to the background; before the gate opens
+    # it neither settles nor snapshots
     async def _detach_scenario():
         gate = asyncio.Event()
         s = await _run_stream(close_early=True, gate=gate, session_id="ss-detach")
         await asyncio.sleep(0.05)
-        assert saved == []                    # 轮次未落定（被 gate 挡住）→ 未快照
-        gate.set()                            # 放行 → 后台轮次跑完
+        assert saved == []                    # turn not settled (blocked by the gate) -> no snapshot
+        gate.set()                            # open the gate -> background turn finishes
         for _ in range(200):
             if saved:
                 break
             await asyncio.sleep(0.02)
-        assert saved == ["ss-detach"]         # 落定后快照照常写
+        assert saved == ["ss-detach"]         # snapshot written as usual after settling
         assert (s.cxt.history[-1].role == "assistant"
-                and s.cxt.history[-1].content == "第一段第二段")  # 完整回复已落 history
+                and s.cxt.history[-1].content == "第一段第二段")  # full reply landed in history
 
     arun(_detach_scenario())
     saved.clear()
 
-    # 2) 正常消费到底：照常快照
+    # 2) Consume to the end: snapshot as usual
     arun(_run_stream(close_early=False, session_id="ss-full"))
     assert saved == ["ss-full"]
 
@@ -419,8 +427,9 @@ def test_trace_events_fan_out_to_sink_with_turn_id():
 
 
 def test_app_trace_picked_up_and_popped():
-    """metadata 里的 app 终态 trace（_APP_TRACE_KEYS）在 turn 落定点捡成一条
-    app_trace 事件后从 metadata 摘除——后续轮次不得重复捡旧值（§6）。"""
+    """The app final-state trace in metadata (_APP_TRACE_KEYS) is picked up
+    as one app_trace event at the turn's settle point and removed from
+    metadata — later turns must not re-pick the stale value (§6)."""
     s, recorded = _wired_stream_session()
     s.cxt.metadata["archify"] = {"diagram_type": "architecture",
                                  "repair_rounds": 6}
@@ -434,9 +443,9 @@ def test_app_trace_picked_up_and_popped():
     assert app_rows[0]["payload"]["data"]["app"] == "archify"
     assert app_rows[0]["payload"]["data"]["trace"] == {
         "diagram_type": "architecture", "repair_rounds": 6}
-    assert "archify" not in s.cxt.metadata          # 捡回后摘除
+    assert "archify" not in s.cxt.metadata          # removed after pickup
 
-    # 下一轮不再重复捡
+    # the next turn does not re-pick it
     provider2 = _StreamProvider([[("再来一轮", [], "stop")]])
     recorded["rows"].clear()
     with patch("atoms.executors.loop_executor.build_provider",
@@ -447,8 +456,8 @@ def test_app_trace_picked_up_and_popped():
 
 
 def test_on_settled_fires_once_after_done():
-    """on_settled 在 done 之后于 turn 任务内触发一次；turn 异常路径同样触发
-    （error done 也是落定）。"""
+    """on_settled fires once inside the turn task after done; the turn error
+    path triggers it too (an error done also counts as settled)."""
     provider = _StreamProvider([[("好", [], "stop")]])
     s = _stream_session("ss-settle")
     settled = []
@@ -464,8 +473,9 @@ def test_on_settled_fires_once_after_done():
 
 
 def test_same_session_turns_serialize():
-    """同 session 的第二个 turn 在引擎侧排队（turn task 持锁），第一个 turn
-    落定前第二个不得开始执行。"""
+    """A second turn on the same session queues on the engine side (the turn
+    task holds the lock); the second turn must not start before the first
+    turn settles."""
     import asyncio
 
     s = _stream_session("ss-lock")
@@ -488,12 +498,12 @@ def test_same_session_turns_serialize():
 
     async def _scenario():
         t1 = asyncio.create_task(chat_turn("q1", "ss-lock", {"ss-lock": s}))
-        # 等 t1 真正拿到锁并开始
+        # wait until t1 actually holds the lock and starts
         while "start-first" not in calls:
             await asyncio.sleep(0.01)
         t2 = asyncio.create_task(chat_turn("q2", "ss-lock", {"ss-lock": s}))
         await asyncio.sleep(0.05)
-        assert "start-second" not in calls      # 第二轮仍在排队
+        assert "start-second" not in calls      # the second turn is still queued
         gate.set()
         await asyncio.gather(t1, t2)
 
@@ -505,7 +515,8 @@ def test_same_session_turns_serialize():
 
 
 def test_sse_endpoint_mounted_without_env(monkeypatch):
-    """The endpoint is first-class now (studio 模版测试 consumes it): mounted
+    """The endpoint is first-class now (the studio template-test page
+    consumes it): mounted
     with no NEXUS_STREAM_DEBUG set at all (unknown session → JSON 404, which
     proves the route exists)."""
     monkeypatch.delenv("NEXUS_STREAM_DEBUG", raising=False)

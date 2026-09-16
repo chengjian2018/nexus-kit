@@ -230,8 +230,9 @@ def test_agent_tool_round_traces():
 
 
 def test_node_end_trace_carries_result_brief():
-    """node_end 携带执行结果摘要（content/next），实时消费者能看到节点
-    产出了什么而不只是「完成了」；缺席键不进 data（wire 紧凑）。"""
+    """node_end carries the execution result brief (content/next), so live
+    consumers can see what the node produced rather than just "it
+    finished"; absent keys stay out of data (compact wire)."""
 
     class _RouterExecutor(NodeExecutor):
         async def execute(self, ec: ExecutionContext) -> TurnResult:
@@ -261,8 +262,9 @@ def test_node_end_trace_carries_result_brief():
 
 
 def test_thinking_chunks_stream_as_thinking_events():
-    """thinking 模型的 reasoning 增量以 kind="thinking" 实时透出，不混入
-    回复 delta；聚合结果（done.result）不受影响。"""
+    """A thinking model's reasoning increments stream live as
+    kind="thinking" events without mixing into reply deltas; the aggregated
+    result (done.result) is unaffected."""
     from nexus.llm.types import LLMChunk
 
     class _ThinkingProvider:
@@ -323,7 +325,8 @@ def test_graph_wait_then_resume_trace_events():
         events = _collect(chat_turn_stream("开始", "wg", {"wg": s}))
 
     # suspension turn: graph_compile → node_start → node_end → graph_wait
-    # → done（恢复轮不重发 graph_compile，以 graph_resume 开头）
+    # → done (the resume turn does not re-emit graph_compile; it starts
+    # with graph_resume)
     assert _kinds(events) == [("trace", "graph_compile"),
                               ("trace", "node_start"),
                               ("trace", "node_end"),
@@ -486,8 +489,9 @@ def test_unified_stage_streams_reply_incrementally():
 
 
 def test_unified_stage_streams_thinking_events():
-    """stage 回复流（stream_llm_reply）同样转发 reasoning 增量为 thinking
-    事件；reply 字段的增量仍走 delta，两者互不污染。"""
+    """The stage reply stream (stream_llm_reply) likewise forwards reasoning
+    increments as thinking events; the reply field's increments still go
+    through delta, and the two do not pollute each other."""
 
     class _ThinkingChunkProvider:
         async def achat_completion_stream(self, messages, model,

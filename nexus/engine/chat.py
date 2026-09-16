@@ -1,5 +1,5 @@
 """
-Dialogue processing — the turn orchestrator (node+pattern 二层模型).
+Dialogue processing — the turn orchestrator (Pattern→Node two-layer model).
 
 Responsibility is narrowed to "orchestrating one turn": locate the session →
 cxt turn lifecycle → **dispatch by pattern_type** → produce a ChatResult.
@@ -94,19 +94,21 @@ STEP_KEY = "__step__"
 # fanout_start; join/later nodes read it until the graph terminates
 FANOUT_RESULTS_KEY = "__fanout_results__"
 
-# node_end / branch_end trace 里执行结果摘要的截断长度（过程展示不搬全量；
-# 消费端想看全文走 done.result / 会话审计）
+# Truncation length of the execution-result summary in node_end /
+# branch_end traces (process display does not haul the full text;
+# consumers wanting the full content read done.result / the session audit)
 _RESULT_TRACE_MAX = 400
 
-# App 级终态 trace 的 metadata 键（docs/design/session-persistence.md §6）：
-# app 在 executor 收尾写 cxt.metadata[key]（如 archify 的完整过程 trace），
-# turn 落定点由引擎统一捡回一条 app_trace 事件进 trace_events 后摘除该键
-# （防止后续轮次重复捡旧值）——app 侧零改动。
+# App-level final-state trace metadata keys (docs/design/session-persistence.md
+# §6): the app writes cxt.metadata[key] at executor wrap-up (e.g. archify's
+# full process trace); the turn wrap-up point has the engine pick it back up
+# as one app_trace event into trace_events, then remove the key (so later
+# turns never re-pick a stale value) — zero changes on the app side.
 _APP_TRACE_KEYS = ("archify",)
 
 
 def _result_brief(text: str) -> str:
-    """节点/分支执行结果的单行摘要（换行拍平 + 截断）。"""
+    """One-line summary of a node/branch execution result (flatten newlines + truncate)."""
     return " ".join((text or "").split())[:_RESULT_TRACE_MAX]
 
 
@@ -118,10 +120,11 @@ def _refresh_llm_config(session: Session, node_code: str = "") -> None:
     """Resolve the LLM config for the current position and write it to
     cxt.llm_config (R1-R4 shared).
 
-    Resolution: the session's llm_override metadata (CLI-side explicit pick,
-    highest, an integral override that skips the layered lookup) > the
-    settings layered lookup (llm_default ⊕ app llm ⊕ app nodes[node_code].llm,
-    resolved inside get_llm_config by pattern_code / node_code).
+    Resolution: the session's llm_override metadata (the caller's / tests'
+    explicit pick, highest, an integral override that skips the layered
+    lookup) > the settings layered lookup (llm_default ⊕ app llm ⊕
+    app nodes[node_code].llm, resolved inside get_llm_config by
+    pattern_code / node_code).
 
     This function must stay in the chat module: R1-R4 resolve
     get_llm_config through this namespace (tests anchor on
@@ -340,7 +343,8 @@ async def _run_fanout(session: Session, node, result: TurnResult,
     graph_state = cxt.graph_state
     sends = list(result.sends or [])
     _emit = getattr(stream, "emit_trace", None)
-    # 扇出宽度守卫上界：app loop.max_fanout 赢，缺省回退 pattern.max_fanout
+    # Fan-out width guard upper bound: app loop.max_fanout wins, falling
+    # back to pattern.max_fanout
     max_fanout = resolve_max_fanout(pattern)
 
     if result.next is not None:
@@ -520,7 +524,8 @@ async def _run_agent_graph(session: Session, pattern, stream=None) -> TurnResult
     """
     cxt = session.cxt
     graph_state = cxt.graph_state
-    # 图级步数预算：app loop.max_steps 赢，缺省回退 pattern.max_steps
+    # Graph-level step budget: app loop.max_steps wins, falling back to
+    # pattern.max_steps
     max_steps = resolve_max_steps(pattern)
     _emit = getattr(stream, "emit_trace", None)
 
@@ -705,6 +710,7 @@ async def chat_turn_stream(
         detach_on_close: bool = False,
         on_settled: Optional[Any] = None,
         turn_task_out: Optional[Dict[str, Any]] = None,
+        on_task: Optional[Any] = None,
 ):
     """Async generator form of chat_turn: yields ChatStreamEvent objects
     (delta / round / trace / done), the final done event carrying the
@@ -739,7 +745,11 @@ async def chat_turn_stream(
     snapshot. ``turn_task_out``: dict that receives ``{"task": ...}`` right
     after the turn task is created (the host registers it in the turn
     registry; it owns the strong reference, eviction shield and shutdown
-    cancel list).
+    cancel list). ``on_task``: sync callback invoked with the turn task at
+    that same creation point — before the generator's first suspension — so
+    a consumer that disconnects before the first event cannot leave the
+    turn unregistered (strong ref / launch guard / shutdown cancel all key
+    off the registry).
 
     The turn steps:
     1. locate session → begin_turn; 2. R1 refresh → compression → record
@@ -777,7 +787,8 @@ async def chat_turn_stream(
 
     emitter = StreamEmitter(sink=_sink)
 
-    def _trace_row(session: Session, t: Any) -> Dict[str, Any]:
+    def _trace_row(
+            session: Session, t: Any, request_id: str) -> Dict[str, Any]:
         """Flatten a TraceEvent into the store's trace_sink row shape."""
         payload: Dict[str, Any] = {"module_code": t.module_code}
         if t.node_code:
@@ -788,8 +799,11 @@ async def chat_turn_stream(
             payload["data"] = t.data
         return {
             "session_id": session.session_id,
-            "turn_id": str((session.cxt.metadata or {}).get("request_id")
-                           or ""),
+            # request_id is snapshotted per turn by the caller: the live
+            # metadata value gets overwritten outside the lock by later
+            # requests of the same session — reading it at write time would
+            # mis-attribute rows across turns
+            "turn_id": request_id,
             "kind": t.event,
             "payload": payload,
         }
@@ -862,7 +876,7 @@ async def chat_turn_stream(
             response = result.content or ""
         except Exception:
             logger.exception("对话处理异常: session=%s", session_id)
-            # Real-time consumers (SSE / CLI events) flag the failed turn via
+            # Real-time consumers (SSE clients) flag the failed turn via
             # this trace instead of string-matching the generic done text;
             # aggregate consumers ignore it (done stays authoritative)
             emitter.emit_trace("turn_error")
@@ -888,6 +902,7 @@ async def chat_turn_stream(
         token = current_emitter.set(emitter)
         session = all_sessions.get(session_id)
         settled = False
+        turn_request_id = ""
         try:
             if session is None:
                 logger.warning("会话不存在: %s", session_id)
@@ -895,56 +910,88 @@ async def chat_turn_stream(
                     text="会话不存在，请先发起对话任务")))
                 return
 
+            # Snapshot request_id per turn: later requests of the same
+            # session overwrite the metadata outside the lock, and this
+            # turn's trace rows must attribute to the request that started
+            # the turn
+            turn_request_id = str(
+                (session.cxt.metadata or {}).get("request_id") or "")
+
             # Per-turn trace writer: started only when a trace_sink is wired
             # (store attached); a single task keeps the trail's FIFO order.
             if session.cxt.trace_sink is not None:
                 state["enqueue"] = lambda t: trace_q.put_nowait(
-                    session.cxt.trace_sink(_trace_row(session, t)))
+                    session.cxt.trace_sink(
+                        _trace_row(session, t, turn_request_id)))
                 trace_writer = asyncio.create_task(
                     _trace_writer_loop(session))
 
-            # The lock spans the whole turn INCLUDING the settled callback:
-            # a queued same-session turn must never interleave with the
-            # end-of-turn snapshot.
+            # The lock spans the whole turn INCLUDING the trace-writer drain
+            # and the settled callback: a queued same-session turn must never
+            # interleave with the end-of-turn bookkeeping — otherwise it can
+            # start mutating graph state while this turn's snapshot is still
+            # reading it (baking in half-executed state / losing the suspension cursor / an older turn overwriting a newer one).
             async with session.turn_lock:
-                await _run_turn_body(session)
-                settled = True
+                try:
+                    await _run_turn_body(session)
+                    settled = True
+                except Exception:
+                    # safety net: the consumer loop terminates on done only —
+                    # an escaped exception must still produce one (details
+                    # already logged by the body's own handling; last resort)
+                    logger.exception("流式轮次异常: session=%s", session_id)
+                    emitter.emit_trace("turn_error")
+                    queue.put_nowait(ChatStreamEvent(
+                        kind="done", result=ChatResult(
+                            text="对话处理异常，请稍后重试")))
+                    settled = True
+                # Drain the trail writer before the settled snapshot so the
+                # snapshot never races pending trace rows; bounded — same-
+                # session turns are serialized on this lock anyway. On
+                # cancellation this still flushes what already happened
+                # (facts survive, state does not).
+                if trace_writer is not None and not trace_writer.done():
+                    trace_q.put_nowait(None)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(trace_writer), 10)
+                    except asyncio.TimeoutError:
+                        trace_writer.cancel()
+                    except asyncio.CancelledError:
+                        trace_writer.cancel()
+                        raise
+                    except Exception:
+                        logger.exception("trace writer 收尾失败: session=%s",
+                                         session_id)
+                if settled and on_settled is not None:
+                    try:
+                        await on_settled()
+                    except Exception:
+                        logger.exception("轮末回调失败: session=%s",
+                                         session_id)
         except Exception:
-            # safety net: the consumer loop terminates on done only — an
-            # escaped exception must still produce one (details already
-            # logged by the body's own handling; this is a last resort)
+            # last-resort net for pre-lock/lock-acquisition failures only —
+            # the body's own error path is handled inside the lock above;
+            # an escaped exception must still produce one done event
             logger.exception("流式轮次异常: session=%s", session_id)
             emitter.emit_trace("turn_error")
             queue.put_nowait(ChatStreamEvent(kind="done", result=ChatResult(
                 text="对话处理异常，请稍后重试")))
-            settled = True
         finally:
             current_emitter.reset(token)
-            # Drain the trail writer first so the settled snapshot never
-            # races pending trace rows; on cancellation this still flushes
-            # what already happened (facts survive, state does not).
             if trace_writer is not None and not trace_writer.done():
-                trace_q.put_nowait(None)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(trace_writer), 10)
-                except asyncio.TimeoutError:
-                    trace_writer.cancel()
-                except asyncio.CancelledError:
-                    trace_writer.cancel()
-                    raise
-                except Exception:
-                    logger.exception("trace writer 收尾失败: session=%s",
-                                     session_id)
-            if settled and on_settled is not None:
-                try:
-                    await on_settled()
-                except Exception:
-                    logger.exception("轮末回调失败: session=%s", session_id)
+                # A writer left behind by a timeout/cancel path is reclaimed here as a backstop — it must not outlive this turn
+                trace_writer.cancel()
 
     task = asyncio.create_task(_run_turn())
     if turn_task_out is not None:
         turn_task_out["task"] = task
+    if on_task is not None:
+        # A synchronous callback, fired before any suspension point of the
+        # generator: even a disconnect before the first event cannot slip in,
+        # so the host registers the turn into its governance surface early
+        # (strong reference / 409 guard / shutdown cancel)
+        on_task(task)
     saw_done = False
     try:
         while True:

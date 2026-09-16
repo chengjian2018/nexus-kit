@@ -64,7 +64,7 @@ def test_create_session_roundtrip(tmp_path):
     assert row["pattern_code"] == "xianyu_agent"
     assert row["request_id"] == "req-s1"
     assert json.loads(row["task_info"]) == {"caller": "pytest"}
-    assert "current_module_code" not in row.keys()  # 模块列已删
+    assert "current_module_code" not in row.keys()  # module column removed
     assert row["current_node_code"] == "route_root"
     assert json.loads(row["graph_state"]) == {"__paused_node__": "n1", "custom": "v"}
     assert json.loads(row["filled_slots"]) == {"brand": "特斯拉"}
@@ -216,6 +216,40 @@ def test_snapshot_without_new_messages_only_refreshes_state(tmp_path):
     assert fetch_one(db, "SELECT COUNT(*) FROM messages")[0] == 1
 
 
+def test_snapshot_epoch_guard_skips_stale_generation(tmp_path):
+    """Generation guard: after a session relaunch (epoch bump; INSERT OR
+    REPLACE resets the row state), state written by the new generation must
+    not be overwritten by a late-settling snapshot from an old-generation
+    turn."""
+    db = str(tmp_path / "t.db")
+    store = arun(SessionStore.create(db))
+    session = make_session()
+    arun(store.create_session(session))
+    store.attach(session)
+    assert arun(store.current_epoch("s1")) == 0
+
+    # relaunch: the new generation takes over (row state reset, epoch=1) and
+    # writes back its own end-of-turn state
+    fresh = make_session()
+    arun(store.create_session(fresh))
+    assert arun(store.current_epoch("s1")) == 1
+    fresh.cxt.filled_slots["brand"] = "新代际状态"
+    arun(store.save_snapshot(fresh, expected_epoch=1))
+
+    # an old-generation in-flight turn settles late: expected_epoch mismatch → the write is abandoned
+    session.cxt.filled_slots["brand"] = "陈旧写入"
+    arun(store.save_snapshot(session, expected_epoch=0))
+    row = fetch_one(db, "SELECT filled_slots FROM sessions WHERE session_id = 's1'")
+    assert json.loads(row["filled_slots"]) == {"brand": "新代际状态"}
+
+    # unguarded calls keep the old semantics (unconditional write); direct
+    # calls from the engine/tests are unaffected
+    arun(store.save_snapshot(session))
+    row = fetch_one(db, "SELECT filled_slots FROM sessions WHERE session_id = 's1'")
+    assert json.loads(row["filled_slots"]) == {"brand": "陈旧写入"}
+    arun(store.close())
+
+
 def test_load_active_sessions_restores_fields(tmp_path):
     """Restore: history/filled_slots/current node/task info are restored; pattern is left empty for the caller to resolve."""
     db = str(tmp_path / "t.db")
@@ -241,7 +275,7 @@ def test_load_active_sessions_restores_fields(tmp_path):
     assert r.task_info == {"caller": "pytest"}
     assert r.cxt.metadata["request_id"] == "req-alive"
     assert r.cxt.current_node_code == "menu_sales"
-    assert r.cxt.graph_state == {"__paused_node__": "menu_sales"}  # 挂起图重启可续
+    assert r.cxt.graph_state == {"__paused_node__": "menu_sales"}  # suspended graph survives restart
     assert r.cxt.filled_slots == {"brand": "特斯拉"}
     assert [(m.role, m.content) for m in r.cxt.history] == [
         ("user", "你好"),
@@ -383,7 +417,7 @@ def test_migrate_adds_tool_columns_to_legacy_db(tmp_path):
             " VALUES ('s1', 'user', '旧数据', 'chat', '{}', 1.0)")
     conn.close()
 
-    store = arun(SessionStore.create(db))  # 打开即迁移：drop 模块列 + 增加 graph_state
+    store = arun(SessionStore.create(db))  # migration on open: drop the module column + add graph_state
     msgs = arun(store.get_messages("s1"))
     assert msgs is not None and msgs[0]["content"] == "旧数据"
     arun(store.close())
@@ -545,7 +579,7 @@ def test_replace_history_midway_failure_rolls_back_delete(tmp_path, monkeypatch)
 
 
 # ============================================================================
-# trace_events（append-only 过程轨迹，docs/design/session-persistence.md §4）
+# trace_events (append-only process trail, docs/design/session-persistence.md §4)
 # ============================================================================
 
 def _trace_row(session_id="s1", kind="node_start", turn_id="req-turn-9",
@@ -578,21 +612,21 @@ def test_append_trace_roundtrip_and_pagination(tmp_path):
     assert rows[0]["payload"] == {"n": 0}
     assert rows[0]["truncated"] is False
 
-    # turn 过滤
+    # turn filter
     rows_t9 = arun(store.get_trace_events("s1", turn_id="req-turn-9"))
     assert [r["kind"] for r in rows_t9] == ["ev0", "ev1"]
-    # id 游标翻页（after_id 独占）
+    # id-cursor pagination (after_id is exclusive)
     rows_page2 = arun(store.get_trace_events("s1", after_id=rows[0]["id"],
                                              limit=1))
     assert [r["kind"] for r in rows_page2] == ["ev1"]
-    # 未知会话
+    # unknown session
     assert arun(store.get_trace_events("no-such")) is None
     arun(store.close())
 
 
 def test_append_trace_truncates_oversize_payload(tmp_path):
-    """超限 payload 截断为 preview + truncated 标记；base64 data-URI 同样拦截
-    （二进制不进 trace 行）。"""
+    """Oversize payloads are truncated to a preview + truncated flag; base64
+    data-URIs are intercepted too (no binary in trace rows)."""
     db = str(tmp_path / "t.db")
     store = arun(SessionStore.create(db))
     session = make_session()
@@ -610,13 +644,14 @@ def test_append_trace_truncates_oversize_payload(tmp_path):
     assert rows[0]["truncated"] is True
     assert rows[0]["payload"]["_truncated"] is True
     assert len(rows[0]["payload"]["_preview"]) <= 8 * 1024
-    assert rows[1]["truncated"] is True          # data-URI 被拦截
+    assert rows[1]["truncated"] is True          # data-URI intercepted
     assert rows[2]["truncated"] is False
     arun(store.close())
 
 
 def test_attach_wires_trace_sink(tmp_path):
-    """attach 同时挂 message_sink 与 trace_sink（trace_sink 指向 append_trace）。"""
+    """attach wires both message_sink and trace_sink (trace_sink points to
+    append_trace)."""
     db = str(tmp_path / "t.db")
     store = arun(SessionStore.create(db))
     session = make_session()
@@ -624,7 +659,7 @@ def test_attach_wires_trace_sink(tmp_path):
     store.attach(session)
     assert session.cxt.message_sink is not None
     assert session.cxt.trace_sink is not None
-    # 经 trace_sink 写一条（引擎 choke point 的调用形态）
+    # write one entry via trace_sink (the engine choke point's call shape)
     arun(session.cxt.trace_sink(_trace_row(turn_id="req-s1")))
     rows = arun(store.get_trace_events("s1"))
     assert len(rows) == 1 and rows[0]["kind"] == "node_start"
@@ -641,16 +676,16 @@ def test_list_sessions_session_id_contains(tmp_path):
     hits = arun(store.list_sessions(session_id_contains="c_def"))
     assert [r["session_id"] for r in hits] == ["abc_def_1"]
 
-    # % 不得作为通配符生效
+    # % must not act as a wildcard
     hits = arun(store.list_sessions(session_id_contains="c%def"))
     assert hits == []
-    # _ 不得匹配任意字符：'abc_def_1' 若未转义会同时命中 'abcxdefy1'
+    # _ must not match any character: unescaped, 'abc_def_1' would also hit 'abcxdefy1'
     hits = arun(store.list_sessions(session_id_contains="abc_def_1"))
     assert [r["session_id"] for r in hits] == ["abc_def_1"]
     hits = arun(store.list_sessions(session_id_contains="bc_d"))
     assert [r["session_id"] for r in hits] == ["abc_def_1"]
 
-    # 与 pattern_code 组合
+    # combined with pattern_code
     arun(store.create_session(make_session("abc_def_x", pattern_code="other")))
     hits = arun(store.list_sessions(pattern_code="other",
                                     session_id_contains="abc_def"))
