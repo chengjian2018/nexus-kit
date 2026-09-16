@@ -18,6 +18,10 @@ are reused entirely via imports:
   (class/function body, lambda wrapper, factory function + AST-scanned
   product classes); ``builtin:`` markers resolve via
   ``pipeline._resolve_builtin_stage``
+- Template knowledge base: ``app-templates/<code>/TEMPLATE.md`` parsed as
+  declaration-state blueprints (never registered; the ``# nexus-pattern:``
+  fenced block is the extraction anchor shared with
+  ``nexus-app-template-skill/references/verify_template.py``)
 
 Usage (repo root, project venv)::
 
@@ -26,6 +30,8 @@ Usage (repo root, project venv)::
     python nexus-introspect-skill/introspect.py pattern xianyu_agent --view resolved
     python nexus-introspect-skill/introspect.py plugin stage install_unified
     python nexus-introspect-skill/introspect.py who-uses stage install_unified
+    python nexus-introspect-skill/introspect.py templates
+    python nexus-introspect-skill/introspect.py template ppt_generator_agent --view yaml
 
 All subcommands support ``--json``. Read-only, no LLM/DB dependency (import
 side effects are pure registration, same source as the host HTTP service's
@@ -40,6 +46,7 @@ import ast
 import dataclasses
 import inspect
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,10 +72,23 @@ from nexus.registry.plugins import DEFAULT_EXECUTOR_CODES  # noqa: E402
 from nexus.registry.plugins import registry as plugin_registry  # noqa: E402
 
 APPS_DIR = REPO_ROOT / "apps"
+TEMPLATES_DIR = REPO_ROOT / "app-templates"
 
 # pattern_type -> executor slot (mirrors chat._resolve_node_executor_code;
 # FSM resolves at the pattern level, AGENT per node)
 TYPE_SLOT = {"fsm": "fsm", "agent": "loop"}
+
+# TEMPLATE.md extraction anchors (same conventions as
+# nexus-app-template-skill/references/verify_template.py)
+TEMPLATE_FENCE_RE = re.compile(                      # ```yaml fence whose first
+    r"```yaml[^\n]*\n(\s*#\s*nexus-pattern:\s*(?P<mark>\S+)[^\n]*\n.*?)```",   # line carries the marker comment
+    re.DOTALL,
+)
+TEMPLATE_HEADING_RE = re.compile(r"^#\s+(\S+)\s+—\s+(.+?)（应用模板）\s*$",
+                                 re.MULTILINE)
+TEMPLATE_META_RE = re.compile(r"^>\s*元信息：(.+)$", re.MULTILINE)
+PLUGIN_CARD_RE = re.compile(r"^####\s*插件卡：", re.MULTILINE)
+TOOL_CARD_RE = re.compile(r"^####\s*工具卡：", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +115,20 @@ class AppInfo:
     files: List[str]
     patterns: List[str]
     plugins: List[List[str]]        # [[kind, code], ...]
+
+
+@dataclasses.dataclass
+class TemplateInfo:
+    code: str                       # directory name (= pattern code by convention)
+    name: str                       # from the heading line
+    file: str                       # repo-relative TEMPLATE.md path
+    pattern_type: str               # "" = fenced block missing/unparseable
+    entry_node_code: str
+    node_codes: List[str]
+    meta: Dict[str, str]            # 元信息 line key/values (业务形态/图类型/借用来源/来源)
+    yaml_block: str                 # marker fenced block verbatim ("" = absent)
+    cards: Dict[str, int]           # {"插件卡": n, "工具卡": m}
+    note: str = ""                  # parse/consistency complaint ("" = clean)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +198,117 @@ def owner_of(file: str) -> Tuple[str, Optional[str]]:
     if "/nexus/" in norm:
         return "nexus", None
     return "other", None
+
+
+# ---------------------------------------------------------------------------
+# Template knowledge base: app-templates/<code>/TEMPLATE.md (declaration state)
+# ---------------------------------------------------------------------------
+
+def _parse_template_meta(text: str) -> Dict[str, str]:
+    """元信息 blockquote line → key/value dict (segments split by ｜)."""
+    m = TEMPLATE_META_RE.search(text)
+    if not m:
+        return {}
+    out: Dict[str, str] = {}
+    for part in m.group(1).split("｜"):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            out[key.strip()] = value.strip()
+    return out
+
+
+def load_templates() -> List[TemplateInfo]:
+    """Every app-templates/<code>/TEMPLATE.md → metadata (pure file parsing;
+    registries untouched, so no warm_up needed)."""
+    out: List[TemplateInfo] = []
+    if not TEMPLATES_DIR.is_dir():
+        return out
+    for entry_dir in sorted(p for p in TEMPLATES_DIR.iterdir() if p.is_dir()):
+        path = entry_dir / "TEMPLATE.md"
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        heading = TEMPLATE_HEADING_RE.search(text)
+        fence = TEMPLATE_FENCE_RE.search(text)
+        info = TemplateInfo(
+            code=entry_dir.name,
+            name=heading.group(2).strip() if heading else "",
+            file=_relativize(str(path)),
+            pattern_type="", entry_node_code="", node_codes=[],
+            meta=_parse_template_meta(text),
+            yaml_block=fence.group(1) if fence else "",
+            cards={"插件卡": len(PLUGIN_CARD_RE.findall(text)),
+                   "工具卡": len(TOOL_CARD_RE.findall(text))},
+        )
+        if fence is None:
+            info.note = "未找到带 # nexus-pattern: 标记的 yaml 围栏块"
+        else:
+            try:
+                import yaml
+                spec = yaml.safe_load(fence.group(1)) or {}
+                info.pattern_type = str(spec.get("pattern_type") or "agent")
+                info.entry_node_code = str(spec.get("entry_node_code") or "")
+                info.node_codes = [str(n.get("code") or "")
+                                   for n in spec.get("nodes") or []
+                                   if isinstance(n, dict)]
+                if spec.get("code") and str(spec["code"]) != fence.group("mark"):
+                    info.note = (f"标记注释 code（{fence.group('mark')!r}）与声明"
+                                 f" code（{spec['code']!r}）不一致")
+            except Exception as e:                  # noqa: BLE001 read-only query must not crash
+                info.note = f"YAML 块解析失败: {e}"
+        out.append(info)
+    return out
+
+
+class _PlaceholderPlugin:
+    """In-process placeholder factory: satisfies Pattern construction's
+    registered-code check only; never instantiated for real."""
+
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError("模板占位插件，无实现")
+
+
+def template_pattern(info: TemplateInfo):
+    """TemplateInfo → (Pattern | None, note). Constructed for rendering only —
+    NOT registered; declared plugin codes missing from the registry get
+    placeholder factories (same device as verify_template.py)."""
+    import yaml
+
+    from nexus.model.pattern import Pattern
+    from nexus.model.plugins_field import PLUGIN_KINDS
+
+    if not info.yaml_block:
+        return None, info.note or "无声明块"
+    spec = yaml.safe_load(info.yaml_block) or {}
+
+    declared: Dict[str, str] = {}   # plugin code -> kind
+    for slot, pc in (spec.get("plugins") or {}).items():
+        kind = PLUGIN_KINDS.get(slot)
+        if kind and pc:
+            declared[str(pc)] = kind
+    for node in spec.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        for slot, pc in (node.get("plugins") or {}).items():
+            kind = PLUGIN_KINDS.get(slot)
+            if kind and pc:
+                declared.setdefault(str(pc), kind)
+    if spec.get("pattern_type") == "fsm":
+        try:
+            for entry in normalize_skeleton(spec.get("stages")):
+                for _slot, pc in entry.items():
+                    if pc:
+                        declared.setdefault(str(pc), "stage")
+        except ValueError:
+            pass                    # let Pattern(**spec) raise the real error
+    for pc, kind in declared.items():
+        if not plugin_registry.has(kind, pc):
+            plugin_registry.register(kind, pc, _PlaceholderPlugin())
+
+    try:
+        return Pattern(**spec), ""
+    except Exception as e:                          # noqa: BLE001 read-only query must not crash
+        return None, f"Pattern 构造失败: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +752,55 @@ def cmd_who_uses(args) -> None:
             print(f"    {w}")
 
 
+def cmd_templates(args) -> None:
+    infos = load_templates()
+    if args.json:
+        print(json.dumps([dataclasses.asdict(i) for i in infos],
+                         ensure_ascii=False, indent=2))
+        return
+    if not TEMPLATES_DIR.is_dir():
+        print("（app-templates/ 不存在）")
+        return
+    print(f"▸ app-templates/ — {len(infos)} 个模板条目（声明态蓝图，未注册）")
+    for i in infos:
+        badge = (f"[{i.pattern_type or '?'}, {len(i.node_codes)} 节点]"
+                 if i.yaml_block else "[无声明块]")
+        print(f"    {i.code}  {badge}  {i.name}")
+        if i.meta.get("业务形态"):
+            print(f"      业务形态: {i.meta['业务形态']}")
+        if i.meta.get("来源"):
+            print(f"      来源:     {i.meta['来源']}")
+        if i.note:
+            print(f"      ⚠ {i.note}")
+
+
+def cmd_template(args) -> None:
+    infos = load_templates()
+    info = next((i for i in infos if i.code == args.code), None)
+    if info is None:
+        raise SystemExit(f"模板 {args.code!r} 不在 app-templates/ 下"
+                         f"（可用: {[i.code for i in infos]}）")
+    if args.json:
+        print(json.dumps(dataclasses.asdict(info), ensure_ascii=False, indent=2))
+        return
+    if args.view == "yaml":
+        print(info.yaml_block.rstrip() if info.yaml_block
+              else f"（{info.note or '无声明块'}）")
+        return
+    warm_up()          # real plugin codes land first; placeholders only fill gaps
+    pattern, note = template_pattern(info)
+    print(f"template {info.code} — {info.name}  [知识库蓝图，未注册]")
+    print(f"  条目: {info.file}  "
+          f"卡片: 插件卡×{info.cards['插件卡']} / 工具卡×{info.cards['工具卡']}")
+    if pattern is not None:
+        print(render_tree(pattern).rstrip())
+        if info.note:
+            print(f"  ⚠ {info.note}")
+    else:
+        print(f"  ⚠ {note}，以下为声明块原文：")
+        print(info.yaml_block.rstrip())
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="nexus-introspect",
@@ -640,9 +834,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_who.add_argument("code")
     p_who.add_argument("--json", **json_flag)
 
+    sub.add_parser("templates",
+                   help="模板知识库总览（app-templates/，声明态蓝图）").add_argument(
+        "--json", **json_flag)
+
+    p_tpl = sub.add_parser("template", help="模板条目视图（未注册蓝图）")
+    p_tpl.add_argument("code")
+    p_tpl.add_argument("--view", choices=["tree", "yaml"], default="tree")
+    p_tpl.add_argument("--json", **json_flag)
+
     args = parser.parse_args(argv)
     handlers = {"apps": cmd_apps, "plugins": cmd_plugins, "pattern": cmd_pattern,
-                "plugin": cmd_plugin, "who-uses": cmd_who_uses}
+                "plugin": cmd_plugin, "who-uses": cmd_who_uses,
+                "templates": cmd_templates, "template": cmd_template}
     handlers[args.cmd](args)
 
 

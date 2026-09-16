@@ -1,6 +1,6 @@
 ---
 name: nexus-introspect
-description: 内省 nexus-kit 的应用 / pattern / 插件（stage、executor、messages_builder 等）。当 agent 需要了解 apps/ 下有哪些应用及其注册物、查看某个 pattern 的结构或生效装配（stages/executor 三层解析结果）、取某个插件码的实现源码纯文本、或评估改动一个插件会影响哪些 pattern 时使用。只读查询，无副作用。
+description: 内省 nexus-kit 的应用 / pattern / 插件（stage、executor、messages_builder 等）/ 模板知识库（app-templates/ 蓝图条目）。当 agent 需要了解 apps/ 下有哪些应用及其注册物、查看某个 pattern 的结构或生效装配（stages/executor 三层解析结果）、取某个插件码的实现源码纯文本、评估改动一个插件会影响哪些 pattern、盘点 app-templates/ 有哪些模板或取某模板的 Pattern 声明（树/YAML）时使用。只读查询，无副作用。
 ---
 
 # nexus-introspect
@@ -22,6 +22,8 @@ PY=nexus-introspect-skill/introspect.py
 | 某 pattern 每个**模块的生效装配**（与运行时同口径：module>pattern>骨架>内置默认 四层解析 + executor 链） | `python $PY pattern install_booking_agent --view resolved` |
 | 某个插件码的实现源码（纯文本，直接可读/可引用） | `python $PY plugin stage install_unified` |
 | 反向索引：谁在声明里引用了这个插件 | `python $PY who-uses stage install_unified` |
+| 模板知识库（app-templates/）有哪些条目 | `python $PY templates` |
+| 某模板的声明树 / 声明 YAML（未注册蓝图） | `python $PY template ppt_generator_agent` / `--view yaml` |
 
 所有子命令支持 `--json`（结构化输出，供程序消费）；`plugin` 支持 `--no-source`（只要元数据）。
 
@@ -38,6 +40,13 @@ PY=nexus-introspect-skill/introspect.py
   不构成声明引用；继承关系看 `plugin` 的源码输出自然可见。
 - **归属**按实现文件路径推断（`apps/<name>/` → 该 app；`atoms/`、`nexus/` → 内核）；
   app→插件映射按「谁 import 时注册」归属（每 app 逐个导入 diff 注册表）。
+- **模板 = 声明态，非运行时口径**：`templates` / `template` 只解析
+  `app-templates/<code>/TEMPLATE.md` 里带 `# nexus-pattern:` 标记的 yaml
+  围栏块（锚点约定与 `nexus-app-template-skill` 的 `verify_template.py`
+  同源）；构造 Pattern 仅供渲染树视图，**不注册进注册表**——声明里
+  尚未实现的插件码以进程内占位工厂满足构造校验。模板专属内容
+  （插件步骤卡 / 节点交互表）与结构闸校验归 TEMPLATE.md 本体与
+  `verify_template.py`，不在本 skill 职责内。
 
 ## 典型工作流
 
@@ -45,8 +54,11 @@ PY=nexus-introspect-skill/introspect.py
    `plugin stage <码>` 看要参考的实现。
 2. 改插件前评估影响面：`who-uses <kind> <code>` → 逐个 `pattern <code> --view resolved` 核对。
 3. 排查「声明了但没生效」：对比 `--view tree`（声明原文）与 `--view resolved`（生效装配）的来源层标注。
+4. 摸模板知识库：`templates` 看蓝图全貌 → `template <code> --view yaml` 取声明 →
+   条目已有实现时对照 `pattern <同名 live code> --view resolved` 看蓝图与实现的差距。
 
 设计文档：`docs/design/introspect-skill.md`（决策与权衡的完整版）。
 
-> 注：本 skill 不在 `.claude/skills/` 下，Claude Code 不会自动发现；agent 需按上表
-> 直接调用脚本（或自行 symlink 回 `.claude/skills/nexus-introspect/` 恢复自动发现）。
+> 注：本 skill 未挂到 `.zcode/skills/`（该目录现挂 nexus-app-builder 与
+> nexus-app-template-skill 两个软链），不会被自动发现；agent 按上表直接调用
+> 脚本即可（或自行把本目录 symlink 进 `.zcode/skills/` 恢复自动发现）。

@@ -227,3 +227,27 @@ python nexus-introspect-skill/introspect.py who-uses stage install_unified  # �
   `query=time_aug_query [pattern]`
 - `inspect who-uses stage install_unified` → 仅 `install_booking_agent`
   （repair 的继承复用不构成声明引用，语义见 §4.4）
+
+## 10. 增补：模板知识库子命令（2026-09-16）
+
+仓库新增一等资产 `app-templates/`（模板知识库：每条目一个
+`<code>/TEMPLATE.md`，Pattern 声明 + 插件/工具占位卡，无实现代码），
+内省面随之扩展两个子命令：
+
+- `templates`：条目总览（code / 图类型 / 节点数 / 名称 / 元信息的业务
+  形态与来源 / 卡片计数）。纯文件解析——标题行、`> 元信息：` 行、
+  `#### 插件卡：/工具卡：` 四级标题、`# nexus-pattern: <code>` 标记的
+  yaml 围栏块，均与 `nexus-app-template-skill` 的骨架/校验约定同源，
+  不触注册表，无需 warm-up。
+- `template <code> [--view tree|yaml] [--json]`：单条目声明视图。yaml 视图
+  原样输出标记围栏块（可直接抄作实现蓝本）；tree 视图经 `Pattern(**spec)`
+  构造后复用 `render_tree` 渲染。
+
+### 语义边界（决策）
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 模板视图口径 | **声明态**，明确标注「未注册」 | 与 `pattern` 子命令的运行时口径（注册表 + resolve 链）区分；模板 code 与 live pattern code 同名（如 `archify`）是常态，绝不注册进注册表以免冲突 |
+| 未实现插件码 | 构造前以进程内占位工厂补位注册（verify_template.py 同一手法）；warm-up 先行，真实码优先 | Pattern 构造校验只要求码在注册表；正向模式模板声明尚未实现的码是常态 |
+| 解析失败 | 列表标 ⚠ 注记，详情回退输出声明块原文 | 只读查询不得崩溃；结构闸校验仍归 verify_template.py，本 skill 只如实呈现 |
+| 与 verify_template.py 分工 | introspect = 查询/呈现；verify = 结构闸（卡片覆盖、交互表行数、INDEX 收录） | 职责不重叠；锚点正则两边同源约定，漂移由 verify 把关 |
