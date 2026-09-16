@@ -9,10 +9,10 @@ Turn a business requirement into a nexus-kit application: one **Pattern** (the
 data template — a graph of nodes) plus **capability plugins** (executors /
 stages / tools), living under `apps/<name>/`.
 
-Work in the phases below, in order. Two of them are **gates**: stop, present
-the specified artifacts, and wait for user confirmation before proceeding.
-A wrong graph type or a wrong node-interaction design means redrawing the
-whole app — that is why the gates exist.
+Work in the phases below, in order, fully autonomously — no step pauses for
+user confirmation. The Phase 1 decision statement and the Phase 2 plan are
+still mandatory artifacts, not permission slips: a wrong graph type or a
+wrong node-interaction design means redrawing the whole app.
 
 ## The framework in 60 seconds
 
@@ -51,7 +51,7 @@ whole app — that is why the gates exist.
    python $PY who-uses stage install_unified    # reverse index: who references it
    ```
 
-## Phase 1 — Graph type → GATE 1
+## Phase 1 — Graph type decision
 
 Decide `fsm` vs `agent` using these criteria (verified against
 `nexus/engine/chat.py`):
@@ -69,12 +69,12 @@ Decide `fsm` vs `agent` using these criteria (verified against
 - Ambiguous → default **agent** (the framework default,
   `nexus/model/pattern.py:36`), but you must say why the fsm signals don't win.
 
-**GATE 1 — present and wait for confirmation:**
-chosen `pattern_type`, the criteria cited (which signals applied), and a
-one-paragraph node sketch (5–10 node codes with one-line purposes). Do not
-design the full graph yet.
+**State the decision before moving on (no waiting):** the chosen
+`pattern_type`, the criteria cited (which signals applied), and a
+one-paragraph node sketch (5–10 node codes with one-line purposes) — the
+statement feeds the Phase 2 plan. Do not design the full graph yet.
 
-## Phase 2 — Plan → GATE 2
+## Phase 2 — Plan
 
 Produce a plan containing **all five** artifacts. A missing node-interaction
 table or a silent "zero borrow" makes the plan invalid.
@@ -115,7 +115,9 @@ table or a silent "zero borrow" makes the plan invalid.
    `tests/test_<app>_route.py` (new), nothing else. Name the pattern code and
    confirm it doesn't collide with existing ones (`python $PY apps`).
 
-**GATE 2 — present the plan and wait for confirmation.**
+**When the plan is written down, proceed straight to Phase 3 — no approval
+stop.** The full plan belongs in your final report so the user can audit
+the decisions afterwards.
 
 ## Phase 3 — Implement
 

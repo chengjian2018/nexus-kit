@@ -11,9 +11,9 @@ description: Convert a business requirement into a nexus-kit application (a Patt
 将业务需求转化为 nexus-kit 应用：一个 **Pattern**（数据模版——节点图）加
 **能力插件**（executor / stage / tool），落在 `apps/<name>/` 下。
 
-按下面的阶段依次推进。其中两个阶段是**闸门**：停下、呈现规定产物、等用户
-确认后再继续。图类型或节点交互设计选错意味着整个应用重画——这就是闸门
-存在的原因。
+按下面的阶段依次推进，全程自主——任何一步都不停下来等待用户确认。
+Phase 1 的选型陈述与 Phase 2 的方案仍是强制产物，但不是许可申请：图类型
+或节点交互设计选错意味着整个应用重画。
 
 ## 框架 60 秒速览
 
@@ -51,7 +51,7 @@ description: Convert a business requirement into a nexus-kit application (a Patt
    python $PY who-uses stage install_unified    # 反向索引：谁在引用它
    ```
 
-## Phase 1 — 图类型 → 闸门 1
+## Phase 1 — 图类型选型
 
 用以下判据决定 `fsm` 还是 `agent`（已对照 `nexus/engine/chat.py` 核实）：
 
@@ -65,11 +65,11 @@ description: Convert a business requirement into a nexus-kit application (a Patt
 - 拿不准 → 默认 **agent**（框架默认值，`nexus/model/pattern.py:36`），
   但必须说明 fsm 信号为什么不占上风。
 
-**闸门 1 —— 呈现并等待确认：**
-选定的 `pattern_type`、引用的判据（哪些信号成立）、一段式的节点草图
-（5–10 个节点 code 加一句话用途）。此时不要展开完整设计。
+**先陈述决策再前进（不等待）：** 选定的 `pattern_type`、引用的判据（哪些
+信号成立）、一段式节点草图（5–10 个节点 code 加一句话用途）——该陈述
+进入 Phase 2 的方案。此时不要展开完整设计。
 
-## Phase 2 — 方案 → 闸门 2
+## Phase 2 — 方案
 
 产出包含以下**全部五件**的方案。缺节点交互表、或"零借鉴"没有显式声明，
 方案无效。
@@ -106,7 +106,8 @@ description: Convert a business requirement into a nexus-kit application (a Patt
    `tests/test_<app>_route.py`（新文件），仅此而已。定好 pattern code 并
    确认不与现存冲突（`python $PY apps`）。
 
-**闸门 2 —— 呈现方案并等待确认。**
+**方案落笔后直接进入 Phase 3，不做任何确认停留。** 五件套方案写入最终
+汇报，供用户事后审计决策。
 
 ## Phase 3 — 实现
 
