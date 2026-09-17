@@ -117,14 +117,26 @@ python -m pytest        # uv 环境：uv run python -m pytest
 - `nexus-app-template-skill/` —— 业务需求 / 现有应用 → **应用模板**（`app-templates/` 蓝图，零实现）
 - `nexus-introspect-skill/` —— 内省 CLI，供 AI 交叉核对源码事实
 
-任何支持技能目录机制的 AI 编程助手（ZCode、Claude Code、Cursor 等）装载后即可使用——
-ZCode 已挂载于 `.zcode/skills/`，其余助手将所需目录复制或软链到自己的技能目录（如
-Claude Code 的 `.claude/skills/`）。对 AI 说一句需求即可触发，全程自主推进：
+这三个目录即唯一事实源，随仓库提交；各助手的挂载目录不入库（`.zcode/` 在
+`.gitignore` 中），新环境自行建立软链即可，例如 ZCode：
+
+```bash
+mkdir -p .zcode/skills
+ln -s ../../nexus-app-builder-skill .zcode/skills/nexus-app-builder
+ln -s ../../nexus-app-template-skill .zcode/skills/nexus-app-template-skill
+```
+
+Claude Code、Cursor 等同理，将软链或拷贝放入各自技能目录（如 `.claude/skills/`）。
+对 AI 说一句需求即可触发，全程自主推进：
 
 - 「把 <业务需求> 做成 nexus-kit 应用」→ 先产出选型陈述与五件套方案，再落地代码与离线测试，放入即自动注册
 - 「把 <业务需求> 沉淀为应用模板」或「把 apps/<name> 逆向为模板」→ 落成 TEMPLATE.md 蓝图，校验后入模板知识库
 
 模板与应用双向接力：蓝图照卡实现为应用，应用逆向沉淀回模板。
+
+此外，`skills/` 是框架运行时的技能扫描根（settings `skills.dir`，约定见
+[skills/README.md](skills/README.md)）——上述 skill 与 `archify` 在其中备有拷贝，
+应用节点可经 `load_skill` 只读装载。
 
 ## Author
 
