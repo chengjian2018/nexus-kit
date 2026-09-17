@@ -138,6 +138,49 @@ Claude Code、Cursor 等同理，将软链或拷贝放入各自技能目录（�
 [skills/README.md](skills/README.md)）——上述 skill 与 `archify` 在其中备有拷贝，
 应用节点可经 `load_skill` 只读装载。
 
+### 7. API 全链路：生成新应用 → 热装载 → 试聊 → 评审优化
+
+上面的构建流程也可以全程走 API：让 `general_agent` 生成新应用 → `reload`
+免重启装载 → 用新应用对话 → 让 `session_reviewer` 评审该会话并优化应用。
+服务全程不重启，在跑会话不受影响：
+
+```bash
+# ① 获取已注册应用列表（data.patterns[] 的 code 即调用句柄）
+curl -s http://localhost:8000/api/v1/console/patterns | python -m json.tool
+
+# ② 调用 general_agent（通用 Agent，挂载 nexus-app-builder 技能）生成新应用
+curl -X POST http://localhost:8000/api/v1/launch -H 'Content-Type: application/json' \
+  -d '{"request_id": "r1", "session_id": "gen-1", "pattern_code": "general_agent", "task_info": {}}'
+curl -X POST http://localhost:8000/api/v1/chat -H 'Content-Type: application/json' \
+  -d '{"request_id": "r2", "session_id": "gen-1",
+       "query": "把「宠物医院预约提醒」做成 nexus-kit 应用写入 apps/pet_reminder，含离线测试"}'
+#    → 回复中会给出新应用的 pattern code（下文以 pet_reminder 为例）
+
+# ③ 热装载：首载运行期生成的 apps/ 新目录（响应如「重载完成：新装载 1 个模块…」；
+#    生成物导入失败会报「装载失败」并保持旧注册，修复文件后再次 reload 即可）
+curl -X POST http://localhost:8000/api/v1/reload
+
+# ④ 重新获取应用列表，新应用已注册（详情见 GET /api/v1/console/patterns/{code}）
+curl -s http://localhost:8000/api/v1/console/patterns | python -m json.tool
+
+# ⑤ 用新应用名跑任务 / 聊天（launch 建会话 → chat 逐轮对话）
+curl -X POST http://localhost:8000/api/v1/launch -H 'Content-Type: application/json' \
+  -d '{"request_id": "r3", "session_id": "pet-1", "pattern_code": "pet_reminder", "task_info": {}}'
+curl -X POST http://localhost:8000/api/v1/chat -H 'Content-Type: application/json' \
+  -d '{"request_id": "r4", "session_id": "pet-1", "query": "帮我预约明天上午带猫打疫苗"}'
+
+# ⑥ 调用 session_reviewer 评审刚才的会话并优化该应用
+curl -X POST http://localhost:8000/api/v1/launch -H 'Content-Type: application/json' \
+  -d '{"request_id": "r5", "session_id": "rev-1", "pattern_code": "session_reviewer",
+       "task_info": {"session_id": "pet-1"}}'
+curl -X POST http://localhost:8000/api/v1/chat -H 'Content-Type: application/json' \
+  -d '{"request_id": "r6", "session_id": "rev-1", "query": "评审会话 pet-1 并给出优化建议"}'
+#    → 本轮回复即五维建议清单，流程挂起在人工闸；再发一条「通过」即实施优化
+#      （自动修改可编辑面 prompts/config → 跑白名单测试 → 失败自修/回滚 → 自动热加载）
+```
+
+如设置了 `NEXUS_API_KEY`，以上请求需附带 `-H "X-API-Key: $NEXUS_API_KEY"`。
+
 ## Author
 
 [chengjian2018](https://github.com/chengjian2018)

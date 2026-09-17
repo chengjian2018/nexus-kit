@@ -805,7 +805,8 @@ app.mount(
 @app.post("/api/v1/reload")
 async def reload_modules() -> DialogueResponse:
     """Reload changed pattern / plugin / channel modules + invalidate the
-    llm config cache.
+    llm config cache + first-load brand-new apps (runtime-generated app
+    directories under apps/).
 
     Afterwards rebinds in-memory sessions to the registry's latest pattern
     objects (in-flight turns holding old references finish on the old
@@ -821,16 +822,20 @@ async def reload_modules() -> DialogueResponse:
 
     studio_report = load_console_artifacts()
     rebound = rebind_sessions(governor.sessions, pattern_registry)
+    imported = result.get("imported") or []
     changed = result.get("changed") or []
     failed = result.get("failed") or []
+    import_failed = result.get("import_failed") or []
     studio_failed = (len(studio_report["plugins"]["failed"])
                      + len(studio_report["patterns"]["failed"]))
-    if failed or studio_failed:
-        message = (f"重载完成：变更 {len(changed)} 个，失败 {len(failed)} 个"
-                   f"（保持旧注册）: {failed}；studio 托管产物失败 "
-                   f"{studio_failed} 个；会话重绑 {rebound} 个")
+    if failed or import_failed or studio_failed:
+        message = (f"重载完成：新装载 {len(imported)} 个、变更 {len(changed)} 个、"
+                   f"装载失败 {len(import_failed)} 个: {import_failed}；"
+                   f"重载失败 {len(failed)} 个（保持旧注册）: {failed}；"
+                   f"studio 托管产物失败 {studio_failed} 个；会话重绑 {rebound} 个")
     else:
-        message = (f"重载完成：变更 {len(changed)} 个模块"
+        message = (f"重载完成：新装载 {len(imported)} 个模块、"
+                   f"变更 {len(changed)} 个模块"
                    f"{'（无变更）' if not changed else ''}；会话重绑 {rebound} 个")
     logger.info("[reload] %s", message)
     return DialogueResponse(code="0", status=True, message=message)

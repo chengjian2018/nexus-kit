@@ -21,25 +21,38 @@ logger = logging.getLogger(__name__)
 # Auto-discovery helpers
 # ---------------------------------------------------------------------------
 
+def registering_app_modules(apps_dir: Optional[Path] = None) -> List[str]:
+    """Dotted names of the self-registering modules under apps/ — the
+    candidate list of :func:`discover_builtin_patterns`, extracted for the
+    host's runtime first-load discovery (``host/reload.py::discover_new``
+    reports candidates that never imported).
+    """
+    apps_path = (
+        Path(apps_dir) if apps_dir is not None
+        else Path(__file__).resolve().parents[2] / "apps"
+    )
+    module_names: List[str] = []
+    if apps_path.is_dir():
+        for app_dir in sorted(p for p in apps_path.iterdir() if p.is_dir()):
+            for path in sorted(app_dir.glob("*.py")):
+                if path.name != "__init__.py" and module_registers(path):
+                    module_names.append(f"apps.{app_dir.name}.{path.stem}")
+    return module_names
+
+
 def discover_builtin_patterns(apps_dir: Optional[Path] = None) -> List[str]:
     """Import self-registering pattern modules under apps/ and return their names.
 
     Every directory under ``apps/`` is one app (route.py / prompts.py /
     channel.py); a file is imported iff it carries a top-level
     ``registry.register()`` call, so prompts and channel adapters are skipped
-    by the AST check itself — no exclusion list needed.
+    by the AST check itself — no exclusion list needed. Re-running is
+    idempotent: ``importlib.import_module`` is a sys.modules cache hit for
+    everything already loaded (never a re-execution), so only brand-new
+    modules actually run.
     """
-    apps_path = (
-        Path(apps_dir) if apps_dir is not None
-        else Path(__file__).resolve().parents[2] / "apps"
-    )
-    module_names = []
-    if apps_path.is_dir():
-        for app_dir in sorted(p for p in apps_path.iterdir() if p.is_dir()):
-            for path in sorted(app_dir.glob("*.py")):
-                if path.name != "__init__.py" and module_registers(path):
-                    module_names.append(f"apps.{app_dir.name}.{path.stem}")
-    return import_modules(module_names, what="pattern module")
+    return import_modules(registering_app_modules(apps_dir),
+                          what="pattern module")
 
 
 # ---------------------------------------------------------------------------

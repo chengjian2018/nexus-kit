@@ -4,7 +4,8 @@ Config side: fingerprint hit skips the file re-read / file change re-parses
 automatically / programmatic invalidate and reload entries / returned deep
 copies do not pollute each other.
 Code side: host.reload mtime detection, replace-mode takeover, dependency
-order replay, session rebinding, channel spec fetched live per request.
+order replay, session rebinding, channel spec fetched live per request,
+first-load discovery of runtime-generated apps.
 """
 
 import os
@@ -361,6 +362,7 @@ def reload_env(tmp_path, monkeypatch):
     hr._MODULE_MTIMES.clear()
     yield harness
     pattern_registry.deregister("reload_demo")
+    pattern_registry.deregister("runtime_demo")
     plugin_registry.deregister("executor", "reload_demo_exec")
     for name in list(sys.modules):
         if name.startswith("_reload_test."):
@@ -580,3 +582,114 @@ def test_reload_prompts_change_propagates_via_consumer(reload_env):
     assert result["failed"] == []
     # route unchanged but transitively replayed -> the Pattern registered into the registry uses the new TITLE
     assert pattern_registry.get("reload_demo").name == "v2"
+
+
+# ============================================================================
+# First-load discovery: runtime-generated apps load without a restart
+# ============================================================================
+
+def _patch_discovery(monkeypatch, harness):
+    """Point host.reload's discovery entry points at the tmp root: the fake
+    pattern discovery walks the harness's apps/ with the same AST predicate
+    and imports newcomers through the out-of-repo bridge (tolerating
+    per-module failures like the real import_modules); the fake candidate
+    list mirrors registering_app_modules."""
+    import host.reload as hr
+    from nexus.registry.discovery import module_registers
+
+    apps_root = harness.root / "apps"
+
+    def _candidates():
+        names = []
+        if apps_root.is_dir():
+            for app_dir in sorted(p for p in apps_root.iterdir() if p.is_dir()):
+                for path in sorted(app_dir.glob("*.py")):
+                    if path.name != "__init__.py" and module_registers(path):
+                        names.append(
+                            f"_reload_test.apps.{app_dir.name}.{path.stem}")
+        return names
+
+    def _discover():
+        imported = []
+        for name in _candidates():
+            if name in sys.modules:
+                continue
+            rel = name[len("_reload_test."):].replace(".", "/") + ".py"
+            try:
+                _import_out_of_repo(harness, name, rel)
+            except Exception:
+                sys.modules.pop(name, None)  # importlib reclaims failed loads
+            else:
+                imported.append(name)
+        return imported
+
+    monkeypatch.setattr(hr, "discover_builtin_patterns", _discover)
+    monkeypatch.setattr(hr, "registering_app_modules", _candidates)
+
+
+def test_reload_all_loads_runtime_generated_app(reload_env, monkeypatch):
+    """A brand-new app directory appearing after boot is first-imported by
+    reload_all (no restart), registered, and folded into the mtime baseline
+    (its next edit is detected as a change, not swallowed as a first
+    sighting)."""
+    import host.reload as hr
+    from nexus.registry.patterns import registry as pattern_registry
+
+    _patch_discovery(monkeypatch, reload_env)
+    assert hr.reload_all()["imported"] == []  # nothing new yet
+
+    reload_env.write_module(
+        "apps/runtime_app/route.py",
+        _PATTERN_MODULE.format(ver=1).replace(
+            'code="reload_demo"', 'code="runtime_demo"'))
+    result = hr.reload_all()
+    assert "_reload_test.apps.runtime_app.route" in result["imported"]
+    assert result["import_failed"] == []
+    assert result["changed"] == []  # newcomers are first-loads, not reloads
+    assert pattern_registry.get("runtime_demo").name == "reload demo v1"
+
+    path = reload_env.root / "apps" / "runtime_app" / "route.py"
+    time.sleep(0.02)
+    reload_env.write_module(
+        "apps/runtime_app/route.py",
+        _PATTERN_MODULE.format(ver=2).replace(
+            'code="reload_demo"', 'code="runtime_demo"'))
+    _bump_mtime(path, delta=5.0)
+    result = hr.reload_changed()
+    assert "_reload_test.apps.runtime_app.route" in result["changed"]
+    assert pattern_registry.get("runtime_demo").name == "reload demo v2"
+
+
+_BROKEN_PATTERN_MODULE = '''\
+"""Registering module whose body raises at import (missing dependency)."""
+import _no_such_dependency_xyz
+
+from nexus.registry.patterns import registry
+
+registry.register("runtime_demo")
+'''
+
+
+def test_discover_new_reports_failed_first_load(reload_env, monkeypatch):
+    """A generated app whose module raises on import: nothing registers, the
+    module lands in import_failed (the service keeps running); fix the file
+    and the next reload loads it."""
+    import host.reload as hr
+    from nexus.registry.patterns import registry as pattern_registry
+
+    _patch_discovery(monkeypatch, reload_env)
+    reload_env.write_module("apps/broken_app/route.py", _BROKEN_PATTERN_MODULE)
+
+    result = hr.discover_new()
+    assert result["imported"] == []
+    assert "_reload_test.apps.broken_app.route" in result["failed"]
+    assert not pattern_registry.is_registered("runtime_demo")
+
+    reload_env.write_module(
+        "apps/broken_app/route.py",
+        _PATTERN_MODULE.format(ver=1).replace(
+            'code="reload_demo"', 'code="runtime_demo"'))
+    result = hr.reload_all()
+    assert "_reload_test.apps.broken_app.route" in result["imported"]
+    assert result["import_failed"] == []
+    assert pattern_registry.get("runtime_demo").name == "reload demo v1"

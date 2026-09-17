@@ -1,7 +1,15 @@
 """Hot reloader — runtime reload of llm config / pattern / plugin /
 channel.
 
-Two reload flavors with entirely different mechanisms:
+Three reload flavors with distinct mechanisms:
+
+**first-load discovery** (``discover_new``): brand-new self-registering
+modules that appeared under apps/ after boot (the runtime half of "an app
+generated a new app" — e.g. general_agent + nexus-app-builder writing a new
+apps/ directory) are imported by re-running the apps discovery; idempotent
+for everything already loaded. reload_all calls it before reload_changed,
+so ``POST /api/v1/reload`` covers both halves: never-loaded modules are
+first-imported, changed-but-loaded modules are replayed.
 
 **llm config (yaml data)**: ``nexus.settings.load_config`` ships its own
 (mtime_ns, size) fingerprint cache — the per-turn R1 refresh only stats
@@ -87,6 +95,11 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from nexus.registry.patterns import (
+    discover_builtin_patterns,
+    registering_app_modules,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,8 +118,9 @@ def _discover_module_names() -> List[str]:
     instances are referenced by pattern.stages declarations; reloading
     them needs cascading pattern rebuilds — restart the process when
     needed). Files never imported in this process do not count as changes
-    — a first load is normal discovery; hot reload only manages what is
-    already loaded.
+    — hot reload only manages what is already loaded; first loads are fed
+    in by :func:`discover_new` (reload_all calls it before reload_changed),
+    which folds the newcomers into this tracking's mtime baseline.
     """
     names: List[str] = []
     for name in list(sys.modules):  # dict insertion order = import completion order
@@ -272,6 +286,47 @@ class _ReplaceMode:
 # Public entry points
 # ============================================================================
 
+def discover_new() -> Dict[str, Any]:
+    """First-load discovery: import brand-new self-registering modules that
+    appeared under apps/ after boot — the runtime half of "an app generated
+    a new app" (e.g. general_agent + nexus-app-builder writing a new apps/
+    directory), loadable into the live service without a restart.
+
+    Re-running the apps discovery is idempotent for everything already
+    loaded (``importlib.import_module`` is a sys.modules cache hit, never a
+    re-execution — changed-but-loaded modules keep going through
+    reload_changed's ordered replay), so only brand-new modules execute
+    here. The newcomers are folded into the mtime baseline right away
+    (otherwise their first sighting in ``_changed_modules`` would establish
+    the baseline and swallow the next edit). Framework atom dirs
+    (atoms/tools | channels | executors) are boot-scanned only and not
+    re-walked: runtime generation targets apps/.
+
+    Returns:
+        ``{"imported": [...], "failed": [...]}`` — imported are the newly
+        executed modules inside the reload scan domain (apps.* /
+        atoms.executors.* / atoms.hooks.*); failed are AST-registering app
+        modules that still did not import (syntax-valid but raising — a
+        missing dependency or an error in the module body; a syntax-broken
+        file is invisible to the AST scanner and never becomes a
+        candidate). Failure details are in the warning logs; fixing the
+        file makes the next reload load it.
+    """
+    before = set(_discover_module_names())
+    discover_builtin_patterns()
+    imported = [n for n in _discover_module_names() if n not in before]
+    failed = [name for name in registering_app_modules()
+              if name not in sys.modules]
+    for name in imported:
+        path = _module_path(name)
+        if path is not None and path.exists():
+            _MODULE_MTIMES[name] = path.stat().st_mtime
+    if imported or failed:
+        logger.info("[reload] 首载发现：新装载 %s（失败 %s）",
+                    imported, failed or "无")
+    return {"imported": imported, "failed": failed}
+
+
 def init_baseline() -> None:
     """Establish the mtime baseline of all tracked modules (idempotent
     refresh).
@@ -325,18 +380,22 @@ def reload_changed() -> Dict[str, List[str]]:
     return {"changed": changed, "reloaded": reloaded, "failed": failed}
 
 
-def reload_all() -> Dict[str, List[str]]:
+def reload_all() -> Dict[str, Any]:
     """Full-reload entry (shared by the API endpoint / CLI / watcher).
 
     The config cache is dropped outright (the settings fingerprint check
     is the primary defense; this one guards against clock skew — the next
-    resolution naturally re-reads); code modules go through
-    :func:`reload_changed`.
+    resolution naturally re-reads); brand-new app modules (runtime
+    generation) are first-loaded via :func:`discover_new`; changed code
+    modules go through :func:`reload_changed`.
     """
     from nexus import settings
 
     settings.invalidate_config_cache()
+    discovered = discover_new()
     result = reload_changed()
+    result["imported"] = discovered["imported"]
+    result["import_failed"] = discovered["failed"]
     result["config"] = "invalidated"
     return result
 
@@ -438,7 +497,8 @@ class ReloadWatcher:
     ``NEXUS_RELOAD_WATCH=1``). uvicorn --reload restarts the whole
     process and cannot touch in-process registries — what this watcher
     covers is exactly the "refresh the registries without restarting the
-    process" scenario.
+    process" scenario, including first-loading brand-new apps/ directories
+    (reload_all runs discover_new first).
     """
 
     def __init__(self, interval: float = 2.0, on_reload=None):

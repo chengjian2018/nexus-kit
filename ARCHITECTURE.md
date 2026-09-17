@@ -448,6 +448,10 @@ sessions 表：`current_node_code`（FSM 游标 / AGENT 图位置镜像）+
 
 - **追踪**：sys.modules 里 `apps.<pkg>.<mod>` 与 `atoms.executors.<mod>`
   名下的模块；mtime 对比找变更
+- **首载发现**（`discover_new`）：重跑 apps 扫描导入运行期新生成的
+  `apps/` 目录（「一个应用生成另一个应用」的免重启装载通道；
+  `import_module` 幂等缓存命中，只执行全新模块），新模块直接折进
+  mtime 基线
 - **重放序**：AST import 边（含相对 import）的拓扑序
 - **注册表收编**：plugin/channel 注册表有 `replace_on_conflict` 开关；
   pattern 注册本就覆盖同名（`rebind_sessions` 显式重绑内存会话，回填
@@ -456,6 +460,7 @@ sessions 表：`current_node_code`（FSM 游标 / AGENT 图位置镜像）+
 
 ### 宿主挂点
 
-- `POST /api/v1/reload`：config 缓存失效 + 代码重载 + 会话重绑
+- `POST /api/v1/reload`：config 缓存失效 + 新应用首载发现（运行期生成的
+  `apps/` 目录免重启装载）+ 代码重载 + 会话重绑
 - `NEXUS_RELOAD_WATCH=1` 后台轮询（默认关）；studio「系统插件」页提供
   可视化选择性重载面
