@@ -1,9 +1,8 @@
 """
 NLG (Natural Language Generation) stage — reply wording generation.
 
-Supports NLG processing for both FSM and ROUTE module types:
-- FSMNLG  : reply generation within finite state machine modules
-- RouteNLG: reply generation for top-level route modules
+Supports NLG processing for FSM patterns:
+- FSMNLG  : reply generation within finite state machine patterns
 
 LLM call chain: config/local_config.yaml → build_provider → chat_completion.
 """
@@ -79,11 +78,11 @@ class BaseNLG(PipelineStage, ABC):
         return content
 
     # ------------------------------------------------------------------
-    # Prompt template selection (priority: node > module > default)
+    # Prompt template selection (priority: node > default)
     # ------------------------------------------------------------------
 
     def _resolve_prompt_template(self, cxt: DialogueContext) -> str:
-        """Resolve the prompt template by priority: node > module > class default."""
+        """Resolve the prompt template by priority: node > class default."""
         system_prompt = resolve_prompt_template(
             cxt, "base_nlg_prompt", self._default_prompt_template()
         )
@@ -97,7 +96,7 @@ class BaseNLG(PipelineStage, ABC):
 
     # ------------------------------------------------------------------
     # Template filling — slot name → data-layer formatting mapping
-    # (assembled in node.py / module.py / base.py; this layer only maps)
+    # (assembled in node.py / context.py; this layer only maps)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -137,13 +136,13 @@ class BaseNLG(PipelineStage, ABC):
 
 
 # ============================================================================
-# FSM module NLG
+# FSM NLG
 # ============================================================================
 
 class FSMNLG(BaseNLG):
-    """NLG implementation for FSM modules — reply generation within the state machine.
+    """NLG implementation for FSM patterns — reply generation within the state machine.
 
-    Uses ``FSM_NLG_DEFAULT_PROMPT`` as the default template; node/module level override supported.
+    Uses ``FSM_NLG_DEFAULT_PROMPT`` as the default template; node level override supported.
     """
 
     stage_name = "fsm_nlg"

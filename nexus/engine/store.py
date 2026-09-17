@@ -215,7 +215,7 @@ class SessionStore:
             self, session: Session,
             expected_epoch: Optional[int] = None) -> None:
         """Write back the end-of-turn sessions state snapshot
-        (module/node/slots/last-active time).
+        (node position / graph_state / slots / last-active time).
 
         Message appending has moved to ``append_message`` (per-message
         write-through once attached); this method no longer touches the
@@ -441,7 +441,7 @@ class SessionStore:
 
         Returns:
             List of ``(Session, wall-clock last_active_at)``. Session.pattern
-            is None and node_map/module_map are empty — resolved and injected
+            is None and node_map is empty — resolved and injected
             by the caller from the registries.
         """
         cutoff = time.time() - ttl_seconds

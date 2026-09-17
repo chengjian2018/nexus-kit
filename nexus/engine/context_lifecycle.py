@@ -7,9 +7,7 @@ the policy into declarative sets: change the set and you change the policy — n
 
 Four field categories (see the TurnLifecycle class attributes):
 - PERSISTENT     : never deleted across turns (the session state itself)
-- PER_TURN_RESET : reset at the start of every turn (this turn's temporary output; never reset
-                   between hops — jump events in actions rely on surviving within the turn until
-                   the hop loop consumes them)
+- PER_TURN_RESET : reset at the start of every turn (this turn's temporary output)
 - INCREMENTAL    : incremental updates (history appends, filled_slots merges); this module provides the entry points
 - STAGE_MANAGED  : self-managed by the stage mechanism; the lifecycle layer never touches them
 """
@@ -26,8 +24,9 @@ class TurnLifecycle:
     """The single owner of DialogueContext field lifecycle.
 
     Call-order contract (the chat-layer orchestrator is responsible for honoring it):
-    1. ``begin_turn``   — exactly once per turn, before the hop loop (including same-turn jump re-entry hops)
-    2. ``merge_slots``  — on demand during FSM/ROUTE transition (incrementally merges nlu slots)
+    1. ``begin_turn``   — exactly once per turn, before the turn's executor
+                           runs (FSM stages / AGENT graph runtime)
+    2. ``merge_slots``  — on demand during the FSM end-of-turn transition (incrementally merges nlu slots)
     3. ``end_turn``     — exactly once per turn, after the reply is produced
 
     The set is the policy: to change a field's category, edit the declaration below — no flow code changes.
@@ -85,12 +84,12 @@ class TurnLifecycle:
     def begin_turn(self, cxt: DialogueContext, user_query: str) -> None:
         """Turn start: overwrite user_query, reset per-turn fields, clear stage-managed bookkeeping.
 
-        Must be called exactly once per turn (before the hop loop); never between hops —
-        jump events in actions must survive within the turn until the hop loop consumes them.
+        Must be called exactly once per turn (before the turn's executor
+        runs; never mid-run — it would wipe this turn's in-flight output).
 
         Also snapshots ``turn_history_start = len(history)`` (the length before adding the user
         message): default_build_messages uses it to split cross-turn history / explicit query /
-        this turn's in-hop rows. That marker is a turn marker derived by begin_turn and does not
+        this turn's graph-run rows. That marker is a turn marker derived by begin_turn and does not
         belong to the four categories below.
         """
         cxt.user_query = user_query
@@ -121,8 +120,8 @@ class TurnLifecycle:
     def merge_slots(self, cxt: DialogueContext, slots: Dict[str, Any]) -> None:
         """Incremental merge: nlu slots merged into filled_slots (later writes override the same key).
 
-        Shared by the FSM/ROUTE transition stages; consolidates the two duplicate copies
-        previously in the chat layer.
+        Used by the FSM end-of-turn transition (chat._fsm_node_transition);
+        consolidates the two duplicate copies previously in the chat layer.
         """
         if slots:
             cxt.filled_slots.update(slots)

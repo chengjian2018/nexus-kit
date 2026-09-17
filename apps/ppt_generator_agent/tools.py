@@ -161,7 +161,7 @@ DEFAULT_CATEGORY = "默认"
 
 def suggest_category(query: str) -> str:
     """Deterministic category suggestion for a PPT topic (keyword table,
-    table order = priority; falls back to 默认)."""
+    table order = priority; falls back to the default category, "默认")."""
     query_lower = (query or "").lower()
     for category, keywords in CATEGORY_KEYWORDS:
         for keyword in keywords:
@@ -173,8 +173,8 @@ def suggest_category(query: str) -> str:
 def pick_theme_for_category(themes: List[Dict[str, Any]],
                             category: str) -> Optional[Dict[str, Any]]:
     """Pick a random theme of ``category`` (weighted toward specific styles
-    over 默认, mirroring the source skill's weighted selection); None when
-    nothing matches at all."""
+    over the default category "默认", mirroring the source skill's weighted
+    selection); None when nothing matches at all."""
     categorized: Dict[str, List[Dict[str, Any]]] = {}
     for theme in themes:
         style_names = theme.get("style_name_list") or []
@@ -190,7 +190,8 @@ def pick_theme_for_category(themes: List[Dict[str, Any]],
         return random.choice(pool)
 
     # Category empty → weighted random across whatever exists (specific
-    # styles weigh 2.0, 默认 weighs 0.5 — source skill's weighting)
+    # styles weigh 2.0, the default category "默认" weighs 0.5 — source
+    # skill's weighting)
     available = [(cat, items) for cat, items in categorized.items() if items]
     if not available:
         return None

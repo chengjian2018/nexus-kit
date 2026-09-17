@@ -335,7 +335,7 @@ class LLMRecallPath(RecallPath):
             logger.warning("LLMRecallPath '%s' 未配置 call_llm，返回空结果", self.name)
             return []
 
-        # node/module-level override resolved by the orchestrator takes priority
+        # node-level override resolved by the orchestrator takes priority
         template = kwargs.pop("prompt_template", None) or self._prompt_template
 
         slots = {
@@ -1205,13 +1205,13 @@ class MultiPathRecaller(PipelineStage):
                     self._auto_injected.append(self._reranker)
 
     # ------------------------------------------------------------------
-    # Prompt template selection (priority: node > module > default)
+    # Prompt template selection (priority: node > default)
     # ------------------------------------------------------------------
 
     def _resolve_prompt_template(self, ctx: DialogueContext) -> Optional[str]:
         """Resolve the recall prompt template by priority.
 
-        Priority: node level > module level > None (use each path's built-in template).
+        Priority: node level > None (use each path's built-in template).
         """
         return resolve_prompt_template(ctx, "base_recall_prompt", None)
 
@@ -1257,7 +1257,7 @@ class MultiPathRecaller(PipelineStage):
         # Inject/refresh LLM callbacks per the current ctx's llm_config
         self._inject_llm_callbacks(ctx.llm_config)
 
-        # Resolve node/module-level recall prompt override and slot values once per execute
+        # Resolve node-level recall prompt override and slot values once per execute
         prompt_template = self._resolve_prompt_template(ctx)
         prompt_slots = self._build_prompt_slots(ctx)
 

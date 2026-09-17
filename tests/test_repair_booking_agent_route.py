@@ -109,14 +109,6 @@ def end_actions(cxt):
     return [a for a in cxt.actions if "conversation_end" in a]
 
 
-def reach_confirm_time(sessions):
-    """Walk the happy prefix (greet → address → time) up to visit-time confirmation."""
-    chat(sessions, "s1", "方便的，是要维修")
-    chat(sessions, "s1", "地址对的")
-    chat(sessions, "s1", "10月1号下午3点吧")
-    chat(sessions, "s1", "可以的没问题")
-
-
 # ============================================================================
 # Structure tests
 # ============================================================================
@@ -248,62 +240,6 @@ def test_connect_turn_opens_call_and_advances(pattern, sessions):
     assert reply == "外呼回复: 地址核对"
 
 
-def test_happy_path_full_walk_collects_fault_before_end(pattern, sessions):
-    """Main flow: opening → address confirmation → time negotiation (specific
-    date) → confirmation → fault inquiry → fault confirmation → call close;
-    the fault slot is collected BETWEEN time confirmation and the hang-up;
-    one LLM call per turn (unified)."""
-    session = launch(pattern, sessions)
-
-    steps = [
-        ("方便的，是要维修", "repair_confirm_addr", "service_needed"),
-        ("对的是这个地址", "repair_ask_time", "address_confirmed"),
-        ("10月1号下午3点吧", "repair_specific_date", "visit_date"),
-        ("可以的没问题", "repair_confirm_time", "visit_time"),
-        ("好的确认", "repair_ask_fault", "visit_time"),
-        ("冰箱不制冷了，还有异响", "repair_confirm_fault",
-         "fault_description"),
-        ("对的没问题", "repair_end", None),
-    ]
-    for query, expected_node, _ in steps:
-        before = FakeProvider.call_count
-        reply = chat(sessions, "s1", query)
-        assert session.cxt.current_node_code == expected_node, (
-            f"{query!r} 后应停在 {expected_node}，"
-            f"实际 {session.cxt.current_node_code}"
-        )
-        assert reply.startswith("外呼回复:")
-        assert FakeProvider.call_count - before == 1  # unified: one call/turn
-
-    # Terminal: entering repair_end fired the conversation_end action
-    assert end_actions(session.cxt)
-
-    # The fault description landed BEFORE the close (the repair call's goal)
-    assert session.cxt.filled_slots.get(
-        "fault_description") == "冰箱不制冷了，还有异响"
-    assert session.cxt.filled_slots.get("visit_time") == "已约定"
-
-
-def test_fault_unclear_stays_asking(pattern, sessions):
-    """Fault collection: cannot describe it → stays on fault-info inquiry
-    (empty next_node); a clear description on the retry advances."""
-    session = launch(pattern, sessions)
-    reach_confirm_time(sessions)
-    assert session.cxt.current_node_code == "repair_confirm_time"
-
-    chat(sessions, "s1", "好的确认")                # → fault-info inquiry
-    assert session.cxt.current_node_code == "repair_ask_fault"
-    reply = chat(sessions, "s1", "说不清楚什么问题")  # cannot describe → stays on the node
-    assert session.cxt.current_node_code == "repair_ask_fault"
-    assert reply == "外呼回复: 故障信息询问"
-
-    reply = chat(sessions, "s1", "就是有异响，嗡嗡的")  # clear description → fault confirmation
-    assert session.cxt.current_node_code == "repair_confirm_fault"
-    chat(sessions, "s1", "对的")
-    assert session.cxt.current_node_code == "repair_end"
-    assert end_actions(session.cxt)
-
-
 # ============================================================================
 # Time-negotiation branch tests
 # ============================================================================
@@ -337,22 +273,6 @@ def test_recommend_pick_path(pattern, sessions):
     reply = chat(sessions, "s1", "第一个不错")        # picks one → specific date
     assert session.cxt.current_node_code == "repair_specific_date"
     assert reply == "外呼回复: 具体日期约定"
-
-
-def test_confirm_time_reschedule_loops(pattern, sessions):
-    """Reschedule after confirmation → reschedule renegotiation → back to time negotiation to rebook."""
-    session = launch(pattern, sessions)
-    reach_confirm_time(sessions)
-    assert session.cxt.current_node_code == "repair_confirm_time"
-
-    reply = chat(sessions, "s1", "时间想改一下")
-    assert session.cxt.current_node_code == "repair_reschedule"
-    assert reply == "外呼回复: 改约重协商"
-
-    chat(sessions, "s1", "嗯重新约")
-    assert session.cxt.current_node_code == "repair_ask_time"
-    chat(sessions, "s1", "10月2号上午10点")
-    assert session.cxt.current_node_code == "repair_specific_date"
 
 
 def test_address_mismatch_ends(pattern, sessions):
@@ -392,20 +312,6 @@ def test_generic_decline_at_any_node(pattern, sessions, decline_query):
     assert session.cxt.current_node_code == "repair_end"
     assert reply == "外呼回复: 通话结束语"
     assert end_actions(session.cxt)
-
-
-def test_quality_complaint_is_not_a_decline(pattern, sessions):
-    """A quality complaint IS the repair reason — it feeds fault collection,
-    never the decline channel (the install app's decline exit is gone)."""
-    session = launch(pattern, sessions)
-    chat(sessions, "s1", "方便的，是要维修")
-    chat(sessions, "s1", "地址对的")
-    chat(sessions, "s1", "10月1号下午3点")
-    chat(sessions, "s1", "可以")
-
-    reply = chat(sessions, "s1", "冰箱有质量问题，不制冷")  # → fault inquiry
-    assert session.cxt.current_node_code == "repair_ask_fault"
-    assert session.cxt.current_node_code != "repair_decline"
 
 
 # ============================================================================

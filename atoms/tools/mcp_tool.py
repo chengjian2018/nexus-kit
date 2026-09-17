@@ -1,5 +1,6 @@
 """MCP tool bootstrap — import side effect: read the ``mcp_servers``
-config, connect each server in the background, and dynamically register
+config, record each server for background connection (the connections are
+spawned by ``ensure_started``), and dynamically register
 the tools into ToolRegistry (toolset=``mcp-<server>``).
 
 The module-level ``registry.register(mcp_list_tools)`` at the top of this
@@ -66,8 +67,8 @@ registry.register(
 # ============================================================================
 
 def bootstrap_mcp() -> None:
-    """Read the ``mcp_servers`` config and start the MCP manager's
-    background connections.
+    """Read the ``mcp_servers`` config and record the servers in the MCP
+    manager (the background connections are spawned by ``ensure_started``).
 
     No-op across the whole chain when: ``NEXUS_MCP_DISABLED`` is set (test
     isolation — pytest run from the repo root would probe CWD into the

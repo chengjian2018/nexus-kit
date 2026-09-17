@@ -1,0 +1,41 @@
+pattern: session_reviewer    # 必填，绑定 pattern code
+
+llm:                          # pattern 级默认，全体节点继承
+  temperature: 0.2            # 词表：code/model/temperature/max_tokens/
+  max_tokens: 8000            #   enable_thinking/timeout/max_retries
+
+nodes:                        # node 级细化：只开放 llm 与 loop.max_tool_rounds
+  sr_review:                  # 评审站质量敏感：低温度 + 大输出预算。
+    llm: {temperature: 0.1, max_tokens: 12000}
+                              # 部署 pin 强模型示例（code 与 model 必须一起写）：
+                              # llm: {code: zai, model: <强模型名>, temperature: 0.1, max_tokens: 12000}
+  sr_apply:                   # 编辑对起草：old_string 逐字契约，低温度防漂移
+    llm: {temperature: 0.1, max_tokens: 16000}
+  sr_fixloop:
+    llm: {temperature: 0.1, max_tokens: 16000}
+  # 未列出的节点整体继承 pattern 级
+
+loop:                         # pattern 级循环预算
+  max_tool_rounds: 6
+  max_steps: 16               # 最坏诚实走位 ≈ 10 步（含自修自环），16 留余量
+
+compression:
+  threshold: 6000
+  retain_count: 12
+
+guardrails:                   # 键名与全局段同名，字段级合并覆盖
+  shell_tool:
+    timeout_seconds: 300      # 白名单 pytest 回归需要长超时
+
+config:                       # 自由 bag：app 自定义参数收口
+  workspace_root: data/session_reviewer_agent
+  auto_approve: false         # true = 跳过 sr_wait_human 人工闸，直入实施环节
+  fix_rounds: 2               # sr_fixloop 自修轮数上限（0 = 失败即回滚）
+  review_retries: 1           # 评审 JSON 解析失败自纠重试
+  run_tests: true             # 实施后是否跑白名单 pytest
+  reload_url: http://127.0.0.1:8000/api/v1/reload
+                              # 实施成功后 best-effort 热加载目标 pattern；
+                              # 置空字符串禁用（离线/测试环境）
+  # session_db_path: data/dialogue.db   # 待评审会话库（默认取全局 session_db_path）
+  # apps_root: apps                     # pattern_code → app 目录反查根
+  # tests_root: tests                   # 白名单测试目录

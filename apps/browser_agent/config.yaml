@@ -1,0 +1,31 @@
+pattern: browser_agent       # 必填，绑定 pattern code
+
+llm:                         # pattern 级默认：计划/修复是结构化输出，低温
+  temperature: 0.2
+  max_tokens: 8000
+
+nodes:                       # node 级细化：计划/修复两站温度钉 0（协议稳定性）
+  ba_plan:
+    llm: {temperature: 0.0}
+  ba_repair:
+    llm: {temperature: 0.0}
+  # ba_run / ba_report 无 LLM 调用，不需要细化
+
+loop:                        # pattern 级循环预算
+  max_tool_rounds: 6         # ba_run 每次访问只跑一条 bash（预算富余即可）
+  max_steps: 20              # 最差诚实走线 ~16 步（plan + 4引擎×2尝试 +
+                             # 2次修复后重跑 + ≤2次人工接管恢复 + report）
+
+guardrails:                  # 单次引擎尝试的 shell 预算：浏览器动作链
+  shell_tool:                # （goto 30s + 滚动/抽取/截图）60s 默认值不够；
+    timeout_seconds: 300     # 超时 SIGKILL 整个进程组，按 network_or_timeout 路由
+
+config:                      # 自由 bag：app 自定义参数收口
+  workspace_root: data/browser_agent
+  max_attempts_per_engine: 2   # 源 skill 默认：每引擎 2 次尝试
+  repair_rounds: 2             # 全局修复预算（selector 漂移等）
+  plan_retries: 1              # 计划 JSON 自纠重试
+  max_human_takeovers: 2       # 登录墙/验证码 wait_human 次数上限
+  install_missing: false       # 引擎依赖缺失时不自动安装（诚实报告安装
+                               # 提示）；确需自动装时置 true（传
+                               # --install-missing 给 orchestrator）

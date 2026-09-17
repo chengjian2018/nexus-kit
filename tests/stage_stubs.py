@@ -17,7 +17,7 @@ _counter = itertools.count()
 def register_stage_stub(stage_cls, prefix="stub"):
     """Register a stage class (or any zero-arg factory) under a unique code.
 
-    Returns the code to declare in stages / node.stages / module.stages.
+    Returns the code to declare in stages / node.stages.
     """
     code = f"{prefix}_{next(_counter)}"
     registry.register("stage", code, stage_cls)

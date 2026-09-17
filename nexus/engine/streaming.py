@@ -7,17 +7,17 @@ the non-streaming entry's behavior is byte-identical (the aggregation
 equivalence is what the tests pin).
 
 Event kinds:
-- "delta": a text increment of the in-flight module's reply (optimistic
+- "delta": a text increment of the in-flight node's reply (optimistic
   forwarding — see the caveat below)
 - "thinking": a thinking-model reasoning increment (LLMChunk.reasoning —
   the model's intermediate thought, never part of the reply); real-time
   consumers render it separately, aggregation ignores it
 - "round": an agent-loop round boundary with its outcome
-  ({"outcome": "tool"|"final"|"transfer"|"max_rounds", "round_idx": n})
-- "trace": a state-transition observability event (jump routing / node
-  transitions / tool calls — see TraceEvent; emitted only when state
-  actually changes, never per-turn unconditionally, so existing exact
-  event-sequence pins stay intact)
+  ({"outcome": "tool"|"final"|"max_rounds", "round_idx": n})
+- "trace": a state-transition observability event (node transitions / tool
+  calls — see TraceEvent; emitted only when state actually changes, never
+  per-turn unconditionally, so existing exact event-sequence pins stay
+  intact)
 - "done": the terminal event; ``result`` holds the authoritative ChatResult
 
 Optimistic-forwarding caveat: OpenAI's finish_reason only arrives at a
@@ -49,16 +49,16 @@ logger = logging.getLogger(__name__)
 current_emitter: ContextVar[Optional["StreamEmitter"]] = ContextVar(
     "nexus_current_emitter", default=None)
 
-# Reply text already forwarded as deltas during THIS module's stage run
+# Reply text already forwarded as deltas during THIS node's stage run
 # (unified reply-field tap / plain NLG stream). Executors read it to avoid
 # double-emitting the reply after stages complete; _run_stages resets it
-# per module execution.
+# per node execution.
 current_streamed_reply: ContextVar[str] = ContextVar(
     "nexus_current_streamed_reply", default="")
 
 
 def reset_streamed_reply() -> None:
-    """Zero the streamed-reply marker (start of each module execution)."""
+    """Zero the streamed-reply marker (start of each node execution)."""
     current_streamed_reply.set("")
 
 
@@ -246,7 +246,7 @@ async def aggregate_turn(events: AsyncGenerator[ChatStreamEvent, None]
 
 
 # ---------------------------------------------------------------------------
-# Stage-level LLM streaming (reply forwarding for FSM/ROUTE pipelines)
+# Stage-level LLM streaming (reply forwarding for FSM stage pipelines)
 # ---------------------------------------------------------------------------
 
 class ReplyFieldTap:
@@ -423,7 +423,7 @@ async def stream_llm_reply(chunks: AsyncGenerator[Any, None],
       (ReplyFieldTap). Raw JSON of other fields never leaks.
 
     Also records what was forwarded into ``current_streamed_reply`` so the
-    fsm/route executors skip re-emitting an identical complete reply. When
+    fsm executor skips re-emitting an identical complete reply. When
     no emitter is attached (non-streaming turn / tests), this is just a
     plain aggregation — callers fall back to it transparently.
     """

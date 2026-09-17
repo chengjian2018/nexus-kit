@@ -137,7 +137,8 @@ class DialogueContext:
 
     # Index of this turn's user row in history (snapshot taken by begin_turn
     # before adding the user message; default_build_messages uses it to split
-    # cross-turn history / explicit query / rows appended within this turn's hops)
+    # cross-turn history / explicit query / rows appended within this turn's
+    # graph run)
     turn_history_start: int = 0
 
     # Per-message write-through persistence hook (injected by SessionStore.attach;
@@ -326,7 +327,8 @@ class DialogueContext:
     # ------------------------------------------------------------------
 
     def format_nlg_next_node(self, stage: str = "nlg") -> str:
-        """Format the current node as prompt-ready text (slot: cur_node).
+        """Format the next node (resolved from nlu_result.next_node) as
+        prompt-ready text.
 
         Stage-specific variants — NLU and NLG need different facets of the node:
         - "nlu": name + todo description + slot definitions (what to collect/decide)

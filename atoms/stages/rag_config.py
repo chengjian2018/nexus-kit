@@ -46,7 +46,7 @@ path). A missing file = zero behavior change (the builtin default
 assembly stays as-is); an existing file is applied at startup by
 ``load_and_apply_rag_config()`` (called at the host.main assembly point).
 
-Effective scope (as-is): modules whose clarify slot declares
+Effective scope (as-is): patterns whose clarify slot declares
 ``rag_clarify`` / ``clarify_default`` / ``builtin:clarify``. The
 install/repair FAQ clarify (``install_clarify`` / ``repair_clarify``) is
 the apps' own keyword-gated assembly, not governed by this config.
@@ -408,7 +408,7 @@ def apply_rag_config(cfg: Dict[str, Any]) -> List[str]:
     Three registration slots (deregister clears the instance cache → the
     next turn's resolve rebuilds):
     - ``rag_clarify``        for explicit declarations (referencable
-                             directly from pattern yml / module stages);
+                             directly from pattern yml / node stages);
     - ``clarify_default``    overrides the atoms builtin default assembly
                              (whose recall paths are empty);
     - stage_factory clarify  the builtin:clarify fallback factory,

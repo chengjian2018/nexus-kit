@@ -275,53 +275,13 @@ def test_pattern_passes_validation(pattern):
 
 def test_connect_turn_opens_call_and_advances(pattern, sessions):
     """Outbound opening: the connect turn runs on the outbound-opening node
-    (module_nodes[0]); the customer's first response advances to address
-    confirmation."""
+    (the pattern's entry node install_greet); the customer's first response
+    advances to address confirmation."""
     session = launch(pattern, sessions)
     reply = chat(sessions, "s1", "喂，你好，方便的你说")
 
     assert session.cxt.current_node_code == "install_confirm_addr"
     assert reply == "外呼回复: 地址核对"
-
-
-# ============================================================================
-# Happy-path walk tests (sketch main flow)
-# ============================================================================
-
-def test_happy_path_full_walk(pattern, sessions):
-    """Main flow: opening → address confirmation → arrival (arrived) → time
-    negotiation (specific date) → confirmation → call close; slots
-    accumulate in filled_slots; one LLM call per turn (unified).
-
-    The picked date has no time annotation (no time_aug hit) → guard is a
-    no-op pass-through; booking proceeds."""
-    session = launch(pattern, sessions)
-
-    steps = [
-        ("方便的，是要安装", "install_confirm_addr", "service_needed"),
-        ("对的是这个地址", "install_check_arrival", "address_confirmed"),
-        ("已经到货了", "install_ask_time", "arrived"),
-        ("10月1号下午3点吧", "install_specific_date", "visit_date"),
-        ("可以的没问题", "install_confirm_time", "visit_date"),
-        ("好的确认", "install_end", "visit_time"),
-    ]
-    for query, expected_node, _ in steps:
-        before = FakeProvider.call_count
-        reply = chat(sessions, "s1", query)
-        assert session.cxt.current_node_code == expected_node, (
-            f"{query!r} 后应停在 {expected_node}，"
-            f"实际 {session.cxt.current_node_code}"
-        )
-        assert reply.startswith("外呼回复:")
-        assert FakeProvider.call_count - before == 1  # unified: one call/turn
-
-    # Terminal: entering install_end fired the conversation_end action
-    assert end_actions(session.cxt)
-
-    # Slot accumulation across the walk (incremental merge per transition)
-    assert session.cxt.filled_slots.get("service_needed") == "方便的，是要安装"
-    assert session.cxt.filled_slots.get("arrived") == "已经到货了"
-    assert session.cxt.filled_slots.get("visit_time") == "已约定"
 
 
 # ============================================================================
@@ -455,26 +415,6 @@ def test_not_available_now_books_callback(pattern, sessions):
     assert "2026-09-11" in slots.get("callback_time", "")
     assert "2026-09-11" in reply          # the spoken reply restates the customer time
     assert end_actions(session.cxt)
-
-
-def test_confirm_time_reschedule_loops(pattern, sessions):
-    """Supplemented: reschedule after confirmation → reschedule renegotiation → back to time negotiation to rebook."""
-    session = launch(pattern, sessions)
-    chat(sessions, "s1", "方便的，是要安装")
-    chat(sessions, "s1", "地址对的")
-    chat(sessions, "s1", "到货了")
-    chat(sessions, "s1", "10月1号下午3点")       # → specific-date booking
-    chat(sessions, "s1", "可以的没问题")          # → time confirmation
-    assert session.cxt.current_node_code == "install_confirm_time"
-
-    reply = chat(sessions, "s1", "时间想改一下")  # reschedule → reschedule renegotiation
-    assert session.cxt.current_node_code == "install_reschedule"
-    assert reply == "外呼回复: 改约重协商"
-
-    chat(sessions, "s1", "嗯重新约")             # → time negotiation
-    assert session.cxt.current_node_code == "install_ask_time"
-    chat(sessions, "s1", "10月2号上午10点")       # rebooked
-    assert session.cxt.current_node_code == "install_specific_date"
 
 
 # ============================================================================

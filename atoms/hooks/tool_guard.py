@@ -37,7 +37,7 @@ guard)::
 
     Pattern(..., plugins={"agent_hooks": "tool_guard"}, ...)
 
-Config section ``tool_guard`` (optional, see local_config.example.yaml):
+Config section ``tool_guard`` (optional, see host/config/local_config.yaml):
 enabled / llm_fallback / llm_max_input_chars / llm_max_queue /
 llm_timeout_seconds / llm (``llm`` is a judge-model override layered on top
 of the ambient connection — point it at a cheap small model).

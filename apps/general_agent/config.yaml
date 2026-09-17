@@ -1,0 +1,12 @@
+pattern: general_agent     # 必填，绑定 pattern code
+
+llm:                       # pattern 级默认，单节点整体继承
+  code: zai                # 换 provider：code 与 model 必须一起写
+  model: glm-5.3           # 通用 Agent 主力模型（默认全局为 glm-5.3-flash）
+  temperature: 0.7
+  max_tokens: 100000
+  enable_thinking: true
+
+
+loop:                      # pattern 级循环预算
+  max_tool_rounds: 50      # 通用 Agent 单轮任务跨度大，放宽全局默认 10 → 50

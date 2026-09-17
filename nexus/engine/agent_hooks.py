@@ -75,7 +75,7 @@ class AgentStartEvent:
 
     cxt is passed by reference (read-only discipline): the hook reads slots/metadata from it to
     decide what data to fetch but does not write back — injected output travels only via the
-    return value, avoiding cross-turn/cross-hop state leakage.
+    return value, avoiding cross-turn state leakage.
     """
 
     session_id: str

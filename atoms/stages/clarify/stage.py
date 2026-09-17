@@ -1,6 +1,6 @@
 """ClarifyStage — integrated dual-track clarify stage (discrimination + retrieval + gating + generation).
 
-Insertion point: the clarify slot in the pipeline skeleton (only modules declaring
+Insertion point: the clarify slot in the pipeline skeleton (only patterns/nodes declaring
 the clarify slot in stages get it resolved in).
 
 Execution flow (see spec 5.1 for details):
@@ -137,7 +137,7 @@ class ClarifyStage(PipelineStage):
         # 1. Per-turn reset (prevent cross-turn residue)
         ctx.metadata["clarify"] = {"triggered": False}
 
-        # 2. Trigger check (the module switch is guaranteed by the pipeline
+        # 2. Trigger check (the stages-declaration switch is guaranteed by the pipeline
         # assembly side; the stage only looks at intent)
         if not self._is_triggered(ctx):
             return ctx

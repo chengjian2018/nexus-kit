@@ -26,7 +26,7 @@ Slot = Tuple[datetime, datetime, str]
 _DATE = r"\d{4}-\d{2}-\d{2}"
 _CLOCK = r"\d{2}:\d{2}"
 
-# Annotation grammar as produced by atoms.augmentation.augment_time._render:
+# Annotation grammar as produced by atoms.augmentation.time_augment._render:
 #   (2026-09-10)                          whole day
 #   (15:00) / (15:00~17:00)               today (date omitted)
 #   (2026-09-10 15:00~17:00)              same-day range

@@ -139,8 +139,8 @@ def _unified(node_name: str, query: str, retry: bool, prompt: str = "") -> str:
             ensure_ascii=False,
         )
     if "硬造澄清意图" in query:
-        # Simulates a module without clarify enabled emitting a clarify signal,
-        # for the allowed-set hard-guard test
+        # Simulates a node without the clarify slot declared emitting a
+        # clarify signal, for the allowed-set hard-guard test
         return json.dumps(
             {
                 "reply": "统一回复: 硬造澄清",

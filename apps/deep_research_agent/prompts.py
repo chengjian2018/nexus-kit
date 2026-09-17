@@ -1,7 +1,7 @@
 """Prompt constants of deep_research_agent.
 
-Five-way division of labor:
-- ``DEEP_RESEARCH_BASE_PROMPT``: module.base_prompt (into the system
+Six-way division of labor:
+- ``DEEP_RESEARCH_BASE_PROMPT``: node.base_prompt (into the system
   base) — role and report discipline, shared by all phases
 - ``PREPLAN_SEARCH_PROMPT``: the PREPLAN phase's user instruction (the
   model itself decides whether to run a retrieval round first; anchor

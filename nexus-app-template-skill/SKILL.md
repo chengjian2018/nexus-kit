@@ -1,46 +1,59 @@
 ---
 name: nexus-app-template-builder
-description: 把业务需求（正向）或现有 apps/ 应用（逆向）转成 nexus-kit 应用模板，写入模板知识库 app-templates/——不实现任何插件与工具，插件位置以「处理步骤卡 / 工具描述卡」的简短描述占位。当用户想为模板知识库新增条目、只要应用蓝图不要实现、或把现有应用逆向沉淀为可复用模板时使用。
+description: Turn a business requirement (forward) or an existing apps/ application (reverse) into a nexus-kit application template entry in the app-templates/ knowledge base — nothing is implemented; plugin and tool positions are placeholders written as short "processing-step cards" / "tool description cards". Use when the user wants to add an entry to the template library, wants an application blueprint without implementation, or wants to distill an existing app into a reusable template.
 ---
 
 # nexus-app-template-builder
 
-把业务需求转成 nexus-kit 应用**模板**：一张 Pattern 图（节点/边/图类型）
-加上一组**以描述占位的插件**（executor / stage / tool 的位置写"处理步骤
-卡"或"工具描述卡"，不写实现代码），落成模板知识库 `app-templates/` 的
-一个条目。模板是知识库资产：结构一致、单文件自包含、机器可校验，后续
-任何实现者（人或 agent）照卡即可落地代码。
+Turn a business requirement into a nexus-kit application **template**: one
+Pattern graph (nodes/edges/graph type) plus a set of **description-placeholder
+plugins** (executor / stage / tool positions written as "processing-step
+cards" or "tool description cards", never implementation code), landing as
+one entry of the template knowledge base `app-templates/`. A template is a
+knowledge-base asset: structurally uniform, single-file self-contained,
+machine-verifiable — any later implementer (human or agent) builds the code
+straight from the cards.
 
-本 skill 完全自持：框架知识在自有 `references/` 里，结构校验脚本在
-`references/verify_template.py`，不依赖仓库内其他 skill 的资产。
+This skill is fully self-contained: framework knowledge lives in its own
+`references/`, the structure-gate script is
+`references/verify_template.py`; it depends on no other skill's assets in
+this repo.
 
-全程自主推进，不等确认；但 Phase 1 选型陈述与 Phase 2 五件套仍是强制
-产物——图类型选错或节点交互表缺失，模板就整体作废。
+Drive forward autonomously, never waiting for confirmation; but the Phase 1
+decision statement and the Phase 2 five artifacts remain mandatory outputs —
+a wrong graph type or a missing node interaction table invalidates the whole
+template.
 
-## 框架参考（自有 references/，路径相对本目录）
+## Framework references (own references/, paths relative to this directory)
 
-| 文件 | 覆盖 |
+| File | Covers |
 |---|---|
-| `references/architecture.md` | 分层、两种图类型（fsm/agent）的运行时语义 |
-| `references/pattern-schema.md` | Pattern/BaseNode 字段表、YAML 形态 |
-| `references/plugin-and-tool-guide.md` | 插件契约、能力分诊三路由 |
-| `references/template-index.md` | app-templates/ 知识库条目 → 业务形态/可借用纪律映射 |
-| `references/pitfalls.md` | 节点交互表模板、graph_state 规则、循环继承 |
-| `references/verify_template.py` | 结构闸校验脚本（Phase 4 用） |
+| `references/architecture.md` | Layering; runtime semantics of both graph types (fsm/agent) |
+| `references/pattern-schema.md` | Pattern/BaseNode field tables, YAML shape |
+| `references/plugin-and-tool-guide.md` | Plugin contracts; the three capability-triage routes |
+| `references/template-index.md` | app-templates/ knowledge-base entries → business shape / borrow-discipline mapping |
+| `references/pitfalls.md` | Node interaction table template, graph_state rules, loop inheritance |
+| `references/verify_template.py` | Structure-gate validation script (used in Phase 4) |
 
-CLI 交叉核对：`python nexus-introspect-skill/introspect.py apps` /
-`pattern <code> --view yaml` / `plugin executor <code>`——源码是唯一事实。
+Cross-check with the CLI: `python nexus-introspect-skill/introspect.py apps`
+/ `pattern <code> --view yaml` / `plugin executor <code>` — source code is
+the only truth.
 
-## 知识库布局
+## Knowledge-base layout
 
 ```
 app-templates/
-├── INDEX.md                       # 总目录：code/名称/业务形态/图类型/来源
-└── <code>/                        # 每模板一目录（code = pattern code）
-    └── TEMPLATE.md                # 单文件自包含条目
+├── INDEX.md                       # master catalog: code/name/business shape/graph type/source
+└── <code>/                        # one directory per template (code = pattern code)
+    └── TEMPLATE.md                # single-file self-contained entry
 ```
 
-## TEMPLATE.md 章节骨架（强制，顺序固定）
+## TEMPLATE.md section skeleton (mandatory, fixed order)
+
+> The skeleton's Chinese section and card headings are **machine-grepped
+> anchors** — verify_template.py matches them verbatim. Copy them into
+> TEMPLATE.md exactly as shown; never translate or reword them. Free text
+> inside tables and cards may be written in any language.
 
 ```markdown
 # <code> — <名称>（应用模板）
@@ -83,114 +96,174 @@ stage / executor / messages_builder / agent_hooks；**内置件被引用也要
 （给未来实现者的提示：时序陷阱、预算、密钥来源、测试范式等）
 ```
 
-四级标题格式（`#### 插件卡：<code>（<kind>）`、`#### 工具卡：<name>（<toolset>）`）
-是机器可 grep 的契约，verify_template.py 靠它做卡片覆盖校验，**不得变体**。
+Skeleton legend (English):
 
-Pattern 声明 YAML 块写**精简声明**：code / name / description /
-pattern_type / entry_node_code / stages（fsm）/ nodes（code、name、
-description、task_description、sub_nodes、slots、is_end、plugins）。
-不放大段 prompt 文本（prompts 属实现，写入实现注意事项即可引用）。
+- `## 节点清单` — node list: table of code / name / purpose / sub_nodes / is_end.
+- `## 节点交互表` — node interaction table: one row per node — reads
+  graph_state / writes graph_state / out-edges & routing; every loop MUST
+  state its checkpoint & experience-inheritance strategy; a
+  loop-inheritance paragraph may follow the table.
+- `## Pattern 声明` — Pattern declaration: one ```yaml fenced block whose
+  first line MUST be the marker comment `# nexus-pattern: <code>`; this is
+  verify_template.py's extraction anchor.
+- `## 插件步骤卡` — plugin step cards: one `#### 插件卡：<code>（<kind>）`
+  H4 per card; kind ∈ stage / executor / messages_builder / agent_hooks;
+  builtin parts being referenced also get a card (binding marked "builtin").
+  Fixed fields per card: binding (绑定位置) / when it runs (触发时机) /
+  reads (读) / processing steps (处理步骤 — a few free-form sentences on
+  what it does and how; the core placeholder description implementers build
+  from) / writes (写) / out-edge impact (出边影响 — whether/how it rewrites
+  next_node and the reply).
+- `## 工具描述卡` — tool description cards: one `#### 工具卡：<name>（<toolset>）`
+  H4 per card; fixed fields: purpose / parameters / returns / why a tool and
+  not a prompt. Parameters carry constraints (enum/range/length); error
+  semantics must be self-correcting (the error text IS the model's
+  next-round self-correction prompt — rules in the tool design rules of
+  `references/plugin-and-tool-guide.md`). Write "（无）" when there are no
+  tools.
+- `## 实现注意事项` — implementation notes: timing traps, budgets, secret
+  sources, test idiom, etc., for the future implementer.
 
-## Phase 0 — 侦察
+The four-level heading formats (`#### 插件卡：<code>（<kind>）`,
+`#### 工具卡：<name>（<toolset>）`) are a machine-greppable contract —
+verify_template.py relies on them for card-coverage checks; **no variants
+allowed**.
 
-1. 读上表参考文档中需要的篇目。
-2. 盘点知识库库存：`app-templates/` 已有条目（权威目录 `INDEX.md`；
-   避免业务形态重复，同形态应说明差异或合并）。
-3. 精读 1-2 个业务形态最接近的既有模板条目（正向模式，选型参考
-   `references/template-index.md` 的"borrow it for"列）或目标应用
-   全量源码（逆向模式）。
+Write the Pattern-declaration YAML block as a **lean declaration**: code /
+name / description / pattern_type / entry_node_code / stages (fsm) / nodes
+(code, name, description, task_description, sub_nodes, slots, is_end,
+plugins). No large prompt bodies — prompts belong to implementation; refer
+to them in the implementation notes instead.
 
-## Phase 1 — 图类型决策
+## Phase 0 — Recon
 
-判据见 `references/architecture.md`：引导式对话、每条用户消息推进一拍、
-槽位/表单收集、逐轮确认、自然循环 → **fsm**；单条用户消息应触发端到端
-交付物（报告/产物/研究结论）的多节点自主管线 → **agent**；模糊时默认
-agent 并说明理由；需求含糊不阻塞成稿——记录所填默认与假设，待确认
-问题写进实现注意事项。**先陈述决策再动笔**：pattern_type、命中的信号、
-5-10 个节点的一句话节点草图。决策直接决定 TEMPLATE.md 的节点清单与
-交互表形态。
+1. Read whichever of the reference files above you need.
+2. Inventory the knowledge base: existing `app-templates/` entries
+   (authoritative catalog: `INDEX.md`; avoid duplicating a business shape —
+   if the shape exists, state the difference or merge).
+3. Study closely the 1–2 existing entries closest in business shape
+   (forward mode; selection guidance in the "borrow it for" column of
+   `references/template-index.md`) or the target application's full source
+   (reverse mode).
 
-## Phase 2 — 五件套方案
+## Phase 1 — Graph type decision
 
-1. **借用清单 + 差异分析**：从 `app-templates/` 已有条目中声明借用什么
-   （图形态/守卫纪律/循环策略/卡片范式，机制级借用优于形态照搬）；
-   零借用须明示理由。
-2. **节点全清单**：code / name / purpose / sub_nodes / is_end。从满足
-   需求的最小图开始——主干之外每个节点都要指出需求信号依据（信号→
-   拓扑映射见 `references/pitfalls.md` §11）。
-3. **节点交互表**（强制）：每节点读/写哪些 graph_state 键；每个循环
-   （设计→验证→修复…）写检查点与经验继承策略（历史数组 / 最佳检查点 /
-   试败日志）。模板见 `references/pitfalls.md`。
-4. **能力分诊表**：每个能力一行，路由到——**提示词原生节点**（语义
-   判断/话术）/ **工具描述卡**（精确计算、外部 API、确定性变换）/
-   **executor 或 stage 步骤卡**（编排、状态桥接、收敛闸门）。分诊规则
-   同 `references/plugin-and-tool-guide.md`；模板里它们落到"卡"而不是
-   代码。
-5. **产物清单**：`app-templates/<code>/TEMPLATE.md`（新目录）+
-   `INDEX.md` 追加一行；确认 code 无冲突（`introspect.py apps` +
-   现有条目）。
+Criteria in `references/architecture.md`: guided conversation where each
+user message advances one step, slot/form collection, per-turn confirmation,
+natural cycles → **fsm**; a single user message should trigger an end-to-end
+deliverable (report / artifact / research conclusion) via a multi-node
+autonomous pipeline → **agent**; when ambiguous, default to agent and say
+why; a vague requirement does not block drafting — record the defaults and
+assumptions you filled, and put open questions into the implementation
+notes. **State the decision before writing**: pattern_type, the signals that
+fired, a one-line 5–10 node sketch. The decision directly shapes
+TEMPLATE.md's node list and interaction table.
 
-## Phase 3 — 写模板
+## Phase 2 — The five-artifact plan
 
-- 按章节骨架逐节填写；交互表行数必须等于节点数；Pattern YAML 块首行
-  带标记注释。
-- 每个被声明的插件码（pattern.plugins / node.plugins / stages 骨架，
-  含内置件）都有一张插件步骤卡；每个工具一张工具描述卡。
-- 处理步骤字段写"几句话"：讲清输入→变换→输出与失败路径即可，不写
-  伪代码细节；确定性要求（零 LLM、防编造、防重放）写进出边影响或
-  实现注意事项。设计→验证→修复环中，验证闸参数（阈值/stale-N/
-  通过规则）只读，修复卡不得改写验证卡——防自改闸（`references/
-  pitfalls.md` §12）。
-- `INDEX.md` 追加一行（code / 名称 / 业务形态 / 图类型 / 来源 / 条目
-  相对链接）。
+1. **Borrow list + diff analysis**: declare what you borrow from existing
+   `app-templates/` entries (graph shape / guard discipline / loop strategy
+   / card idiom — mechanism-level borrowing beats shape copying); zero
+   borrow must be stated explicitly with reasons.
+2. **Full node list**: code / name / purpose / sub_nodes / is_end. Start
+   from the smallest graph that satisfies the requirement — every node
+   beyond the trunk cites the requirement signal that demands it
+   (signal→topology map: `references/pitfalls.md` §11).
+3. **Node interaction table** (mandatory): per node, which graph_state keys
+   it reads/writes; every loop (design→verify→fix…) states its checkpoint
+   & experience-inheritance strategy (history array / best checkpoint /
+   tried-and-failed log). Template in `references/pitfalls.md`.
+4. **Capability triage table**: one row per capability, routed to —
+   **prompt-native node** (semantic judgment / phrasing) / **tool
+   description card** (precise computation, external API, deterministic
+   transforms) / **executor or stage step card** (orchestration, state
+   bridging, convergence gates). Triage rules as in
+   `references/plugin-and-tool-guide.md`; in a template they land as
+   cards, not code.
+5. **Artifact list**: `app-templates/<code>/TEMPLATE.md` (new directory) +
+   one appended `INDEX.md` line; confirm the code does not collide
+   (`introspect.py apps` + existing entries).
 
-**逆向模式**（现有应用 → 模板）：
-1. 读 `apps/<name>/` 全量源码（route/prompts/stages/executor/tools），
-   `introspect.py pattern <code> --view yaml` 交叉核对声明。
-2. 反推五件套：节点与边从 route.py 转写；交互表从 executor/stage 的
-   graph_state 读写反推；分诊表从"哪些行为在代码里确定性完成"反推。
-3. 插件卡的处理步骤 = 对该插件真实实现的**概括转述**（讲清读什么、
-   分几步、写什么、失败怎么办），不是源码粘贴。
-4. 来源标注"逆向自 apps/<name>"，实现注意事项写明该应用已存在、
-   模板是它的结构沉淀。
+## Phase 3 — Write the template
 
-## Phase 4 — 双闸验证（全部必过，红=未完成）
+- Fill in section by section following the skeleton; the interaction-table
+  row count must equal the node count; the Pattern YAML block's first line
+  carries the marker comment.
+- Every declared plugin code (pattern.plugins / node.plugins / stages
+  skeleton, builtin parts included) gets a plugin step card; every tool
+  gets a tool description card.
+- The processing-steps field is "a few sentences": input→transform→output
+  plus the failure path; no pseudocode detail. Determinism requirements
+  (zero LLM, anti-fabrication, anti-replay) go into out-edge impact or the
+  implementation notes. In a design→verify→fix loop, gate parameters
+  (thresholds / stale-N / pass rules) are read-only — a repair card must
+  not rewrite the verify card (anti-gate-tampering,
+  `references/pitfalls.md` §12).
+- Append one `INDEX.md` line (code / name / business shape / graph type /
+  source / relative link to the entry).
 
-**内容闸（checklist）**：
-- [ ] 章节骨架完整且顺序正确；交互表行数 = 节点数
-- [ ] 每个循环都有检查点与经验继承策略
-- [ ] 每个被声明的插件码（含内置件）有卡；每个工具有卡；无孤立卡
-- [ ] YAML 块与卡声明一致（码、kind、绑定槽位）
-- [ ] 借用清单明示；code 无冲突；INDEX.md 已追加
+**Reverse mode** (existing app → template):
 
-**结构闸（脚本）**：
+1. Read the full `apps/<name>/` source (route/prompts/stages/executor/
+   tools); cross-check the declaration with
+   `introspect.py pattern <code> --view yaml`.
+2. Derive the five artifacts backwards: nodes and edges from route.py; the
+   interaction table from the executor/stage graph_state reads/writes; the
+   triage table from "which behaviors are done deterministically in code".
+3. A plugin card's processing steps = a **condensed retelling** of that
+   plugin's real implementation (what it reads, the steps, what it writes,
+   what happens on failure) — not pasted source.
+4. Mark the source "reverse-engineered from apps/<name>"; the
+   implementation notes state that the app already exists and the template
+   is its structural distillation.
+
+## Phase 4 — Dual-gate verification (all mandatory; red = not done)
+
+**Content gate (checklist)**:
+
+- [ ] Section skeleton complete and in order; interaction-table rows equal node count
+- [ ] Every loop has a checkpoint & experience-inheritance strategy
+- [ ] Every declared plugin code (builtin parts included) has a card; every tool has a card; no orphan cards
+- [ ] YAML block and card declarations agree (codes, kinds, binding slots)
+- [ ] Borrow list explicit; code collision-free; INDEX.md appended
+
+**Structure gate (script)**:
 
 ```bash
 python nexus-app-template-skill/references/verify_template.py \
     app-templates/<code>/TEMPLATE.md
 ```
 
-脚本抽取 YAML 块 → 为声明的插件码注册占位工厂 → 构造 Pattern →
-`validate_pattern` + 结构断言（入口/悬空边/终节点/卡片覆盖/交互表
-行数/INDEX 收录）。零实现即可跑通结构合法性。
+The script extracts the YAML block → registers placeholder factories for
+declared plugin codes → constructs the Pattern → `validate_pattern` +
+structural assertions (entry / dangling edges / end nodes / card coverage /
+interaction-table rows / INDEX listing). Zero implementation is needed to
+prove structural soundness.
 
-如实报告：过了什么、缺什么。任一闸红不得宣布完成。
+Report honestly: what passed, what is missing. Never declare done while any
+gate is red.
 
-## 模板 → 实现的接力
+## Template → implementation relay
 
-模板条目就是实现蓝本：节点清单、交互表、能力分诊表就位后，实现者
-（人或 agent）照插件步骤卡与工具描述卡落地代码——每张卡的字段（绑定
-位置/读/处理步骤/写/出边影响）即实现契约；实现注意事项给出时序与
-测试要求。反向接力即本 skill 的逆向模式：已实现应用回填知识库。
+A template entry IS the implementation blueprint: with the node list,
+interaction table, and triage table in place, an implementer (human or
+agent) builds the code from the plugin step cards and tool description
+cards — each card's fields (binding / reads / processing steps / writes /
+out-edge impact) are the implementation contract; the implementation notes
+carry timing and test requirements. The reverse relay is this skill's
+reverse mode: implemented apps distill back into the knowledge base.
 
-## 安全红线（硬性，无例外）
+## Safety red lines (hard, no exceptions)
 
-1. **只写**：`app-templates/<code>/`（新目录）、`app-templates/INDEX.md`
-   （追加行）、`nexus-app-template-skill/`（本 skill 自身维护）。
-2. **不改**：`nexus/`、`atoms/`、`host/`、`ui/`、`apps/`、`tests/`、
-   `docs/`、其他既有条目。
-3. 模板不产生任何可执行代码（YAML 围栏块是声明数据，不是被 import
-   的模块）；不写 `host/config/`。
-4. 密钥等敏感信息不进模板（密钥来源以环境变量名提及即可）。
-5. 工具授权描述遵循拒绝式默认语义（allow_toolset ∩ use_tools），模板
-   不得描述"为跑通而放宽授权"的方案。
+1. **Write only**: `app-templates/<code>/` (new directory),
+   `app-templates/INDEX.md` (appended line), `nexus-app-template-skill/`
+   (this skill's own maintenance).
+2. **Never modify**: `nexus/`, `atoms/`, `host/`, `ui/`, `apps/`, `tests/`,
+   `docs/`, other existing entries.
+3. Templates produce no executable code (the YAML fenced block is
+   declaration data, not an imported module); never write `host/config/`.
+4. Secrets never enter a template (mention secret sources by
+   environment-variable name only).
+5. Tool authorization descriptions follow deny-by-default semantics
+   (allow_toolset ∩ use_tools); a template must never describe "widening
+   grants to make it run".

@@ -145,7 +145,7 @@ def _ppt_unified(node_name: str, query: str):
             {"reply": "PPT回复: 结束语", "next_node": "ppt_end", "slots": {}},
             ensure_ascii=False)
 
-    # 结束语 / unknown → stay
+    # Closing line ("结束语") / unknown -> stay
     return json.dumps(
         {"reply": "PPT回复: 结束语", "next_node": "", "slots": {}},
         ensure_ascii=False)

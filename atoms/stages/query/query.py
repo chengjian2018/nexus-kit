@@ -35,7 +35,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
     Subclasses must implement ``prompt_build`` and ``execute``; they may override
     ``_default_prompt_template`` to provide a custom default template.
 
-    Node/module level prompt template override is supported via the ``base_query_rewrite_prompt`` attribute.
+    Node level prompt template override is supported via the ``base_query_rewrite_prompt`` attribute.
     """
 
     stage_name = "query_rewrite"
@@ -161,11 +161,11 @@ class BaseQueryRewriter(PipelineStage, ABC):
         return result
 
     # ------------------------------------------------------------------
-    # Prompt template selection (priority: node > module > default)
+    # Prompt template selection (priority: node > default)
     # ------------------------------------------------------------------
 
     def _resolve_prompt_template(self, cxt: DialogueContext) -> str:
-        """Resolve the prompt template by priority: node > module > class default."""
+        """Resolve the prompt template by priority: node > class default."""
         return resolve_prompt_template(
             cxt, "base_query_rewrite_prompt", self._default_prompt_template()
         )
@@ -176,7 +176,7 @@ class BaseQueryRewriter(PipelineStage, ABC):
 
     # ------------------------------------------------------------------
     # Template filling — slot name → data-layer formatting mapping
-    # (assembled in node.py / module.py / base.py; this layer only maps)
+    # (assembled in node.py / context.py; this layer only maps)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -221,7 +221,7 @@ class QueryRewriter(BaseQueryRewriter):
     """Default Query Rewrite implementation.
 
     Uses ``QUERY_REWRITE_DEFAULT_PROMPT`` as the default template;
-    node/module level override via ``base_query_rewrite_prompt`` supported.
+    node level override via ``base_query_rewrite_prompt`` supported.
 
     Rewrite results are written to ``ctx.rewritten_queries``.
     """

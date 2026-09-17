@@ -12,9 +12,9 @@ are self-contained in this file. Covers:
    no tool rows in history / graph termination clears graph_state /
    trace lands in metadata
 3. Convergence honest exit: repeated validation failures without
-   improvement -> the repair station takes the deterministic honest exit on
-   its 3rd visit (no LLM call on the 3rd), report includes unresolved
-   diagnostics
+   improvement -> the repair station takes the deterministic honest exit at
+   the stale-5 convergence gate (no LLM call on the intercepted round),
+   report includes unresolved diagnostics
 4. Pass after improvement: fail(2) -> fail(1) -> pass, freeze and deliver,
    2 repair rounds
 5. Probe notice: update_available -> report includes a compact notice +

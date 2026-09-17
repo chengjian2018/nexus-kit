@@ -3,9 +3,9 @@
 The old AgentRunner protocol + LoopAgentRunner (a parameter-level injection
 with no registry) have been superseded by the plugin registry
 (nexus/registry/plugins.py, kind="executor") and the ModuleExecutor contract
-(nexus/engine/execution.py): executors are resolved per module
-(module.executor > pattern.executor_<type> > type default code) and receive
-an ExecutionContext. The default loop implementation lives in
+(nexus/engine/execution.py): executors are resolved per node/pattern
+(node.plugins[slot] > pattern.plugins[slot] > the type default code) and
+receive an ExecutionContext. The default loop implementation lives in
 atoms/executors/loop_executor.py.
 
 The "no new global singletons" note that used to live here is obsolete —

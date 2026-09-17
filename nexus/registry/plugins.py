@@ -3,8 +3,8 @@
 Kinds of plugins (kind is a plain string, so new extension points do not need
 registry API changes):
 
-- ``executor``       : module executors (agent loop / FSM pipeline / ROUTE
-                       pipeline); interface ModuleExecutor.execute(ec) ->
+- ``executor``       : node/pattern executors (agent loop / FSM pipeline);
+                       interface ModuleExecutor.execute(ec) ->
                        TurnResult (nexus/engine/execution.py). Default
                        implementations live in atoms/executors/ — the kernel
                        never imports them; the host/test warm-up registers

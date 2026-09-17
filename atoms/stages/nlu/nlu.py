@@ -1,9 +1,8 @@
 """
 NLU (Natural Language Understanding) stage — intent recognition and slot extraction.
 
-Supports NLU processing for both FSM and ROUTE module types:
-- FSMNLU  : intent recognition and transitions within finite state machine modules
-- RouteNLU: intent classification and dispatch for top-level route modules
+Supports NLU processing for FSM patterns:
+- FSMNLU  : intent recognition and transitions within finite state machine patterns
 
 LLM call chain: config/local_config.yaml → build_provider → chat_completion.
 """
@@ -176,11 +175,11 @@ class BaseNLU(PipelineStage, ABC):
         return result
 
     # ------------------------------------------------------------------
-    # Prompt template selection (priority: node > module > default)
+    # Prompt template selection (priority: node > default)
     # ------------------------------------------------------------------
 
     def _resolve_prompt_template(self, cxt: DialogueContext) -> str:
-        """Resolve the prompt template by priority: node > module > class default."""
+        """Resolve the prompt template by priority: node > class default."""
         system_prompt = resolve_prompt_template(
             cxt, "base_nlu_prompt", self._default_prompt_template()
         )
@@ -195,7 +194,7 @@ class BaseNLU(PipelineStage, ABC):
 
     # ------------------------------------------------------------------
     # Template filling — slot name → data-layer formatting mapping
-    # (assembled in node.py / module.py / base.py; this layer only maps)
+    # (assembled in node.py / context.py; this layer only maps)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -235,13 +234,13 @@ class BaseNLU(PipelineStage, ABC):
 
 
 # ============================================================================
-# FSM module NLU
+# FSM NLU
 # ============================================================================
 
 class FSMNLU(BaseNLU):
-    """NLU implementation for FSM modules — intent recognition and slot extraction within the state machine.
+    """NLU implementation for FSM patterns — intent recognition and slot extraction within the state machine.
 
-    Uses ``FSM_NLU_DEFAULT_PROMPT`` as the default template; node/module level override supported.
+    Uses ``FSM_NLU_DEFAULT_PROMPT`` as the default template; node level override supported.
     """
 
     stage_name = "fsm_nlu"

@@ -7,8 +7,8 @@ is written to ``ctx.rewritten_queries``:
     "I can go next Monday" -> "I can go next Monday(2026-09-07)"
 
 An alternative to the LLM-based ``QueryRewriter`` (query.py), selectable via the
-``query`` slot attribute on pattern/module/node (three-layer deferred resolution
-in stage_slots.py). Does not inherit ``BaseQueryRewriter``: that base class is
+``query`` slot of the stages skeleton (two-layer resolution: node.stages >
+pattern skeleton, see pipeline.py). Does not inherit ``BaseQueryRewriter``: that base class is
 bound to the LLM flow (prompt_build / _call_llm / retry); a pure-rule rewrite
 only needs ``PipelineStage.execute``.
 """

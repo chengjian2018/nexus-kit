@@ -14,8 +14,9 @@ search trial console. Conventions:
   pattern serialization is pure CPU too; the exception is the session-review
   section (§Session review), which goes through the aiosqlite-based
   SessionStore and is therefore async def;
-- Source of truth: patterns always come from the registry (currently all
-  code-managed; PRD D-1's fork-to-edit is P1); knowledge-base writes go
+- Source of truth: patterns always come from the registry (code-managed
+  plus ui/studio's console-hosted copies — the same-code console version
+  wins, D-1's fork-to-edit); knowledge-base writes go
   through atoms.knowledge.store's management CRUD (update semantics = only
   the keys that appear are updated; None explicitly clears a field).
 """

@@ -206,7 +206,7 @@ class _UnifiedBaseNLU(BaseNLU):
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
-    # Prompt assembly (reuses BaseNLU template priority node > module > default)
+    # Prompt assembly (reuses BaseNLU template priority node > default)
     # ------------------------------------------------------------------
 
     def _build_template_kwargs(self, cxt: DialogueContext) -> Dict[str, str]:
@@ -267,7 +267,7 @@ class _UnifiedBaseNLU(BaseNLU):
 
             if next_node not in valid_values:
                 # Hard guard: illegal transition edge → stay on the current node.
-                # If the rejected value is a clarify signal (module without dual-track
+                # If the rejected value is a clarify signal (node without dual-track
                 # clarify enabled), the model's reply is usually a "let me confirm for
                 # you" take-over promise that no later clarify step will honor —
                 # replace the reply with the fallback as well.
@@ -294,15 +294,15 @@ class _UnifiedBaseNLU(BaseNLU):
 
 
 # ============================================================================
-# FSM module unified stage
+# FSM unified stage
 # ============================================================================
 
 class FSMUnifiedNLU(_UnifiedBaseNLU):
-    """FSM module unified stage: one structured call completes intent/slot extraction and reply generation.
+    """FSM unified stage: one structured call completes intent/slot extraction and reply generation.
 
-    Paired with ``PassThroughNLG`` (the nlg position of the generate dict), the FSM
+    Paired with ``PassThroughNLG`` (the nlg slot of the stages skeleton), the FSM
     pipeline goes from [NLU, NLG] two LLM calls to a single unified-stage call;
-    node transition and slot merge logic (_handle_node_transition) unchanged.
+    node transition and slot merge logic (_fsm_node_transition) unchanged.
     """
 
     stage_name = "fsm_unified"
@@ -333,7 +333,7 @@ class FSMUnifiedNLU(_UnifiedBaseNLU):
 class PassThroughNLG(PipelineStage):
     """Placeholder NLG stage: preserves the nlg_result already written by the unified stage, skipping a second generation.
 
-    Usage (declarative form): ``stages = {"nlu": "fsm_unified", "nlg": "pass_through"}``
+    Usage (declarative form): ``stages = {"nlu": "fsm_unified", "nlg": "nlg_pass_through"}``
     on the pattern (the string code resolves from the plugin registry; PassThroughNLG
     registers as ``nlg_pass_through``), or the unified stage directly as the
     single-stage form (the nlg component guard auto no-ops), replacing the
@@ -371,7 +371,7 @@ class OpeningBroadcastNLG(PipelineStage):
     """Opening broadcast stage: assembles task_info fields with a text template into a greeting, written directly
     to nlg_result["content"] (zero LLM calls).
 
-    Wiring: mounted on the entry node's ``generate`` (single-stage form). Once the FSM
+    Wiring: declared in the entry node's ``stages`` nlg slot (single-stage form). Once the FSM
     transitions away it never returns to that node, so it naturally broadcasts only
     once; nlu_result stays empty → the transition guard stays on the current node
     until a business node takes over.

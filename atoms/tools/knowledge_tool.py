@@ -2,8 +2,10 @@
 
 Ported from Customer-Agent's Agent/CustomerAgent/tools/ (get_product_knowledge /
 search_customer_service_knowledge / get_shop_products / send_goods_link),
-with the registration mechanism swapped for hermes-nexus's
-``registry.register()`` (AST auto-discovery).
+with the registration mechanism swapped for this framework's
+``registry.register()`` (run by a module-level loop at import time — note
+the AST scanner only sees top-level register calls, so importers must import
+this module directly rather than rely on discover_builtin_tools).
 
 Differences from the original (degradation notes):
 - no trusted dependency injection: ``account_id`` is a tool parameter, copied
